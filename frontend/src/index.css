@@ -1,0 +1,33 @@
+:root{
+  --sidebar-bg:#0b1220;
+  --sidebar-fg:#e6eef8;
+  --accent:#4f46e5;
+  --surface:#0f1724;
+  --muted:#94a3b8;
+}
+*{box-sizing:border-box}
+body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-serif;background:#071022;color:var(--sidebar-fg)}
+.app-root{display:flex;min-height:100vh}
+.sidebar{width:250px;background:var(--sidebar-bg);padding:24px;color:var(--sidebar-fg);display:flex;flex-direction:column}
+.logo{font-weight:700;font-size:18px;margin-bottom:24px}
+.nav{margin-top:8px}
+.nav a{display:block;padding:10px 12px;border-radius:8px;color:var(--sidebar-fg);text-decoration:none;margin-bottom:8px}
+.nav a.active{background:rgba(255,255,255,0.04);border-left:4px solid var(--accent);padding-left:8px}
+.main-area{flex:1;display:flex;flex-direction:column}
+.topbar{height:64px;background:rgba(255,255,255,0.02);display:flex;align-items:center;padding:0 20px;border-bottom:1px solid rgba(255,255,255,0.02)}
+.content{padding:20px}
+.page-title{margin:0 0 16px 0;font-size:20px}
+.calendar-card{background:var(--surface);padding:16px;border-radius:8px;min-height:520px}
+.calendar-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.month-label{font-weight:600}
+.controls button{margin-left:8px;padding:6px 10px;border-radius:6px;border:0;background:transparent;color:var(--sidebar-fg);cursor:pointer}
+.controls button.primary{background:var(--accent);color:white}
+.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+.day-cell{min-height:100px;background:rgba(255,255,255,0.02);border-radius:6px;padding:8px;position:relative}
+.empty-state{height:260px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-style:italic}
+.day-number{font-size:12px;font-weight:500;margin-bottom:4px;color:var(--muted)}
+.shifts-container{display:flex;flex-direction:column;gap:4px}
+.shift-item{background:rgba(79,70,229,0.1);border-left:3px solid var(--accent);padding:4px 6px;border-radius:3px;font-size:11px;line-height:1.2}
+.shift-time{font-weight:500;color:var(--accent)}
+.shift-facility{color:var(--sidebar-fg);font-size:10px}
+.shift-role{color:var(--muted);font-size:10px}
