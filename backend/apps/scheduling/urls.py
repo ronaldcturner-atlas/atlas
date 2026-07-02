@@ -1,5 +1,7 @@
 from django.urls import path
 
+from . import api
+
 urlpatterns = [
-    # Scheduling routes go here.
+    path("shifts/", api.shifts_list, name="shifts_list"),
 ]

@@ -1,4 +1,12 @@
 from django.db import models
 
 
-# No facility models defined yet.
+class Facility(models.Model):
+    """A medical facility where shifts are scheduled."""
+    name = models.CharField(max_length=255)
+    
+    def __str__(self):
+        return self.name
+    
+    class Meta:
+        ordering = ['name']
