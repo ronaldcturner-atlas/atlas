@@ -81,6 +81,18 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .facility-field input[type="color"]{padding:4px;cursor:pointer}
 .physician-active-field{display:flex;align-items:center;justify-content:space-between;padding:6px 0}
 .physician-active-field input[type="checkbox"]{width:18px;height:18px}
+.shift-filters-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.shift-modal.shift-modal-wide{max-width:680px}
+.shift-notes{border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:10px;color:var(--sidebar-fg);resize:vertical}
+.shift-modal-actions button:disabled{opacity:0.6;cursor:not-allowed}
+.active-days-list{display:flex;flex-wrap:wrap;gap:6px}
+.active-day-chip{padding:2px 8px;border-radius:999px;background:rgba(255,255,255,0.08);font-size:11px;color:var(--sidebar-fg)}
+.days-fieldset{border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:10px 12px;margin:0}
+.days-fieldset legend{padding:0 6px;color:var(--muted);font-size:13px}
+.days-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.day-option{display:flex;align-items:center;gap:8px;color:var(--sidebar-fg);font-size:13px}
+.inline-checkbox-field{display:flex;align-items:center;justify-content:space-between}
+.inline-checkbox-field input{width:18px;height:18px}
 
 .facility-chip-list{display:flex;flex-wrap:wrap;gap:8px}
 .facility-chip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02);font-size:12px}

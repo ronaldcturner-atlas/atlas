@@ -3,11 +3,12 @@ import React, { useEffect, useMemo, useState } from 'react'
 type APIShift = {
   id: number
   facility_name: string
-  role: string
   physician_name: string
-  start_datetime: string
-  end_datetime: string
-  status: string
+  role_display: string
+  date: string
+  start_time: string
+  end_time: string
+  status_display: string
 }
 
 type APIFacility = {
@@ -32,13 +33,20 @@ type ShiftGroup = {
 
 type SchedulerViewProps = {
   facilitiesRefreshToken: number
+  shiftsRefreshToken: number
 }
 
-function formatTime(date: Date) {
-  const hour = date.getUTCHours()
+function formatTime(timeValue: string) {
+  const [hoursRaw, minutesRaw] = timeValue.split(':')
+  const hour = Number(hoursRaw)
+  const minutes = Number(minutesRaw)
+  if (Number.isNaN(hour) || Number.isNaN(minutes)) {
+    return timeValue
+  }
+
   const suffix = hour < 12 ? 'a' : 'p'
   const displayHour = hour % 12 || 12
-  return `${displayHour}${suffix}`
+  return `${displayHour}:${String(minutes).padStart(2, '0')}${suffix}`
 }
 
 function formatDateLabel(date: Date) {
@@ -51,7 +59,7 @@ function formatDateLabel(date: Date) {
   })
 }
 
-export default function SchedulerView({ facilitiesRefreshToken }: SchedulerViewProps) {
+export default function SchedulerView({ facilitiesRefreshToken, shiftsRefreshToken }: SchedulerViewProps) {
   const [allShifts, setAllShifts] = useState<APIShift[]>([])
   const [facilities, setFacilities] = useState<APIFacility[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -63,6 +71,10 @@ export default function SchedulerView({ facilitiesRefreshToken }: SchedulerViewP
           fetch('http://localhost:8000/api/shifts/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/facilities/', { credentials: 'include' }),
         ])
+
+        if (!shiftsResponse.ok || !facilitiesResponse.ok) {
+          throw new Error('Unable to load scheduler data')
+        }
 
         const shiftsData = await shiftsResponse.json()
         const facilitiesData = await facilitiesResponse.json()
@@ -77,7 +89,7 @@ export default function SchedulerView({ facilitiesRefreshToken }: SchedulerViewP
     }
 
     fetchSchedulerData()
-  }, [facilitiesRefreshToken])
+  }, [facilitiesRefreshToken, shiftsRefreshToken])
 
   const activeFacilities = useMemo(
     () => facilities.filter((facility) => facility.active).sort((a, b) => a.name.localeCompare(b.name)),
@@ -88,9 +100,8 @@ export default function SchedulerView({ facilitiesRefreshToken }: SchedulerViewP
     const groupedMap = new Map<string, ShiftGroup>()
 
     allShifts.forEach((shift) => {
-      const startDate = new Date(shift.start_datetime)
-      const endDate = new Date(shift.end_datetime)
-      const dayKey = startDate.toISOString().slice(0, 10)
+      const startDate = new Date(`${shift.date}T00:00:00`)
+      const dayKey = shift.date
 
       if (!groupedMap.has(dayKey)) {
         groupedMap.set(dayKey, {
@@ -102,10 +113,10 @@ export default function SchedulerView({ facilitiesRefreshToken }: SchedulerViewP
       groupedMap.get(dayKey)!.items.push({
         id: shift.id,
         facility: shift.facility_name,
-        shiftTime: `${formatTime(startDate)}-${formatTime(endDate)}`,
+        shiftTime: `${formatTime(shift.start_time)}-${formatTime(shift.end_time)}`,
         physician: shift.physician_name,
-        role: shift.role,
-        status: shift.status.charAt(0).toUpperCase() + shift.status.slice(1),
+        role: shift.role_display,
+        status: shift.status_display,
       })
     })
 

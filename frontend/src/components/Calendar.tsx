@@ -4,12 +4,15 @@ type APIShift = {
   id: number
   facility: number
   facility_name: string
-  role: string
   physician: number
   physician_name: string
-  start_datetime: string
-  end_datetime: string
+  role: string
+  role_display: string
+  date: string
+  start_time: string
+  end_time: string
   status: string
+  status_display: string
 }
 
 type Shift = {
@@ -36,13 +39,21 @@ function getShiftTone(role: string) {
 }
 
 function formatDisplayTime(date: Date) {
-  const hour = date.getUTCHours()
+  const hour = date.getHours()
   const suffix = hour < 12 ? 'a' : 'p'
   const displayHour = hour % 12 || 12
   return `${displayHour}${suffix}`
 }
 
-export default function Calendar(){
+function parseDateTime(dateValue: string, timeValue: string) {
+  return new Date(`${dateValue}T${timeValue}`)
+}
+
+type CalendarProps = {
+  shiftsRefreshToken: number
+}
+
+export default function Calendar({ shiftsRefreshToken }: CalendarProps){
   const today = new Date()
 
   // viewDate represents the first day of the currently displayed month
@@ -55,7 +66,12 @@ export default function Calendar(){
   useEffect(() => {
     const fetchShifts = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/shifts/')
+        const response = await fetch('http://localhost:8000/api/shifts/', {
+          credentials: 'include',
+        })
+        if (!response.ok) {
+          throw new Error('Unable to load shifts')
+        }
         const data = await response.json()
         setAllShifts(data)
       } catch (error) {
@@ -66,7 +82,7 @@ export default function Calendar(){
     }
 
     fetchShifts()
-  }, [])
+  }, [shiftsRefreshToken])
 
   const year = viewDate.getFullYear()
   const month = viewDate.getMonth() // 0 = January
@@ -81,21 +97,21 @@ export default function Calendar(){
   // Convert API shifts to calendar format
   const shifts: Record<number, Shift[]> = {}
   allShifts.forEach((apiShift) => {
-    const startDate = new Date(apiShift.start_datetime)
-    const endDate = new Date(apiShift.end_datetime)
+    const startDate = parseDateTime(apiShift.date, apiShift.start_time)
+    const endDate = parseDateTime(apiShift.date, apiShift.end_time)
     
     // Only show shifts from the current month
-    if (startDate.getUTCFullYear() === year && startDate.getUTCMonth() === month) {
-      const dayNum = startDate.getUTCDate()
+    if (startDate.getFullYear() === year && startDate.getMonth() === month) {
+      const dayNum = startDate.getDate()
       
       // Format time range (e.g., "7a–7p")
       const shift = `${formatDisplayTime(startDate)}–${formatDisplayTime(endDate)}`
       
       // Format date string
-      const dateStr = startDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' })
+      const dateStr = startDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
       
       // Capitalize status
-      const statusCapitalized = apiShift.status.charAt(0).toUpperCase() + apiShift.status.slice(1)
+      const statusCapitalized = apiShift.status_display
       
       if (!shifts[dayNum]) {
         shifts[dayNum] = []
@@ -104,7 +120,7 @@ export default function Calendar(){
       shifts[dayNum].push({
         facility: apiShift.facility_name,
         shift,
-        role: apiShift.role,
+        role: apiShift.role_display,
         physician_name: apiShift.physician_name,
         date: dateStr,
         status: statusCapitalized

@@ -118,6 +118,23 @@ Core Atlas Data Model
 - Schedule Block
 - Schedule Version
 
+Shift Builder Requirements (Updated)
+
+Reference: `docs/specifications/shift-builder-requirements.md`
+
+- Shift Builder defines generic recurring shift templates (not assigned users).
+- Required template fields:
+	- facility, name, start_time, end_time
+	- active_days_of_week (Sunday through Saturday)
+	- weekend_days (Friday/Saturday/Sunday only)
+	- night_shift (boolean)
+	- default_staffing_count (default 1)
+	- active (boolean)
+- Current scope constraints:
+	- Do not assign users in Shift Builder.
+	- Do not use specific calendar dates in Shift Builder.
+	- Do not connect Shift Builder to My Schedule yet.
+
 ---
 
 # Sprint 2
