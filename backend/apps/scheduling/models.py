@@ -3,6 +3,18 @@ from apps.facilities.models import Facility
 from apps.accounts.models import Physician
 
 
+def _format_template_time(time_value):
+    hour_24 = time_value.hour
+    minute = time_value.minute
+    suffix = 'a' if hour_24 < 12 else 'p'
+    hour_12 = hour_24 % 12 or 12
+
+    if minute == 0:
+        return f"{hour_12}{suffix}"
+
+    return f"{hour_12}:{minute:02d}{suffix}"
+
+
 class Shift(models.Model):
     """A shift scheduled for a physician at a facility."""
 
@@ -74,8 +86,15 @@ class ShiftTemplate(models.Model):
     default_staffing_count = models.PositiveIntegerField(default=1)
     active = models.BooleanField(default=True)
 
+    def generated_name(self):
+        return f"{self.facility.name} {_format_template_time(self.start_time)}-{_format_template_time(self.end_time)}"
+
+    def save(self, *args, **kwargs):
+        self.name = self.generated_name()
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.name} ({self.facility.name})"
+        return self.generated_name()
 
     class Meta:
         ordering = ['facility__name', 'name', 'start_time']

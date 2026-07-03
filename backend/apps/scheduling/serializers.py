@@ -69,6 +69,7 @@ class ShiftSerializer(serializers.ModelSerializer):
 
 class ShiftTemplateSerializer(serializers.ModelSerializer):
     facility_name = serializers.CharField(source='facility.name', read_only=True)
+    name = serializers.SerializerMethodField()
 
     class Meta:
         model = ShiftTemplate
@@ -85,7 +86,24 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
             'default_staffing_count',
             'active',
         ]
-        read_only_fields = ['id', 'facility_name']
+        read_only_fields = ['id', 'facility_name', 'name']
+
+    def _format_template_time(self, time_value):
+        hour_24 = time_value.hour
+        minute = time_value.minute
+        suffix = 'a' if hour_24 < 12 else 'p'
+        hour_12 = hour_24 % 12 or 12
+
+        if minute == 0:
+            return f'{hour_12}{suffix}'
+
+        return f'{hour_12}:{minute:02d}{suffix}'
+
+    def _build_generated_name(self, facility, start_time, end_time):
+        return f'{facility.name} {self._format_template_time(start_time)}-{self._format_template_time(end_time)}'
+
+    def get_name(self, obj):
+        return self._build_generated_name(obj.facility, obj.start_time, obj.end_time)
 
     def validate_active_days_of_week(self, value):
         if not isinstance(value, list):
@@ -132,8 +150,23 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
 
     def validate_default_staffing_count(self, value):
         if value < 1:
-            raise serializers.ValidationError('Staffing count must be at least 1.')
+            raise serializers.ValidationError('Required staffing must be at least 1.')
         return value
+
+    def create(self, validated_data):
+        validated_data['name'] = self._build_generated_name(
+            validated_data['facility'],
+            validated_data['start_time'],
+            validated_data['end_time'],
+        )
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        facility = validated_data.get('facility', instance.facility)
+        start_time = validated_data.get('start_time', instance.start_time)
+        end_time = validated_data.get('end_time', instance.end_time)
+        validated_data['name'] = self._build_generated_name(facility, start_time, end_time)
+        return super().update(instance, validated_data)
 
     def validate(self, attrs):
         attrs = super().validate(attrs)

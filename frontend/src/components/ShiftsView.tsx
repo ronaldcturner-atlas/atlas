@@ -33,7 +33,6 @@ type WeekendDay = 'Friday' | 'Saturday' | 'Sunday'
 
 type ShiftTemplateFormState = {
   facility: string
-  name: string
   start_time: string
   end_time: string
   active_days_of_week: DayOfWeek[]
@@ -59,7 +58,6 @@ const WEEKEND_DAY_OPTIONS: WeekendDay[] = ['Friday', 'Saturday', 'Sunday']
 
 const defaultFormState: ShiftTemplateFormState = {
   facility: '',
-  name: '',
   start_time: '07:00',
   end_time: '19:00',
   active_days_of_week: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
@@ -207,7 +205,6 @@ export default function ShiftsView() {
     setEditingTemplateId(template.id)
     setFormState({
       facility: String(template.facility),
-      name: template.name,
       start_time: template.start_time.slice(0, 5),
       end_time: template.end_time.slice(0, 5),
       active_days_of_week: template.active_days_of_week,
@@ -268,13 +265,13 @@ export default function ShiftsView() {
   const saveTemplate = async () => {
     const staffingCount = Number(formState.default_staffing_count)
 
-    if (!formState.facility || !formState.name.trim() || !formState.start_time || !formState.end_time) {
-      setError('Facility, name, start time, and end time are required.')
+    if (!formState.facility || !formState.start_time || !formState.end_time) {
+      setError('Facility, start time, and end time are required.')
       return
     }
 
     if (!Number.isInteger(staffingCount) || staffingCount < 1) {
-      setError('Staffing count must be a whole number of at least 1.')
+      setError('Required staffing must be a whole number of at least 1.')
       return
     }
 
@@ -307,7 +304,6 @@ export default function ShiftsView() {
         credentials: 'include',
         body: JSON.stringify({
           facility: Number(formState.facility),
-          name: formState.name.trim(),
           start_time: formState.start_time,
           end_time: formState.end_time,
           active_days_of_week: formState.active_days_of_week,
@@ -392,7 +388,7 @@ export default function ShiftsView() {
               <th>Active Days</th>
               <th>Weekend</th>
               <th>Night</th>
-              <th>Staffing Count</th>
+              <th>Required Staffing</th>
               <th>Status</th>
               <th>Actions</th>
             </tr>
@@ -449,18 +445,6 @@ export default function ShiftsView() {
             </div>
 
             <div className="shift-modal-body">
-              <label className="facility-field">
-                <span>Name</span>
-                <input
-                  type="text"
-                  value={formState.name}
-                  onChange={(event) =>
-                    setFormState((current) => ({ ...current, name: event.target.value }))
-                  }
-                  placeholder="e.g., Berkeley 7a-7p"
-                />
-              </label>
-
               <label className="facility-field">
                 <span>Facility</span>
                 <select
@@ -548,7 +532,7 @@ export default function ShiftsView() {
               </label>
 
               <label className="facility-field">
-                <span>Default Staffing Count</span>
+                <span>Required Staffing</span>
                 <input
                   type="number"
                   min={1}
