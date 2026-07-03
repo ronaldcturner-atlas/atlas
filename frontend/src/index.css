@@ -11,8 +11,9 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .sidebar{width:250px;background:var(--sidebar-bg);padding:24px;color:var(--sidebar-fg);display:flex;flex-direction:column}
 .logo{font-weight:700;font-size:18px;margin-bottom:24px}
 .nav{margin-top:8px}
-.nav a{display:block;padding:10px 12px;border-radius:8px;color:var(--sidebar-fg);text-decoration:none;margin-bottom:8px}
-.nav a.active{background:rgba(255,255,255,0.04);border-left:4px solid var(--accent);padding-left:8px}
+.nav button{display:block;width:100%;text-align:left;padding:10px 12px;border-radius:8px;color:var(--sidebar-fg);text-decoration:none;margin-bottom:8px;background:transparent;border:0;cursor:pointer;font-size:14px}
+.nav button.active{background:rgba(255,255,255,0.04);border-left:4px solid var(--accent);padding-left:8px}
+.nav button:hover{background:rgba(255,255,255,0.03)}
 .main-area{flex:1;display:flex;flex-direction:column}
 .topbar{height:64px;background:rgba(255,255,255,0.02);display:flex;align-items:center;padding:0 20px;border-bottom:1px solid rgba(255,255,255,0.02)}
 .content{padding:20px}
@@ -52,3 +53,32 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .shift-modal-actions button{padding:8px 14px;border-radius:8px;border:0;background:rgba(255,255,255,0.08);color:var(--sidebar-fg);cursor:pointer}
 .shift-modal-actions button.secondary{background:rgba(255,255,255,0.06)}
 .shift-modal-actions button.secondary:hover{background:rgba(255,255,255,0.12)}
+
+.scheduler-view-card{background:var(--surface);border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:18px}
+.scheduler-day-group h2{margin:0 0 10px 0;font-size:16px;color:var(--sidebar-fg)}
+.scheduler-table-wrap{overflow-x:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px}
+.scheduler-table{width:100%;border-collapse:collapse;min-width:760px}
+.scheduler-table th,.scheduler-table td{padding:10px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.06);font-size:13px}
+.scheduler-table th{font-size:12px;text-transform:uppercase;letter-spacing:0.04em;color:var(--muted);background:rgba(255,255,255,0.02)}
+.scheduler-table tbody tr:hover{background:rgba(255,255,255,0.02)}
+.scheduler-table tbody tr:last-child td{border-bottom:0}
+.scheduler-loading{background:var(--surface);border-radius:8px;padding:24px;color:var(--muted)}
+
+.facilities-view-card{background:var(--surface);border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:16px}
+.facilities-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.facilities-header h2{margin:0;font-size:16px}
+.primary-action{padding:8px 12px;border-radius:8px;border:0;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+.facilities-error{padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.16);color:#fecaca;font-size:13px}
+.facility-actions{display:flex;gap:8px}
+.facility-actions button{padding:6px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.16);background:transparent;color:var(--sidebar-fg);cursor:pointer}
+.facility-actions button:hover{background:rgba(255,255,255,0.06)}
+.facility-color-cell{display:inline-flex;align-items:center;gap:8px}
+.facility-color-swatch{width:12px;height:12px;border-radius:50%;border:1px solid rgba(255,255,255,0.35);display:inline-block}
+.facility-field{display:grid;gap:6px}
+.facility-field span{font-size:13px;color:var(--muted)}
+.facility-field input{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:0 10px;color:var(--sidebar-fg)}
+.facility-field input[type="color"]{padding:4px;cursor:pointer}
+
+.facility-chip-list{display:flex;flex-wrap:wrap;gap:8px}
+.facility-chip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02);font-size:12px}
+.facility-timezone{color:var(--muted);font-size:11px}
