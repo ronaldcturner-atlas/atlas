@@ -16,8 +16,30 @@ type Shift = {
   facility: string
   shift: string
   role: string
+  physician_name: string
   date: string
   status: string
+}
+
+const SHIFT_TONE_CLASS: Record<string, string> = {
+  '7a-7p': 'shift-tone-day',
+  '7p-7a': 'shift-tone-night',
+  '9a-9p': 'shift-tone-long-day',
+  '1p-1a': 'shift-tone-swing',
+  'fast-track': 'shift-tone-fast-track',
+  midday: 'shift-tone-midday',
+}
+
+function getShiftTone(role: string) {
+  const normalized = role.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  return SHIFT_TONE_CLASS[normalized] ?? 'shift-tone-default'
+}
+
+function formatDisplayTime(date: Date) {
+  const hour = date.getUTCHours()
+  const suffix = hour < 12 ? 'a' : 'p'
+  const displayHour = hour % 12 || 12
+  return `${displayHour}${suffix}`
 }
 
 export default function Calendar(){
@@ -63,20 +85,14 @@ export default function Calendar(){
     const endDate = new Date(apiShift.end_datetime)
     
     // Only show shifts from the current month
-    if (startDate.getFullYear() === year && startDate.getMonth() === month) {
-      const dayNum = startDate.getDate()
+    if (startDate.getUTCFullYear() === year && startDate.getUTCMonth() === month) {
+      const dayNum = startDate.getUTCDate()
       
       // Format time range (e.g., "7a–7p")
-      const startHour = startDate.getHours()
-      const endHour = endDate.getHours()
-      const startAmPm = startHour < 12 ? 'a' : 'p'
-      const endAmPm = endHour < 12 ? 'a' : 'p'
-      const displayStartHour = startHour % 12 || 12
-      const displayEndHour = endHour % 12 || 12
-      const shift = `${displayStartHour}${startAmPm}–${displayEndHour}${endAmPm}`
+      const shift = `${formatDisplayTime(startDate)}–${formatDisplayTime(endDate)}`
       
       // Format date string
-      const dateStr = startDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+      const dateStr = startDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' })
       
       // Capitalize status
       const statusCapitalized = apiShift.status.charAt(0).toUpperCase() + apiShift.status.slice(1)
@@ -89,6 +105,7 @@ export default function Calendar(){
         facility: apiShift.facility_name,
         shift,
         role: apiShift.role,
+        physician_name: apiShift.physician_name,
         date: dateStr,
         status: statusCapitalized
       })
@@ -134,12 +151,15 @@ export default function Calendar(){
                     {shifts[dayNum].map((shift, idx) => (
                       <div
                         key={idx}
-                        className="shift-item clickable"
+                        className={`shift-item clickable ${getShiftTone(shift.role)}`}
                         onClick={() => setSelectedShift(shift)}
                       >
-                        <div className="shift-time">{shift.shift}</div>
+                        <div className="shift-time-row">
+                          <div className="shift-time">{shift.shift}</div>
+                          <div className="shift-role-badge">{shift.role}</div>
+                        </div>
+                        <div className="shift-physician">{shift.physician_name}</div>
                         <div className="shift-facility">{shift.facility}</div>
-                        <div className="shift-role">{shift.role}</div>
                       </div>
                     ))}
                   </div>
@@ -164,6 +184,7 @@ export default function Calendar(){
             </div>
             <div className="shift-modal-body">
               <div className="detail-row"><span>Facility</span><span>{selectedShift.facility}</span></div>
+              <div className="detail-row"><span>Physician</span><span>{selectedShift.physician_name}</span></div>
               <div className="detail-row"><span>Role</span><span>{selectedShift.role}</span></div>
               <div className="detail-row"><span>Date</span><span>{selectedShift.date}</span></div>
               <div className="detail-row"><span>Time</span><span>{selectedShift.shift}</span></div>
