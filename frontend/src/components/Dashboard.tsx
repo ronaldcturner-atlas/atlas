@@ -4,9 +4,10 @@ import Topbar from './Topbar'
 import Calendar from './Calendar'
 import SchedulerView from './SchedulerView'
 import FacilitiesView from './FacilitiesView'
+import PhysiciansView from './PhysiciansView'
 
 export default function Dashboard() {
-  const [activeView, setActiveView] = React.useState<'my-schedule' | 'scheduler-view' | 'facilities'>('my-schedule')
+  const [activeView, setActiveView] = React.useState<'my-schedule' | 'scheduler-view' | 'facilities' | 'physicians'>('my-schedule')
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
 
   const pageTitle =
@@ -14,7 +15,9 @@ export default function Dashboard() {
       ? 'My Schedule'
       : activeView === 'scheduler-view'
         ? 'Scheduler View'
-        : 'Facilities'
+        : activeView === 'facilities'
+          ? 'Facilities'
+          : 'Physicians'
 
   return (
     <div className="app-root">
@@ -28,6 +31,7 @@ export default function Dashboard() {
           {activeView === 'facilities' && (
             <FacilitiesView onFacilitiesChanged={() => setFacilitiesRefreshToken((current) => current + 1)} />
           )}
+          {activeView === 'physicians' && <PhysiciansView />}
         </main>
       </div>
     </div>

@@ -77,7 +77,10 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .facility-field{display:grid;gap:6px}
 .facility-field span{font-size:13px;color:var(--muted)}
 .facility-field input{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:0 10px;color:var(--sidebar-fg)}
+.facility-field select{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:0 10px;color:var(--sidebar-fg)}
 .facility-field input[type="color"]{padding:4px;cursor:pointer}
+.physician-active-field{display:flex;align-items:center;justify-content:space-between;padding:6px 0}
+.physician-active-field input[type="checkbox"]{width:18px;height:18px}
 
 .facility-chip-list{display:flex;flex-wrap:wrap;gap:8px}
 .facility-chip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02);font-size:12px}
