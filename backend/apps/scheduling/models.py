@@ -98,3 +98,41 @@ class ShiftTemplate(models.Model):
 
     class Meta:
         ordering = ['facility__name', 'name', 'start_time']
+
+
+class ScheduleBlock(models.Model):
+    """Defines the lifecycle and metadata for a schedule planning block."""
+
+    class BuildStatus(models.TextChoices):
+        PRE_BUILD = 'PRE_BUILD', 'PRE_BUILD'
+        BUILD = 'BUILD', 'BUILD'
+        PREVIEW = 'PREVIEW', 'PREVIEW'
+        ARCHIVE = 'ARCHIVE', 'ARCHIVE'
+
+    start_date = models.DateField()
+    end_date = models.DateField()
+    request_open_datetime = models.DateTimeField()
+    request_close_datetime = models.DateTimeField()
+    build_status = models.CharField(
+        max_length=20,
+        choices=BuildStatus.choices,
+        default=BuildStatus.PRE_BUILD,
+        editable=False,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    published_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return self.generated_name
+
+    @property
+    def generated_name(self):
+        start_label = self.start_date.strftime('%b %Y')
+        end_label = self.end_date.strftime('%b %Y')
+        if start_label == end_label:
+            return start_label
+        return f'{start_label}-{end_label}'
+
+    class Meta:
+        ordering = ['-created_at', '-id']

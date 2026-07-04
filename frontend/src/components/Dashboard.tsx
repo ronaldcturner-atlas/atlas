@@ -4,11 +4,12 @@ import Topbar from './Topbar'
 import Calendar from './Calendar'
 import SchedulerView from './SchedulerView'
 import ShiftsView from './ShiftsView'
+import ScheduleBlocksView from './ScheduleBlocksView'
 import FacilitiesView from './FacilitiesView'
 import PhysiciansView from './PhysiciansView'
 
 export default function Dashboard() {
-  const [activeView, setActiveView] = React.useState<'my-schedule' | 'scheduler-view' | 'shift-builder' | 'facilities' | 'physicians'>('my-schedule')
+  const [activeView, setActiveView] = React.useState<'my-schedule' | 'scheduler-view' | 'shift-builder' | 'schedule-blocks' | 'facilities' | 'physicians'>('my-schedule')
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
   const [shiftsRefreshToken, setShiftsRefreshToken] = React.useState(0)
 
@@ -19,6 +20,8 @@ export default function Dashboard() {
         ? 'Scheduler View'
         : activeView === 'shift-builder'
           ? 'Shift Builder'
+        : activeView === 'schedule-blocks'
+          ? 'Schedule Blocks'
         : activeView === 'facilities'
           ? 'Facilities'
           : 'Physicians'
@@ -42,6 +45,7 @@ export default function Dashboard() {
             />
           )}
           {activeView === 'shift-builder' && <ShiftsView />}
+          {activeView === 'schedule-blocks' && <ScheduleBlocksView />}
           {activeView === 'facilities' && (
             <FacilitiesView onFacilitiesChanged={handleFacilitiesChanged} />
           )}

@@ -1,8 +1,8 @@
 import React from 'react'
 
 type SidebarProps = {
-  activeView: 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'facilities' | 'physicians'
-  onSelectView: (view: 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'facilities' | 'physicians') => void
+  activeView: 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'schedule-blocks' | 'facilities' | 'physicians'
+  onSelectView: (view: 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'schedule-blocks' | 'facilities' | 'physicians') => void
 }
 
 export default function Sidebar({ activeView, onSelectView }: SidebarProps){
@@ -30,6 +30,13 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           onClick={() => onSelectView('shift-builder')}
         >
           Shift Builder
+        </button>
+        <button
+          type="button"
+          className={activeView === 'schedule-blocks' ? 'active' : ''}
+          onClick={() => onSelectView('schedule-blocks')}
+        >
+          Schedule Blocks
         </button>
         <button
           type="button"

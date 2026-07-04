@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta
 
 from rest_framework import serializers
-from .models import Shift, ShiftTemplate
+from django.utils import timezone
+
+from .models import ScheduleBlock, Shift, ShiftTemplate
 
 
 class ShiftSerializer(serializers.ModelSerializer):
@@ -178,5 +180,92 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'weekend_days': 'Weekend designation days must also be selected in active days.'
             })
+
+        return attrs
+
+
+class ScheduleBlockSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField()
+    request_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ScheduleBlock
+        fields = [
+            'id',
+            'name',
+            'start_date',
+            'end_date',
+            'request_open_datetime',
+            'request_close_datetime',
+            'request_status',
+            'build_status',
+            'created_at',
+            'updated_at',
+            'published_at',
+        ]
+        read_only_fields = [
+            'id',
+            'name',
+            'request_status',
+            'build_status',
+            'created_at',
+            'updated_at',
+            'published_at',
+        ]
+
+    def get_name(self, obj):
+        return obj.generated_name
+
+    def get_request_status(self, obj):
+        now = timezone.now()
+        if now < obj.request_open_datetime:
+            return 'Not Open'
+        if now <= obj.request_close_datetime:
+            return 'Open'
+        return 'Closed'
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        if 'build_status' in self.initial_data:
+            raise serializers.ValidationError({'build_status': 'build_status cannot be edited manually.'})
+
+        instance = self.instance
+        start_date = attrs.get('start_date', getattr(instance, 'start_date', None))
+        end_date = attrs.get('end_date', getattr(instance, 'end_date', None))
+        request_open_datetime = attrs.get(
+            'request_open_datetime',
+            getattr(instance, 'request_open_datetime', None),
+        )
+        request_close_datetime = attrs.get(
+            'request_close_datetime',
+            getattr(instance, 'request_close_datetime', None),
+        )
+
+        if start_date and end_date and end_date < start_date:
+            raise serializers.ValidationError({'end_date': 'End date must be on or after start date.'})
+
+        if start_date and end_date:
+            month_span = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month) + 1
+            if month_span < 1:
+                raise serializers.ValidationError({'end_date': 'Schedule block must be at least 1 month.'})
+            if month_span > 12:
+                raise serializers.ValidationError({'end_date': 'Schedule block cannot exceed 12 months.'})
+
+        if request_open_datetime and request_close_datetime and request_close_datetime <= request_open_datetime:
+            raise serializers.ValidationError({
+                'request_close_datetime': 'Request close must be later than request open.'
+            })
+
+        if instance and instance.build_status == ScheduleBlock.BuildStatus.ARCHIVE:
+            editable_fields = {
+                'start_date',
+                'end_date',
+                'request_open_datetime',
+                'request_close_datetime',
+            }
+            attempted_edits = editable_fields.intersection(set(attrs.keys()))
+            if attempted_edits:
+                raise serializers.ValidationError('Archived Schedule Blocks are read only.')
 
         return attrs
