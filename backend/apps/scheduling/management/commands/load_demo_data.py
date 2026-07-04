@@ -10,6 +10,15 @@ from apps.facilities.models import Facility
 from apps.scheduling.models import Shift
 
 
+def _derive_short_name(name):
+    lowered = name.lower()
+    for suffix in [' medical center', ' hospital', ' clinic', ' center']:
+        if lowered.endswith(suffix):
+            candidate = name[: -len(suffix)].strip(' ,-/')
+            return candidate or name
+    return name
+
+
 class Command(BaseCommand):
     help = 'Load demo data for the calendar'
 
@@ -45,7 +54,10 @@ class Command(BaseCommand):
 
         created_facilities = []
         for facility_name in facilities:
-            facility, _ = Facility.objects.get_or_create(name=facility_name)
+            facility, _ = Facility.objects.get_or_create(
+                name=facility_name,
+                defaults={'short_name': _derive_short_name(facility_name)},
+            )
             created_facilities.append(facility)
             self.stdout.write(self.style.SUCCESS(f'Facility: {facility.name}'))
 

@@ -100,7 +100,7 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
         return f'{hour_12}:{minute:02d}{suffix}'
 
     def _build_generated_name(self, facility, start_time, end_time):
-        return f'{facility.name} {self._format_template_time(start_time)}-{self._format_template_time(end_time)}'
+        return f'{facility.short_name} {self._format_template_time(start_time)}-{self._format_template_time(end_time)}'
 
     def get_name(self, obj):
         return self._build_generated_name(obj.facility, obj.start_time, obj.end_time)

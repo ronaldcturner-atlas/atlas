@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react'
 type Facility = {
   id: number
   name: string
+  short_name: string
   timezone: string
   color: string
   active: boolean
@@ -10,6 +11,7 @@ type Facility = {
 
 type FacilityFormState = {
   name: string
+  short_name: string
   timezone: string
   color: string
 }
@@ -22,6 +24,7 @@ const API_BASE = 'http://localhost:8000/api'
 
 const defaultFormState: FacilityFormState = {
   name: '',
+  short_name: '',
   timezone: 'UTC',
   color: '#2563eb',
 }
@@ -114,6 +117,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
     setEditingFacilityId(facility.id)
     setFormState({
       name: facility.name,
+      short_name: facility.short_name,
       timezone: facility.timezone,
       color: facility.color,
     })
@@ -129,6 +133,11 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
   const saveFacility = async () => {
     if (!formState.name.trim()) {
       setError('Facility name is required.')
+      return
+    }
+
+    if (!formState.short_name.trim()) {
+      setError('Facility short name is required.')
       return
     }
 
@@ -150,6 +159,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
         credentials: 'include',
         body: JSON.stringify({
           name: formState.name.trim(),
+          short_name: formState.short_name.trim(),
           timezone: formState.timezone.trim() || 'UTC',
           color: formState.color,
         }),
@@ -171,24 +181,32 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
     }
   }
 
-  const disableFacility = async (facility: Facility) => {
+  const setFacilityActiveState = async (facility: Facility, active: boolean) => {
     try {
       setError(null)
-      const response = await fetch(`${API_BASE}/facilities/${facility.id}/disable/`, {
-        method: 'POST',
+      const response = await fetch(`${API_BASE}/facilities/${facility.id}/`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
         credentials: 'include',
+        body: JSON.stringify({ active }),
       })
 
       if (!response.ok) {
         const errorMessage = await getApiErrorMessage(response)
-        throw new Error(errorMessage ?? 'Unable to disable facility')
+        throw new Error(errorMessage ?? `Unable to ${active ? 'enable' : 'disable'} facility`)
       }
 
       await fetchFacilities()
       onFacilitiesChanged()
-    } catch (disableError) {
-      console.error(disableError)
-      setError(disableError instanceof Error ? disableError.message : `Unable to disable ${facility.name}.`)
+    } catch (toggleError) {
+      console.error(toggleError)
+      setError(
+        toggleError instanceof Error
+          ? toggleError.message
+          : `Unable to ${active ? 'enable' : 'disable'} ${facility.name}.`
+      )
     }
   }
 
@@ -212,6 +230,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
           <thead>
             <tr>
               <th>Name</th>
+              <th>Short Name</th>
               <th>Timezone</th>
               <th>Color</th>
               <th>Status</th>
@@ -222,6 +241,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
             {facilities.map((facility) => (
               <tr key={facility.id}>
                 <td>{facility.name}</td>
+                <td>{facility.short_name}</td>
                 <td>{facility.timezone}</td>
                 <td>
                   <span className="facility-color-cell">
@@ -239,9 +259,13 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                     <button type="button" onClick={() => openEditModal(facility)}>
                       Edit
                     </button>
-                    {facility.active && (
-                      <button type="button" onClick={() => disableFacility(facility)}>
+                    {facility.active ? (
+                      <button type="button" onClick={() => setFacilityActiveState(facility, false)}>
                         Disable
+                      </button>
+                    ) : (
+                      <button type="button" onClick={() => setFacilityActiveState(facility, true)}>
+                        Enable
                       </button>
                     )}
                   </div>
@@ -270,6 +294,17 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                     setFormState((current) => ({ ...current, name: event.target.value }))
                   }
                   placeholder="Downtown Medical Center"
+                />
+              </label>
+              <label className="facility-field">
+                <span>Short Name</span>
+                <input
+                  type="text"
+                  value={formState.short_name}
+                  onChange={(event) =>
+                    setFormState((current) => ({ ...current, short_name: event.target.value }))
+                  }
+                  placeholder="Downtown"
                 />
               </label>
               <label className="facility-field">

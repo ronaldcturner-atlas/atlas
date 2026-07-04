@@ -87,7 +87,7 @@ class ShiftTemplate(models.Model):
     active = models.BooleanField(default=True)
 
     def generated_name(self):
-        return f"{self.facility.name} {_format_template_time(self.start_time)}-{_format_template_time(self.end_time)}"
+        return f"{self.facility.short_name} {_format_template_time(self.start_time)}-{_format_template_time(self.end_time)}"
 
     def save(self, *args, **kwargs):
         self.name = self.generated_name()
