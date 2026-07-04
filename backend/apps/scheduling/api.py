@@ -238,9 +238,7 @@ def schedule_block_requests_context(request, block_id):
         )
     else:
         self_physician = _resolve_self_physician(request.user)
-        if not self_physician:
-            return Response({'detail': 'Authenticated user is not linked to a physician profile.'}, status=status.HTTP_403_FORBIDDEN)
-        physicians = [self_physician]
+        physicians = [self_physician] if self_physician else []
 
     selected_physician_id_param = request.query_params.get('physician_id')
     selected_physician_id = physicians[0].id if physicians else None

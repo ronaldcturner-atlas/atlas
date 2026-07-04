@@ -203,3 +203,20 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(payload['schedule_block']['id'], self.block.id)
         self.assertEqual(payload['selected_physician_id'], self.physician.id)
         self.assertGreaterEqual(len(payload['physicians']), 1)
+
+    def test_context_returns_200_for_authenticated_user_without_physician(self):
+        user_without_physician = get_user_model().objects.create_user(
+            username='observer@example.com',
+            email='observer@example.com',
+            password='password123',
+        )
+        self.client.force_authenticate(user=user_without_physician)
+
+        response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['schedule_block']['id'], self.block.id)
+        self.assertEqual(payload['can_manage_requests'], False)
+        self.assertEqual(payload['selected_physician_id'], None)
+        self.assertEqual(payload['physicians'], [])
