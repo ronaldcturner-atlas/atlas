@@ -14,6 +14,32 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .nav button{display:block;width:100%;text-align:left;padding:10px 12px;border-radius:8px;color:var(--sidebar-fg);text-decoration:none;margin-bottom:8px;background:transparent;border:0;cursor:pointer;font-size:14px}
 .nav button.active{background:rgba(255,255,255,0.04);border-left:4px solid var(--accent);padding-left:8px}
 .nav button:hover{background:rgba(255,255,255,0.03)}
+
+select{
+  height:36px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,0.18);
+  background:#fff;
+  color:#000;
+  padding:0 34px 0 10px;
+  font:inherit;
+}
+select:hover{border-color:rgba(255,255,255,0.35)}
+select:focus{
+  outline:none;
+  border-color:var(--accent);
+  box-shadow:0 0 0 3px rgba(79,70,229,0.22);
+}
+select:disabled{opacity:0.6;cursor:not-allowed}
+select option{
+  background:#fff;
+  color:#000;
+}
+select option:checked{
+  background-color:#0b57d0;
+  color:#fff;
+}
+
 .main-area{flex:1;display:flex;flex-direction:column}
 .topbar{height:64px;background:rgba(255,255,255,0.02);display:flex;align-items:center;padding:0 20px;border-bottom:1px solid rgba(255,255,255,0.02)}
 .content{padding:20px}
@@ -77,7 +103,6 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .facility-field{display:grid;gap:6px}
 .facility-field span{font-size:13px;color:var(--muted)}
 .facility-field input{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:0 10px;color:var(--sidebar-fg)}
-.facility-field select{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:0 10px;color:var(--sidebar-fg)}
 .facility-field input[type="color"]{padding:4px;cursor:pointer}
 .physician-active-field{display:flex;align-items:center;justify-content:space-between;padding:6px 0}
 .physician-active-field input[type="checkbox"]{width:18px;height:18px}
@@ -114,7 +139,6 @@ body,html,#root{height:100%;margin:0;font-family:Inter, system-ui, Arial, sans-s
 .request-builder-physician{display:grid;gap:6px;min-width:280px}
 .request-builder-physician span{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em}
 .request-builder-selected-name{padding:8px 10px;border:1px solid rgba(255,255,255,0.12);border-radius:8px;background:rgba(255,255,255,0.03)}
-.request-builder-physician select{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);padding:0 10px;color:var(--sidebar-fg)}
 .request-builder-month-nav{display:flex;align-items:center;gap:10px}
 .request-builder-month-nav button{padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .request-builder-month-nav button:disabled{opacity:0.5;cursor:not-allowed}
