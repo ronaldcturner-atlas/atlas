@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from rest_framework import serializers
 from django.utils import timezone
 
-from .models import ScheduleBlock, Shift, ShiftTemplate
+from .models import ScheduleBlock, ScheduleRequest, Shift, ShiftTemplate
 
 
 class ShiftSerializer(serializers.ModelSerializer):
@@ -269,3 +269,33 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError('Archived Schedule Blocks are read only.')
 
         return attrs
+
+
+class ScheduleRequestSerializer(serializers.ModelSerializer):
+    physician_name = serializers.SerializerMethodField()
+    shift_template_ids = serializers.PrimaryKeyRelatedField(
+        source='shift_templates',
+        many=True,
+        read_only=True,
+    )
+
+    class Meta:
+        model = ScheduleRequest
+        fields = [
+            'id',
+            'schedule_block',
+            'physician',
+            'physician_name',
+            'date',
+            'request_scope',
+            'request_type',
+            'weight',
+            'shift_template_ids',
+            'created_by',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_physician_name(self, obj):
+        return obj.physician.display_name or obj.physician.user.get_full_name() or obj.physician.user.username

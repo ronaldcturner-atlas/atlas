@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import RequestBuilderView from './RequestBuilderView'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 
@@ -182,6 +183,8 @@ export default function ScheduleBlocksView() {
   const [editingBlockId, setEditingBlockId] = useState<number | null>(null)
   const [isReadOnlyOpen, setIsReadOnlyOpen] = useState(false)
   const [formState, setFormState] = useState<ScheduleBlockFormState>(defaultFormState)
+  const [openedBlock, setOpenedBlock] = useState<ScheduleBlock | null>(null)
+  const [activeModalTab, setActiveModalTab] = useState<'details' | 'requests'>('details')
 
   const fetchBlocks = async () => {
     try {
@@ -211,6 +214,15 @@ export default function ScheduleBlocksView() {
     fetchBlocks()
   }, [])
 
+  useEffect(() => {
+    if (editingBlockId === null) {
+      return
+    }
+
+    const updatedBlock = blocks.find((block) => block.id === editingBlockId) ?? null
+    setOpenedBlock(updatedBlock)
+  }, [blocks, editingBlockId])
+
   const sortedBlocks = useMemo(
     () => [...blocks].sort((a, b) => b.created_at.localeCompare(a.created_at)),
     [blocks],
@@ -219,13 +231,17 @@ export default function ScheduleBlocksView() {
   const openCreateModal = () => {
     setEditingBlockId(null)
     setIsReadOnlyOpen(false)
+    setOpenedBlock(null)
+    setActiveModalTab('details')
     setFormState(defaultFormState)
     setIsModalOpen(true)
   }
 
-  const openBlock = (block: ScheduleBlock, readOnly = false) => {
+  const openBlock = (block: ScheduleBlock, readOnly = false, initialTab: 'details' | 'requests' = 'details') => {
     setEditingBlockId(block.id)
     setIsReadOnlyOpen(readOnly || block.build_status === 'ARCHIVE')
+    setOpenedBlock(block)
+    setActiveModalTab(initialTab)
     setFormState({
       start_date: block.start_date,
       end_date: block.end_date,
@@ -239,6 +255,8 @@ export default function ScheduleBlocksView() {
     setIsModalOpen(false)
     setEditingBlockId(null)
     setIsReadOnlyOpen(false)
+    setOpenedBlock(null)
+    setActiveModalTab('details')
     setFormState(defaultFormState)
   }
 
@@ -455,6 +473,9 @@ export default function ScheduleBlocksView() {
                     <button type="button" onClick={() => openBlock(block, block.build_status === 'ARCHIVE')}>
                       Open
                     </button>
+                    <button type="button" onClick={() => openBlock(block, block.build_status === 'ARCHIVE', 'requests')}>
+                      Requests
+                    </button>
                     {block.build_status !== 'ARCHIVE' && (
                       <>
                         <button type="button" onClick={() => openBlock(block)}>Edit Dates</button>
@@ -482,99 +503,138 @@ export default function ScheduleBlocksView() {
 
       {isModalOpen && (
         <div className="shift-modal-overlay" onClick={closeModal}>
-          <div className="shift-modal shift-modal-wide" onClick={(event) => event.stopPropagation()}>
+          <div className="shift-modal shift-modal-wide schedule-block-modal" onClick={(event) => event.stopPropagation()}>
             <div className="shift-modal-header">
               <h2>
-                {editingBlockId === null ? 'Create New Schedule Block' : isReadOnlyOpen ? 'Schedule Block (View Only)' : 'Edit Schedule Block'}
+                {editingBlockId === null
+                  ? 'Create New Schedule Block'
+                  : activeModalTab === 'requests'
+                    ? 'Schedule Block Requests'
+                    : isReadOnlyOpen
+                      ? 'Schedule Block (View Only)'
+                      : 'Edit Schedule Block'}
               </h2>
             </div>
+            {editingBlockId !== null && (
+              <div className="schedule-block-modal-tabs">
+                <button
+                  type="button"
+                  className={activeModalTab === 'details' ? 'active' : ''}
+                  onClick={() => setActiveModalTab('details')}
+                >
+                  Details
+                </button>
+                <button
+                  type="button"
+                  className={activeModalTab === 'requests' ? 'active' : ''}
+                  onClick={() => setActiveModalTab('requests')}
+                >
+                  Requests
+                </button>
+              </div>
+            )}
             <div className="shift-modal-body">
-              <label className="facility-field">
-                <span>Schedule Block Name</span>
-                <input
-                  type="text"
-                  value={buildGeneratedName(formState.start_date, formState.end_date)}
-                  readOnly
-                />
-              </label>
-              <div className="shift-filters-grid">
-                <label className="facility-field">
-                  <span>Schedule Start Date</span>
-                  <input
-                    type="date"
-                    value={formState.start_date}
-                    onChange={(event) =>
-                      setFormState((current) => {
-                        const nextStartDate = event.target.value
-                        const nextEndDate = current.end_date && current.end_date < nextStartDate
-                          ? nextStartDate
-                          : current.end_date
-                        return {
-                          ...current,
-                          start_date: nextStartDate,
-                          end_date: nextEndDate,
+              {activeModalTab === 'details' && (
+                <>
+                  <label className="facility-field">
+                    <span>Schedule Block Name</span>
+                    <input
+                      type="text"
+                      value={buildGeneratedName(formState.start_date, formState.end_date)}
+                      readOnly
+                    />
+                  </label>
+                  <div className="shift-filters-grid">
+                    <label className="facility-field">
+                      <span>Schedule Start Date</span>
+                      <input
+                        type="date"
+                        value={formState.start_date}
+                        onChange={(event) =>
+                          setFormState((current) => {
+                            const nextStartDate = event.target.value
+                            const nextEndDate = current.end_date && current.end_date < nextStartDate
+                              ? nextStartDate
+                              : current.end_date
+                            return {
+                              ...current,
+                              start_date: nextStartDate,
+                              end_date: nextEndDate,
+                            }
+                          })
                         }
-                      })
-                    }
-                    disabled={isReadOnlyOpen}
-                  />
-                </label>
-                <label className="facility-field">
-                  <span>Schedule End Date</span>
-                  <input
-                    type="date"
-                    value={formState.end_date}
-                    min={formState.start_date || undefined}
-                    onChange={(event) =>
-                      setFormState((current) => ({ ...current, end_date: event.target.value }))
-                    }
-                    disabled={isReadOnlyOpen}
-                  />
-                </label>
-              </div>
-              <div className="shift-filters-grid">
-                <label className="facility-field">
-                  <span>Request Open Date/Time</span>
-                  <input
-                    type="datetime-local"
-                    value={formState.request_open_datetime}
-                    onChange={(event) =>
-                      setFormState((current) => {
-                        const nextRequestOpen = event.target.value
-                        const nextRequestClose =
-                          current.request_close_datetime && current.request_close_datetime < nextRequestOpen
-                            ? nextRequestOpen
-                            : current.request_close_datetime
+                        disabled={isReadOnlyOpen}
+                      />
+                    </label>
+                    <label className="facility-field">
+                      <span>Schedule End Date</span>
+                      <input
+                        type="date"
+                        value={formState.end_date}
+                        min={formState.start_date || undefined}
+                        onChange={(event) =>
+                          setFormState((current) => ({ ...current, end_date: event.target.value }))
+                        }
+                        disabled={isReadOnlyOpen}
+                      />
+                    </label>
+                  </div>
+                  <div className="shift-filters-grid">
+                    <label className="facility-field">
+                      <span>Request Open Date/Time</span>
+                      <input
+                        type="datetime-local"
+                        value={formState.request_open_datetime}
+                        onChange={(event) =>
+                          setFormState((current) => {
+                            const nextRequestOpen = event.target.value
+                            const nextRequestClose =
+                              current.request_close_datetime && current.request_close_datetime < nextRequestOpen
+                                ? nextRequestOpen
+                                : current.request_close_datetime
 
-                        return {
-                          ...current,
-                          request_open_datetime: nextRequestOpen,
-                          request_close_datetime: nextRequestClose,
+                            return {
+                              ...current,
+                              request_open_datetime: nextRequestOpen,
+                              request_close_datetime: nextRequestClose,
+                            }
+                          })
                         }
-                      })
-                    }
-                    disabled={isReadOnlyOpen}
-                  />
-                </label>
-                <label className="facility-field">
-                  <span>Request Close Date/Time</span>
-                  <input
-                    type="datetime-local"
-                    value={formState.request_close_datetime}
-                    min={formState.request_open_datetime || undefined}
-                    onChange={(event) =>
-                      setFormState((current) => ({ ...current, request_close_datetime: event.target.value }))
-                    }
-                    disabled={isReadOnlyOpen}
-                  />
-                </label>
-              </div>
+                        disabled={isReadOnlyOpen}
+                      />
+                    </label>
+                    <label className="facility-field">
+                      <span>Request Close Date/Time</span>
+                      <input
+                        type="datetime-local"
+                        value={formState.request_close_datetime}
+                        min={formState.request_open_datetime || undefined}
+                        onChange={(event) =>
+                          setFormState((current) => ({ ...current, request_close_datetime: event.target.value }))
+                        }
+                        disabled={isReadOnlyOpen}
+                      />
+                    </label>
+                  </div>
+                </>
+              )}
+
+              {activeModalTab === 'requests' && openedBlock && (
+                <RequestBuilderView
+                  block={{
+                    id: openedBlock.id,
+                    start_date: openedBlock.start_date,
+                    end_date: openedBlock.end_date,
+                    build_status: openedBlock.build_status,
+                  }}
+                />
+              )}
             </div>
             <div className="shift-modal-actions">
               <button className="secondary" type="button" onClick={closeModal}>
                 Close
               </button>
-              {!isReadOnlyOpen && (
+              {activeModalTab === 'details' && !isReadOnlyOpen && (
                 <button type="button" onClick={saveBlock} disabled={isSaving}>
                   {isSaving ? 'Saving...' : 'Save'}
                 </button>

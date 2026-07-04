@@ -1,4 +1,5 @@
 from django.db import models
+from django.contrib.auth.models import User
 from apps.facilities.models import Facility
 from apps.accounts.models import Physician
 
@@ -136,3 +137,60 @@ class ScheduleBlock(models.Model):
 
     class Meta:
         ordering = ['-created_at', '-id']
+
+
+class ScheduleRequest(models.Model):
+    """A physician request entered for a specific date inside a Schedule Block."""
+
+    class RequestScope(models.TextChoices):
+        USER = 'USER', 'User'
+        ADMIN = 'ADMIN', 'Admin'
+
+    class RequestType(models.TextChoices):
+        DAY_OFF = 'DAY_OFF', 'Day Off'
+        SHIFT_OFF = 'SHIFT_OFF', 'Shift Off'
+        DAY_ON = 'DAY_ON', 'Day On'
+        SHIFT_ON = 'SHIFT_ON', 'Shift On'
+
+    class Weight(models.TextChoices):
+        LOW = 'LOW', 'Low'
+        MEDIUM = 'MEDIUM', 'Medium'
+        HIGH = 'HIGH', 'High'
+        FIXED = 'FIXED', 'Fixed'
+
+    schedule_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.CASCADE,
+        related_name='requests',
+    )
+    physician = models.ForeignKey(
+        Physician,
+        on_delete=models.CASCADE,
+        related_name='schedule_requests',
+    )
+    date = models.DateField()
+    request_scope = models.CharField(max_length=10, choices=RequestScope.choices, default=RequestScope.USER)
+    request_type = models.CharField(max_length=12, choices=RequestType.choices)
+    weight = models.CharField(max_length=10, choices=Weight.choices)
+    shift_templates = models.ManyToManyField(ShiftTemplate, blank=True, related_name='schedule_requests')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_schedule_requests')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.schedule_block_id}:{self.physician_id}:{self.date}:{self.request_scope}:{self.request_type}'
+
+    class Meta:
+        ordering = ['date', 'physician__user__last_name', 'physician__user__first_name', 'request_scope']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_block', 'physician', 'date'],
+                condition=models.Q(request_scope='USER'),
+                name='unique_user_request_per_block_physician_date',
+            ),
+            models.UniqueConstraint(
+                fields=['schedule_block', 'physician', 'date'],
+                condition=models.Q(request_scope='ADMIN'),
+                name='unique_admin_request_per_block_physician_date',
+            ),
+        ]

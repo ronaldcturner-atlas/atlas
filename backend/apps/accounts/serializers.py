@@ -7,9 +7,19 @@ from .models import Physician
 
 
 class UserSerializer(serializers.ModelSerializer):
+    physician_id = serializers.SerializerMethodField()
+    groups = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'first_name', 'last_name']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'is_staff', 'is_superuser', 'physician_id', 'groups']
+
+    def get_physician_id(self, obj):
+        physician = getattr(obj, 'physician', None)
+        return physician.id if physician else None
+
+    def get_groups(self, obj):
+        return list(obj.groups.values_list('name', flat=True))
 
 
 class PhysicianSerializer(serializers.ModelSerializer):
