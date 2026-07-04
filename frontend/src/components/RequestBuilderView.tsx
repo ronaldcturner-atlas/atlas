@@ -477,14 +477,6 @@ export default function RequestBuilderView({ block }: Props) {
     return <div className="facilities-error">Unable to load Request Builder context.</div>
   }
 
-  if (!contextData.physicians.length) {
-    return <div className="facilities-error">No physicians are available for Request Builder.</div>
-  }
-
-  if (selectedPhysicianId === null) {
-    return <div className="scheduler-loading">Loading Request Builder...</div>
-  }
-
   const selectedPhysician = contextData.physicians.find((physician) => physician.id === selectedPhysicianId) ?? null
   const shiftSelectionMode = requestType === 'SHIFT_ON' ? 'single' : requestType === 'SHIFT_OFF' ? 'multiple' : 'none'
   const bulkShiftSelectionMode = bulkRequestType === 'SHIFT_ON' ? 'single' : bulkRequestType === 'SHIFT_OFF' ? 'multiple' : 'none'
@@ -492,6 +484,10 @@ export default function RequestBuilderView({ block }: Props) {
   return (
     <div className="request-builder-root">
       {error && <div className="facilities-error">{error}</div>}
+
+      {!contextData.physicians.length && (
+        <div className="facilities-error">No physicians are linked to this user context. Calendar is shown in read-only mode.</div>
+      )}
 
       {!canEdit && (
         <div className="request-builder-banner">
@@ -504,9 +500,11 @@ export default function RequestBuilderView({ block }: Props) {
           <span>Selected Physician</span>
           {contextData.can_manage_requests ? (
             <select
-              value={selectedPhysicianId}
+              value={selectedPhysicianId ?? ''}
               onChange={(event) => void handlePhysicianChange(Number(event.target.value))}
+              disabled={!contextData.physicians.length}
             >
+              {!contextData.physicians.length && <option value="">No physicians available</option>}
               {contextData.physicians.map((physician) => (
                 <option key={physician.id} value={physician.id}>
                   {physician.name}
@@ -514,7 +512,7 @@ export default function RequestBuilderView({ block }: Props) {
               ))}
             </select>
           ) : (
-            <div className="request-builder-selected-name">{selectedPhysician?.name}</div>
+            <div className="request-builder-selected-name">{selectedPhysician?.name ?? 'No physician assigned'}</div>
           )}
         </div>
 
