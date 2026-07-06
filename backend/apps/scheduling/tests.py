@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
+from django.contrib.auth.models import Group, Permission
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -10,7 +10,7 @@ from apps.accounts.models import Physician
 from apps.domains.models import Domain
 from apps.facilities.models import Facility
 
-from .models import ScheduleBlock, ScheduleRequest, ShiftTemplate
+from .models import Contract, ContractUserAssignment, ScheduleBlock, ScheduleRequest, ShiftTemplate
 from .serializers import ScheduleBlockSerializer
 
 
@@ -136,6 +136,22 @@ class ScheduleRequestApiTests(TestCase):
             build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
         )
 
+    def _assign_contract(self, request_settings, facilities=None):
+        domain = Domain.objects.create(name='Emergency Medicine', active=True)
+        contract = Contract.objects.create(
+            domain=domain,
+            name='Request Contract',
+            active=True,
+            request_settings=request_settings,
+        )
+        contract.facilities.set(facilities or [self.facility])
+        ContractUserAssignment.objects.create(
+            contract=contract,
+            domain=domain,
+            physician=self.physician,
+        )
+        return contract
+
     def test_scheduler_can_store_user_and_admin_request_same_day(self):
         self.client.force_authenticate(user=self.scheduler_user)
 
@@ -194,16 +210,46 @@ class ScheduleRequestApiTests(TestCase):
 
     def test_context_returns_schedule_block_data_for_scheduler(self):
         self.client.force_authenticate(user=self.scheduler_user)
-        self.physician.active = False
-        self.physician.save(update_fields=['active'])
+        inactive_user = get_user_model().objects.create_user(
+            username='inactive@example.com',
+            email='inactive@example.com',
+        )
+        inactive_physician = Physician.objects.create(
+            user=inactive_user,
+            display_name='Inactive Physician',
+            active=False,
+        )
 
         response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload['schedule_block']['id'], self.block.id)
+        self.assertTrue(payload['is_scheduler_or_admin'])
         self.assertEqual(payload['selected_physician_id'], self.physician.id)
-        self.assertGreaterEqual(len(payload['physicians']), 1)
+        returned_ids = {item['id'] for item in payload['physicians']}
+        self.assertIn(self.physician.id, returned_ids)
+        self.assertNotIn(inactive_physician.id, returned_ids)
+
+    def test_request_change_permission_grants_scheduler_context_access(self):
+        permission_user = get_user_model().objects.create_user(
+            username='request-manager@example.com',
+            email='request-manager@example.com',
+        )
+        permission_user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label='scheduling',
+                codename='change_schedulerequest',
+            )
+        )
+        self.client.force_authenticate(user=permission_user)
+
+        response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload['is_scheduler_or_admin'])
+        self.assertEqual(payload['selected_physician_id'], self.physician.id)
 
     def test_context_returns_200_for_authenticated_user_without_physician(self):
         user_without_physician = get_user_model().objects.create_user(
@@ -219,8 +265,521 @@ class ScheduleRequestApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload['schedule_block']['id'], self.block.id)
         self.assertEqual(payload['can_manage_requests'], False)
+        self.assertEqual(payload['is_scheduler_or_admin'], False)
         self.assertEqual(payload['selected_physician_id'], None)
         self.assertEqual(payload['physicians'], [])
+
+    def test_normal_user_request_options_and_templates_follow_contract(self):
+        other_facility = Facility.objects.create(name='Other Hospital', short_name='Other')
+        other_template = ShiftTemplate.objects.create(
+            facility=other_facility,
+            start_time=time(8, 0),
+            end_time=time(16, 0),
+            active_days_of_week=['Wednesday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self._assign_contract(
+            {
+                'allow_day_off': False,
+                'allow_shift_off': True,
+                'allow_day_on': False,
+                'allow_shift_on': True,
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
+
+        self.assertEqual(context_response.status_code, 200)
+        payload = context_response.json()
+        self.assertEqual(payload['request_policy']['allowed_request_types'], ['SHIFT_OFF', 'SHIFT_ON'])
+        returned_template_ids = {item['id'] for item in payload['shift_templates']}
+        self.assertIn(self.shift_template.id, returned_template_ids)
+        self.assertNotIn(other_template.id, returned_template_ids)
+
+        disallowed_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(disallowed_response.status_code, 400)
+        self.assertIn('request_type', disallowed_response.json())
+
+    def test_scheduler_has_all_request_types_even_when_contract_restricts_user(self):
+        self._assign_contract(
+            {
+                'allow_day_off': False,
+                'allow_shift_off': False,
+                'allow_day_on': False,
+                'allow_shift_on': False,
+            }
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            set(response.json()['request_policy']['allowed_request_types']),
+            {'DAY_OFF', 'SHIFT_OFF', 'DAY_ON', 'SHIFT_ON'},
+        )
+
+    def test_normal_user_without_unambiguous_contract_cannot_create_request(self):
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('request_type', response.json())
+
+    def test_user_request_limit_is_enforced_and_returned_in_counters(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'allow_shift_off': True,
+                'allow_day_on': True,
+                'allow_shift_on': True,
+                'high_request_limit': '1',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.physician_user)
+        payload = {
+            'physician_id': self.physician.id,
+            'request_scope': 'USER',
+            'request_type': 'DAY_OFF',
+            'weight': 'HIGH',
+            'shift_template_ids': [],
+        }
+
+        first_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={**payload, 'date': '2026-07-01'},
+            format='json',
+        )
+        second_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={**payload, 'date': '2026-07-02'},
+            format='json',
+        )
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 400)
+        self.assertIn('request_limit', second_response.json())
+        high_counter = context_response.json()['request_counters']['HIGH']
+        self.assertEqual(high_counter, {'used': 1, 'limit': 1, 'unlimited': False})
+
+    def test_weekend_counter_uses_shift_template_weekend_designation(self):
+        self.shift_template.active_days_of_week = ['Friday']
+        self.shift_template.weekend_days = ['Friday']
+        self.shift_template.save(update_fields=['active_days_of_week', 'weekend_days'])
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'allow_shift_off': True,
+                'allow_day_on': True,
+                'allow_shift_on': True,
+                'weekend_request_limit': '2',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        save_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-03',
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
+
+        self.assertEqual(save_response.status_code, 200)
+        self.assertEqual(context_response.json()['request_counters']['WEEKEND']['used'], 1)
+
+    def test_user_counters_increment_and_none_decrements_selected_scope_only(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'allow_shift_off': True,
+                'allow_day_on': True,
+                'allow_shift_on': True,
+                'high_request_limit': '5',
+                'medium_request_limit': '5',
+                'low_request_limit': '5',
+                'low_request_unlimited': False,
+            }
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        request_url = f'/api/schedule-blocks/{self.block.id}/requests/upsert/'
+        base_payload = {
+            'physician_id': self.physician.id,
+            'request_scope': 'USER',
+            'request_type': 'DAY_OFF',
+            'shift_template_ids': [],
+        }
+
+        for request_date, weight in [
+            ('2026-07-01', 'HIGH'),
+            ('2026-07-02', 'MEDIUM'),
+            ('2026-07-03', 'LOW'),
+        ]:
+            response = self.client.post(
+                request_url,
+                data={**base_payload, 'date': request_date, 'weight': weight},
+                format='json',
+            )
+            self.assertEqual(response.status_code, 200)
+
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+        counters = context_response.json()['request_counters']
+        self.assertEqual(counters['HIGH']['used'], 1)
+        self.assertEqual(counters['MEDIUM']['used'], 1)
+        self.assertEqual(counters['LOW']['used'], 1)
+
+        delete_response = self.client.post(
+            request_url,
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'NONE',
+            },
+            format='json',
+        )
+        self.assertEqual(delete_response.status_code, 200)
+
+        refreshed_context = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+        refreshed_counters = refreshed_context.json()['request_counters']
+        self.assertEqual(refreshed_counters['HIGH']['used'], 0)
+        self.assertEqual(refreshed_counters['MEDIUM']['used'], 1)
+        self.assertEqual(refreshed_counters['LOW']['used'], 1)
+
+    def test_admin_request_does_not_create_user_request_or_consume_counter(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'high_request_limit': '5',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        request_url = f'/api/schedule-blocks/{self.block.id}/requests/upsert/'
+
+        admin_response = self.client.post(
+            request_url,
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'ADMIN',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(admin_response.status_code, 200)
+        self.assertEqual(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+                request_scope='ADMIN',
+            ).count(),
+            1,
+        )
+        self.assertFalse(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+                request_scope='USER',
+            ).exists()
+        )
+
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+        self.assertEqual(context_response.json()['request_counters']['HIGH']['used'], 0)
+
+        user_response = self.client.post(
+            request_url,
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'DAY_ON',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+        self.assertEqual(user_response.status_code, 200)
+        self.assertEqual(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+                date=date(2026, 7, 1),
+            ).count(),
+            2,
+        )
+
+    def test_multiple_weekend_shift_off_templates_count_as_one_weekend_request(self):
+        self.shift_template.active_days_of_week = ['Friday']
+        self.shift_template.weekend_days = ['Friday']
+        self.shift_template.save(update_fields=['active_days_of_week', 'weekend_days'])
+        second_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(16, 0),
+            end_time=time(23, 0),
+            active_days_of_week=['Friday'],
+            weekend_days=['Friday'],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self._assign_contract(
+            {
+                'allow_shift_off': True,
+                'weekend_request_limit': '5',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-03',
+                'request_scope': 'USER',
+                'request_type': 'SHIFT_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [self.shift_template.id, second_template.id],
+            },
+            format='json',
+        )
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(context_response.json()['request_counters']['WEEKEND']['used'], 1)
+
+    def test_normal_user_request_list_hides_admin_request(self):
+        ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.HIGH,
+            created_by=self.physician_user,
+        )
+        ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.ADMIN,
+            request_type=ScheduleRequest.RequestType.DAY_ON,
+            weight=ScheduleRequest.Weight.FIXED,
+            created_by=self.scheduler_user,
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+        self.assertEqual(response.json()[0]['request_scope'], 'USER')
+
+    def test_scheduler_bulk_request_creates_one_request_per_physician_and_date(self):
+        second_user = get_user_model().objects.create_user(
+            username='second.physician@example.com',
+            email='second.physician@example.com',
+            password='password123',
+        )
+        second_physician = Physician.objects.create(user=second_user, display_name='Second Physician')
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={
+                'physician_ids': [self.physician.id, second_physician.id],
+                'dates': ['2026-07-01', '2026-07-02'],
+                'request_type': 'DAY_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['saved_count'], 4)
+        self.assertEqual(ScheduleRequest.objects.filter(schedule_block=self.block).count(), 4)
+
+    def test_bulk_request_scope_creates_only_the_selected_scope_without_duplicates(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'medium_request_limit': '5',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        bulk_url = f'/api/schedule-blocks/{self.block.id}/requests/bulk/'
+        common_payload = {
+            'physician_ids': [self.physician.id],
+            'dates': ['2026-07-01', '2026-07-02'],
+            'request_type': 'DAY_OFF',
+            'shift_template_ids': [],
+        }
+
+        user_response = self.client.post(
+            bulk_url,
+            data={
+                **common_payload,
+                'request_scope': 'USER',
+                'weight': 'MEDIUM',
+            },
+            format='json',
+        )
+        admin_response = self.client.post(
+            bulk_url,
+            data={
+                **common_payload,
+                'request_scope': 'ADMIN',
+                'weight': 'FIXED',
+            },
+            format='json',
+        )
+        repeated_admin_response = self.client.post(
+            bulk_url,
+            data={
+                **common_payload,
+                'request_scope': 'ADMIN',
+                'weight': 'FIXED',
+            },
+            format='json',
+        )
+
+        self.assertEqual(user_response.status_code, 200)
+        self.assertEqual(admin_response.status_code, 200)
+        self.assertEqual(repeated_admin_response.status_code, 200)
+        self.assertEqual(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+                request_scope='USER',
+            ).count(),
+            2,
+        )
+        self.assertEqual(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+                request_scope='ADMIN',
+            ).count(),
+            2,
+        )
+        self.assertEqual(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+            ).count(),
+            4,
+        )
+
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+        self.assertEqual(context_response.json()['request_counters']['MEDIUM']['used'], 2)
+
+    def test_clear_requests_removes_only_requested_scope(self):
+        user_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.HIGH,
+            created_by=self.scheduler_user,
+        )
+        admin_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.ADMIN,
+            request_type=ScheduleRequest.RequestType.DAY_ON,
+            weight=ScheduleRequest.Weight.FIXED,
+            created_by=self.scheduler_user,
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        clear_url = f'/api/schedule-blocks/{self.block.id}/requests/clear/'
+
+        user_clear_response = self.client.post(
+            clear_url,
+            data={'request_scope': 'USER'},
+            format='json',
+        )
+
+        self.assertEqual(user_clear_response.status_code, 200)
+        self.assertFalse(ScheduleRequest.objects.filter(id=user_request.id).exists())
+        self.assertTrue(ScheduleRequest.objects.filter(id=admin_request.id).exists())
+
+        admin_clear_response = self.client.post(
+            clear_url,
+            data={'request_scope': 'ADMIN'},
+            format='json',
+        )
+
+        self.assertEqual(admin_clear_response.status_code, 200)
+        self.assertFalse(ScheduleRequest.objects.filter(id=admin_request.id).exists())
+
+    def test_normal_user_cannot_clear_schedule_block_requests(self):
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/clear/',
+            data={'request_scope': 'USER'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 403)
 
 
 class ContractApiTests(TestCase):

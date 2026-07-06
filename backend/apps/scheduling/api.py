@@ -160,7 +160,12 @@ def _can_manage_requests(user):
     if user.is_staff or user.is_superuser:
         return True
 
-    return user.groups.filter(Q(name__iexact='admin') | Q(name__iexact='scheduler')).exists()
+    if user.groups.filter(Q(name__iexact='admin') | Q(name__iexact='scheduler')).exists():
+        return True
+
+    return user.has_perm('scheduling.add_schedulerequest') or user.has_perm(
+        'scheduling.change_schedulerequest'
+    )
 
 
 def _editable_request_status(block):
@@ -184,10 +189,193 @@ def _parse_request_date(raw_value):
         return None
 
 
-def _get_available_shift_templates_for_date(target_date):
+def _get_request_contract(physician):
+    """Return the single active contract when Request Builder can resolve one unambiguously."""
+    contracts = list(
+        Contract.objects.filter(
+            active=True,
+            user_assignments__physician=physician,
+        )
+        .prefetch_related('facilities')
+        .distinct()[:2]
+    )
+    return contracts[0] if len(contracts) == 1 else None
+
+
+def _parse_request_limit(value):
+    if value in (None, ''):
+        return None
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    return parsed if parsed >= 0 else None
+
+
+def _get_request_policy(physician, can_manage=False):
+    all_types = [choice[0] for choice in ScheduleRequest.RequestType.choices]
+    contract = _get_request_contract(physician)
+
+    if contract is None:
+        return {
+            'contract_id': None,
+            'contract_name': None,
+            'allowed_request_types': all_types if can_manage else [],
+            'eligible_facility_ids': None,
+            'limits': {
+                'HIGH': None,
+                'MEDIUM': None,
+                'LOW': None,
+                'WEEKEND': None,
+            },
+            'low_unlimited': True,
+        }
+
+    settings = contract.request_settings if isinstance(contract.request_settings, dict) else {}
+    setting_names = {
+        ScheduleRequest.RequestType.DAY_OFF: 'allow_day_off',
+        ScheduleRequest.RequestType.SHIFT_OFF: 'allow_shift_off',
+        ScheduleRequest.RequestType.DAY_ON: 'allow_day_on',
+        ScheduleRequest.RequestType.SHIFT_ON: 'allow_shift_on',
+    }
+    contract_allowed_types = [
+        request_type
+        for request_type in all_types
+        if settings.get(setting_names[request_type], True) is True
+    ]
+
+    return {
+        'contract_id': contract.id,
+        'contract_name': contract.name,
+        'allowed_request_types': all_types if can_manage else contract_allowed_types,
+        'eligible_facility_ids': list(contract.facilities.values_list('id', flat=True)),
+        'limits': {
+            'HIGH': _parse_request_limit(settings.get('high_request_limit')),
+            'MEDIUM': _parse_request_limit(settings.get('medium_request_limit')),
+            'LOW': _parse_request_limit(settings.get('low_request_limit')),
+            'WEEKEND': _parse_request_limit(settings.get('weekend_request_limit')),
+        },
+        'low_unlimited': bool(settings.get('low_request_unlimited', False)),
+    }
+
+
+def _get_available_shift_templates_for_date(target_date, eligible_facility_ids=None):
     day_name = target_date.strftime('%A')
     templates = ShiftTemplate.objects.select_related('facility').filter(active=True)
+    if eligible_facility_ids is not None:
+        templates = templates.filter(facility_id__in=eligible_facility_ids)
     return [template for template in templates if day_name in (template.active_days_of_week or [])]
+
+
+def _request_counts_as_weekend(schedule_request, eligible_facility_ids=None):
+    day_name = schedule_request.date.strftime('%A')
+
+    if schedule_request.request_type == ScheduleRequest.RequestType.DAY_OFF:
+        available_templates = _get_available_shift_templates_for_date(
+            schedule_request.date,
+            eligible_facility_ids,
+        )
+        return any(day_name in (template.weekend_days or []) for template in available_templates)
+
+    if schedule_request.request_type == ScheduleRequest.RequestType.SHIFT_OFF:
+        return any(
+            day_name in (template.weekend_days or [])
+            for template in schedule_request.shift_templates.all()
+        )
+
+    return False
+
+
+def _build_request_counters(block, physician, policy, exclude_request_ids=None):
+    exclude_request_ids = exclude_request_ids or []
+    requests = (
+        ScheduleRequest.objects.filter(
+            schedule_block=block,
+            physician=physician,
+            request_scope=ScheduleRequest.RequestScope.USER,
+        )
+        .exclude(id__in=exclude_request_ids)
+        .prefetch_related('shift_templates__facility')
+    )
+
+    used = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'WEEKEND': 0}
+    for schedule_request in requests:
+        if schedule_request.weight in used:
+            used[schedule_request.weight] += 1
+        if _request_counts_as_weekend(schedule_request, policy['eligible_facility_ids']):
+            used['WEEKEND'] += 1
+
+    return {
+        key: {
+            'used': count,
+            'limit': policy['limits'][key],
+            'unlimited': key == 'LOW' and policy['low_unlimited'],
+        }
+        for key, count in used.items()
+    }
+
+
+def _request_counter_increments(request_date, request_type, weight, selected_templates, policy):
+    increments = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'WEEKEND': 0}
+    if weight in increments:
+        increments[weight] = 1
+
+    day_name = request_date.strftime('%A')
+    if request_type == ScheduleRequest.RequestType.DAY_OFF:
+        available_templates = _get_available_shift_templates_for_date(
+            request_date,
+            policy['eligible_facility_ids'],
+        )
+        increments['WEEKEND'] = int(
+            any(day_name in (template.weekend_days or []) for template in available_templates)
+        )
+    elif request_type == ScheduleRequest.RequestType.SHIFT_OFF:
+        increments['WEEKEND'] = int(
+            any(day_name in (template.weekend_days or []) for template in selected_templates)
+        )
+
+    return increments
+
+
+def _prospective_request_limit_error(
+    block,
+    physician,
+    policy,
+    request_date,
+    request_type,
+    weight,
+    selected_templates,
+    request_scope,
+    exclude_request_ids=None,
+):
+    if request_scope != ScheduleRequest.RequestScope.USER:
+        return None
+
+    counters = _build_request_counters(block, physician, policy, exclude_request_ids)
+    increments = _request_counter_increments(
+        request_date,
+        request_type,
+        weight,
+        selected_templates,
+        policy,
+    )
+
+    for key, increment in increments.items():
+        if not increment:
+            continue
+        counter = counters[key]
+        if counter['unlimited']:
+            continue
+        if counter['limit'] is not None and counter['used'] + increment > counter['limit']:
+            return {
+                'request_limit': (
+                    f'{key.title()} request limit of {counter["limit"]} has been reached.'
+                )
+            }
+
+    return None
 
 
 def _serialize_physician_choice(physician):
@@ -228,13 +416,39 @@ def _validate_request_payload(request_type, weight, shift_template_ids, availabl
 @api_view(['GET'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
+def schedule_block_requests_list(request, block_id):
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    requests = (
+        ScheduleRequest.objects.filter(schedule_block=block)
+        .select_related('physician__user')
+        .prefetch_related('shift_templates__facility')
+    )
+
+    if not _can_manage_requests(request.user):
+        physician = _resolve_self_physician(request.user)
+        if physician is None:
+            requests = ScheduleRequest.objects.none()
+        else:
+            requests = requests.filter(
+                physician=physician,
+                request_scope=ScheduleRequest.RequestScope.USER,
+            )
+
+    return Response(ScheduleRequestSerializer(requests, many=True).data)
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
 def schedule_block_requests_context(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
     can_manage = _can_manage_requests(request.user)
 
     if can_manage:
         physicians = list(
-            Physician.objects.select_related('user').order_by('user__last_name', 'user__first_name')
+            Physician.objects.filter(active=True)
+            .select_related('user')
+            .order_by('user__last_name', 'user__first_name')
         )
     else:
         self_physician = _resolve_self_physician(request.user)
@@ -254,24 +468,59 @@ def schedule_block_requests_context(request, block_id):
         else:
             return Response({'detail': 'You do not have permission to view requests for this physician.'}, status=status.HTTP_403_FORBIDDEN)
 
-    request_items = ScheduleRequest.objects.filter(
-        schedule_block=block,
-        physician_id=selected_physician_id,
-    ).prefetch_related('shift_templates') if selected_physician_id else ScheduleRequest.objects.none()
+    request_items = (
+        ScheduleRequest.objects.filter(
+            schedule_block=block,
+            physician_id=selected_physician_id,
+        )
+        .select_related('physician__user')
+        .prefetch_related('shift_templates__facility')
+        if selected_physician_id
+        else ScheduleRequest.objects.none()
+    )
+    if not can_manage:
+        request_items = request_items.filter(request_scope=ScheduleRequest.RequestScope.USER)
 
-    serialized_templates = ShiftTemplateSerializer(
-        ShiftTemplate.objects.select_related('facility').filter(active=True),
-        many=True,
-    ).data
+    selected_physician = next(
+        (physician for physician in physicians if physician.id == selected_physician_id),
+        None,
+    )
+    policy = _get_request_policy(selected_physician, can_manage) if selected_physician else None
+
+    visible_requests = (
+        ScheduleRequest.objects.filter(schedule_block=block)
+        .select_related('physician__user')
+        .prefetch_related('shift_templates__facility')
+        if can_manage
+        else request_items
+    )
+
+    templates = ShiftTemplate.objects.select_related('facility').filter(active=True)
+    if policy and policy['eligible_facility_ids'] is not None:
+        templates = templates.filter(facility_id__in=policy['eligible_facility_ids'])
+
+    serialized_templates = ShiftTemplateSerializer(templates, many=True).data
+    counters = (
+        _build_request_counters(block, selected_physician, policy)
+        if selected_physician and policy
+        else {
+            key: {'used': 0, 'limit': None, 'unlimited': key == 'LOW'}
+            for key in ['HIGH', 'MEDIUM', 'LOW', 'WEEKEND']
+        }
+    )
 
     return Response(
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
             'can_manage_requests': can_manage,
+            'is_scheduler_or_admin': can_manage,
             'selected_physician_id': selected_physician_id,
             'physicians': [_serialize_physician_choice(physician) for physician in physicians],
             'requests': ScheduleRequestSerializer(request_items, many=True).data,
+            'visible_requests': ScheduleRequestSerializer(visible_requests, many=True).data,
             'shift_templates': serialized_templates,
+            'request_policy': policy,
+            'request_counters': counters,
         }
     )
 
@@ -304,6 +553,7 @@ def schedule_block_request_upsert(request, block_id):
         if physician_id != self_physician.id:
             return Response({'detail': 'You do not have permission to modify requests for this physician.'}, status=status.HTTP_403_FORBIDDEN)
         physician = self_physician
+    policy = _get_request_policy(physician, can_manage)
 
     parsed_date = _parse_request_date(request.data.get('date'))
     if not parsed_date:
@@ -330,6 +580,12 @@ def schedule_block_request_upsert(request, block_id):
         ).delete()
         return Response({'deleted': bool(deleted)})
 
+    if not can_manage and request_type not in policy['allowed_request_types']:
+        return Response(
+            {'request_type': 'This request type is not allowed by your contract.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     weight = str(request.data.get('weight') or '').upper()
 
     raw_shift_template_ids = request.data.get('shift_template_ids') or []
@@ -341,12 +597,38 @@ def schedule_block_request_upsert(request, block_id):
     except (TypeError, ValueError):
         return Response({'shift_template_ids': 'shift_template_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    available_templates = _get_available_shift_templates_for_date(parsed_date)
+    available_templates = _get_available_shift_templates_for_date(
+        parsed_date,
+        policy['eligible_facility_ids'],
+    )
     available_template_ids = {template.id for template in available_templates}
 
     payload_error = _validate_request_payload(request_type, weight, shift_template_ids, available_template_ids)
     if payload_error:
         return Response(payload_error, status=status.HTTP_400_BAD_REQUEST)
+
+    selected_templates = [
+        template for template in available_templates if template.id in shift_template_ids
+    ]
+    existing_request = ScheduleRequest.objects.filter(
+        schedule_block=block,
+        physician=physician,
+        date=parsed_date,
+        request_scope=request_scope,
+    ).first()
+    limit_error = _prospective_request_limit_error(
+        block,
+        physician,
+        policy,
+        parsed_date,
+        request_type,
+        weight,
+        selected_templates,
+        request_scope,
+        [existing_request.id] if existing_request else None,
+    )
+    if limit_error:
+        return Response(limit_error, status=status.HTTP_400_BAD_REQUEST)
 
     schedule_request, _ = ScheduleRequest.objects.get_or_create(
         schedule_block=block,
@@ -371,6 +653,73 @@ def schedule_block_request_upsert(request, block_id):
         schedule_request.shift_templates.clear()
 
     return Response(ScheduleRequestSerializer(schedule_request).data)
+
+
+@api_view(['GET', 'DELETE'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_request_detail(request, block_id, request_id):
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    schedule_request = get_object_or_404(
+        ScheduleRequest.objects.select_related('physician__user').prefetch_related('shift_templates__facility'),
+        id=request_id,
+        schedule_block=block,
+    )
+
+    can_manage = _can_manage_requests(request.user)
+    self_physician = _resolve_self_physician(request.user)
+    if not can_manage and (
+        self_physician is None
+        or schedule_request.physician_id != self_physician.id
+        or schedule_request.request_scope != ScheduleRequest.RequestScope.USER
+    ):
+        return Response({'detail': 'You do not have permission to access this request.'}, status=status.HTTP_403_FORBIDDEN)
+
+    if request.method == 'GET':
+        return Response(ScheduleRequestSerializer(schedule_request).data)
+
+    if not _editable_request_status(block):
+        return Response(
+            {'detail': 'Requests can only be removed from PRE_BUILD or BUILD Schedule Blocks.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    schedule_request.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_clear_requests(request, block_id):
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    if not _can_manage_requests(request.user):
+        return Response(
+            {'detail': 'Only admin/scheduler users can clear Schedule Block requests.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if not _editable_request_status(block):
+        return Response(
+            {'detail': 'Requests can only be cleared from PRE_BUILD or BUILD Schedule Blocks.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    request_scope = str(request.data.get('request_scope') or '').upper()
+    if request_scope not in {
+        ScheduleRequest.RequestScope.USER,
+        ScheduleRequest.RequestScope.ADMIN,
+    }:
+        return Response(
+            {'request_scope': 'request_scope must be USER or ADMIN.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    deleted_count, _ = ScheduleRequest.objects.filter(
+        schedule_block=block,
+        request_scope=request_scope,
+    ).delete()
+    return Response({'deleted_count': deleted_count, 'request_scope': request_scope})
 
 
 @api_view(['POST'])
@@ -435,16 +784,74 @@ def schedule_block_bulk_requests(request, block_id):
     except (TypeError, ValueError):
         return Response({'shift_template_ids': 'shift_template_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    template_ids_by_date = {}
-    for parsed_date in parsed_dates:
-        available_template_ids = {template.id for template in _get_available_shift_templates_for_date(parsed_date)}
-        payload_error = _validate_request_payload(request_type, weight, shift_template_ids, available_template_ids)
-        if payload_error:
-            payload_error['date'] = parsed_date.isoformat()
-            return Response(payload_error, status=status.HTTP_400_BAD_REQUEST)
-        template_ids_by_date[parsed_date] = shift_template_ids
+    plans = {}
+    for physician in physicians:
+        policy = _get_request_policy(physician, can_manage=True)
+        existing_target_ids = list(
+            ScheduleRequest.objects.filter(
+                schedule_block=block,
+                physician=physician,
+                date__in=parsed_dates,
+                request_scope=request_scope,
+            ).values_list('id', flat=True)
+        )
+        projected_counters = _build_request_counters(
+            block,
+            physician,
+            policy,
+            existing_target_ids if request_scope == ScheduleRequest.RequestScope.USER else None,
+        )
 
-    template_queryset = ShiftTemplate.objects.filter(id__in=shift_template_ids)
+        for parsed_date in parsed_dates:
+            available_templates = _get_available_shift_templates_for_date(
+                parsed_date,
+                policy['eligible_facility_ids'],
+            )
+            available_template_ids = {template.id for template in available_templates}
+            payload_error = _validate_request_payload(
+                request_type,
+                weight,
+                shift_template_ids,
+                available_template_ids,
+            )
+            if payload_error:
+                payload_error['date'] = parsed_date.isoformat()
+                payload_error['physician_id'] = physician.id
+                return Response(payload_error, status=status.HTTP_400_BAD_REQUEST)
+
+            selected_templates = [
+                template for template in available_templates if template.id in shift_template_ids
+            ]
+            plans[(physician.id, parsed_date)] = selected_templates
+
+            if request_scope != ScheduleRequest.RequestScope.USER:
+                continue
+
+            increments = _request_counter_increments(
+                parsed_date,
+                request_type,
+                weight,
+                selected_templates,
+                policy,
+            )
+            for key, increment in increments.items():
+                if not increment:
+                    continue
+                counter = projected_counters[key]
+                if not counter['unlimited'] and counter['limit'] is not None:
+                    if counter['used'] + increment > counter['limit']:
+                        return Response(
+                            {
+                                'request_limit': (
+                                    f'{key.title()} request limit of {counter["limit"]} '
+                                    f'has been reached for {_serialize_physician_choice(physician)["name"]}.'
+                                ),
+                                'physician_id': physician.id,
+                                'date': parsed_date.isoformat(),
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                counter['used'] += increment
 
     saved_count = 0
     with transaction.atomic():
@@ -465,8 +872,9 @@ def schedule_block_bulk_requests(request, block_id):
                 schedule_request.weight = weight
                 schedule_request.created_by = request.user
                 schedule_request.save()
-                if template_ids_by_date[parsed_date]:
-                    schedule_request.shift_templates.set(template_queryset)
+                selected_templates = plans[(physician.id, parsed_date)]
+                if selected_templates:
+                    schedule_request.shift_templates.set(selected_templates)
                 else:
                     schedule_request.shift_templates.clear()
                 saved_count += 1

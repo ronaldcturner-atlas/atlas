@@ -282,6 +282,7 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
         many=True,
         read_only=True,
     )
+    shift_template_details = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleRequest
@@ -295,6 +296,7 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
             'request_type',
             'weight',
             'shift_template_ids',
+            'shift_template_details',
             'created_by',
             'created_at',
             'updated_at',
@@ -303,6 +305,16 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
 
     def get_physician_name(self, obj):
         return obj.physician.display_name or obj.physician.user.get_full_name() or obj.physician.user.username
+
+    def get_shift_template_details(self, obj):
+        return [
+            {
+                'id': template.id,
+                'name': template.generated_name(),
+                'facility_name': template.facility.name,
+            }
+            for template in obj.shift_templates.all()
+        ]
 
 
 class ContractSerializer(serializers.ModelSerializer):

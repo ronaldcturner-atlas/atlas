@@ -1,25 +1,27 @@
 from django.core.management.base import BaseCommand
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 
 
 class Command(BaseCommand):
     help = 'Create demo user for Atlas application'
 
     def handle(self, *args, **options):
-        # Check if user already exists
-        if User.objects.filter(username='ron').exists():
-            self.stdout.write(self.style.WARNING('Demo user "ron" already exists'))
-            return
-        
-        # Create the user
-        user = User.objects.create_user(
+        user, created = User.objects.get_or_create(
             username='ron',
-            password='atlas',
-            first_name='Ron',
-            last_name='Turner',
-            email='ron@atlas.local'
+            defaults={
+                'first_name': 'Ron',
+                'last_name': 'Turner',
+                'email': 'ron@atlas.local',
+            },
         )
-        
+        if created:
+            user.set_password('atlas')
+            user.save(update_fields=['password'])
+
+        scheduler_group, _ = Group.objects.get_or_create(name='Scheduler')
+        user.groups.add(scheduler_group)
+
+        action = 'Created' if created else 'Updated'
         self.stdout.write(
-            self.style.SUCCESS(f'Successfully created demo user "{user.username}"')
+            self.style.SUCCESS(f'{action} demo Scheduler user "{user.username}"')
         )

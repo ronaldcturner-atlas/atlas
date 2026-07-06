@@ -23,6 +23,12 @@ type ScheduleBlockFormState = {
   request_close_datetime: string
 }
 
+type ScheduleBlocksViewProps = {
+  requestBlockId?: number | null
+  onOpenRequests?: (blockId: number) => void
+  onCloseRequests?: () => void
+}
+
 const API_BASE = 'http://localhost:8000/api'
 
 const defaultFormState: ScheduleBlockFormState = {
@@ -173,7 +179,11 @@ async function parseApiResponseError(response: Response) {
   return { message: null, requiresAcknowledgement: false }
 }
 
-export default function ScheduleBlocksView() {
+export default function ScheduleBlocksView({
+  requestBlockId = null,
+  onOpenRequests,
+  onCloseRequests,
+}: ScheduleBlocksViewProps) {
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
@@ -223,6 +233,37 @@ export default function ScheduleBlocksView() {
     setOpenedBlock(updatedBlock)
   }, [blocks, editingBlockId])
 
+  useEffect(() => {
+    if (requestBlockId === null) {
+      if (activeModalTab === 'requests') {
+        setIsModalOpen(false)
+        setEditingBlockId(null)
+        setIsReadOnlyOpen(false)
+        setOpenedBlock(null)
+        setActiveModalTab('details')
+        setFormState(defaultFormState)
+      }
+      return
+    }
+
+    const block = blocks.find((item) => item.id === requestBlockId)
+    if (!block) {
+      return
+    }
+
+    setEditingBlockId(block.id)
+    setIsReadOnlyOpen(block.build_status === 'ARCHIVE')
+    setOpenedBlock(block)
+    setActiveModalTab('requests')
+    setFormState({
+      start_date: block.start_date,
+      end_date: block.end_date,
+      request_open_datetime: toLocalDatetimeInputValue(block.request_open_datetime),
+      request_close_datetime: toLocalDatetimeInputValue(block.request_close_datetime),
+    })
+    setIsModalOpen(true)
+  }, [blocks, requestBlockId])
+
   const sortedBlocks = useMemo(
     () => [...blocks].sort((a, b) => b.created_at.localeCompare(a.created_at)),
     [blocks],
@@ -252,12 +293,24 @@ export default function ScheduleBlocksView() {
   }
 
   const closeModal = () => {
+    const shouldReturnToScheduleBlocks = activeModalTab === 'requests' && requestBlockId !== null
     setIsModalOpen(false)
     setEditingBlockId(null)
     setIsReadOnlyOpen(false)
     setOpenedBlock(null)
     setActiveModalTab('details')
     setFormState(defaultFormState)
+    if (shouldReturnToScheduleBlocks) {
+      onCloseRequests?.()
+    }
+  }
+
+  const openRequests = (block: ScheduleBlock) => {
+    if (onOpenRequests) {
+      onOpenRequests(block.id)
+      return
+    }
+    openBlock(block, block.build_status === 'ARCHIVE', 'requests')
   }
 
   const saveBlock = async () => {
@@ -473,7 +526,7 @@ export default function ScheduleBlocksView() {
                     <button type="button" onClick={() => openBlock(block, block.build_status === 'ARCHIVE')}>
                       Open
                     </button>
-                    <button type="button" onClick={() => openBlock(block, block.build_status === 'ARCHIVE', 'requests')}>
+                    <button type="button" onClick={() => openRequests(block)}>
                       Requests
                     </button>
                     {block.build_status !== 'ARCHIVE' && (
@@ -503,7 +556,10 @@ export default function ScheduleBlocksView() {
 
       {isModalOpen && (
         <div className="shift-modal-overlay" onClick={closeModal}>
-          <div className="shift-modal shift-modal-wide schedule-block-modal" onClick={(event) => event.stopPropagation()}>
+          <div
+            className={`shift-modal shift-modal-wide schedule-block-modal ${activeModalTab === 'requests' ? 'request-builder-modal' : ''}`}
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="shift-modal-header">
               <h2>
                 {editingBlockId === null
@@ -520,14 +576,25 @@ export default function ScheduleBlocksView() {
                 <button
                   type="button"
                   className={activeModalTab === 'details' ? 'active' : ''}
-                  onClick={() => setActiveModalTab('details')}
+                  onClick={() => {
+                    setActiveModalTab('details')
+                    if (requestBlockId !== null) {
+                      onCloseRequests?.()
+                    }
+                  }}
                 >
                   Details
                 </button>
                 <button
                   type="button"
                   className={activeModalTab === 'requests' ? 'active' : ''}
-                  onClick={() => setActiveModalTab('requests')}
+                  onClick={() => {
+                    if (editingBlockId !== null && onOpenRequests) {
+                      onOpenRequests(editingBlockId)
+                    } else {
+                      setActiveModalTab('requests')
+                    }
+                  }}
                 >
                   Requests
                 </button>
@@ -632,7 +699,7 @@ export default function ScheduleBlocksView() {
             </div>
             <div className="shift-modal-actions">
               <button className="secondary" type="button" onClick={closeModal}>
-                Close
+                {activeModalTab === 'requests' ? 'Back to Schedule Blocks' : 'Close'}
               </button>
               {activeModalTab === 'details' && !isReadOnlyOpen && (
                 <button type="button" onClick={saveBlock} disabled={isSaving}>
