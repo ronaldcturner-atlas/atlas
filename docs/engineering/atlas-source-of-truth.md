@@ -114,7 +114,11 @@ The Schedule Build Workspace is the pre-optimizer workspace for a Schedule Block
 - Generation safely reuses the existing BUILD version and does not duplicate a template/date instance.
 - Generated instances begin open and unassigned.
 
-The workspace is not the Live Schedule, preview, publication, optimization, or automatic assignment. It does not evaluate Contracts, penalties, or physician eligibility.
+Schedulers and Admins can manually assign active physicians to generated Shift Instances in a BUILD version. Assignments belong to instances, never to Shift Templates. An instance supports separate assignment records up to its required staffing; the same physician cannot be assigned to the same instance twice or to overlapping Shift Instances in the same Schedule Version. Staffing displays as assigned/required, and an instance remains open while its assigned count is below required staffing. Manual assignments persist with the BUILD version and may be removed there.
+
+Manual Assignment V1 uses the physician's active Contract assignment in the Schedule Version's Domain as the available domain-membership evidence. The Contract must include the instance's Facility for the physician to be eligible. The assignment picker lists only active physicians who meet that eligibility; when none do, it shows an explicit empty state. It does not infer membership from primary Facility or clinician type.
+
+The workspace is not the Live Schedule, preview, publication, optimization, or automatic assignment. Manual Assignment V1 prevents overlapping assignments as basic schedule validity, but does not evaluate requests, workload, nights, weekends, rest, penalties, or other soft scheduling rules.
 
 Shift Templates do not currently have a Domain relationship. The Schedule Version is Domain-scoped, while V1 generation reads the existing global active Shift Template catalog. Atlas must not infer a hidden Template-to-Domain mapping through Contracts or Facilities.
 
@@ -265,7 +269,7 @@ The following roadmap items are deferred, not permanently prohibited: the schedu
 - Organization has no current data model.
 - Domain membership for Physicians is not modeled.
 - Shift Templates are not currently assigned to Domains; BUILD generation therefore uses the global active template catalog.
-- Contract workload, shift, night, and weekend scheduling rules are not evaluated by an optimizer or schedule builder.
+- Contract workload, shift, night, and weekend scheduling rules are not evaluated by an optimizer or schedule builder; Manual Assignment reads Domain and Facility eligibility and separately enforces overlap validity.
 - Request Builder cannot choose among multiple active Contracts across different Domains; Contract enforcement requires one unambiguous active assignment.
 - Request timestamps do not currently authorize or reject request writes.
 - Publishing records block history, but the repository does not yet contain the full Live Schedule editing workflow described by the roadmap.

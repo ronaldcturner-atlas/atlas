@@ -9,6 +9,7 @@ from apps.facilities.models import Facility
 from .models import (
     ScheduleBlock,
     ScheduleRequest,
+    ScheduleShiftAssignment,
     ScheduleShiftInstance,
     ScheduleVersion,
     Shift,
@@ -303,6 +304,30 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ScheduleShiftAssignmentSerializer(serializers.ModelSerializer):
+    physician_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ScheduleShiftAssignment
+        fields = [
+            'id',
+            'shift_instance',
+            'physician',
+            'physician_name',
+            'created_by',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_physician_name(self, obj):
+        return (
+            obj.physician.display_name
+            or obj.physician.user.get_full_name()
+            or obj.physician.user.username
+        )
+
+
 class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
     facility_name = serializers.CharField(source='facility.name', read_only=True)
     facility_short_name = serializers.CharField(source='facility.short_name', read_only=True)
@@ -311,6 +336,8 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
     template_end_time = serializers.TimeField(source='shift_template.end_time', read_only=True)
     assigned_count = serializers.SerializerMethodField()
     open_count = serializers.SerializerMethodField()
+    is_open = serializers.SerializerMethodField()
+    assignments = ScheduleShiftAssignmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = ScheduleShiftInstance
@@ -329,9 +356,10 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
             'template_start_time',
             'template_end_time',
             'required_staffing',
-            'assigned_user',
+            'assignments',
             'assigned_count',
             'open_count',
+            'is_open',
             'status',
             'created_at',
             'updated_at',
@@ -342,10 +370,13 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
         return obj.shift_template.generated_name()
 
     def get_assigned_count(self, obj):
-        return 1 if obj.assigned_user_id else 0
+        return obj.assignments.count()
 
     def get_open_count(self, obj):
         return max(obj.required_staffing - self.get_assigned_count(obj), 0)
+
+    def get_is_open(self, obj):
+        return self.get_open_count(obj) > 0
 
 
 class ScheduleRequestSerializer(serializers.ModelSerializer):

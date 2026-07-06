@@ -15,6 +15,7 @@ from .models import (
     ContractUserAssignment,
     ScheduleBlock,
     ScheduleRequest,
+    ScheduleShiftAssignment,
     ScheduleShiftInstance,
     ScheduleVersion,
     ShiftTemplate,
@@ -845,6 +846,32 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
         )
 
+    def _create_assignment_physician(self, email, display_name, facilities=None, active=True):
+        name_parts = display_name.split()
+        user = get_user_model().objects.create_user(
+            username=email,
+            email=email,
+            first_name=name_parts[0],
+            last_name=name_parts[-1],
+        )
+        physician = Physician.objects.create(
+            user=user,
+            display_name=display_name,
+            active=active,
+        )
+        contract = Contract.objects.create(
+            domain=self.domain,
+            name=f'{display_name} Contract',
+            active=True,
+        )
+        contract.facilities.set(facilities or [])
+        ContractUserAssignment.objects.create(
+            contract=contract,
+            domain=self.domain,
+            physician=physician,
+        )
+        return physician
+
     def test_generate_creates_open_dated_instances_and_moves_block_to_build(self):
         response = self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -866,7 +893,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         day_instance = instances.get(shift_template=self.day_template)
         self.assertEqual(day_instance.date, date(2026, 7, 6))
         self.assertEqual(day_instance.required_staffing, 2)
-        self.assertIsNone(day_instance.assigned_user)
+        self.assertFalse(day_instance.assignments.exists())
         self.assertEqual(day_instance.status, ScheduleShiftInstance.Status.OPEN)
 
         overnight_instance = instances.get(shift_template=self.overnight_template)
@@ -929,6 +956,247 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(ScheduleVersion.objects.filter(schedule_block=self.block).exists())
+
+    def test_assign_remove_and_refresh_multiple_physicians(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        shift_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        first = self._create_assignment_physician(
+            'turner@example.com',
+            'Alex Turner',
+            facilities=[self.facility],
+        )
+        second = self._create_assignment_physician(
+            'ng@example.com',
+            'Casey Ng',
+            facilities=[self.facility],
+        )
+        assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{shift_instance.id}/assignments/'
+        )
+
+        context_response = self.client.get(assignment_url)
+        self.assertEqual(context_response.status_code, 200)
+        physician_context = {
+            item['id']: item for item in context_response.json()['eligible_physicians']
+        }
+        self.assertTrue(physician_context[first.id]['can_assign'])
+        self.assertTrue(physician_context[second.id]['can_assign'])
+
+        first_response = self.client.post(
+            assignment_url,
+            data={'physician_id': first.id},
+            format='json',
+        )
+        self.assertEqual(first_response.status_code, 201)
+        first_shift = first_response.json()['shift_instance']
+        self.assertEqual(first_shift['assigned_count'], 1)
+        self.assertEqual(first_shift['open_count'], 1)
+        self.assertTrue(first_shift['is_open'])
+        self.assertEqual(first_shift['status'], ScheduleShiftInstance.Status.OPEN)
+
+        duplicate_response = self.client.post(
+            assignment_url,
+            data={'physician_id': first.id},
+            format='json',
+        )
+        self.assertEqual(duplicate_response.status_code, 400)
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(shift_instance=shift_instance).count(),
+            1,
+        )
+
+        second_response = self.client.post(
+            assignment_url,
+            data={'physician_id': second.id},
+            format='json',
+        )
+        self.assertEqual(second_response.status_code, 201)
+        second_shift = second_response.json()['shift_instance']
+        self.assertEqual(second_shift['assigned_count'], 2)
+        self.assertEqual(second_shift['open_count'], 0)
+        self.assertFalse(second_shift['is_open'])
+        self.assertEqual(second_shift['status'], ScheduleShiftInstance.Status.ASSIGNED)
+
+        first_assignment_id = next(
+            assignment['id']
+            for assignment in second_shift['assignments']
+            if assignment['physician'] == first.id
+        )
+        delete_response = self.client.delete(f'{assignment_url}{first_assignment_id}/')
+        self.assertEqual(delete_response.status_code, 200)
+        deleted_shift = delete_response.json()['shift_instance']
+        self.assertEqual(deleted_shift['assigned_count'], 1)
+        self.assertEqual(deleted_shift['open_count'], 1)
+        self.assertEqual(deleted_shift['status'], ScheduleShiftInstance.Status.OPEN)
+
+        refresh_response = self.client.get(assignment_url)
+        self.assertEqual(refresh_response.status_code, 200)
+        refreshed_shift = refresh_response.json()['shift_instance']
+        self.assertEqual(refreshed_shift['assigned_count'], 1)
+        self.assertEqual(refreshed_shift['assignments'][0]['physician'], second.id)
+
+    def test_assignment_context_marks_facility_ineligible_and_excludes_inactive(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        shift_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        ineligible = self._create_assignment_physician(
+            'outside@example.com',
+            'Morgan Outside',
+        )
+        inactive = self._create_assignment_physician(
+            'inactive@example.com',
+            'Inactive Physician',
+            facilities=[self.facility],
+            active=False,
+        )
+        assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{shift_instance.id}/assignments/'
+        )
+
+        response = self.client.get(assignment_url)
+        self.assertEqual(response.status_code, 200)
+        physician_context = {
+            item['id']: item for item in response.json()['eligible_physicians']
+        }
+        self.assertIn(ineligible.id, physician_context)
+        self.assertFalse(physician_context[ineligible.id]['facility_eligible'])
+        self.assertFalse(physician_context[ineligible.id]['can_assign'])
+        self.assertNotIn(inactive.id, physician_context)
+
+        assign_response = self.client.post(
+            assignment_url,
+            data={'physician_id': ineligible.id},
+            format='json',
+        )
+        self.assertEqual(assign_response.status_code, 400)
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(shift_instance=shift_instance).exists()
+        )
+
+    def test_assignment_rejects_overlapping_shift_in_same_version(self):
+        overlapping_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(12, 0),
+            end_time=time(22, 0),
+            active_days_of_week=['Monday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        day_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        overlapping_instance = ScheduleShiftInstance.objects.get(
+            shift_template=overlapping_template
+        )
+        physician = self._create_assignment_physician(
+            'turner.overlap@example.com',
+            'Alex Turner',
+            facilities=[self.facility],
+        )
+        day_assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{day_instance.id}/assignments/'
+        )
+        overlapping_assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{overlapping_instance.id}/assignments/'
+        )
+
+        assigned_response = self.client.post(
+            day_assignment_url,
+            data={'physician_id': physician.id},
+            format='json',
+        )
+        overlap_response = self.client.post(
+            overlapping_assignment_url,
+            data={'physician_id': physician.id},
+            format='json',
+        )
+
+        self.assertEqual(assigned_response.status_code, 201)
+        self.assertEqual(overlap_response.status_code, 400)
+        self.assertIn('Alex Turner is already assigned to Berkeley 7a-4p', str(overlap_response.json()))
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(physician=physician).count(),
+            1,
+        )
+
+        context_response = self.client.get(overlapping_assignment_url)
+        physician_context = {
+            item['id']: item for item in context_response.json()['eligible_physicians']
+        }
+        self.assertFalse(physician_context[physician.id]['can_assign'])
+        self.assertIn(
+            'overlaps this shift',
+            physician_context[physician.id]['ineligibility_reason'],
+        )
+
+    def test_assignment_rejects_overnight_overlap(self):
+        early_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(6, 0),
+            end_time=time(12, 0),
+            active_days_of_week=['Tuesday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        overnight_instance = ScheduleShiftInstance.objects.get(
+            shift_template=self.overnight_template
+        )
+        early_instance = ScheduleShiftInstance.objects.get(shift_template=early_template)
+        physician = self._create_assignment_physician(
+            'turner.overnight@example.com',
+            'Alex Turner',
+            facilities=[self.facility],
+        )
+        overnight_assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{overnight_instance.id}/assignments/'
+        )
+        early_assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{early_instance.id}/assignments/'
+        )
+
+        assigned_response = self.client.post(
+            overnight_assignment_url,
+            data={'physician_id': physician.id},
+            format='json',
+        )
+        overlap_response = self.client.post(
+            early_assignment_url,
+            data={'physician_id': physician.id},
+            format='json',
+        )
+
+        self.assertEqual(assigned_response.status_code, 201)
+        self.assertEqual(overlap_response.status_code, 400)
+        self.assertIn('overlaps this shift', str(overlap_response.json()))
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(physician=physician).count(),
+            1,
+        )
 
 
 class ContractApiTests(TestCase):

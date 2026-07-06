@@ -208,13 +208,6 @@ class ScheduleShiftInstance(models.Model):
     start_datetime = models.DateTimeField()
     end_datetime = models.DateTimeField()
     required_staffing = models.PositiveIntegerField(default=1)
-    assigned_user = models.ForeignKey(
-        Physician,
-        on_delete=models.SET_NULL,
-        related_name='schedule_shift_instances',
-        null=True,
-        blank=True,
-    )
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -228,6 +221,42 @@ class ScheduleShiftInstance(models.Model):
             models.UniqueConstraint(
                 fields=['schedule_version', 'date', 'shift_template'],
                 name='unique_shift_template_date_per_schedule_version',
+            ),
+        ]
+
+
+class ScheduleShiftAssignment(models.Model):
+    """A physician assigned to one dated Schedule Shift Instance."""
+
+    shift_instance = models.ForeignKey(
+        ScheduleShiftInstance,
+        on_delete=models.CASCADE,
+        related_name='assignments',
+    )
+    physician = models.ForeignKey(
+        Physician,
+        on_delete=models.CASCADE,
+        related_name='schedule_shift_assignments',
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name='created_schedule_shift_assignments',
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.shift_instance_id}: {self.physician}'
+
+    class Meta:
+        ordering = ['physician__user__last_name', 'physician__user__first_name', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['shift_instance', 'physician'],
+                name='unique_physician_per_schedule_shift_instance',
             ),
         ]
 

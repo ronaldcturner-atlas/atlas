@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 
@@ -38,7 +38,37 @@ type ShiftInstance = {
   required_staffing: number
   assigned_count: number
   open_count: number
+  is_open: boolean
   status: 'OPEN' | 'ASSIGNED'
+  assignments: ShiftAssignment[]
+}
+
+type ShiftAssignment = {
+  id: number
+  physician: number
+  physician_name: string
+}
+
+type EligiblePhysician = {
+  id: number
+  name: string
+  already_assigned: boolean
+  domain_eligible: boolean
+  facility_eligible: boolean
+  can_assign: boolean
+  ineligibility_reason: string
+}
+
+type AssignmentContext = {
+  shift_instance: ShiftInstance
+  eligible_physicians: EligiblePhysician[]
+}
+
+type PopoverPosition = {
+  left: number
+  top?: number
+  bottom?: number
+  maxHeight: number
 }
 
 type BuildContext = {
@@ -102,6 +132,26 @@ function formatTime(value: string) {
   return minutes === 0 ? `${hour}${suffix}` : `${hour}:${String(minutes).padStart(2, '0')}${suffix}`
 }
 
+function physicianLastName(name: string) {
+  const parts = name.trim().split(/\s+/)
+  return parts[parts.length - 1] || name
+}
+
+function shiftLabel(instance: ShiftInstance) {
+  const staffing = `${instance.assigned_count}/${instance.required_staffing}`
+  const names = instance.assignments.map((assignment) => physicianLastName(assignment.physician_name))
+  const assignedLabel = names.length
+    ? `${names[0]}${names.length > 1 ? ` +${names.length - 1}` : ''}`
+    : ''
+  const openLabel = instance.is_open ? 'Open ' : ''
+  return [
+    instance.facility_short_name,
+    `${formatTime(instance.template_start_time)}-${formatTime(instance.template_end_time)}`,
+    assignedLabel,
+    `${openLabel}${staffing}`,
+  ].filter(Boolean).join(' ')
+}
+
 function monthGrid(month: Date, blockStart: Date, blockEnd: Date) {
   const first = startOfMonthUtc(month)
   const last = endOfMonthUtc(month)
@@ -143,6 +193,31 @@ function apiError(data: unknown, fallback: string) {
   return messages.join(' ') || fallback
 }
 
+function sortedPhysicianMatches(
+  physicians: EligiblePhysician[],
+  query: string,
+) {
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const alphaSort = (left: EligiblePhysician, right: EligiblePhysician) => (
+    left.name.localeCompare(right.name, undefined, { sensitivity: 'base' })
+  )
+
+  if (!normalizedQuery) {
+    return [...physicians].sort(alphaSort)
+  }
+
+  return physicians
+    .filter((physician) => physician.name.toLocaleLowerCase().includes(normalizedQuery))
+    .sort((left, right) => {
+      const leftStarts = left.name.toLocaleLowerCase().startsWith(normalizedQuery)
+      const rightStarts = right.name.toLocaleLowerCase().startsWith(normalizedQuery)
+      if (leftStarts !== rightStarts) {
+        return leftStarts ? -1 : 1
+      }
+      return alphaSort(left, right)
+    })
+}
+
 export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [context, setContext] = useState<BuildContext | null>(null)
   const [selectedDomainId, setSelectedDomainId] = useState<number | null>(null)
@@ -151,6 +226,26 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isGenerating, setIsGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [assignmentContext, setAssignmentContext] = useState<AssignmentContext | null>(null)
+  const [assignmentTarget, setAssignmentTarget] = useState<ShiftInstance | null>(null)
+  const [isAssignmentLoading, setIsAssignmentLoading] = useState(false)
+  const [isAssignmentSaving, setIsAssignmentSaving] = useState(false)
+  const [assignmentError, setAssignmentError] = useState<string | null>(null)
+  const [physicianSearch, setPhysicianSearch] = useState('')
+  const [popoverPosition, setPopoverPosition] = useState<PopoverPosition | null>(null)
+  const assignmentPopoverRef = useRef<HTMLDivElement | null>(null)
+  const assignmentTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const assignmentLoadIdRef = useRef(0)
+
+  const closeAssignments = () => {
+    assignmentLoadIdRef.current += 1
+    setAssignmentTarget(null)
+    setAssignmentContext(null)
+    setAssignmentError(null)
+    setPhysicianSearch('')
+    setPopoverPosition(null)
+    assignmentTriggerRef.current = null
+  }
 
   const fetchContext = async (versionId?: number) => {
     try {
@@ -182,8 +277,57 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   }
 
   useEffect(() => {
+    closeAssignments()
     void fetchContext()
   }, [blockId])
+
+  useEffect(() => {
+    if (!assignmentTarget) {
+      return undefined
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node
+      if (
+        !assignmentPopoverRef.current?.contains(target)
+        && !assignmentTriggerRef.current?.contains(target)
+        && !isAssignmentSaving
+      ) {
+        closeAssignments()
+      }
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !isAssignmentSaving) {
+        closeAssignments()
+      }
+    }
+    const handleViewportChange = () => {
+      if (!isAssignmentSaving) {
+        closeAssignments()
+      }
+    }
+    const handleScroll = (event: Event) => {
+      const target = event.target
+      if (
+        target instanceof Node
+        && assignmentPopoverRef.current?.contains(target)
+      ) {
+        return
+      }
+      handleViewportChange()
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('resize', handleViewportChange)
+    document.addEventListener('scroll', handleScroll, true)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('resize', handleViewportChange)
+      document.removeEventListener('scroll', handleScroll, true)
+    }
+  }, [assignmentTarget, isAssignmentSaving])
 
   const instancesByDate = useMemo(() => {
     const map = new Map<string, ShiftInstance[]>()
@@ -252,6 +396,154 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const applyAssignmentContext = (nextAssignmentContext: AssignmentContext) => {
+    setAssignmentContext(nextAssignmentContext)
+    setContext((current) => current
+      ? {
+        ...current,
+        shift_instances: current.shift_instances.map((instance) => (
+          instance.id === nextAssignmentContext.shift_instance.id
+            ? nextAssignmentContext.shift_instance
+            : instance
+        )),
+      }
+      : current)
+  }
+
+  const openAssignments = async (
+    instance: ShiftInstance,
+    trigger: HTMLButtonElement,
+  ) => {
+    if (isAssignmentSaving) {
+      return
+    }
+    if (assignmentTarget?.id === instance.id) {
+      closeAssignments()
+      return
+    }
+
+    const loadId = assignmentLoadIdRef.current + 1
+    assignmentLoadIdRef.current = loadId
+    try {
+      const triggerRect = trigger.getBoundingClientRect()
+      const popoverWidth = Math.min(320, window.innerWidth - 16)
+      const left = Math.max(
+        8,
+        Math.min(triggerRect.left, window.innerWidth - popoverWidth - 8),
+      )
+      const spaceBelow = window.innerHeight - triggerRect.bottom - 12
+      const spaceAbove = triggerRect.top - 12
+      const opensBelow = spaceBelow >= spaceAbove || spaceAbove < 180
+      const maxHeight = Math.max(120, Math.min(440, opensBelow ? spaceBelow : spaceAbove))
+      setPopoverPosition(opensBelow
+        ? { left, top: triggerRect.bottom + 6, maxHeight }
+        : { left, bottom: window.innerHeight - triggerRect.top + 6, maxHeight })
+      assignmentTriggerRef.current = trigger
+      setAssignmentTarget(instance)
+      setAssignmentContext(null)
+      setIsAssignmentLoading(true)
+      setAssignmentError(null)
+      setPhysicianSearch('')
+      const response = await fetch(
+        `${API_BASE}/schedule-blocks/${blockId}/build/shift-instances/${instance.id}/assignments/`,
+        {
+          credentials: 'include',
+          cache: 'no-store',
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to load shift assignments.'))
+      }
+      if (assignmentLoadIdRef.current !== loadId) {
+        return
+      }
+      setAssignmentContext(data as AssignmentContext)
+    } catch (assignmentLoadError) {
+      if (assignmentLoadIdRef.current !== loadId) {
+        return
+      }
+      setAssignmentError(
+        assignmentLoadError instanceof Error
+          ? assignmentLoadError.message
+          : 'Unable to load shift assignments.',
+      )
+    } finally {
+      if (assignmentLoadIdRef.current === loadId) {
+        setIsAssignmentLoading(false)
+      }
+    }
+  }
+
+  const assignPhysician = async (physicianId: number) => {
+    if (!assignmentContext) {
+      return
+    }
+    try {
+      setIsAssignmentSaving(true)
+      setAssignmentError(null)
+      const response = await fetch(
+        `${API_BASE}/schedule-blocks/${blockId}/build/shift-instances/${assignmentContext.shift_instance.id}/assignments/`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ physician_id: physicianId }),
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to assign physician.'))
+      }
+      const nextAssignmentContext = data as AssignmentContext
+      applyAssignmentContext(nextAssignmentContext)
+      setPhysicianSearch('')
+      if (nextAssignmentContext.shift_instance.open_count === 0) {
+        closeAssignments()
+      } else {
+        setAssignmentTarget(nextAssignmentContext.shift_instance)
+      }
+    } catch (assignmentSaveError) {
+      setAssignmentError(
+        assignmentSaveError instanceof Error
+          ? assignmentSaveError.message
+          : 'Unable to assign physician.',
+      )
+    } finally {
+      setIsAssignmentSaving(false)
+    }
+  }
+
+  const removeAssignment = async (assignmentId: number) => {
+    if (!assignmentContext) {
+      return
+    }
+    try {
+      setIsAssignmentSaving(true)
+      setAssignmentError(null)
+      const response = await fetch(
+        `${API_BASE}/schedule-blocks/${blockId}/build/shift-instances/${assignmentContext.shift_instance.id}/assignments/${assignmentId}/`,
+        {
+          method: 'DELETE',
+          credentials: 'include',
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to remove physician.'))
+      }
+      applyAssignmentContext(data as AssignmentContext)
+    } catch (assignmentSaveError) {
+      setAssignmentError(
+        assignmentSaveError instanceof Error
+          ? assignmentSaveError.message
+          : 'Unable to remove physician.',
+      )
+    } finally {
+      setIsAssignmentSaving(false)
+    }
+  }
+
   if (isLoading && !context) {
     return <div className="scheduler-loading">Loading Schedule Build Workspace...</div>
   }
@@ -267,6 +559,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const canGenerate = context.schedule_block.build_status === 'PRE_BUILD'
     || context.schedule_block.build_status === 'BUILD'
+  const canEditAssignments = context.schedule_block.build_status === 'BUILD'
+    && context.selected_version?.status === 'BUILD'
+  const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
+    (physician) => physician.can_assign && !physician.already_assigned,
+  ) ?? []
+  const filteredPhysicians = sortedPhysicianMatches(
+    eligiblePhysicians,
+    physicianSearch,
+  )
+  const displayedShift = assignmentContext?.shift_instance ?? assignmentTarget
 
   return (
     <div className="facilities-view-card build-workspace">
@@ -379,11 +681,15 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   <div key={cell.key} className="build-day">
                     <div className="build-day-number">{cell.date.getUTCDate()}</div>
                     {instances.map((instance) => (
-                      <div key={instance.id} className="build-shift-chip">
-                        {instance.facility_short_name}{' '}
-                        {formatTime(instance.template_start_time)}-{formatTime(instance.template_end_time)}{' '}
-                        Open {instance.assigned_count}/{instance.required_staffing}
-                      </div>
+                      <button
+                        key={instance.id}
+                        type="button"
+                        className="build-shift-chip"
+                        aria-expanded={assignmentTarget?.id === instance.id}
+                        onClick={(event) => void openAssignments(instance, event.currentTarget)}
+                      >
+                        {shiftLabel(instance)}
+                      </button>
                     ))}
                   </div>
                 )
@@ -391,6 +697,94 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             </div>
           </div>
         </>
+      )}
+
+      {displayedShift && popoverPosition && (
+        <div
+          ref={assignmentPopoverRef}
+          className="assignment-popover"
+          style={popoverPosition}
+          role="dialog"
+          aria-label={`Assignments for ${displayedShift.shift_template_name}`}
+        >
+          <div className="assignment-popover-header">
+            <div>
+              <strong>
+                {displayedShift.facility_short_name}{' '}
+                {formatTime(displayedShift.template_start_time)}-{formatTime(displayedShift.template_end_time)}
+              </strong>
+              <span>
+                {formatDate(displayedShift.date)} · {displayedShift.assigned_count}/{displayedShift.required_staffing} staffed
+              </span>
+            </div>
+            <button
+              type="button"
+              aria-label="Close assignment popover"
+              disabled={isAssignmentSaving}
+              onClick={closeAssignments}
+            >
+              ×
+            </button>
+          </div>
+
+          {assignmentError && <div className="assignment-popover-error">{assignmentError}</div>}
+          {isAssignmentLoading ? (
+            <div className="assignment-popover-state">Loading assignments...</div>
+          ) : assignmentContext && (
+            <>
+              {displayedShift.assignments.length > 0 && (
+                <div className="assignment-popover-current">
+                  <span className="assignment-popover-label">Assigned</span>
+                  {displayedShift.assignments.map((assignment) => (
+                    <div key={assignment.id} className="assignment-popover-assignment">
+                      <span>{assignment.physician_name}</span>
+                      <button
+                        type="button"
+                        disabled={isAssignmentSaving || !canEditAssignments}
+                        onClick={() => void removeAssignment(assignment.id)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {!canEditAssignments ? (
+                <div className="assignment-popover-state">
+                  Assignments can only be edited in a BUILD Schedule Version.
+                </div>
+              ) : displayedShift.open_count > 0 && (
+                <div className="assignment-popover-picker">
+                  <input
+                    type="search"
+                    value={physicianSearch}
+                    onChange={(event) => setPhysicianSearch(event.target.value)}
+                    placeholder="Search eligible physicians"
+                    aria-label="Search eligible physicians"
+                    autoFocus
+                  />
+                  <div className="assignment-popover-options">
+                    {filteredPhysicians.length ? filteredPhysicians.map((physician) => (
+                      <button
+                        key={physician.id}
+                        type="button"
+                        disabled={isAssignmentSaving}
+                        onClick={() => void assignPhysician(physician.id)}
+                      >
+                        {physician.name}
+                      </button>
+                    )) : <div className="assignment-popover-state">
+                      {eligiblePhysicians.length
+                        ? 'No matching eligible physicians.'
+                        : 'No eligible physicians.'}
+                    </div>}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
       )}
     </div>
   )
