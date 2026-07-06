@@ -6,7 +6,14 @@ from django.utils import timezone
 from apps.accounts.models import Physician
 from apps.facilities.models import Facility
 
-from .models import ScheduleBlock, ScheduleRequest, Shift, ShiftTemplate
+from .models import (
+    ScheduleBlock,
+    ScheduleRequest,
+    ScheduleShiftInstance,
+    ScheduleVersion,
+    Shift,
+    ShiftTemplate,
+)
 from .models import Contract, ContractUserAssignment
 
 
@@ -273,6 +280,72 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError('Archived Schedule Blocks are read only.')
 
         return attrs
+
+
+class ScheduleVersionSerializer(serializers.ModelSerializer):
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    shift_instance_count = serializers.IntegerField(source='shift_instances.count', read_only=True)
+
+    class Meta:
+        model = ScheduleVersion
+        fields = [
+            'id',
+            'schedule_block',
+            'domain',
+            'domain_name',
+            'version_number',
+            'name',
+            'status',
+            'shift_instance_count',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+
+class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
+    facility_name = serializers.CharField(source='facility.name', read_only=True)
+    facility_short_name = serializers.CharField(source='facility.short_name', read_only=True)
+    shift_template_name = serializers.SerializerMethodField()
+    template_start_time = serializers.TimeField(source='shift_template.start_time', read_only=True)
+    template_end_time = serializers.TimeField(source='shift_template.end_time', read_only=True)
+    assigned_count = serializers.SerializerMethodField()
+    open_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ScheduleShiftInstance
+        fields = [
+            'id',
+            'schedule_version',
+            'schedule_block',
+            'date',
+            'shift_template',
+            'shift_template_name',
+            'facility',
+            'facility_name',
+            'facility_short_name',
+            'start_datetime',
+            'end_datetime',
+            'template_start_time',
+            'template_end_time',
+            'required_staffing',
+            'assigned_user',
+            'assigned_count',
+            'open_count',
+            'status',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_shift_template_name(self, obj):
+        return obj.shift_template.generated_name()
+
+    def get_assigned_count(self, obj):
+        return 1 if obj.assigned_user_id else 0
+
+    def get_open_count(self, obj):
+        return max(obj.required_staffing - self.get_assigned_count(obj), 0)
 
 
 class ScheduleRequestSerializer(serializers.ModelSerializer):

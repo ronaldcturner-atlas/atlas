@@ -22,6 +22,8 @@ This is a product-behavior summary, not a claim that every roadmap phase is comp
 - A **Shift Template** is a reusable, facility-specific recurring definition. It has no physician and no calendar date.
 - A **Shift** is a dated assignment of one physician to one facility.
 - A **Schedule Block** is a dated planning and publication container with its own request window and lifecycle.
+- A **Schedule Version** is a Domain-scoped workspace version inside a Schedule Block.
+- A **Schedule Shift Instance** is a dated staffing requirement generated from a Shift Template inside a Schedule Version.
 - A **Schedule Request** is a physician preference or administrative instruction for one date inside one Schedule Block.
 - A **Contract** is a domain-specific bundle of configurable scheduling and request rules that can be assigned as a physician's default contract in that domain.
 
@@ -89,15 +91,32 @@ The established statuses are:
 Status is workflow-controlled and cannot be edited as an ordinary field.
 
 - New blocks begin in `PRE_BUILD`.
+- Generating the first Schedule Build Workspace moves a `PRE_BUILD` block to `BUILD`.
 - Only `PRE_BUILD` blocks can be deleted.
 - `PRE_BUILD` and `BUILD` blocks can enter `PREVIEW`.
 - Only `PREVIEW` blocks can be published.
 - Publishing stamps `published_at` and moves the block to `ARCHIVE`.
 - Archived blocks are read-only and cannot return to preview.
 
-`BUILD` exists in the model, but the current repository has no endpoint that moves a block from `PRE_BUILD` to `BUILD`. Future work should not invent that transition without a product decision.
-
 Overlapping planning blocks are allowed. Creating a block that overlaps already-published dates requires acknowledgement. Publishing over already-published dates also requires acknowledgement: the newer publication replaces the Live Schedule for overlapping dates, while the previous published block remains archived as historical schedule-of-record data.
+
+## Schedule Build Workspace
+
+### Settled purpose
+
+The Schedule Build Workspace is the pre-optimizer workspace for a Schedule Block. It generates and displays the dated, unassigned staffing requirements that later scheduling work will fill.
+
+- A Schedule Version belongs to one Schedule Block and one Domain.
+- The initial generated version has `BUILD` status.
+- Generating creates one Schedule Shift Instance for each active Shift Template on each matching active day inside the Schedule Block.
+- Each instance carries its date, source template, Facility, start/end datetimes, required staffing, and open assignment state.
+- Overnight instances end on the following calendar day when their template end time is earlier than or equal to its start time.
+- Generation safely reuses the existing BUILD version and does not duplicate a template/date instance.
+- Generated instances begin open and unassigned.
+
+The workspace is not the Live Schedule, preview, publication, optimization, or automatic assignment. It does not evaluate Contracts, penalties, or physician eligibility.
+
+Shift Templates do not currently have a Domain relationship. The Schedule Version is Domain-scoped, while V1 generation reads the existing global active Shift Template catalog. Atlas must not infer a hidden Template-to-Domain mapping through Contracts or Facilities.
 
 ## Request Builder
 
@@ -239,17 +258,17 @@ Atlas should not build:
 - recurring request records when the current pattern helper is only a way to select explicit dates;
 - claims that Contract workload, shift, night, or weekend scheduling rules are enforced before the optimizer integration actually exists.
 
-The following roadmap items are deferred, not permanently prohibited: the build workspace and version tree, penalty engine, background optimization, preview/publish/live editing beyond the current block lifecycle, and report builder/export. They should be implemented only in their intended phase and after their product behavior is settled.
+The following roadmap items are deferred, not permanently prohibited: the schedule version tree beyond the initial BUILD version, penalty engine, background optimization, preview/publish/live editing beyond the current block lifecycle, and report builder/export. They should be implemented only in their intended phase and after their product behavior is settled.
 
 ## Known Gaps That Must Not Be Filled by Assumption
 
 - Organization has no current data model.
 - Domain membership for Physicians is not modeled.
-- There is no implemented `PRE_BUILD` to `BUILD` transition.
+- Shift Templates are not currently assigned to Domains; BUILD generation therefore uses the global active template catalog.
 - Contract workload, shift, night, and weekend scheduling rules are not evaluated by an optimizer or schedule builder.
 - Request Builder cannot choose among multiple active Contracts across different Domains; Contract enforcement requires one unambiguous active assignment.
 - Request timestamps do not currently authorize or reject request writes.
 - Publishing records block history, but the repository does not yet contain the full Live Schedule editing workflow described by the roadmap.
-- Optimization, schedule versioning, penalties, comments, reports, and exports remain roadmap work.
+- Optimization, schedule version branching, penalties, comments, reports, and exports remain roadmap work.
 
 These gaps require explicit product decisions. Their absence is not permission to infer policy.

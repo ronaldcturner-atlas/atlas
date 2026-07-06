@@ -27,6 +27,7 @@ type ScheduleBlocksViewProps = {
   requestBlockId?: number | null
   onOpenRequests?: (blockId: number) => void
   onCloseRequests?: () => void
+  onOpenBuild?: (blockId: number) => void
 }
 
 const API_BASE = 'http://localhost:8000/api'
@@ -183,6 +184,7 @@ export default function ScheduleBlocksView({
   requestBlockId = null,
   onOpenRequests,
   onCloseRequests,
+  onOpenBuild,
 }: ScheduleBlocksViewProps) {
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -529,6 +531,11 @@ export default function ScheduleBlocksView({
                     <button type="button" onClick={() => openRequests(block)}>
                       Requests
                     </button>
+                    {(block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
+                      <button type="button" onClick={() => onOpenBuild?.(block.id)}>
+                        Build Schedule
+                      </button>
+                    )}
                     {block.build_status !== 'ARCHIVE' && (
                       <>
                         <button type="button" onClick={() => openBlock(block)}>Edit Dates</button>

@@ -140,6 +140,98 @@ class ScheduleBlock(models.Model):
         ordering = ['-created_at', '-id']
 
 
+class ScheduleVersion(models.Model):
+    """A domain-scoped schedule workspace version for a Schedule Block."""
+
+    class Status(models.TextChoices):
+        BUILD = 'BUILD', 'Build'
+        PREVIEW = 'PREVIEW', 'Preview'
+        ARCHIVED = 'ARCHIVED', 'Archived'
+
+    schedule_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.CASCADE,
+        related_name='schedule_versions',
+    )
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.CASCADE,
+        related_name='schedule_versions',
+    )
+    version_number = models.PositiveIntegerField(default=1)
+    name = models.CharField(max_length=120)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.BUILD)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.schedule_block.generated_name}: {self.name}'
+
+    class Meta:
+        ordering = ['-version_number', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_block', 'domain', 'version_number'],
+                name='unique_schedule_version_number_per_block_domain',
+            ),
+        ]
+
+
+class ScheduleShiftInstance(models.Model):
+    """A dated shift requirement generated from a recurring Shift Template."""
+
+    class Status(models.TextChoices):
+        OPEN = 'OPEN', 'Open'
+        ASSIGNED = 'ASSIGNED', 'Assigned'
+
+    schedule_version = models.ForeignKey(
+        ScheduleVersion,
+        on_delete=models.CASCADE,
+        related_name='shift_instances',
+    )
+    schedule_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.CASCADE,
+        related_name='shift_instances',
+    )
+    date = models.DateField()
+    shift_template = models.ForeignKey(
+        ShiftTemplate,
+        on_delete=models.PROTECT,
+        related_name='shift_instances',
+    )
+    facility = models.ForeignKey(
+        Facility,
+        on_delete=models.PROTECT,
+        related_name='schedule_shift_instances',
+    )
+    start_datetime = models.DateTimeField()
+    end_datetime = models.DateTimeField()
+    required_staffing = models.PositiveIntegerField(default=1)
+    assigned_user = models.ForeignKey(
+        Physician,
+        on_delete=models.SET_NULL,
+        related_name='schedule_shift_instances',
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.date}: {self.shift_template.generated_name()}'
+
+    class Meta:
+        ordering = ['date', 'start_datetime', 'facility__name', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_version', 'date', 'shift_template'],
+                name='unique_shift_template_date_per_schedule_version',
+            ),
+        ]
+
+
 class ScheduleRequest(models.Model):
     """A physician request entered for a specific date inside a Schedule Block."""
 

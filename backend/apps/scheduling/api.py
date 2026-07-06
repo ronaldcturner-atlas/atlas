@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone as datetime_timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db.models import Q
 from django.db import transaction
@@ -12,9 +13,26 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.accounts.models import Physician
+from apps.domains.models import Domain
 
-from .models import Contract, ScheduleBlock, ScheduleRequest, Shift, ShiftTemplate
-from .serializers import ContractSerializer, ScheduleBlockSerializer, ScheduleRequestSerializer, ShiftSerializer, ShiftTemplateSerializer
+from .models import (
+    Contract,
+    ScheduleBlock,
+    ScheduleRequest,
+    ScheduleShiftInstance,
+    ScheduleVersion,
+    Shift,
+    ShiftTemplate,
+)
+from .serializers import (
+    ContractSerializer,
+    ScheduleBlockSerializer,
+    ScheduleRequestSerializer,
+    ScheduleShiftInstanceSerializer,
+    ScheduleVersionSerializer,
+    ShiftSerializer,
+    ShiftTemplateSerializer,
+)
 
 
 class CsrfExemptSessionAuthentication(SessionAuthentication):
@@ -165,6 +183,18 @@ def _can_manage_requests(user):
 
     return user.has_perm('scheduling.add_schedulerequest') or user.has_perm(
         'scheduling.change_schedulerequest'
+    )
+
+
+def _can_manage_build_workspace(user):
+    if user.is_staff or user.is_superuser:
+        return True
+
+    if user.groups.filter(Q(name__iexact='admin') | Q(name__iexact='scheduler')).exists():
+        return True
+
+    return user.has_perm('scheduling.add_scheduleversion') or user.has_perm(
+        'scheduling.change_scheduleversion'
     )
 
 
@@ -880,6 +910,235 @@ def schedule_block_bulk_requests(request, block_id):
                 saved_count += 1
 
     return Response({'saved_count': saved_count, 'request_scope': request_scope})
+
+
+def _build_workspace_forbidden_response():
+    return Response(
+        {'detail': 'Only admin/scheduler users can manage the Schedule Build Workspace.'},
+        status=status.HTTP_403_FORBIDDEN,
+    )
+
+
+def _schedule_version_queryset(block):
+    return (
+        ScheduleVersion.objects.filter(schedule_block=block)
+        .select_related('domain')
+        .prefetch_related('shift_instances')
+    )
+
+
+def _shift_instance_queryset(version):
+    return (
+        ScheduleShiftInstance.objects.filter(schedule_version=version)
+        .select_related('facility', 'shift_template', 'assigned_user__user')
+    )
+
+
+def _facility_timezone(facility):
+    try:
+        return ZoneInfo(facility.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return datetime_timezone.utc
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_build_context(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    versions = _schedule_version_queryset(block)
+    selected_version = None
+
+    version_id = request.query_params.get('version_id')
+    if version_id:
+        try:
+            version_id = int(version_id)
+        except (TypeError, ValueError):
+            return Response(
+                {'version_id': 'version_id must be a valid integer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        selected_version = get_object_or_404(versions, id=version_id)
+    else:
+        selected_version = versions.filter(status=ScheduleVersion.Status.BUILD).first() or versions.first()
+
+    shift_instances = (
+        ScheduleShiftInstanceSerializer(
+            _shift_instance_queryset(selected_version),
+            many=True,
+        ).data
+        if selected_version
+        else []
+    )
+
+    return Response(
+        {
+            'schedule_block': ScheduleBlockSerializer(block).data,
+            'domains': [
+                {'id': domain.id, 'name': domain.name}
+                for domain in Domain.objects.filter(active=True).order_by('name')
+            ],
+            'versions': ScheduleVersionSerializer(versions, many=True).data,
+            'selected_version': (
+                ScheduleVersionSerializer(selected_version).data
+                if selected_version
+                else None
+            ),
+            'shift_instances': shift_instances,
+        }
+    )
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_schedule_versions(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    return Response(ScheduleVersionSerializer(_schedule_version_queryset(block), many=True).data)
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_shift_instances(request, block_id, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('domain'),
+        id=version_id,
+        schedule_block=block,
+    )
+    return Response(
+        ScheduleShiftInstanceSerializer(
+            _shift_instance_queryset(version),
+            many=True,
+        ).data
+    )
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_generate_shift_instances(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    if block.build_status not in {
+        ScheduleBlock.BuildStatus.PRE_BUILD,
+        ScheduleBlock.BuildStatus.BUILD,
+    }:
+        return Response(
+            {'detail': 'Shift instances can only be generated for PRE_BUILD or BUILD Schedule Blocks.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        domain_id = int(request.data.get('domain_id'))
+    except (TypeError, ValueError):
+        return Response(
+            {'domain_id': 'domain_id is required and must be a valid integer.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    domain = get_object_or_404(Domain, id=domain_id, active=True)
+
+    with transaction.atomic():
+        version = (
+            ScheduleVersion.objects.select_for_update()
+            .filter(
+                schedule_block=block,
+                domain=domain,
+                status=ScheduleVersion.Status.BUILD,
+            )
+            .order_by('-version_number')
+            .first()
+        )
+        if version is None:
+            latest_version_number = (
+                ScheduleVersion.objects.filter(schedule_block=block, domain=domain)
+                .order_by('-version_number')
+                .values_list('version_number', flat=True)
+                .first()
+                or 0
+            )
+            version = ScheduleVersion.objects.create(
+                schedule_block=block,
+                domain=domain,
+                version_number=latest_version_number + 1,
+                name=f'Build {latest_version_number + 1}',
+                status=ScheduleVersion.Status.BUILD,
+            )
+
+        templates = list(
+            ShiftTemplate.objects.filter(active=True)
+            .select_related('facility')
+            .order_by('facility__name', 'start_time', 'id')
+        )
+        created_count = 0
+        current_date = block.start_date
+        while current_date <= block.end_date:
+            day_name = current_date.strftime('%A')
+            for template in templates:
+                if day_name not in (template.active_days_of_week or []):
+                    continue
+
+                timezone_info = _facility_timezone(template.facility)
+                end_date = current_date
+                if template.end_time <= template.start_time:
+                    end_date = current_date + timedelta(days=1)
+
+                _, created = ScheduleShiftInstance.objects.get_or_create(
+                    schedule_version=version,
+                    date=current_date,
+                    shift_template=template,
+                    defaults={
+                        'schedule_block': block,
+                        'facility': template.facility,
+                        'start_datetime': datetime.combine(
+                            current_date,
+                            template.start_time,
+                            tzinfo=timezone_info,
+                        ),
+                        'end_datetime': datetime.combine(
+                            end_date,
+                            template.end_time,
+                            tzinfo=timezone_info,
+                        ),
+                        'required_staffing': template.default_staffing_count,
+                        'assigned_user': None,
+                        'status': ScheduleShiftInstance.Status.OPEN,
+                    },
+                )
+                if created:
+                    created_count += 1
+            current_date += timedelta(days=1)
+
+        if block.build_status == ScheduleBlock.BuildStatus.PRE_BUILD:
+            block.build_status = ScheduleBlock.BuildStatus.BUILD
+            block.save(update_fields=['build_status', 'updated_at'])
+
+    total_count = ScheduleShiftInstance.objects.filter(schedule_version=version).count()
+    return Response(
+        {
+            'message': (
+                f'Created {created_count} shift instances.'
+                if created_count
+                else 'Shift instances already exist for this BUILD version.'
+            ),
+            'created_count': created_count,
+            'total_count': total_count,
+            'schedule_block': ScheduleBlockSerializer(block).data,
+            'schedule_version': ScheduleVersionSerializer(version).data,
+        }
+    )
 
 
 @api_view(['GET', 'POST'])

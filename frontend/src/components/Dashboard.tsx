@@ -5,6 +5,7 @@ import Topbar from './Topbar'
 import Calendar from './Calendar'
 import SchedulerView from './SchedulerView'
 import ShiftsView from './ShiftsView'
+import ScheduleBuildWorkspace from './ScheduleBuildWorkspace'
 import ScheduleBlocksView from './ScheduleBlocksView'
 import ContractsView from './ContractsView'
 import FacilitiesView from './FacilitiesView'
@@ -32,7 +33,11 @@ function viewFromPath(pathname: string): AppView | null {
   if (pathname === '/shift-builder') {
     return 'shift-builder'
   }
-  if (pathname === '/schedule-blocks' || /^\/schedule-blocks\/\d+\/requests$/.test(pathname)) {
+  if (
+    pathname === '/schedule-blocks'
+    || /^\/schedule-blocks\/\d+\/requests$/.test(pathname)
+    || /^\/schedule-blocks\/\d+\/build$/.test(pathname)
+  ) {
     return 'schedule-blocks'
   }
   if (pathname === '/contracts') {
@@ -53,11 +58,15 @@ export default function Dashboard() {
   const activeView = viewFromPath(location.pathname) ?? 'my-schedule'
   const requestBuilderMatch = location.pathname.match(/^\/schedule-blocks\/(\d+)\/requests$/)
   const requestBlockId = requestBuilderMatch ? Number(requestBuilderMatch[1]) : null
+  const buildWorkspaceMatch = location.pathname.match(/^\/schedule-blocks\/(\d+)\/build$/)
+  const buildBlockId = buildWorkspaceMatch ? Number(buildWorkspaceMatch[1]) : null
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
   const [shiftsRefreshToken, setShiftsRefreshToken] = React.useState(0)
 
   const pageTitle =
-    requestBlockId !== null
+    buildBlockId !== null
+      ? 'Schedule Build Workspace'
+      : requestBlockId !== null
       ? 'Request Builder'
       : activeView === 'my-schedule'
       ? 'My Schedule'
@@ -101,11 +110,18 @@ export default function Dashboard() {
             />
           )}
           {activeView === 'shift-builder' && <ShiftsView />}
-          {activeView === 'schedule-blocks' && (
+          {activeView === 'schedule-blocks' && buildBlockId !== null && (
+            <ScheduleBuildWorkspace
+              blockId={buildBlockId}
+              onBack={() => navigate('/schedule-blocks')}
+            />
+          )}
+          {activeView === 'schedule-blocks' && buildBlockId === null && (
             <ScheduleBlocksView
               requestBlockId={requestBlockId}
               onOpenRequests={(blockId) => navigate(`/schedule-blocks/${blockId}/requests`)}
               onCloseRequests={() => navigate('/schedule-blocks')}
+              onOpenBuild={(blockId) => navigate(`/schedule-blocks/${blockId}/build`)}
             />
           )}
           {activeView === 'contracts' && <ContractsView />}

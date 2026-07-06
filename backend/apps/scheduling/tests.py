@@ -10,7 +10,15 @@ from apps.accounts.models import Physician
 from apps.domains.models import Domain
 from apps.facilities.models import Facility
 
-from .models import Contract, ContractUserAssignment, ScheduleBlock, ScheduleRequest, ShiftTemplate
+from .models import (
+    Contract,
+    ContractUserAssignment,
+    ScheduleBlock,
+    ScheduleRequest,
+    ScheduleShiftInstance,
+    ScheduleVersion,
+    ShiftTemplate,
+)
 from .serializers import ScheduleBlockSerializer
 
 
@@ -780,6 +788,147 @@ class ScheduleRequestApiTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+
+class ScheduleBuildWorkspaceApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.scheduler_user = get_user_model().objects.create_user(
+            username='build-scheduler@example.com',
+            password='password123',
+        )
+        scheduler_group, _ = Group.objects.get_or_create(name='Scheduler')
+        self.scheduler_user.groups.add(scheduler_group)
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        self.domain = Domain.objects.create(name='Physician', active=True)
+        self.facility = Facility.objects.create(
+            name='Berkeley Hospital',
+            short_name='Berkeley',
+            timezone='UTC',
+        )
+        self.day_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(16, 0),
+            active_days_of_week=['Monday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=2,
+            active=True,
+        )
+        self.overnight_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(19, 0),
+            end_time=time(7, 0),
+            active_days_of_week=['Monday'],
+            weekend_days=[],
+            night_shift=True,
+            default_staffing_count=1,
+            active=True,
+        )
+        ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(10, 0),
+            end_time=time(18, 0),
+            active_days_of_week=['Monday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=False,
+        )
+        self.block = ScheduleBlock.objects.create(
+            start_date=date(2026, 7, 6),
+            end_date=date(2026, 7, 7),
+            request_open_datetime=timezone.make_aware(datetime(2026, 5, 1, 12, 0)),
+            request_close_datetime=timezone.make_aware(datetime(2026, 5, 15, 12, 0)),
+            build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        )
+
+    def test_generate_creates_open_dated_instances_and_moves_block_to_build(self):
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['created_count'], 2)
+        self.block.refresh_from_db()
+        self.assertEqual(self.block.build_status, ScheduleBlock.BuildStatus.BUILD)
+
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        self.assertEqual(version.domain, self.domain)
+        self.assertEqual(version.status, ScheduleVersion.Status.BUILD)
+
+        instances = ScheduleShiftInstance.objects.filter(schedule_version=version)
+        self.assertEqual(instances.count(), 2)
+        day_instance = instances.get(shift_template=self.day_template)
+        self.assertEqual(day_instance.date, date(2026, 7, 6))
+        self.assertEqual(day_instance.required_staffing, 2)
+        self.assertIsNone(day_instance.assigned_user)
+        self.assertEqual(day_instance.status, ScheduleShiftInstance.Status.OPEN)
+
+        overnight_instance = instances.get(shift_template=self.overnight_template)
+        self.assertEqual(overnight_instance.start_datetime.date(), date(2026, 7, 6))
+        self.assertEqual(overnight_instance.end_datetime.date(), date(2026, 7, 7))
+        self.assertGreater(overnight_instance.end_datetime, overnight_instance.start_datetime)
+
+    def test_generate_is_idempotent_for_existing_build_version(self):
+        generate_url = f'/api/schedule-blocks/{self.block.id}/build/generate/'
+
+        first_response = self.client.post(
+            generate_url,
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        second_response = self.client.post(
+            generate_url,
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_response.json()['created_count'], 0)
+        self.assertEqual(ScheduleVersion.objects.filter(schedule_block=self.block).count(), 1)
+        self.assertEqual(ScheduleShiftInstance.objects.filter(schedule_block=self.block).count(), 2)
+
+    def test_context_and_list_endpoints_return_selected_version_and_instances(self):
+        generate_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version_id = generate_response.json()['schedule_version']['id']
+
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/')
+        versions_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/versions/')
+        shifts_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/versions/{version_id}/shifts/'
+        )
+
+        self.assertEqual(context_response.status_code, 200)
+        self.assertEqual(context_response.json()['selected_version']['id'], version_id)
+        self.assertEqual(len(context_response.json()['shift_instances']), 2)
+        self.assertEqual(versions_response.status_code, 200)
+        self.assertEqual(len(versions_response.json()), 1)
+        self.assertEqual(shifts_response.status_code, 200)
+        self.assertEqual(len(shifts_response.json()), 2)
+        self.assertEqual(shifts_response.json()[0]['assigned_count'], 0)
+
+    def test_generate_rejects_preview_or_archived_block(self):
+        self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
+        self.block.save(update_fields=['build_status', 'updated_at'])
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(ScheduleVersion.objects.filter(schedule_block=self.block).exists())
 
 
 class ContractApiTests(TestCase):
