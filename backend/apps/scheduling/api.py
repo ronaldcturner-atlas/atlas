@@ -1104,7 +1104,9 @@ def _physician_assignment_eligibility(physician, shift_instance):
     )
     can_assign = physician.active and domain_eligible and facility_eligible
 
-    if not domain_eligible:
+    if not physician.active:
+        reason = 'Physician is inactive.'
+    elif not domain_eligible:
         reason = (
             f'No active Contract assignment in '
             f'{shift_instance.schedule_version.domain.name}.'
@@ -1206,8 +1208,12 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
     physician = get_object_or_404(
         Physician.objects.select_related('user'),
         id=physician_id,
-        active=True,
     )
+    if not physician.active:
+        return Response(
+            {'physician_id': 'Physician is inactive.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     eligibility = _physician_assignment_eligibility(physician, shift_instance)
     if not eligibility['can_assign']:
         return Response(
@@ -1347,7 +1353,7 @@ def schedule_block_generate_shift_instances(request, block_id):
             )
 
         templates = list(
-            ShiftTemplate.objects.filter(active=True)
+            ShiftTemplate.objects.filter(active=True, facility__active=True)
             .select_related('facility')
             .order_by('facility__name', 'start_time', 'id')
         )

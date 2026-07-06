@@ -828,7 +828,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             default_staffing_count=1,
             active=True,
         )
-        ShiftTemplate.objects.create(
+        self.inactive_template = ShiftTemplate.objects.create(
             facility=self.facility,
             start_time=time(10, 0),
             end_time=time(18, 0),
@@ -837,6 +837,22 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             night_shift=False,
             default_staffing_count=1,
             active=False,
+        )
+        self.inactive_facility = Facility.objects.create(
+            name='Closed Hospital',
+            short_name='Closed',
+            timezone='UTC',
+            active=False,
+        )
+        self.inactive_facility_template = ShiftTemplate.objects.create(
+            facility=self.inactive_facility,
+            start_time=time(8, 0),
+            end_time=time(17, 0),
+            active_days_of_week=['Monday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
         )
         self.block = ScheduleBlock.objects.create(
             start_date=date(2026, 7, 6),
@@ -890,6 +906,12 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         instances = ScheduleShiftInstance.objects.filter(schedule_version=version)
         self.assertEqual(instances.count(), 2)
+        self.assertFalse(
+            instances.filter(shift_template=self.inactive_template).exists()
+        )
+        self.assertFalse(
+            instances.filter(shift_template=self.inactive_facility_template).exists()
+        )
         day_instance = instances.get(shift_template=self.day_template)
         self.assertEqual(day_instance.date, date(2026, 7, 6))
         self.assertEqual(day_instance.required_staffing, 2)
@@ -974,6 +996,11 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             'Casey Ng',
             facilities=[self.facility],
         )
+        third = self._create_assignment_physician(
+            'third@example.com',
+            'Jamie Third',
+            facilities=[self.facility],
+        )
         assignment_url = (
             f'/api/schedule-blocks/{self.block.id}/build/'
             f'shift-instances/{shift_instance.id}/assignments/'
@@ -1021,6 +1048,18 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(second_shift['open_count'], 0)
         self.assertFalse(second_shift['is_open'])
         self.assertEqual(second_shift['status'], ScheduleShiftInstance.Status.ASSIGNED)
+
+        full_response = self.client.post(
+            assignment_url,
+            data={'physician_id': third.id},
+            format='json',
+        )
+        self.assertEqual(full_response.status_code, 400)
+        self.assertEqual(full_response.json()['detail'], 'This shift instance is already fully staffed.')
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(shift_instance=shift_instance).count(),
+            2,
+        )
 
         first_assignment_id = next(
             assignment['id']
@@ -1078,6 +1117,81 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             format='json',
         )
         self.assertEqual(assign_response.status_code, 400)
+        self.assertIn('Contract does not include Berkeley Hospital.', assign_response.json()['physician_id'])
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(shift_instance=shift_instance).exists()
+        )
+
+    def test_assignment_rejects_inactive_and_out_of_domain_physicians_clearly(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        shift_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        inactive = self._create_assignment_physician(
+            'inactive.assign@example.com',
+            'Inactive Physician',
+            facilities=[self.facility],
+            active=False,
+        )
+        other_domain = Domain.objects.create(name='Other Domain', active=True)
+        outside_user = get_user_model().objects.create_user(
+            username='outside.domain@example.com',
+            email='outside.domain@example.com',
+            first_name='Outside',
+            last_name='Domain',
+        )
+        outside_physician = Physician.objects.create(
+            user=outside_user,
+            display_name='Outside Domain',
+            active=True,
+        )
+        outside_contract = Contract.objects.create(
+            domain=other_domain,
+            name='Outside Domain Contract',
+            active=True,
+        )
+        outside_contract.facilities.set([self.facility])
+        ContractUserAssignment.objects.create(
+            contract=outside_contract,
+            domain=other_domain,
+            physician=outside_physician,
+        )
+        assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{shift_instance.id}/assignments/'
+        )
+
+        context_response = self.client.get(assignment_url)
+        physician_context = {
+            item['id']: item for item in context_response.json()['eligible_physicians']
+        }
+        self.assertNotIn(inactive.id, physician_context)
+        self.assertFalse(physician_context[outside_physician.id]['can_assign'])
+        self.assertIn(
+            'No active Contract assignment in Physician.',
+            physician_context[outside_physician.id]['ineligibility_reason'],
+        )
+
+        inactive_response = self.client.post(
+            assignment_url,
+            data={'physician_id': inactive.id},
+            format='json',
+        )
+        outside_response = self.client.post(
+            assignment_url,
+            data={'physician_id': outside_physician.id},
+            format='json',
+        )
+
+        self.assertEqual(inactive_response.status_code, 400)
+        self.assertEqual(inactive_response.json()['physician_id'], 'Physician is inactive.')
+        self.assertEqual(outside_response.status_code, 400)
+        self.assertIn(
+            'No active Contract assignment in Physician.',
+            outside_response.json()['physician_id'],
+        )
         self.assertFalse(
             ScheduleShiftAssignment.objects.filter(shift_instance=shift_instance).exists()
         )
