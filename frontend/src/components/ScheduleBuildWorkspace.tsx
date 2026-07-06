@@ -192,6 +192,25 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       values.push(instance)
       map.set(instance.date, values)
     }
+    for (const instances of map.values()) {
+      instances.sort((left, right) => {
+        const facilityOrder = left.facility_short_name.localeCompare(
+          right.facility_short_name,
+          undefined,
+          { sensitivity: 'base' },
+        )
+        if (facilityOrder !== 0) {
+          return facilityOrder
+        }
+
+        const startTimeOrder = left.template_start_time.localeCompare(right.template_start_time)
+        if (startTimeOrder !== 0) {
+          return startTimeOrder
+        }
+
+        return left.id - right.id
+      })
+    }
     return map
   }, [context?.shift_instances])
 
