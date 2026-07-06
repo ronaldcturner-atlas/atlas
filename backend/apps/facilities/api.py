@@ -20,6 +20,11 @@ class CsrfExemptSessionAuthentication(SessionAuthentication):
 def facilities_list_create(request):
 	if request.method == 'GET':
 		facilities = Facility.objects.all()
+
+		active_filter = request.query_params.get('active')
+		if active_filter in {'true', 'false'}:
+			facilities = facilities.filter(active=active_filter == 'true')
+
 		serializer = FacilitySerializer(facilities, many=True)
 		return Response(serializer.data)
 

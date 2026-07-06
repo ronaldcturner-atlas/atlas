@@ -47,3 +47,15 @@ class FacilitiesTests(TestCase):
         self.assertEqual(response.status_code, 200)
         facility.refresh_from_db()
         self.assertTrue(facility.active)
+
+    def test_facilities_list_active_filter(self):
+        Facility.objects.create(name='Alpha', short_name='Alpha', active=True)
+        Facility.objects.create(name='Beta', short_name='Beta', active=False)
+
+        response = self.client.get('/api/facilities/?active=true')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        names = {item['name'] for item in payload}
+        self.assertIn('Alpha', names)
+        self.assertNotIn('Beta', names)

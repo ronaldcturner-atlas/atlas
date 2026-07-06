@@ -3,6 +3,11 @@ from django.urls import path
 from . import api
 
 urlpatterns = [
+    path("contracts/", api.contracts_list_create, name="contracts_list_create"),
+    path("contracts/<int:contract_id>/", api.contract_detail, name="contract_detail"),
+    path("contracts/<int:contract_id>/duplicate/", api.contract_duplicate, name="contract_duplicate"),
+    path("contracts/<int:contract_id>/deactivate/", api.contract_deactivate, name="contract_deactivate"),
+    path("contracts/<int:contract_id>/reactivate/", api.contract_reactivate, name="contract_reactivate"),
     path("shifts/", api.shifts_list_create, name="shifts_list_create"),
     path("shifts/<int:shift_id>/", api.shift_detail, name="shift_detail"),
     path("shift-templates/", api.shift_templates_list_create, name="shift_templates_list_create"),

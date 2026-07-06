@@ -2,6 +2,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from apps.facilities.models import Facility
 from apps.accounts.models import Physician
+from apps.domains.models import Domain
 
 
 def _format_template_time(time_value):
@@ -192,5 +193,63 @@ class ScheduleRequest(models.Model):
                 fields=['schedule_block', 'physician', 'date'],
                 condition=models.Q(request_scope='ADMIN'),
                 name='unique_admin_request_per_block_physician_date',
+            ),
+        ]
+
+
+class Contract(models.Model):
+    """A domain-specific scheduling rule set."""
+
+    domain = models.ForeignKey(Domain, on_delete=models.CASCADE, related_name='contracts')
+    name = models.CharField(max_length=255)
+    active = models.BooleanField(default=True)
+    facilities = models.ManyToManyField(Facility, blank=True, related_name='contracts')
+    workload_settings = models.JSONField(default=dict, blank=True)
+    shift_settings = models.JSONField(default=dict, blank=True)
+    night_settings = models.JSONField(default=dict, blank=True)
+    weekend_settings = models.JSONField(default=dict, blank=True)
+    request_settings = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.domain.name}: {self.name}'
+
+    class Meta:
+        ordering = ['domain__name', 'name', '-id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['domain', 'name'],
+                name='unique_contract_name_per_domain',
+            ),
+        ]
+
+
+class ContractUserAssignment(models.Model):
+    """Assigns a physician to a contract as their default contract for a domain."""
+
+    contract = models.ForeignKey(Contract, on_delete=models.CASCADE, related_name='user_assignments')
+    domain = models.ForeignKey(Domain, on_delete=models.CASCADE, related_name='contract_user_assignments')
+    physician = models.ForeignKey(Physician, on_delete=models.CASCADE, related_name='contract_assignments')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        self.domain = self.contract.domain
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.physician_id}:{self.domain_id}:{self.contract_id}'
+
+    class Meta:
+        ordering = ['physician__user__last_name', 'physician__user__first_name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['contract', 'physician'],
+                name='unique_physician_per_contract_assignment',
+            ),
+            models.UniqueConstraint(
+                fields=['domain', 'physician'],
+                name='unique_physician_default_contract_per_domain',
             ),
         ]

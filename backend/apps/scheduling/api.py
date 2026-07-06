@@ -13,8 +13,8 @@ from rest_framework.response import Response
 
 from apps.accounts.models import Physician
 
-from .models import ScheduleBlock, ScheduleRequest, Shift, ShiftTemplate
-from .serializers import ScheduleBlockSerializer, ScheduleRequestSerializer, ShiftSerializer, ShiftTemplateSerializer
+from .models import Contract, ScheduleBlock, ScheduleRequest, Shift, ShiftTemplate
+from .serializers import ContractSerializer, ScheduleBlockSerializer, ScheduleRequestSerializer, ShiftSerializer, ShiftTemplateSerializer
 
 
 class CsrfExemptSessionAuthentication(SessionAuthentication):
@@ -583,3 +583,117 @@ def schedule_block_publish(request, block_id):
     block.build_status = ScheduleBlock.BuildStatus.ARCHIVE
     block.save(update_fields=['published_at', 'build_status', 'updated_at'])
     return Response(ScheduleBlockSerializer(block).data)
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contracts_list_create(request):
+    if request.method == 'GET':
+        contracts = Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments__physician__user').all()
+
+        domain_id = request.query_params.get('domain')
+        include_inactive = request.query_params.get('include_inactive') == 'true'
+        search = (request.query_params.get('search') or '').strip()
+
+        if domain_id:
+            contracts = contracts.filter(domain_id=domain_id)
+
+        if not include_inactive:
+            contracts = contracts.filter(active=True)
+
+        if search:
+            contracts = contracts.filter(name__icontains=search)
+
+        serializer = ContractSerializer(contracts, many=True)
+        return Response(serializer.data)
+
+    serializer = ContractSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    contract = serializer.save()
+    return Response(ContractSerializer(contract).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET', 'PUT', 'PATCH'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contract_detail(request, contract_id):
+    contract = get_object_or_404(
+        Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments__physician__user'),
+        id=contract_id,
+    )
+
+    if request.method == 'GET':
+        serializer = ContractSerializer(contract)
+        return Response(serializer.data)
+
+    partial = request.method == 'PATCH'
+    serializer = ContractSerializer(contract, data=request.data, partial=partial)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    contract.refresh_from_db()
+    return Response(ContractSerializer(contract).data)
+
+
+def _copy_json_dict(source_value):
+    if isinstance(source_value, dict):
+        return dict(source_value)
+    return {}
+
+
+def _build_duplicate_contract_name(source_contract):
+    base_name = f'{source_contract.name} (Copy)'
+    next_name = base_name
+    suffix = 2
+
+    while Contract.objects.filter(domain=source_contract.domain, name=next_name).exists():
+        next_name = f'{base_name} {suffix}'
+        suffix += 1
+
+    return next_name
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contract_duplicate(request, contract_id):
+    source_contract = get_object_or_404(
+        Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments'),
+        id=contract_id,
+    )
+
+    with transaction.atomic():
+        duplicate = Contract.objects.create(
+            domain=source_contract.domain,
+            name=_build_duplicate_contract_name(source_contract),
+            active=False,
+            workload_settings=_copy_json_dict(source_contract.workload_settings),
+            shift_settings=_copy_json_dict(source_contract.shift_settings),
+            night_settings=_copy_json_dict(source_contract.night_settings),
+            weekend_settings=_copy_json_dict(source_contract.weekend_settings),
+            request_settings=_copy_json_dict(source_contract.request_settings),
+        )
+        duplicate.facilities.set(source_contract.facilities.all())
+
+    serializer = ContractSerializer(duplicate)
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contract_deactivate(request, contract_id):
+    contract = get_object_or_404(Contract, id=contract_id)
+    contract.active = False
+    contract.save(update_fields=['active', 'updated_at'])
+    return Response(ContractSerializer(contract).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contract_reactivate(request, contract_id):
+    contract = get_object_or_404(Contract, id=contract_id)
+    contract.active = True
+    contract.save(update_fields=['active', 'updated_at'])
+    return Response(ContractSerializer(contract).data)

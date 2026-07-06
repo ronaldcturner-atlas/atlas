@@ -3,7 +3,11 @@ from datetime import datetime, timedelta
 from rest_framework import serializers
 from django.utils import timezone
 
+from apps.accounts.models import Physician
+from apps.facilities.models import Facility
+
 from .models import ScheduleBlock, ScheduleRequest, Shift, ShiftTemplate
+from .models import Contract, ContractUserAssignment
 
 
 class ShiftSerializer(serializers.ModelSerializer):
@@ -299,3 +303,139 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
 
     def get_physician_name(self, obj):
         return obj.physician.display_name or obj.physician.user.get_full_name() or obj.physician.user.username
+
+
+class ContractSerializer(serializers.ModelSerializer):
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    facility_ids = serializers.PrimaryKeyRelatedField(
+        source='facilities',
+        many=True,
+        queryset=Facility.objects.all(),
+        required=False,
+    )
+    assigned_user_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        write_only=True,
+        required=False,
+    )
+    assigned_users = serializers.SerializerMethodField()
+    assigned_users_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Contract
+        fields = [
+            'id',
+            'domain',
+            'domain_name',
+            'name',
+            'active',
+            'facility_ids',
+            'workload_settings',
+            'shift_settings',
+            'night_settings',
+            'weekend_settings',
+            'request_settings',
+            'assigned_user_ids',
+            'assigned_users',
+            'assigned_users_count',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id',
+            'domain_name',
+            'assigned_users',
+            'assigned_users_count',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_assigned_users(self, obj):
+        assignments = obj.user_assignments.select_related('physician__user').all()
+        return [
+            {
+                'id': assignment.physician_id,
+                'name': assignment.physician.display_name
+                or assignment.physician.user.get_full_name()
+                or assignment.physician.user.username,
+            }
+            for assignment in assignments
+        ]
+
+    def get_assigned_users_count(self, obj):
+        return obj.user_assignments.count()
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError('Name is required.')
+        return value
+
+    def validate_assigned_user_ids(self, value):
+        unique_ids = sorted(set(value))
+        matched_count = Physician.objects.filter(id__in=unique_ids).count()
+        if matched_count != len(unique_ids):
+            raise serializers.ValidationError('One or more physicians do not exist.')
+        return unique_ids
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        assigned_user_ids = attrs.get('assigned_user_ids')
+        next_active = attrs.get('active', self.instance.active if self.instance else True)
+
+        if assigned_user_ids and not next_active:
+            raise serializers.ValidationError({
+                'assigned_user_ids': 'Inactive contracts cannot be assigned to users unless reactivated.'
+            })
+
+        return attrs
+
+    def _save_assignments(self, contract, assigned_user_ids):
+        if assigned_user_ids is None:
+            return
+
+        ContractUserAssignment.objects.filter(contract=contract).exclude(physician_id__in=assigned_user_ids).delete()
+
+        existing_ids = set(
+            ContractUserAssignment.objects.filter(contract=contract).values_list('physician_id', flat=True)
+        )
+
+        for physician_id in assigned_user_ids:
+            if physician_id in existing_ids:
+                continue
+
+            # Replace any previous default contract in this domain for this physician.
+            ContractUserAssignment.objects.filter(
+                domain=contract.domain,
+                physician_id=physician_id,
+            ).exclude(contract=contract).delete()
+
+            ContractUserAssignment.objects.create(
+                contract=contract,
+                domain=contract.domain,
+                physician_id=physician_id,
+            )
+
+    def create(self, validated_data):
+        assigned_user_ids = validated_data.pop('assigned_user_ids', None)
+        facilities = validated_data.pop('facilities', [])
+
+        contract = Contract.objects.create(**validated_data)
+        contract.facilities.set(facilities)
+        self._save_assignments(contract, assigned_user_ids)
+        return contract
+
+    def update(self, instance, validated_data):
+        assigned_user_ids = validated_data.pop('assigned_user_ids', None)
+        facilities = validated_data.pop('facilities', None)
+
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.save()
+
+        if facilities is not None:
+            instance.facilities.set(facilities)
+
+        self._save_assignments(instance, assigned_user_ids)
+        return instance
