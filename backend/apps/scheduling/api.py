@@ -26,6 +26,7 @@ from .models import (
     Shift,
     ShiftTemplate,
 )
+from .optimizer import build_violation_report, optimize_schedule_version
 from .serializers import (
     ContractSerializer,
     ScheduleBlockSerializer,
@@ -932,6 +933,10 @@ def _schedule_version_queryset(block):
 def _shift_instance_queryset(version):
     return (
         ScheduleShiftInstance.objects.filter(schedule_version=version)
+        .filter(
+            date__gte=version.schedule_block.start_date,
+            date__lte=version.schedule_block.end_date,
+        )
         .select_related('facility', 'shift_template')
         .prefetch_related('assignments__physician__user')
     )
@@ -990,6 +995,11 @@ def schedule_block_build_context(request, block_id):
                 if selected_version
                 else None
             ),
+            'optimizer_summary': (
+                selected_version.optimizer_summary or None
+                if selected_version
+                else None
+            ),
             'shift_instances': shift_instances,
         }
     )
@@ -1024,6 +1034,182 @@ def schedule_version_shift_instances(request, block_id, version_id):
             _shift_instance_queryset(version),
             many=True,
         ).data
+    )
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_optimize(request, block_id, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+        schedule_block=block,
+    )
+    try:
+        summary = optimize_schedule_version(version, created_by=request.user)
+    except ValueError as optimizer_error:
+        return Response(
+            {'detail': str(optimizer_error)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response(summary)
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_violation_report(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+    )
+    return Response(build_violation_report(version))
+
+
+def _schedule_version_assignment_summary(version, message, cleared_count=0):
+    instances = list(
+        ScheduleShiftInstance.objects.filter(
+            schedule_version=version,
+            date__gte=version.schedule_block.start_date,
+            date__lte=version.schedule_block.end_date,
+        )
+        .prefetch_related('assignments')
+    )
+    unfilled_shift_count = sum(
+        max(instance.required_staffing - instance.assignments.count(), 0)
+        for instance in instances
+    )
+    return {
+        'message': message,
+        'assignments_cleared': cleared_count,
+        'total_score': 0,
+        'unfilled_shift_count': unfilled_shift_count,
+        'assignments_made': 0,
+        'request_violations_summary': {
+            'violations': 0,
+            'rewards': 0,
+        },
+        'rest_violations_blocked': 0,
+        'debug': {
+            'schedule_version_id': version.id,
+            'schedule_block_id': version.schedule_block_id,
+            'schedule_block_start_date': version.schedule_block.start_date.isoformat(),
+            'schedule_block_end_date': version.schedule_block.end_date.isoformat(),
+            'shift_instances_considered': len(instances),
+        },
+        'workload_summary': [],
+    }
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+        schedule_block=block,
+    )
+    if (
+        block.build_status != ScheduleBlock.BuildStatus.BUILD
+        or version.status != ScheduleVersion.Status.BUILD
+    ):
+        return Response(
+            {'detail': 'Assignments can only be cleared in a BUILD Schedule Version.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        affected_instance_ids = list(
+            ScheduleShiftInstance.objects.filter(
+                schedule_version=version,
+                assignments__assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            )
+            .distinct()
+            .values_list('id', flat=True)
+        )
+        affected_instances = list(
+            ScheduleShiftInstance.objects.select_for_update()
+            .filter(id__in=affected_instance_ids)
+        )
+        cleared_count, _ = ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_version=version,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+        ).delete()
+        for instance in affected_instances:
+            _sync_shift_instance_status(instance)
+        version.optimizer_summary = {}
+        version.save(update_fields=['optimizer_summary', 'updated_at'])
+
+    return Response(
+        _schedule_version_assignment_summary(
+            version,
+            f'Cleared {cleared_count} optimizer-generated assignment(s).',
+            cleared_count,
+        )
+    )
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_clear_all_assignments(request, block_id, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+        schedule_block=block,
+    )
+    if (
+        block.build_status != ScheduleBlock.BuildStatus.BUILD
+        or version.status != ScheduleVersion.Status.BUILD
+    ):
+        return Response(
+            {'detail': 'Assignments can only be cleared in a BUILD Schedule Version.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        affected_instance_ids = list(
+            ScheduleShiftInstance.objects
+            .filter(schedule_version=version, assignments__isnull=False)
+            .distinct()
+            .values_list('id', flat=True)
+        )
+        affected_instances = list(
+            ScheduleShiftInstance.objects.select_for_update()
+            .filter(id__in=affected_instance_ids)
+        )
+        cleared_count, _ = ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_version=version,
+        ).delete()
+        for instance in affected_instances:
+            _sync_shift_instance_status(instance)
+        version.optimizer_summary = {}
+        version.save(update_fields=['optimizer_summary', 'updated_at'])
+
+    return Response(
+        _schedule_version_assignment_summary(
+            version,
+            f'Cleared {cleared_count} assignment(s).',
+            cleared_count,
+        )
     )
 
 
@@ -1258,6 +1444,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             shift_instance=locked_instance,
             physician=physician,
             created_by=request.user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
         )
         _sync_shift_instance_status(locked_instance)
 

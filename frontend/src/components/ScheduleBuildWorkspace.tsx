@@ -64,6 +64,59 @@ type AssignmentContext = {
   eligible_physicians: EligiblePhysician[]
 }
 
+type OptimizerSummary = {
+  message?: string
+  assignments_cleared?: number
+  total_score: number
+  initial_score?: number
+  final_score?: number
+  improvement_count?: number
+  iterations_run?: number
+  unfilled_shift_count: number
+  assignments_made: number
+  candidate_rest_rejections?: number
+  rest_violations_blocked?: number
+  final_rest_violations?: number
+  final_overlap_violations?: number
+  final_duplicate_violations?: number
+  final_overstaffed_violations?: number
+  same_shift_violations_count?: number
+  night_violations_count?: number
+  total_night_shifts?: number
+  max_nights_assigned_to_one_physician?: number
+  night_fix_improvements?: number
+  night_unresolved_reasons?: string[]
+  score_breakdown?: {
+    coverage_score: number
+    workload_score: number
+    underutilization_score?: number
+    request_score: number
+    rest_score: number
+    overlap_score: number
+    invalid_assignment_score?: number
+    consecutive_days_score?: number
+    same_shift_score?: number
+    night_score?: number
+    weekend_score?: number
+    facility_distribution_score?: number
+    total_score: number
+  }
+  debug?: Record<string, unknown>
+  request_violations_summary?: {
+    violations: number
+    rewards: number
+  }
+  workload_summary?: Array<{
+    physician_id: number
+    physician_name: string
+    assigned_hours: number
+    assigned_shifts: number
+    night_shifts?: number
+    target_units: 'HOURS' | 'SHIFTS' | null
+    target: number | null
+  }>
+}
+
 type PopoverPosition = {
   left: number
   top?: number
@@ -76,6 +129,7 @@ type BuildContext = {
   domains: DomainOption[]
   versions: ScheduleVersion[]
   selected_version: ScheduleVersion | null
+  optimizer_summary?: OptimizerSummary | null
   shift_instances: ShiftInstance[]
 }
 
@@ -224,6 +278,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [visibleMonth, setVisibleMonth] = useState<Date | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isOptimizing, setIsOptimizing] = useState(false)
+  const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
+  const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
+  const [showWorkloadDetails, setShowWorkloadDetails] = useState(false)
+  const [showOptimizerDebug, setShowOptimizerDebug] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [assignmentContext, setAssignmentContext] = useState<AssignmentContext | null>(null)
@@ -247,10 +306,17 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     assignmentTriggerRef.current = null
   }
 
-  const fetchContext = async (versionId?: number) => {
+  const fetchContext = async (
+    versionId?: number,
+    options: { preserveError?: boolean; quiet?: boolean; rethrow?: boolean } = {},
+  ) => {
     try {
-      setIsLoading(true)
-      setError(null)
+      if (!options.quiet) {
+        setIsLoading(true)
+      }
+      if (!options.preserveError) {
+        setError(null)
+      }
       const query = versionId ? `?version_id=${versionId}` : ''
       const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/${query}`, {
         credentials: 'include',
@@ -263,6 +329,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       const nextContext = data as BuildContext
       setContext(nextContext)
+      setOptimizerSummary(nextContext.optimizer_summary ?? null)
       setSelectedDomainId(
         nextContext.selected_version?.domain
         ?? nextContext.domains[0]?.id
@@ -270,9 +337,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       )
       setVisibleMonth(startOfMonthUtc(parseIsoDateToUtc(nextContext.schedule_block.start_date)))
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : 'Unable to load the Schedule Build Workspace.')
+      if (!options.preserveError) {
+        setError(loadError instanceof Error ? loadError.message : 'Unable to load the Schedule Build Workspace.')
+      }
+      if (options.rethrow) {
+        throw loadError
+      }
     } finally {
-      setIsLoading(false)
+      if (!options.quiet) {
+        setIsLoading(false)
+      }
     }
   }
 
@@ -393,6 +467,116 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setError(generateError instanceof Error ? generateError.message : 'Unable to generate shift instances.')
     } finally {
       setIsGenerating(false)
+    }
+  }
+
+  const runOptimizer = async () => {
+    const versionId = context.selected_version?.id
+    if (!versionId) {
+      setError('Select a BUILD Schedule Version before running the optimizer.')
+      return
+    }
+
+    let optimizeErrorMessage: string | null = null
+    try {
+      closeAssignments()
+      setIsOptimizing(true)
+      setError(null)
+      setNotice(null)
+      setOptimizerSummary(null)
+      setShowWorkloadDetails(false)
+      setShowOptimizerDebug(false)
+      const response = await fetch(
+        `${API_BASE}/schedule-blocks/${blockId}/build/versions/${versionId}/optimize/`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to run optimizer.'))
+      }
+
+      setOptimizerSummary(data as OptimizerSummary)
+      setNotice((data as OptimizerSummary).message ?? 'Optimizer v0 completed.')
+    } catch (optimizeError) {
+      optimizeErrorMessage = optimizeError instanceof Error ? optimizeError.message : 'Unable to run optimizer.'
+      setError(optimizeErrorMessage)
+    } finally {
+      try {
+        await fetchContext(versionId, {
+          preserveError: Boolean(optimizeErrorMessage),
+          quiet: true,
+          rethrow: true,
+        })
+      } catch {
+        if (!optimizeErrorMessage) {
+          setError('Optimizer completed, but the Schedule Build Workspace could not refresh.')
+        }
+      }
+      setIsOptimizing(false)
+    }
+  }
+
+  const clearScheduleAssignments = async (clearType: 'optimizer' | 'all') => {
+    const versionId = context.selected_version?.id
+    if (!versionId) {
+      setError('Select a BUILD Schedule Version before clearing assignments.')
+      return
+    }
+
+    const confirmed = window.confirm(
+      clearType === 'optimizer'
+        ? 'Clear optimizer-generated assignments for this schedule version?'
+        : 'Clear ALL assignments for this schedule version? This is for development/testing only.',
+    )
+    if (!confirmed) {
+      return
+    }
+
+    let clearErrorMessage: string | null = null
+    try {
+      closeAssignments()
+      setClearingAction(clearType)
+      setError(null)
+      setNotice(null)
+      setOptimizerSummary(null)
+      setShowWorkloadDetails(false)
+      setShowOptimizerDebug(false)
+      const endpoint = clearType === 'optimizer'
+        ? 'clear-optimizer-assignments'
+        : 'clear-all-assignments'
+      const response = await fetch(
+        `${API_BASE}/schedule-blocks/${blockId}/build/versions/${versionId}/${endpoint}/`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to clear assignments.'))
+      }
+
+      setOptimizerSummary(data as OptimizerSummary)
+      setNotice((data as OptimizerSummary).message ?? 'Assignments cleared.')
+    } catch (clearError) {
+      clearErrorMessage = clearError instanceof Error ? clearError.message : 'Unable to clear assignments.'
+      setError(clearErrorMessage)
+    } finally {
+      try {
+        await fetchContext(versionId, {
+          preserveError: Boolean(clearErrorMessage),
+          quiet: true,
+          rethrow: true,
+        })
+      } catch {
+        if (!clearErrorMessage) {
+          setError('Assignments were cleared, but the Schedule Build Workspace could not refresh.')
+        }
+      }
+      setClearingAction(null)
     }
   }
 
@@ -561,6 +745,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     || context.schedule_block.build_status === 'BUILD'
   const canEditAssignments = context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
+  const canOptimize = canEditAssignments && context.shift_instances.length > 0
+  const canClearAssignments = canEditAssignments && context.shift_instances.length > 0
+  const isMutatingBuild = isGenerating || isOptimizing || clearingAction !== null
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -622,11 +809,194 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           type="button"
           className="primary-action"
           onClick={generateInstances}
-          disabled={!canGenerate || !selectedDomainId || isGenerating}
+          disabled={!canGenerate || !selectedDomainId || isMutatingBuild}
         >
           {isGenerating ? 'Generating...' : 'Generate Shift Instances'}
         </button>
+
+        <button
+          type="button"
+          className="primary-action"
+          onClick={runOptimizer}
+          disabled={!canOptimize || isMutatingBuild}
+        >
+          {isOptimizing ? 'Running...' : 'Run Optimizer v0'}
+        </button>
+
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => void clearScheduleAssignments('optimizer')}
+          disabled={!canClearAssignments || isMutatingBuild}
+        >
+          {clearingAction === 'optimizer' ? 'Clearing...' : 'Clear Optimizer Assignments'}
+        </button>
+
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => void clearScheduleAssignments('all')}
+          disabled={!canClearAssignments || isMutatingBuild}
+        >
+          {clearingAction === 'all' ? 'Clearing...' : 'Clear All Assignments'}
+        </button>
+
+        {context.selected_version && (
+          <a
+            className="secondary build-workspace-link-button"
+            href={`/schedule-versions/${context.selected_version.id}/violations`}
+          >
+            View Violation Report
+          </a>
+        )}
       </div>
+
+      {optimizerSummary && (
+        <div className="optimizer-summary-panel" aria-live="polite">
+          <div>
+            <span>Initial score</span>
+            <strong>{(optimizerSummary.initial_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Final score</span>
+            <strong>{(optimizerSummary.final_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Improvements</span>
+            <strong>{optimizerSummary.improvement_count ?? 0}</strong>
+          </div>
+          <div>
+            <span>Iterations</span>
+            <strong>{optimizerSummary.iterations_run ?? 0}</strong>
+          </div>
+          <div>
+            <span>Assignments made</span>
+            <strong>{optimizerSummary.assignments_made}</strong>
+          </div>
+          {optimizerSummary.assignments_cleared !== undefined && (
+            <div>
+              <span>Assignments cleared</span>
+              <strong>{optimizerSummary.assignments_cleared}</strong>
+            </div>
+          )}
+          <div>
+            <span>Unfilled shifts</span>
+            <strong>{optimizerSummary.unfilled_shift_count}</strong>
+          </div>
+          {optimizerSummary.request_violations_summary && (
+            <div>
+              <span>Request violations</span>
+              <strong>{optimizerSummary.request_violations_summary.violations}</strong>
+            </div>
+          )}
+          <div>
+            <span>Final rest violations</span>
+            <strong>{optimizerSummary.final_rest_violations ?? 0}</strong>
+          </div>
+          <div>
+            <span>Final overlap violations</span>
+            <strong>{optimizerSummary.final_overlap_violations ?? 0}</strong>
+          </div>
+          <div>
+            <span>Workload score</span>
+            <strong>{(optimizerSummary.score_breakdown?.workload_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Underutilization score</span>
+            <strong>{(optimizerSummary.score_breakdown?.underutilization_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Request score</span>
+            <strong>{(optimizerSummary.score_breakdown?.request_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Coverage score</span>
+            <strong>{(optimizerSummary.score_breakdown?.coverage_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Consecutive days score</span>
+            <strong>{(optimizerSummary.score_breakdown?.consecutive_days_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Same shift score</span>
+            <strong>{(optimizerSummary.score_breakdown?.same_shift_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Same shift violations</span>
+            <strong>{optimizerSummary.same_shift_violations_count ?? 0}</strong>
+          </div>
+          <div>
+            <span>Night score</span>
+            <strong>{(optimizerSummary.score_breakdown?.night_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Night violations</span>
+            <strong>{optimizerSummary.night_violations_count ?? 0}</strong>
+          </div>
+          <div>
+            <span>Total night shifts</span>
+            <strong>{optimizerSummary.total_night_shifts ?? 0}</strong>
+          </div>
+          <div>
+            <span>Max nights assigned</span>
+            <strong>{optimizerSummary.max_nights_assigned_to_one_physician ?? 0}</strong>
+          </div>
+          <div>
+            <span>Night fixes kept</span>
+            <strong>{optimizerSummary.night_fix_improvements ?? 0}</strong>
+          </div>
+          <div>
+            <span>Weekend score</span>
+            <strong>{(optimizerSummary.score_breakdown?.weekend_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Facility distribution score</span>
+            <strong>{(optimizerSummary.score_breakdown?.facility_distribution_score ?? 0).toFixed(1)}</strong>
+          </div>
+          <div>
+            <span>Candidate rest rejections</span>
+            <strong>{optimizerSummary.candidate_rest_rejections ?? optimizerSummary.rest_violations_blocked ?? 0}</strong>
+          </div>
+          {optimizerSummary.workload_summary?.length ? (
+            <div className="optimizer-workload-summary">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setShowWorkloadDetails((current) => !current)}
+                aria-expanded={showWorkloadDetails}
+              >
+                {showWorkloadDetails ? 'Hide workload details' : 'Show workload details'}
+              </button>
+              {showWorkloadDetails && (
+                <ul>
+                  {optimizerSummary.workload_summary.map((item) => (
+                    <li key={item.physician_id}>
+                      {item.physician_name}: {item.assigned_shifts} shifts, {item.assigned_hours.toFixed(1)}h, {item.night_shifts ?? 0} night
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
+          {optimizerSummary.debug && (
+            <div className="optimizer-workload-summary">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setShowOptimizerDebug((current) => !current)}
+                aria-expanded={showOptimizerDebug}
+              >
+                {showOptimizerDebug ? 'Hide optimizer debug' : 'Show optimizer debug'}
+              </button>
+              {showOptimizerDebug && (
+                <pre className="optimizer-debug-details">
+                  {JSON.stringify(optimizerSummary.debug, null, 2)}
+                </pre>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {!context.shift_instances.length ? (
         <div className="build-workspace-empty">
@@ -635,7 +1005,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             type="button"
             className="primary-action"
             onClick={generateInstances}
-            disabled={!canGenerate || !selectedDomainId || isGenerating}
+            disabled={!canGenerate || !selectedDomainId || isMutatingBuild}
           >
             Generate Shift Instances
           </button>

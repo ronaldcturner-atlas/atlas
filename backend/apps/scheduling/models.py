@@ -161,6 +161,7 @@ class ScheduleVersion(models.Model):
     version_number = models.PositiveIntegerField(default=1)
     name = models.CharField(max_length=120)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.BUILD)
+    optimizer_summary = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -228,6 +229,10 @@ class ScheduleShiftInstance(models.Model):
 class ScheduleShiftAssignment(models.Model):
     """A physician assigned to one dated Schedule Shift Instance."""
 
+    class AssignmentSource(models.TextChoices):
+        MANUAL = 'MANUAL', 'Manual'
+        OPTIMIZER = 'OPTIMIZER', 'Optimizer'
+
     shift_instance = models.ForeignKey(
         ScheduleShiftInstance,
         on_delete=models.CASCADE,
@@ -244,6 +249,11 @@ class ScheduleShiftAssignment(models.Model):
         related_name='created_schedule_shift_assignments',
         null=True,
         blank=True,
+    )
+    assignment_source = models.CharField(
+        max_length=20,
+        choices=AssignmentSource.choices,
+        default=AssignmentSource.MANUAL,
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

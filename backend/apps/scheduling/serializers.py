@@ -285,7 +285,7 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
 
 class ScheduleVersionSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(source='domain.name', read_only=True)
-    shift_instance_count = serializers.IntegerField(source='shift_instances.count', read_only=True)
+    shift_instance_count = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleVersion
@@ -297,11 +297,18 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'version_number',
             'name',
             'status',
+            'optimizer_summary',
             'shift_instance_count',
             'created_at',
             'updated_at',
         ]
         read_only_fields = fields
+
+    def get_shift_instance_count(self, obj):
+        return obj.shift_instances.filter(
+            date__gte=obj.schedule_block.start_date,
+            date__lte=obj.schedule_block.end_date,
+        ).count()
 
 
 class ScheduleShiftAssignmentSerializer(serializers.ModelSerializer):

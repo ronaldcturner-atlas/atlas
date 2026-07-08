@@ -118,9 +118,28 @@ Schedulers and Admins can manually assign active physicians to generated Shift I
 
 Manual Assignment V1 uses the physician's active Contract assignment in the Schedule Version's Domain as the available domain-membership evidence. The Contract must include the instance's Facility for the physician to be eligible. The assignment picker lists only active physicians who meet that eligibility; when none do, it shows an explicit empty state. It does not infer membership from primary Facility or clinician type.
 
-The workspace is not the Live Schedule, preview, publication, optimization, or automatic assignment. Manual Assignment V1 prevents overlapping assignments as basic schedule validity, but does not evaluate requests, workload, nights, weekends, rest, penalties, or other soft scheduling rules.
+The workspace is not the Live Schedule, preview, or publication. Manual Assignment V1 prevents overlapping assignments as basic schedule validity, but does not evaluate requests, workload, nights, weekends, rest, penalties, or other soft scheduling rules.
 
 Shift Templates do not currently have a Domain relationship. The Schedule Version is Domain-scoped, while V1 generation reads the existing global active Shift Template catalog. Atlas must not infer a hidden Template-to-Domain mapping through Contracts or Facilities.
+
+### Optimizer v0
+
+Optimizer v0 runs inside the selected `BUILD` Schedule Version. It does not create a new Schedule Version, does not preview, does not publish, and does not create or mutate a Live Schedule. It uses a greedy initial fill followed by bounded local-search improvement that keeps only valid reassignment or swap moves that lower the total score.
+
+Optimizer v0 scoring includes coverage, workload, request, final validity, and simple distribution penalties. Distribution penalties are limited v0 heuristics for eligible physicians left unused, excessive consecutive days, repeated same shift templates, night-shift distribution and configured night rules, weekend concentration, and mild facility concentration. Where existing Contract rule values are available, v0 uses them; otherwise it falls back to conservative defaults. Same-shift repetition is measured by consecutive occurrences of the same Shift Template for the same physician, with a v0 fallback of max 2 and penalty 2000 per excess occurrence. Night scoring uses night-designated Shift Templates, configured night volume/consecutive/day-off rules when present, and mild distribution balancing when no night volume rule is configured. Night rules are evaluated using night blocks: consecutive night-designated assignments on consecutive dates for the same physician form one block, max consecutive nights controls the length of one night block, days off after a night block before a non-night shift apply to the next non-night assignment after that block, and days off after a night block before the next night block apply only between distinct night blocks. Atlas does not require days off before starting an initial night block except normal overlap and minimum-rest validity. Valid night blocks are preferred over scattered isolated nights when Contract rules allow them. Configured minimum night volume is treated as a high-priority v0 optimization target before extra night-block concentration and workload balancing when valid alternatives exist. Optimizer v0 fills night shifts before general non-night shifts, then strongly avoids assigning non-night shifts inside configured post-night recovery windows and assigning separate night blocks inside configured post-night night-block recovery windows when other valid candidates exist. Its improvement pass uses targeted workload-transfer, same-shift, night-minimum, night-block/recovery, and consecutive-day phases before pairwise swaps. These penalties are draft-build guidance, not preview, publication, or Live Schedule logic.
+
+The latest Optimizer v0 summary/debug payload is stored on the selected Schedule Version and is returned by the Schedule Build Workspace context API so the workspace can reload the latest optimizer result after navigation or browser refresh. If no optimizer has run for that version, the workspace shows no optimizer summary.
+
+The Schedule Build Workspace can open an Optimizer Violation Report for the selected Schedule Version. The report reuses Optimizer v0 scoring data, lists every eligible physician, and breaks visible penalty totals into per-user violation rows. It is informational only and does not change Contract rules, assignments, Schedule Version lifecycle, preview, publication, or Live Schedule behavior.
+
+Schedule Shift Assignments record their source as either `MANUAL` or `OPTIMIZER`. Manual assignments are preserved by default and remain fixed during optimizer improvement. Optimizer-generated assignments are replaceable: each optimizer run clears previous `OPTIMIZER` assignments for the selected Schedule Version, keeps `MANUAL` assignments locked, recalculates remaining open slots, and writes new `OPTIMIZER` assignments into that same version.
+
+During the MVP build phase, the Schedule Build Workspace includes development clear actions for schedulers/admins:
+
+- Clear Optimizer Assignments removes only `OPTIMIZER` assignments for the selected Schedule Version.
+- Clear All Assignments removes all assignments for the selected Schedule Version and is for development/testing only.
+
+These clear actions do not delete Shift Instances and do not alter preview, publication, or Live Schedule behavior.
 
 ## Request Builder
 
@@ -214,7 +233,7 @@ Domain-specific physician membership is not modeled yet. The current Contract ed
 
 ### Current enforcement boundary
 
-Contract rules are persisted as structured JSON configuration. Request Builder consumes the applicable Contract's Facility eligibility, allowed request types, request limits, and unlimited-Low setting. No optimizer or schedule-building engine in the current repository evaluates workload, shift, night, or weekend scheduling rules. The repository does not yet contain an operational schedule constraint engine.
+Contract rules are persisted as structured JSON configuration. Request Builder consumes the applicable Contract's Facility eligibility, allowed request types, request limits, and unlimited-Low setting. Optimizer v0 reads limited available Contract and request data for simple draft scoring and basic rest checks, but the repository does not yet contain the full operational schedule constraint engine described by the roadmap.
 
 ## Facilities
 
@@ -269,7 +288,7 @@ The following roadmap items are deferred, not permanently prohibited: the schedu
 - Organization has no current data model.
 - Domain membership for Physicians is not modeled.
 - Shift Templates are not currently assigned to Domains; BUILD generation therefore uses the global active template catalog.
-- Contract workload, shift, night, and weekend scheduling rules are not evaluated by an optimizer or schedule builder; Manual Assignment reads Domain and Facility eligibility and separately enforces overlap validity.
+- The full Contract workload, shift, night, and weekend scheduling rule set is not yet evaluated by the schedule builder; Manual Assignment reads Domain and Facility eligibility and separately enforces overlap validity, while Optimizer v0 uses only limited available rule data for simple draft scoring and basic rest checks.
 - Request Builder cannot choose among multiple active Contracts across different Domains; Contract enforcement requires one unambiguous active assignment.
 - Request timestamps do not currently authorize or reject request writes.
 - Publishing records block history, but the repository does not yet contain the full Live Schedule editing workflow described by the roadmap.

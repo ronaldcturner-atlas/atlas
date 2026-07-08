@@ -1,0 +1,19 @@
+warning: in the working copy of 'backend/apps/scheduling/api.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/apps/scheduling/models.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/apps/scheduling/serializers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/apps/scheduling/tests.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/apps/scheduling/urls.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docs/engineering/atlas-source-of-truth.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/components/Dashboard.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/components/ScheduleBuildWorkspace.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/index.css', LF will be replaced by CRLF the next time Git touches it
+ backend/apps/scheduling/api.py                     |  187 [32m++++[m
+ backend/apps/scheduling/models.py                  |   10 [32m+[m
+ backend/apps/scheduling/serializers.py             |    9 [32m+[m[31m-[m
+ backend/apps/scheduling/tests.py                   | 1172 [32m+++++++++++++++++++[m[31m-[m
+ backend/apps/scheduling/urls.py                    |    4 [32m+[m
+ docs/engineering/atlas-source-of-truth.md          |   25 [32m+[m[31m-[m
+ frontend/src/components/Dashboard.tsx              |   13 [32m+[m[31m-[m
+ frontend/src/components/ScheduleBuildWorkspace.tsx |  384 [32m++++++[m[31m-[m
+ frontend/src/index.css                             |   27 [32m+[m[31m-[m
+ 9 files changed, 1815 insertions(+), 16 deletions(-)

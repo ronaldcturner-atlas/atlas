@@ -199,9 +199,31 @@ select option:checked{
 .build-workspace-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
 .build-workspace-header h2{margin:0 0 6px}
 .build-workspace-subtitle{color:var(--muted);font-size:13px}
-.build-workspace-controls{display:grid;grid-template-columns:minmax(220px,1fr) minmax(260px,1.4fr) auto;gap:12px;align-items:end}
-.build-workspace-controls .primary-action{height:38px}
+.build-workspace-controls{display:grid;grid-template-columns:minmax(220px,1fr) minmax(260px,1.4fr) repeat(4,auto);gap:12px;align-items:end}
+.build-workspace-controls .primary-action,.build-workspace-controls .secondary{height:38px;white-space:nowrap}
 .build-workspace-empty{display:grid;justify-items:center;gap:14px;padding:54px 20px;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;color:var(--muted)}
+.optimizer-summary-panel{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:10px;padding:12px;border:1px solid rgba(147,197,253,0.24);border-radius:8px;background:rgba(15,23,42,0.42)}
+.optimizer-summary-panel>div{display:grid;gap:3px;min-width:0}
+.optimizer-summary-panel span{color:var(--muted);font-size:11px}
+.optimizer-summary-panel strong{font-size:16px}
+.optimizer-workload-summary{grid-column:1/-1}
+.optimizer-workload-summary button{justify-self:start}
+.optimizer-workload-summary ul{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:4px 12px;margin:0;padding:0;list-style:none;font-size:12px}
+.optimizer-debug-details{max-height:220px;overflow:auto;margin:0;padding:10px;border-radius:8px;background:rgba(0,0,0,0.18);font-size:11px;color:var(--sidebar-fg);white-space:pre-wrap}
+.build-workspace-link-button{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;min-height:38px}
+.violation-report-page{display:flex;flex-direction:column;gap:18px}
+.violation-report-warning{border:1px solid rgba(251,191,36,0.45);background:rgba(251,191,36,0.12);color:var(--sidebar-fg);border-radius:8px;padding:12px}
+.violation-report-warning p{margin:0 0 6px}
+.violation-report-warning p:last-child{margin-bottom:0}
+.violation-user-list{display:flex;flex-direction:column;gap:16px}
+.violation-user-section{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:14px}
+.violation-user-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
+.violation-user-heading h3{margin:0;font-size:16px}
+.violation-user-metrics{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:13px}
+.violation-empty{margin:0;color:var(--muted)}
+.violation-table-wrap{overflow:auto}
+.violation-table{min-width:980px}
+.violation-table td{vertical-align:top}
 .build-calendar-toolbar{display:flex;justify-content:center;align-items:center;gap:14px}
 .build-calendar-toolbar button{padding:7px 11px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .build-calendar-toolbar button:disabled{opacity:0.5;cursor:not-allowed}
@@ -238,6 +260,7 @@ select option:checked{
 
 @media (max-width: 900px){
   .build-workspace-controls{grid-template-columns:1fr}
+  .optimizer-summary-panel{grid-template-columns:1fr 1fr}
   .build-calendar{overflow-x:auto}
   .build-calendar-weekdays,.build-calendar-grid{min-width:840px}
 }

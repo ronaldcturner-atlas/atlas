@@ -7,6 +7,7 @@ import SchedulerView from './SchedulerView'
 import ShiftsView from './ShiftsView'
 import ScheduleBuildWorkspace from './ScheduleBuildWorkspace'
 import ScheduleBlocksView from './ScheduleBlocksView'
+import ScheduleVersionViolationReport from './ScheduleVersionViolationReport'
 import ContractsView from './ContractsView'
 import FacilitiesView from './FacilitiesView'
 import PhysiciansView from './PhysiciansView'
@@ -37,6 +38,7 @@ function viewFromPath(pathname: string): AppView | null {
     pathname === '/schedule-blocks'
     || /^\/schedule-blocks\/\d+\/requests$/.test(pathname)
     || /^\/schedule-blocks\/\d+\/build$/.test(pathname)
+    || /^\/schedule-versions\/\d+\/violations$/.test(pathname)
   ) {
     return 'schedule-blocks'
   }
@@ -60,12 +62,16 @@ export default function Dashboard() {
   const requestBlockId = requestBuilderMatch ? Number(requestBuilderMatch[1]) : null
   const buildWorkspaceMatch = location.pathname.match(/^\/schedule-blocks\/(\d+)\/build$/)
   const buildBlockId = buildWorkspaceMatch ? Number(buildWorkspaceMatch[1]) : null
+  const violationReportMatch = location.pathname.match(/^\/schedule-versions\/(\d+)\/violations$/)
+  const violationVersionId = violationReportMatch ? Number(violationReportMatch[1]) : null
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
   const [shiftsRefreshToken, setShiftsRefreshToken] = React.useState(0)
 
   const pageTitle =
     buildBlockId !== null
       ? 'Schedule Build Workspace'
+      : violationVersionId !== null
+      ? 'Optimizer Violation Report'
       : requestBlockId !== null
       ? 'Request Builder'
       : activeView === 'my-schedule'
@@ -110,13 +116,16 @@ export default function Dashboard() {
             />
           )}
           {activeView === 'shift-builder' && <ShiftsView />}
-          {activeView === 'schedule-blocks' && buildBlockId !== null && (
+          {activeView === 'schedule-blocks' && violationVersionId !== null && (
+            <ScheduleVersionViolationReport versionId={violationVersionId} />
+          )}
+          {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId !== null && (
             <ScheduleBuildWorkspace
               blockId={buildBlockId}
               onBack={() => navigate('/schedule-blocks')}
             />
           )}
-          {activeView === 'schedule-blocks' && buildBlockId === null && (
+          {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId === null && (
             <ScheduleBlocksView
               requestBlockId={requestBlockId}
               onOpenRequests={(blockId) => navigate(`/schedule-blocks/${blockId}/requests`)}
