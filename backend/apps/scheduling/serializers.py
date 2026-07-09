@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 
+from django.db import models
 from rest_framework import serializers
 from django.utils import timezone
 
@@ -7,6 +8,7 @@ from apps.accounts.models import Physician
 from apps.facilities.models import Facility
 
 from .models import (
+    OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
     ScheduleShiftAssignment,
@@ -286,6 +288,7 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
 class ScheduleVersionSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(source='domain.name', read_only=True)
     shift_instance_count = serializers.SerializerMethodField()
+    active_optimizer_run = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleVersion
@@ -298,6 +301,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'name',
             'status',
             'optimizer_summary',
+            'active_optimizer_run',
             'shift_instance_count',
             'created_at',
             'updated_at',
@@ -309,6 +313,37 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             date__gte=obj.schedule_block.start_date,
             date__lte=obj.schedule_block.end_date,
         ).count()
+
+    def get_active_optimizer_run(self, obj):
+        run = getattr(obj, 'active_optimizer_run_cached', None)
+        if run is None:
+            run = obj.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
+        return OptimizerRunSerializer(run).data if run else None
+
+
+class OptimizerRunSerializer(serializers.ModelSerializer):
+    schedule_version_name = serializers.CharField(source='schedule_version.name', read_only=True)
+
+    class Meta:
+        model = OptimizerRun
+        fields = [
+            'id',
+            'schedule_version',
+            'schedule_version_name',
+            'run_number',
+            'created_at',
+            'created_by',
+            'status',
+            'seed',
+            'initial_score',
+            'final_score',
+            'score_breakdown',
+            'optimizer_summary',
+            'optimizer_debug',
+            'notes',
+            'is_active',
+        ]
+        read_only_fields = fields
 
 
 class ScheduleShiftAssignmentSerializer(serializers.ModelSerializer):
@@ -344,7 +379,7 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
     assigned_count = serializers.SerializerMethodField()
     open_count = serializers.SerializerMethodField()
     is_open = serializers.SerializerMethodField()
-    assignments = ScheduleShiftAssignmentSerializer(many=True, read_only=True)
+    assignments = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleShiftInstance
@@ -377,13 +412,29 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
         return obj.shift_template.generated_name()
 
     def get_assigned_count(self, obj):
-        return obj.assignments.count()
+        return self._visible_assignments(obj).count()
 
     def get_open_count(self, obj):
         return max(obj.required_staffing - self.get_assigned_count(obj), 0)
 
     def get_is_open(self, obj):
         return self.get_open_count(obj) > 0
+
+    def get_assignments(self, obj):
+        return ScheduleShiftAssignmentSerializer(self._visible_assignments(obj), many=True).data
+
+    def _visible_assignments(self, obj):
+        optimizer_run_id = self.context.get('optimizer_run_id')
+        query = obj.assignments.select_related('physician__user')
+        if optimizer_run_id:
+            return query.filter(
+                models.Q(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
+                | models.Q(
+                    assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+                    optimizer_run_id=optimizer_run_id,
+                )
+            )
+        return query.filter(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
 
 
 class ScheduleRequestSerializer(serializers.ModelSerializer):

@@ -206,6 +206,13 @@ select option:checked{
 .optimizer-summary-panel>div{display:grid;gap:3px;min-width:0}
 .optimizer-summary-panel span{color:var(--muted);font-size:11px}
 .optimizer-summary-panel strong{font-size:16px}
+.optimizer-runs-panel{display:grid;gap:10px;padding:12px;border:1px solid var(--border);border-radius:8px;background:rgba(15,23,42,0.28)}
+.optimizer-runs-heading h3{margin:0;font-size:15px}
+.optimizer-runs-list{display:grid;gap:8px}
+.optimizer-run-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px;border:1px solid rgba(148,163,184,0.22);border-radius:6px}
+.optimizer-run-row>div:first-child{display:flex;flex-wrap:wrap;gap:8px;align-items:center;min-width:0}
+.optimizer-run-row span{color:var(--muted);font-size:12px}
+.optimizer-run-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
 .optimizer-workload-summary{grid-column:1/-1}
 .optimizer-workload-summary button{justify-self:start}
 .optimizer-workload-summary ul{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:4px 12px;margin:0;padding:0;list-style:none;font-size:12px}
@@ -261,6 +268,8 @@ select option:checked{
 @media (max-width: 900px){
   .build-workspace-controls{grid-template-columns:1fr}
   .optimizer-summary-panel{grid-template-columns:1fr 1fr}
+  .optimizer-run-row{align-items:stretch;flex-direction:column}
+  .optimizer-run-actions{justify-content:flex-start}
   .build-calendar{overflow-x:auto}
   .build-calendar-weekdays,.build-calendar-grid{min-width:840px}
 }

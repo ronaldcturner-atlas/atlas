@@ -16,6 +16,7 @@ from apps.facilities.models import Facility
 from .models import (
     Contract,
     ContractUserAssignment,
+    OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
     ScheduleShiftAssignment,
@@ -892,6 +893,13 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         return physician
 
+    def _optimizer_run_signature(self, optimizer_run):
+        return tuple(
+            ScheduleShiftAssignment.objects.filter(optimizer_run=optimizer_run)
+            .order_by('shift_instance_id', 'physician_id')
+            .values_list('shift_instance_id', 'physician_id')
+        )
+
     def test_generate_creates_open_dated_instances_and_moves_block_to_build(self):
         response = self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -1581,7 +1589,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(payload['debug']['night_minimum_period'], 'SCHEDULE_BLOCK')
         self.assertGreater(payload['debug']['night_block_assignment_attempts'], 0)
 
-    def test_optimizer_reruns_replace_optimizer_assignments_and_do_not_overstaff(self):
+    def test_optimizer_reruns_create_history_and_active_view_does_not_overstaff(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
             data={'domain_id': self.domain.id},
@@ -1599,8 +1607,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             f'/api/schedule-blocks/{self.block.id}/build/versions/{version.id}/optimize/',
             format='json',
         )
-        assignment_count = ScheduleShiftAssignment.objects.filter(
+        first_run = OptimizerRun.objects.get(schedule_version=version, run_number=1)
+        first_assignment_count = ScheduleShiftAssignment.objects.filter(
             shift_instance__schedule_version=version,
+            optimizer_run=first_run,
         ).count()
         second_response = self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/versions/{version.id}/optimize/',
@@ -1609,16 +1619,226 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(second_response.status_code, 200)
-        self.assertEqual(second_response.json()['assignments_made'], assignment_count)
+        self.assertEqual(OptimizerRun.objects.filter(schedule_version=version).count(), 2)
+        second_run = OptimizerRun.objects.get(schedule_version=version, run_number=2)
+        self.assertFalse(OptimizerRun.objects.get(id=first_run.id).is_active)
+        self.assertTrue(second_run.is_active)
+        self.assertEqual(second_response.json()['assignments_made'], first_assignment_count)
         self.assertEqual(
             ScheduleShiftAssignment.objects.filter(
                 shift_instance__schedule_version=version,
+                optimizer_run=first_run,
             ).count(),
-            assignment_count,
+            first_assignment_count,
         )
-        for instance in ScheduleShiftInstance.objects.filter(schedule_version=version):
-            self.assertLessEqual(instance.assignments.count(), instance.required_staffing)
-            self.assertEqual(instance.assignments.count(), instance.required_staffing)
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(
+                shift_instance__schedule_version=version,
+                optimizer_run=second_run,
+            ).count(),
+            first_assignment_count,
+        )
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}'
+        )
+        self.assertEqual(context_response.status_code, 200)
+        for instance in context_response.json()['shift_instances']:
+            self.assertLessEqual(instance['assigned_count'], instance['required_staffing'])
+            self.assertEqual(instance['assigned_count'], instance['required_staffing'])
+
+    def test_optimizer_seed_is_stored_and_returned_in_summary_debug(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(4):
+            self._create_assignment_physician(
+                f'seeded{index}@example.com',
+                f'Seeded {index}',
+                facilities=[self.facility],
+            )
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 12345},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        optimizer_run = OptimizerRun.objects.get(id=payload['optimizer_run_id'])
+        self.assertEqual(payload['seed'], 12345)
+        self.assertEqual(payload['debug']['seed'], 12345)
+        self.assertEqual(optimizer_run.seed, 12345)
+        self.assertEqual(optimizer_run.optimizer_summary['seed'], 12345)
+        self.assertEqual(optimizer_run.optimizer_debug['seed'], 12345)
+
+    def test_optimizer_same_seed_reproduces_assignment_signature(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(5):
+            self._create_assignment_physician(
+                f'replay{index}@example.com',
+                f'Replay {index}',
+                facilities=[self.facility],
+            )
+
+        first_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 20260709},
+            format='json',
+        )
+        second_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 20260709},
+            format='json',
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        first_run = OptimizerRun.objects.get(id=first_response.json()['optimizer_run_id'])
+        second_run = OptimizerRun.objects.get(id=second_response.json()['optimizer_run_id'])
+        self.assertEqual(
+            self._optimizer_run_signature(first_run),
+            self._optimizer_run_signature(second_run),
+        )
+
+    def test_optimizer_different_seeds_produce_different_assignment_signature(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(7):
+            self._create_assignment_physician(
+                f'diverse{index}@example.com',
+                f'Diverse {index}',
+                facilities=[self.facility],
+            )
+
+        first_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 101},
+            format='json',
+        )
+        second_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 202},
+            format='json',
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        first_run = OptimizerRun.objects.get(id=first_response.json()['optimizer_run_id'])
+        second_run = OptimizerRun.objects.get(id=second_response.json()['optimizer_run_id'])
+        self.assertNotEqual(
+            self._optimizer_run_signature(first_run),
+            self._optimizer_run_signature(second_run),
+        )
+
+    def test_optimizer_generated_seeds_are_distinct_for_repeated_runs(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(5):
+            self._create_assignment_physician(
+                f'generatedseed{index}@example.com',
+                f'Generated Seed {index}',
+                facilities=[self.facility],
+            )
+
+        first_response = self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+        second_response = self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+        third_response = self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(third_response.status_code, 200)
+        seeds = {
+            first_response.json()['seed'],
+            second_response.json()['seed'],
+            third_response.json()['seed'],
+        }
+        self.assertEqual(len(seeds), 3)
+
+    def test_activating_prior_optimizer_run_switches_active_summary(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(4):
+            self._create_assignment_physician(
+                f'activate{index}@example.com',
+                f'Activate {index}',
+                facilities=[self.facility],
+            )
+
+        first_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            format='json',
+        )
+        second_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            format='json',
+        )
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        run_one = OptimizerRun.objects.get(schedule_version=version, run_number=1)
+        run_two = OptimizerRun.objects.get(schedule_version=version, run_number=2)
+
+        activate_response = self.client.post(f'/api/optimizer-runs/{run_one.id}/activate/')
+
+        self.assertEqual(activate_response.status_code, 200)
+        run_one.refresh_from_db()
+        run_two.refresh_from_db()
+        self.assertTrue(run_one.is_active)
+        self.assertFalse(run_two.is_active)
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}'
+        )
+        self.assertEqual(context_response.status_code, 200)
+        context_payload = context_response.json()
+        self.assertEqual(context_payload['selected_optimizer_run']['id'], run_one.id)
+        self.assertEqual(context_payload['optimizer_summary']['optimizer_run_id'], run_one.id)
+
+    def test_optimizer_run_violation_report_uses_selected_or_active_run(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(3):
+            self._create_assignment_physician(
+                f'runreport{index}@example.com',
+                f'Run Report {index}',
+                facilities=[self.facility],
+            )
+        self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+        self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+        active_run = OptimizerRun.objects.get(schedule_version=version, is_active=True)
+        run_one = OptimizerRun.objects.get(schedule_version=version, run_number=1)
+
+        active_response = self.client.get(f'/api/schedule-versions/{version.id}/violation-report/')
+        selected_response = self.client.get(f'/api/optimizer-runs/{run_one.id}/violations/')
+
+        self.assertEqual(active_response.status_code, 200)
+        self.assertEqual(selected_response.status_code, 200)
+        self.assertEqual(active_response.json()['optimizer_run']['id'], active_run.id)
+        self.assertEqual(selected_response.json()['optimizer_run']['id'], run_one.id)
+        self.assertEqual(selected_response.json()['schedule_version']['id'], version.id)
 
     def test_optimizer_balances_unbalanced_workload_scoring(self):
         self.day_template.default_staffing_count = 1
@@ -2845,10 +3065,15 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         payload = optimize_response.json()
         self.assertEqual(payload['debug']['shift_instances_considered'], 2)
         self.assertEqual(payload['debug']['assignment_rows_before'], 0)
-        self.assertEqual(payload['debug']['optimizer_assignments_deleted'], 1)
+        self.assertEqual(payload['debug']['optimizer_assignments_deleted'], 0)
         self.assertEqual(payload['assignments_made'], 3)
         self.assertEqual(payload['unfilled_shift_count'], 0)
-        self.assertFalse(out_of_range_instance.assignments.exists())
+        self.assertTrue(out_of_range_instance.assignments.exists())
+        self.assertFalse(
+            out_of_range_instance.assignments.filter(
+                optimizer_run_id=payload['optimizer_run_id'],
+            ).exists()
+        )
         self.assertEqual(
             sum(item['assigned_shifts'] for item in payload['workload_summary']),
             3,

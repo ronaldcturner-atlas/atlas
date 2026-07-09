@@ -178,6 +178,56 @@ class ScheduleVersion(models.Model):
         ]
 
 
+class OptimizerRun(models.Model):
+    """A historical optimizer result for a Schedule Version."""
+
+    class Status(models.TextChoices):
+        RUNNING = 'RUNNING', 'Running'
+        COMPLETED = 'COMPLETED', 'Completed'
+        FAILED = 'FAILED', 'Failed'
+
+    schedule_version = models.ForeignKey(
+        ScheduleVersion,
+        on_delete=models.CASCADE,
+        related_name='optimizer_runs',
+    )
+    run_number = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name='created_optimizer_runs',
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.RUNNING)
+    seed = models.BigIntegerField(null=True, blank=True)
+    initial_score = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    final_score = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    score_breakdown = models.JSONField(default=dict, blank=True)
+    optimizer_summary = models.JSONField(default=dict, blank=True)
+    optimizer_debug = models.JSONField(default=dict, blank=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f'{self.schedule_version_id}: Run {self.run_number}'
+
+    class Meta:
+        ordering = ['-run_number', '-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_version', 'run_number'],
+                name='unique_optimizer_run_number_per_schedule_version',
+            ),
+            models.UniqueConstraint(
+                fields=['schedule_version'],
+                condition=models.Q(is_active=True),
+                name='unique_active_optimizer_run_per_schedule_version',
+            ),
+        ]
+
+
 class ScheduleShiftInstance(models.Model):
     """A dated shift requirement generated from a recurring Shift Template."""
 
@@ -255,6 +305,13 @@ class ScheduleShiftAssignment(models.Model):
         choices=AssignmentSource.choices,
         default=AssignmentSource.MANUAL,
     )
+    optimizer_run = models.ForeignKey(
+        OptimizerRun,
+        on_delete=models.SET_NULL,
+        related_name='assignments',
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -266,7 +323,13 @@ class ScheduleShiftAssignment(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=['shift_instance', 'physician'],
-                name='unique_physician_per_schedule_shift_instance',
+                condition=models.Q(assignment_source='MANUAL'),
+                name='unique_manual_physician_per_schedule_shift_instance',
+            ),
+            models.UniqueConstraint(
+                fields=['shift_instance', 'physician', 'optimizer_run'],
+                condition=models.Q(assignment_source='OPTIMIZER', optimizer_run__isnull=False),
+                name='unique_optimizer_run_physician_per_shift_instance',
             ),
         ]
 

@@ -18,6 +18,7 @@ from apps.domains.models import Domain
 from .models import (
     Contract,
     ContractUserAssignment,
+    OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
     ScheduleShiftAssignment,
@@ -29,6 +30,7 @@ from .models import (
 from .optimizer import build_violation_report, optimize_schedule_version
 from .serializers import (
     ContractSerializer,
+    OptimizerRunSerializer,
     ScheduleBlockSerializer,
     ScheduleRequestSerializer,
     ScheduleShiftInstanceSerializer,
@@ -926,11 +928,35 @@ def _schedule_version_queryset(block):
     return (
         ScheduleVersion.objects.filter(schedule_block=block)
         .select_related('domain')
-        .prefetch_related('shift_instances')
+        .prefetch_related('shift_instances', 'optimizer_runs')
     )
 
 
-def _shift_instance_queryset(version):
+def _active_optimizer_run(version):
+    return version.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
+
+
+def _get_optimizer_run_for_version(version, run_id):
+    if not run_id:
+        return _active_optimizer_run(version)
+    try:
+        parsed_run_id = int(run_id)
+    except (TypeError, ValueError):
+        return None
+    return OptimizerRun.objects.filter(id=parsed_run_id, schedule_version=version).first()
+
+
+def _visible_assignment_filter(optimizer_run):
+    query = Q(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
+    if optimizer_run is not None:
+        query |= Q(
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=optimizer_run,
+        )
+    return query
+
+
+def _shift_instance_queryset(version, optimizer_run=None):
     return (
         ScheduleShiftInstance.objects.filter(schedule_version=version)
         .filter(
@@ -973,10 +999,30 @@ def schedule_block_build_context(request, block_id):
     else:
         selected_version = versions.filter(status=ScheduleVersion.Status.BUILD).first() or versions.first()
 
+    optimizer_run_id = request.query_params.get('optimizer_run_id')
+    if optimizer_run_id and not version_id:
+        requested_optimizer_run = OptimizerRun.objects.filter(
+            id=optimizer_run_id,
+            schedule_version__schedule_block=block,
+        ).select_related('schedule_version').first()
+        if requested_optimizer_run is not None:
+            selected_version = requested_optimizer_run.schedule_version
+
+    selected_optimizer_run = (
+        _get_optimizer_run_for_version(selected_version, optimizer_run_id)
+        if selected_version
+        else None
+    )
+    optimizer_summary = None
+    if selected_optimizer_run:
+        optimizer_summary = selected_optimizer_run.optimizer_summary or None
+    elif selected_version:
+        optimizer_summary = selected_version.optimizer_summary or None
     shift_instances = (
         ScheduleShiftInstanceSerializer(
-            _shift_instance_queryset(selected_version),
+            _shift_instance_queryset(selected_version, selected_optimizer_run),
             many=True,
+            context={'optimizer_run_id': selected_optimizer_run.id if selected_optimizer_run else None},
         ).data
         if selected_version
         else []
@@ -996,8 +1042,19 @@ def schedule_block_build_context(request, block_id):
                 else None
             ),
             'optimizer_summary': (
-                selected_version.optimizer_summary or None
+                optimizer_summary
+            ),
+            'optimizer_runs': (
+                OptimizerRunSerializer(
+                    selected_version.optimizer_runs.order_by('-run_number'),
+                    many=True,
+                ).data
                 if selected_version
+                else []
+            ),
+            'selected_optimizer_run': (
+                OptimizerRunSerializer(selected_optimizer_run).data
+                if selected_optimizer_run
                 else None
             ),
             'shift_instances': shift_instances,
@@ -1029,12 +1086,23 @@ def schedule_version_shift_instances(request, block_id, version_id):
         id=version_id,
         schedule_block=block,
     )
+    optimizer_run = _get_optimizer_run_for_version(version, request.query_params.get('optimizer_run_id'))
     return Response(
         ScheduleShiftInstanceSerializer(
-            _shift_instance_queryset(version),
+            _shift_instance_queryset(version, optimizer_run),
             many=True,
+            context={'optimizer_run_id': optimizer_run.id if optimizer_run else None},
         ).data
     )
+
+
+def _parse_optimizer_seed(request):
+    if 'seed' not in request.data or request.data.get('seed') in (None, ''):
+        return None, None
+    try:
+        return int(request.data.get('seed')), None
+    except (TypeError, ValueError):
+        return None, {'seed': 'seed must be an integer.'}
 
 
 @api_view(['POST'])
@@ -1050,8 +1118,11 @@ def schedule_version_optimize(request, block_id, version_id):
         id=version_id,
         schedule_block=block,
     )
+    seed, seed_error = _parse_optimizer_seed(request)
+    if seed_error:
+        return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
     try:
-        summary = optimize_schedule_version(version, created_by=request.user)
+        summary = optimize_schedule_version(version, created_by=request.user, seed=seed)
     except ValueError as optimizer_error:
         return Response(
             {'detail': str(optimizer_error)},
@@ -1059,6 +1130,85 @@ def schedule_version_optimize(request, block_id, version_id):
         )
 
     return Response(summary)
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_optimizer_runs(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    version = get_object_or_404(ScheduleVersion, id=version_id)
+    runs = OptimizerRun.objects.filter(schedule_version=version).order_by('-run_number')
+    return Response(OptimizerRunSerializer(runs, many=True).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_run_optimizer(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+    )
+    seed, seed_error = _parse_optimizer_seed(request)
+    if seed_error:
+        return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        summary = optimize_schedule_version(version, created_by=request.user, seed=seed)
+    except ValueError as optimizer_error:
+        return Response(
+            {'detail': str(optimizer_error)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(summary)
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def optimizer_run_detail(request, run_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    optimizer_run = get_object_or_404(
+        OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
+        id=run_id,
+    )
+    return Response(OptimizerRunSerializer(optimizer_run).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def optimizer_run_activate(request, run_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    optimizer_run = get_object_or_404(
+        OptimizerRun.objects.select_related('schedule_version'),
+        id=run_id,
+    )
+    if optimizer_run.status != OptimizerRun.Status.COMPLETED:
+        return Response(
+            {'detail': 'Only completed optimizer runs can be activated.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        OptimizerRun.objects.filter(
+            schedule_version=optimizer_run.schedule_version,
+            is_active=True,
+        ).exclude(id=optimizer_run.id).update(is_active=False)
+        optimizer_run.is_active = True
+        optimizer_run.save(update_fields=['is_active'])
+        version = optimizer_run.schedule_version
+        version.optimizer_summary = optimizer_run.optimizer_summary
+        version.save(update_fields=['optimizer_summary', 'updated_at'])
+    return Response(OptimizerRunSerializer(optimizer_run).data)
 
 
 @api_view(['GET'])
@@ -1072,10 +1222,26 @@ def schedule_version_violation_report(request, version_id):
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
-    return Response(build_violation_report(version))
+    optimizer_run = _get_optimizer_run_for_version(version, request.query_params.get('optimizer_run_id'))
+    return Response(build_violation_report(version, optimizer_run=optimizer_run))
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def optimizer_run_violations(request, run_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    optimizer_run = get_object_or_404(
+        OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
+        id=run_id,
+    )
+    return Response(build_violation_report(optimizer_run.schedule_version, optimizer_run=optimizer_run))
 
 
 def _schedule_version_assignment_summary(version, message, cleared_count=0):
+    active_run = _active_optimizer_run(version)
     instances = list(
         ScheduleShiftInstance.objects.filter(
             schedule_version=version,
@@ -1085,7 +1251,7 @@ def _schedule_version_assignment_summary(version, message, cleared_count=0):
         .prefetch_related('assignments')
     )
     unfilled_shift_count = sum(
-        max(instance.required_staffing - instance.assignments.count(), 0)
+        max(instance.required_staffing - instance.assignments.filter(_visible_assignment_filter(active_run)).count(), 0)
         for instance in instances
     )
     return {
@@ -1133,10 +1299,20 @@ def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
         )
 
     with transaction.atomic():
+        active_run = _active_optimizer_run(version)
+        if active_run is None:
+            return Response(
+                _schedule_version_assignment_summary(
+                    version,
+                    'No active optimizer run assignments to clear.',
+                    0,
+                )
+            )
         affected_instance_ids = list(
             ScheduleShiftInstance.objects.filter(
                 schedule_version=version,
                 assignments__assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+                assignments__optimizer_run=active_run,
             )
             .distinct()
             .values_list('id', flat=True)
@@ -1148,9 +1324,13 @@ def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
         cleared_count, _ = ScheduleShiftAssignment.objects.filter(
             shift_instance__schedule_version=version,
             assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=active_run,
         ).delete()
         for instance in affected_instances:
             _sync_shift_instance_status(instance)
+        active_run.is_active = False
+        active_run.notes = (active_run.notes + '\n' if active_run.notes else '') + 'Active optimizer assignments were cleared.'
+        active_run.save(update_fields=['is_active', 'notes'])
         version.optimizer_summary = {}
         version.save(update_fields=['optimizer_summary', 'updated_at'])
 
@@ -1201,6 +1381,7 @@ def schedule_version_clear_all_assignments(request, block_id, version_id):
         ).delete()
         for instance in affected_instances:
             _sync_shift_instance_status(instance)
+        OptimizerRun.objects.filter(schedule_version=version, is_active=True).update(is_active=False)
         version.optimizer_summary = {}
         version.save(update_fields=['optimizer_summary', 'updated_at'])
 
@@ -1214,7 +1395,9 @@ def schedule_version_clear_all_assignments(request, block_id, version_id):
 
 
 def _sync_shift_instance_status(instance):
-    assigned_count = instance.assignments.count()
+    assigned_count = instance.assignments.filter(
+        _visible_assignment_filter(_active_optimizer_run(instance.schedule_version))
+    ).count()
     next_status = (
         ScheduleShiftInstance.Status.ASSIGNED
         if assigned_count >= instance.required_staffing
@@ -1241,8 +1424,10 @@ def _physician_display_name(physician):
 
 
 def _overlapping_assignment_for_physician(physician, shift_instance):
+    active_run = _active_optimizer_run(shift_instance.schedule_version)
     return (
         ScheduleShiftAssignment.objects.filter(
+            _visible_assignment_filter(active_run),
             physician=physician,
             shift_instance__schedule_version=shift_instance.schedule_version,
             shift_instance__start_datetime__lt=shift_instance.end_datetime,
@@ -1319,6 +1504,7 @@ def _physician_assignment_eligibility(physician, shift_instance):
 
 
 def _assignment_context_payload(shift_instance):
+    active_run = _active_optimizer_run(shift_instance.schedule_version)
     shift_instance = (
         ScheduleShiftInstance.objects.select_related(
             'facility',
@@ -1330,7 +1516,9 @@ def _assignment_context_payload(shift_instance):
         .get(id=shift_instance.id)
     )
     assigned_physician_ids = set(
-        shift_instance.assignments.values_list('physician_id', flat=True)
+        shift_instance.assignments.filter(
+            _visible_assignment_filter(active_run)
+        ).values_list('physician_id', flat=True)
     )
     eligible_physicians = []
     for physician in Physician.objects.filter(active=True).select_related('user').order_by(
@@ -1350,7 +1538,10 @@ def _assignment_context_payload(shift_instance):
         )
 
     return {
-        'shift_instance': ScheduleShiftInstanceSerializer(shift_instance).data,
+        'shift_instance': ScheduleShiftInstanceSerializer(
+            shift_instance,
+            context={'optimizer_run_id': active_run.id if active_run else None},
+        ).data,
         'eligible_physicians': eligible_physicians,
     }
 
@@ -1422,7 +1613,8 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
                 {'physician_id': 'Physician is already assigned to this shift instance.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if locked_instance.assignments.count() >= locked_instance.required_staffing:
+        active_run = _active_optimizer_run(locked_instance.schedule_version)
+        if locked_instance.assignments.filter(_visible_assignment_filter(active_run)).count() >= locked_instance.required_staffing:
             return Response(
                 {'detail': 'This shift instance is already fully staffed.'},
                 status=status.HTTP_400_BAD_REQUEST,

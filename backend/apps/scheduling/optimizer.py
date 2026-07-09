@@ -2,13 +2,16 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from datetime import timedelta
 from math import ceil
+import random
+import secrets
 from time import monotonic
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 
 from .models import (
     ContractUserAssignment,
+    OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
     ScheduleShiftAssignment,
@@ -2504,7 +2507,22 @@ def _score_audit(scoring, night_report, request_rows):
     }
 
 
-def build_violation_report(schedule_version):
+def _assignments_for_optimizer_run(version, optimizer_run=None):
+    query = Q(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
+    if optimizer_run is not None:
+        query |= Q(
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=optimizer_run,
+        )
+    return ScheduleShiftAssignment.objects.filter(
+        query,
+        shift_instance__schedule_version=version,
+        shift_instance__date__gte=version.schedule_block.start_date,
+        shift_instance__date__lte=version.schedule_block.end_date,
+    )
+
+
+def build_violation_report(schedule_version, optimizer_run=None):
     version = (
         ScheduleVersion.objects
         .select_related('schedule_block', 'domain')
@@ -2516,12 +2534,10 @@ def build_violation_report(schedule_version):
         .prefetch_related('assignments__physician__user')
         .order_by('date', 'facility__name', 'start_datetime', 'id')
     )
+    if optimizer_run is None:
+        optimizer_run = version.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
     assignments = list(
-        ScheduleShiftAssignment.objects.filter(
-            shift_instance__schedule_version=version,
-            shift_instance__date__gte=version.schedule_block.start_date,
-            shift_instance__date__lte=version.schedule_block.end_date,
-        )
+        _assignments_for_optimizer_run(version, optimizer_run)
         .select_related('shift_instance__facility', 'shift_instance__shift_template', 'physician__user')
     )
     active_contract_assignments = list(
@@ -2696,6 +2712,20 @@ def build_violation_report(schedule_version):
             'start_date': version.schedule_block.start_date.isoformat(),
             'end_date': version.schedule_block.end_date.isoformat(),
         },
+        'optimizer_run': (
+            {
+                'id': optimizer_run.id,
+                'schedule_version': optimizer_run.schedule_version_id,
+                'run_number': optimizer_run.run_number,
+                'created_at': optimizer_run.created_at.isoformat(),
+                'status': optimizer_run.status,
+                'initial_score': float(optimizer_run.initial_score) if optimizer_run.initial_score is not None else None,
+                'final_score': float(optimizer_run.final_score) if optimizer_run.final_score is not None else None,
+                'is_active': optimizer_run.is_active,
+            }
+            if optimizer_run is not None
+            else None
+        ),
         'total_score': float(scoring['score']),
         'score_breakdown': {
             key: float(value)
@@ -2736,7 +2766,7 @@ def build_violation_report(schedule_version):
     }
 
 
-def optimize_schedule_version(schedule_version, created_by=None):
+def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=None, seed=None):
     if schedule_version.status != ScheduleVersion.Status.BUILD:
         raise ValueError('Optimizer can only run on a BUILD Schedule Version.')
     if schedule_version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD:
@@ -2748,16 +2778,56 @@ def optimize_schedule_version(schedule_version, created_by=None):
             .select_related('schedule_block', 'domain')
             .get(id=schedule_version.id)
         )
+        if optimizer_run is None:
+            latest_run_number = (
+                OptimizerRun.objects.filter(schedule_version=version)
+                .order_by('-run_number')
+                .values_list('run_number', flat=True)
+                .first()
+                or 0
+            )
+            if seed is None:
+                seed = secrets.randbits(63)
+            optimizer_run = OptimizerRun.objects.create(
+                schedule_version=version,
+                run_number=latest_run_number + 1,
+                created_by=created_by,
+                status=OptimizerRun.Status.RUNNING,
+                seed=seed,
+            )
+        else:
+            optimizer_run = OptimizerRun.objects.select_for_update().get(
+                id=optimizer_run.id,
+                schedule_version=version,
+            )
+            if seed is not None and optimizer_run.seed != seed:
+                optimizer_run.seed = seed
+                optimizer_run.save(update_fields=['seed'])
+        if optimizer_run.seed is None:
+            optimizer_run.seed = seed if seed is not None else secrets.randbits(63)
+            optimizer_run.save(update_fields=['seed'])
+        seed = optimizer_run.seed
+        rng = random.Random(seed)
+
+        def random_tie_sorted(items, key):
+            decorated = [
+                (key(item), rng.random(), index, item)
+                for index, item in enumerate(items)
+            ]
+            decorated.sort(key=lambda row: (row[0], row[1], row[2]))
+            return [item for _key, _tie, _index, item in decorated]
+
+        def shuffle(items):
+            values = list(items)
+            rng.shuffle(values)
+            return values
+
         assignment_rows_before = ScheduleShiftAssignment.objects.filter(
             shift_instance__schedule_version=version,
             shift_instance__date__gte=version.schedule_block.start_date,
             shift_instance__date__lte=version.schedule_block.end_date,
         ).count()
-        optimizer_delete_queryset = ScheduleShiftAssignment.objects.filter(
-            shift_instance__schedule_version=version,
-            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
-        )
-        optimizer_assignments_deleted, _ = optimizer_delete_queryset.delete()
+        optimizer_assignments_deleted = 0
         instances = list(
             _version_shift_instances_queryset(version)
             .select_for_update()
@@ -2766,11 +2836,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
             .order_by('date', 'facility__name', 'start_datetime', 'id')
         )
         assignments = list(
-            ScheduleShiftAssignment.objects.filter(
-                shift_instance__schedule_version=version,
-                shift_instance__date__gte=version.schedule_block.start_date,
-                shift_instance__date__lte=version.schedule_block.end_date,
-            )
+            _assignments_for_optimizer_run(version, None)
             .select_related('shift_instance', 'physician__user')
         )
         manual_assignments_preserved = sum(
@@ -2889,7 +2955,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                         minimum_rest_by_physician,
                         include_internal_night_heuristics=True,
                     )
-                    for physician in physicians:
+                    for physician in shuffle(physicians):
                         if physician.id in state[instance.id]:
                             continue
                         if instance.facility_id not in eligible_facilities_by_physician.get(physician.id, set()):
@@ -2970,9 +3036,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                                 + night_block_bonus
                                 + night_minimum_bonus
                                 + (recovery_penalty * RECOVERY_CONFLICT_AVOIDANCE_MULTIPLIER),
-                                physician.user.last_name.lower(),
-                                physician.user.first_name.lower(),
-                                physician.id,
+                                rng.random(),
                                 physician,
                             )
                         )
@@ -2994,9 +3058,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     (
                         _has_recovery_conflict,
                         _candidate_score,
-                        _last_name,
-                        _first_name,
-                        _physician_id,
+                        _tie_breaker,
                         selected_physician,
                     ) = min(candidate_pool)
                     _add_to_state(state, instance.id, selected_physician.id)
@@ -3012,6 +3074,8 @@ def optimize_schedule_version(schedule_version, created_by=None):
             instance for instance in instances
             if not instance.shift_template.night_shift
         ]
+        night_instances = shuffle(night_instances)
+        non_night_instances = shuffle(non_night_instances)
         fill_open_instances(night_instances, 'night')
         fill_open_instances(non_night_instances, 'non_night')
 
@@ -3237,7 +3301,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
             row['physician_id']
             for row in minimum_status['physicians_over_night_minimum']
         }
-        for to_physician_id in sorted(under_minimum_ids):
+        for to_physician_id in shuffle(sorted(under_minimum_ids)):
             improved_minimum = False
             night_sources = [
                 (instance_id, from_physician_id)
@@ -3245,6 +3309,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                 if from_physician_id in over_minimum_ids
                 and instances_by_id[instance_id].shift_template.night_shift
             ]
+            night_sources = shuffle(night_sources)
             for instance_id, from_physician_id in night_sources:
                 night_minimum_fix_attempts += 1
                 result = try_reassign(instance_id, from_physician_id, to_physician_id)
@@ -3288,6 +3353,8 @@ def optimize_schedule_version(schedule_version, created_by=None):
                 if physician_id in over_minimum_ids
                 and instances_by_id[instance_id].shift_template.night_shift
             ]
+            non_night_pairs = shuffle(non_night_pairs)
+            donor_night_pairs = shuffle(donor_night_pairs)
             for non_night_instance_id, under_physician_id in non_night_pairs:
                 if improved_minimum:
                     break
@@ -3382,6 +3449,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                 contract_by_physician,
                 requests_by_physician_date,
             )
+            request_candidates = shuffle(request_candidates)
             for from_physician_id, instance_id in request_candidates[:MAX_CANDIDATES_PER_REPAIR]:
                 if improved or (_pass_number > 0 and runtime_exceeded()):
                     break
@@ -3397,7 +3465,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     minimum_rest_by_physician,
                     include_internal_night_heuristics=True,
                 )
-                ordered_recipients = sorted(
+                ordered_recipients = random_tie_sorted(
                     physicians,
                     key=lambda physician: (
                         bool(_requests_for_shift(requests_by_physician_date, physician.id, instance)),
@@ -3406,9 +3474,6 @@ def optimize_schedule_version(schedule_version, created_by=None):
                             current_for_request['physician_hours'][physician.id] + _shift_hours(instance),
                             current_for_request['physician_shifts'][physician.id] + 1,
                         ),
-                        physician.user.last_name.lower(),
-                        physician.user.first_name.lower(),
-                        physician.id,
                     ),
                 )
                 for physician in ordered_recipients[:MAX_CANDIDATES_PER_REPAIR]:
@@ -3456,6 +3521,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     manual_pairs,
                     current_scoring,
                 )
+                workload_candidates = shuffle(workload_candidates)
                 for high_physician_id, low_physician_id, instance_id in workload_candidates[:workload_candidate_budget]:
                     if runtime_exceeded():
                         stopped_reason = 'runtime_limit'
@@ -3506,6 +3572,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     manual_pairs,
                     current_scoring,
                 )
+                workload_swap_candidates = shuffle(workload_swap_candidates)
                 for high_physician_id, low_physician_id, high_instance_id, low_instance_id in workload_swap_candidates[:workload_candidate_budget]:
                     if runtime_exceeded():
                         stopped_reason = 'runtime_limit'
@@ -3549,21 +3616,19 @@ def optimize_schedule_version(schedule_version, created_by=None):
             )
             low_night_physicians = [
                 physician.id
-                for physician in sorted(
+                for physician in random_tie_sorted(
                     physicians,
                     key=lambda item: (
                         night_counts.get(item.id, 0),
-                        item.user.last_name.lower(),
-                        item.user.first_name.lower(),
-                        item.id,
                     ),
                 )
             ]
+            night_sources = shuffle(night_sources)
             for from_physician_id, instance_id in night_sources:
                 if improved:
                     break
                 night_instance = instances_by_id[instance_id]
-                ordered_night_recipients = sorted(
+                ordered_night_recipients = random_tie_sorted(
                     low_night_physicians,
                     key=lambda physician_id: (
                         not _can_extend_night_block(
@@ -3574,7 +3639,6 @@ def optimize_schedule_version(schedule_version, created_by=None):
                             night_instance,
                         ),
                         night_counts.get(physician_id, 0),
-                        physician_id,
                     ),
                 )
                 for to_physician_id in ordered_night_recipients:
@@ -3602,6 +3666,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     for instance_id, physician_id in _optimizer_pairs(state, manual_pairs)
                     if not instances_by_id[instance_id].shift_template.night_shift
                 ]
+                non_night_pairs = shuffle(non_night_pairs)
                 for from_physician_id, night_instance_id in night_sources:
                     if improved:
                         break
@@ -3685,17 +3750,19 @@ def optimize_schedule_version(schedule_version, created_by=None):
             )
             low_workload_physicians = [
                 physician_id
-                for _delta, physician_id in sorted(
-                    _physician_workload_rows(physician_ids, current_scoring, targets)
+                for _delta, physician_id in random_tie_sorted(
+                    _physician_workload_rows(physician_ids, current_scoring, targets),
+                    key=lambda row: row[0],
                 )
             ]
-            for from_physician_id, instance_id in _night_recovery_conflict_pairs(
+            recovery_conflict_pairs = shuffle(_night_recovery_conflict_pairs(
                 instances,
                 physicians,
                 state,
                 manual_pairs,
                 contract_by_physician,
-            ):
+            ))
+            for from_physician_id, instance_id in recovery_conflict_pairs:
                 if improved:
                     break
                 for to_physician_id in low_workload_physicians:
@@ -3734,17 +3801,19 @@ def optimize_schedule_version(schedule_version, created_by=None):
             )
             low_workload_physicians = [
                 physician_id
-                for _delta, physician_id in sorted(
-                    _physician_workload_rows(physician_ids, current_scoring, targets)
+                for _delta, physician_id in random_tie_sorted(
+                    _physician_workload_rows(physician_ids, current_scoring, targets),
+                    key=lambda row: row[0],
                 )
             ]
-            for from_physician_id, instance_id in _same_shift_break_candidates(
+            same_shift_candidates = shuffle(_same_shift_break_candidates(
                 instances,
                 physicians,
                 state,
                 manual_pairs,
                 contract_by_physician,
-            ):
+            ))
+            for from_physician_id, instance_id in same_shift_candidates:
                 if improved:
                     break
                 for to_physician_id in low_workload_physicians:
@@ -3781,16 +3850,18 @@ def optimize_schedule_version(schedule_version, created_by=None):
             )
             low_workload_physicians = [
                 physician_id
-                for _delta, physician_id in sorted(
-                    _physician_workload_rows(physician_ids, current_scoring, targets)
+                for _delta, physician_id in random_tie_sorted(
+                    _physician_workload_rows(physician_ids, current_scoring, targets),
+                    key=lambda row: row[0],
                 )
             ]
-            for from_physician_id, instance_id in _consecutive_day_break_candidates(
+            consecutive_day_candidates = shuffle(_consecutive_day_break_candidates(
                 state,
                 instances_by_id,
                 manual_pairs,
                 contract_by_physician,
-            ):
+            ))
+            for from_physician_id, instance_id in consecutive_day_candidates:
                 if improved:
                     break
                 for to_physician_id in low_workload_physicians:
@@ -3814,6 +3885,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
             improved = False
 
             pairs = _optimizer_pairs(state, manual_pairs)
+            pairs = shuffle(pairs)
             swap_attempts_this_pass = 0
             for left_index, (left_instance_id, left_physician_id) in enumerate(pairs):
                 if general_swap_attempts > 0 and runtime_exceeded():
@@ -4019,7 +4091,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
             state,
             contract_by_physician,
         )
-        under_rows = list(repair_status['physicians_under_night_minimum'])
+        under_rows = shuffle(repair_status['physicians_under_night_minimum'])
         for under_row in under_rows:
             to_physician_id = under_row['physician_id']
             debug_row = repair_rejection_state(to_physician_id)
@@ -4062,7 +4134,10 @@ def optimize_schedule_version(schedule_version, created_by=None):
                 and instances_by_id[instance_id].shift_template.night_shift
                 and night_counts.get(physician_id, 0) > night_counts.get(to_physician_id, 0)
             ]
-            donor_night_pairs = sorted(donor_night_pairs, reverse=True)
+            donor_night_pairs = random_tie_sorted(
+                donor_night_pairs,
+                key=lambda item: (-item[0], item[1]),
+            )
 
             repaired = False
             for _night_count, night_instance_id, donor_physician_id in donor_night_pairs:
@@ -4113,6 +4188,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     if physician_id == to_physician_id
                     and not instances_by_id[instance_id].shift_template.night_shift
                 ]
+                non_night_pairs = shuffle(non_night_pairs)
                 for non_night_instance_id, under_physician_id in non_night_pairs:
                     if repaired:
                         break
@@ -4232,6 +4308,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
                     physician_id=physician_id,
                     created_by=created_by,
                     assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+                    optimizer_run=optimizer_run,
                 )
 
             next_status = (
@@ -4286,6 +4363,9 @@ def optimize_schedule_version(schedule_version, created_by=None):
 
     summary = {
         'message': message,
+        'optimizer_run_id': optimizer_run.id,
+        'optimizer_run_number': optimizer_run.run_number,
+        'seed': seed,
         'total_score': float(final_score),
         'initial_score': float(initial_score),
         'final_score': float(final_score),
@@ -4308,6 +4388,7 @@ def optimize_schedule_version(schedule_version, created_by=None):
         'candidate_rest_rejections': rest_violations_blocked,
         'rest_violations_blocked': rest_violations_blocked,
         'debug': {
+            'seed': seed,
             'schedule_version_id': version.id,
             'schedule_block_id': version.schedule_block_id,
             'schedule_block_start_date': version.schedule_block.start_date.isoformat(),
@@ -4439,6 +4520,25 @@ def optimize_schedule_version(schedule_version, created_by=None):
             final_scoring['workload_score_rows'],
         ),
     }
-    version.optimizer_summary = summary
-    version.save(update_fields=['optimizer_summary', 'updated_at'])
+    with transaction.atomic():
+        OptimizerRun.objects.filter(schedule_version=version, is_active=True).exclude(id=optimizer_run.id).update(is_active=False)
+        optimizer_run.status = OptimizerRun.Status.COMPLETED
+        optimizer_run.initial_score = summary['initial_score']
+        optimizer_run.final_score = summary['final_score']
+        optimizer_run.score_breakdown = summary['score_breakdown']
+        optimizer_run.optimizer_summary = summary
+        optimizer_run.optimizer_debug = summary.get('debug', {})
+        optimizer_run.is_active = True
+        optimizer_run.save(update_fields=[
+            'status',
+            'initial_score',
+            'final_score',
+            'score_breakdown',
+            'optimizer_summary',
+            'optimizer_debug',
+            'seed',
+            'is_active',
+        ])
+        version.optimizer_summary = summary
+        version.save(update_fields=['optimizer_summary', 'updated_at'])
     return summary

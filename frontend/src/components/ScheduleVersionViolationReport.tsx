@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 
 type ScheduleVersion = {
   id: number
@@ -83,6 +84,12 @@ type ViolationUser = {
 type ViolationReport = {
   schedule_version: ScheduleVersion
   schedule_block: ScheduleBlock
+  optimizer_run: {
+    id: number
+    run_number: number
+    created_at: string
+    final_score: number | null
+  } | null
   total_score: number
   score_breakdown: Record<string, number>
   warnings: string[]
@@ -108,6 +115,16 @@ function formatDate(value: string) {
     day: 'numeric',
     year: 'numeric',
     timeZone: 'UTC',
+  })
+}
+
+function formatTimestamp(value: string) {
+  return new Date(value).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
   })
 }
 
@@ -192,6 +209,8 @@ function workloadDeviationLabel(row: WorkloadScoreRow) {
 }
 
 export default function ScheduleVersionViolationReport({ versionId }: Props) {
+  const location = useLocation()
+  const optimizerRunId = new URLSearchParams(location.search).get('optimizer_run_id')
   const [report, setReport] = useState<ViolationReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
@@ -202,7 +221,8 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
       setIsLoading(true)
       setError(null)
       try {
-        const response = await fetch(`${API_BASE}/schedule-versions/${versionId}/violation-report/`, {
+        const query = optimizerRunId ? `?optimizer_run_id=${optimizerRunId}` : ''
+        const response = await fetch(`${API_BASE}/schedule-versions/${versionId}/violation-report/${query}`, {
           credentials: 'include',
         })
         const data = await response.json().catch(() => null)
@@ -226,7 +246,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
     return () => {
       cancelled = true
     }
-  }, [versionId])
+  }, [versionId, optimizerRunId])
 
   if (isLoading) {
     return <div className="build-workspace-empty">Loading violation report...</div>
@@ -243,9 +263,15 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
           <h2>{report.schedule_block.name}</h2>
           <div className="build-workspace-subtitle">
             {report.schedule_version.name} · {report.schedule_version.domain_name} · {report.schedule_version.status}
+            {report.optimizer_run && (
+              <>
+                {' · '}
+                Run {report.optimizer_run.run_number} · {formatTimestamp(report.optimizer_run.created_at)} · Final {report.optimizer_run.final_score?.toFixed(1) ?? '-'}
+              </>
+            )}
           </div>
         </div>
-        <a className="secondary build-workspace-link-button" href={`/schedule-blocks/${report.schedule_block.id}/build`}>
+        <a className="secondary build-workspace-link-button" href={`/schedule-blocks/${report.schedule_block.id}/build${report.optimizer_run ? `?optimizer_run_id=${report.optimizer_run.id}` : ''}`}>
           Back to Build Schedule
         </a>
       </div>

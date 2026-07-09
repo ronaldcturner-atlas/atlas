@@ -66,6 +66,9 @@ type AssignmentContext = {
 
 type OptimizerSummary = {
   message?: string
+  optimizer_run_id?: number
+  optimizer_run_number?: number
+  seed?: number
   assignments_cleared?: number
   total_score: number
   initial_score?: number
@@ -117,6 +120,19 @@ type OptimizerSummary = {
   }>
 }
 
+type OptimizerRun = {
+  id: number
+  schedule_version: number
+  run_number: number
+  created_at: string
+  status: 'RUNNING' | 'COMPLETED' | 'FAILED'
+  seed: number | string | null
+  initial_score: string | number | null
+  final_score: string | number | null
+  is_active: boolean
+  optimizer_summary?: OptimizerSummary
+}
+
 type PopoverPosition = {
   left: number
   top?: number
@@ -130,6 +146,8 @@ type BuildContext = {
   versions: ScheduleVersion[]
   selected_version: ScheduleVersion | null
   optimizer_summary?: OptimizerSummary | null
+  optimizer_runs?: OptimizerRun[]
+  selected_optimizer_run?: OptimizerRun | null
   shift_instances: ShiftInstance[]
 }
 
@@ -175,6 +193,23 @@ function formatDate(value: string) {
     year: 'numeric',
     timeZone: 'UTC',
   })
+}
+
+function formatTimestamp(value: string) {
+  return new Date(value).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+function formatScore(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === '') {
+    return '-'
+  }
+  return Number(value).toFixed(1)
 }
 
 function formatTime(value: string) {
@@ -308,7 +343,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const fetchContext = async (
     versionId?: number,
-    options: { preserveError?: boolean; quiet?: boolean; rethrow?: boolean } = {},
+    options: { preserveError?: boolean; quiet?: boolean; rethrow?: boolean; optimizerRunId?: number } = {},
   ) => {
     try {
       if (!options.quiet) {
@@ -317,7 +352,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       if (!options.preserveError) {
         setError(null)
       }
-      const query = versionId ? `?version_id=${versionId}` : ''
+      const params = new URLSearchParams()
+      if (versionId) {
+        params.set('version_id', String(versionId))
+      }
+      if (options.optimizerRunId) {
+        params.set('optimizer_run_id', String(options.optimizerRunId))
+      }
+      const query = params.toString() ? `?${params.toString()}` : ''
       const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/${query}`, {
         credentials: 'include',
         cache: 'no-store',
@@ -350,9 +392,39 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const selectedOptimizerRun = context?.selected_optimizer_run ?? null
+  const optimizerRuns = context?.optimizer_runs ?? []
+
+  const activateOptimizerRun = async (runId: number) => {
+    const versionId = context?.selected_version?.id
+    if (!versionId) {
+      return
+    }
+    try {
+      closeAssignments()
+      setError(null)
+      setNotice(null)
+      const response = await fetch(`${API_BASE}/optimizer-runs/${runId}/activate/`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to activate optimizer run.'))
+      }
+      setNotice(`Run ${(data as OptimizerRun).run_number} is active.`)
+      await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
+    } catch (activateError) {
+      setError(activateError instanceof Error ? activateError.message : 'Unable to activate optimizer run.')
+    }
+  }
+
   useEffect(() => {
     closeAssignments()
-    void fetchContext()
+    const optimizerRunId = new URLSearchParams(window.location.search).get('optimizer_run_id')
+    void fetchContext(undefined, {
+      optimizerRunId: optimizerRunId ? Number(optimizerRunId) : undefined,
+    })
   }, [blockId])
 
   useEffect(() => {
@@ -478,6 +550,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
 
     let optimizeErrorMessage: string | null = null
+    let completedOptimizerRunId: number | undefined
     try {
       closeAssignments()
       setIsOptimizing(true)
@@ -487,7 +560,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setShowWorkloadDetails(false)
       setShowOptimizerDebug(false)
       const response = await fetch(
-        `${API_BASE}/schedule-blocks/${blockId}/build/versions/${versionId}/optimize/`,
+        `${API_BASE}/schedule-versions/${versionId}/run-optimizer/`,
         {
           method: 'POST',
           credentials: 'include',
@@ -498,7 +571,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         throw new Error(apiError(data, 'Unable to run optimizer.'))
       }
 
-      setOptimizerSummary(data as OptimizerSummary)
+      const summary = data as OptimizerSummary
+      completedOptimizerRunId = summary.optimizer_run_id
+      setOptimizerSummary(summary)
       setNotice((data as OptimizerSummary).message ?? 'Optimizer v0 completed.')
     } catch (optimizeError) {
       optimizeErrorMessage = optimizeError instanceof Error ? optimizeError.message : 'Unable to run optimizer.'
@@ -509,6 +584,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           preserveError: Boolean(optimizeErrorMessage),
           quiet: true,
           rethrow: true,
+          optimizerRunId: completedOptimizerRunId,
         })
       } catch {
         if (!optimizeErrorMessage) {
@@ -844,12 +920,57 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         {context.selected_version && (
           <a
             className="secondary build-workspace-link-button"
-            href={`/schedule-versions/${context.selected_version.id}/violations`}
+            href={`/schedule-versions/${context.selected_version.id}/violations${selectedOptimizerRun ? `?optimizer_run_id=${selectedOptimizerRun.id}` : ''}`}
           >
             View Violation Report
           </a>
         )}
       </div>
+
+      {optimizerRuns.length > 0 && (
+        <div className="optimizer-runs-panel">
+          <div className="optimizer-runs-heading">
+            <h3>Optimizer Runs</h3>
+          </div>
+          <div className="optimizer-runs-list">
+            {optimizerRuns.map((run) => (
+              <div className="optimizer-run-row" key={run.id}>
+                <div>
+                  <strong>Run {run.run_number}</strong>
+                  <span>{formatScore(run.final_score)} final</span>
+                  <span>{formatTimestamp(run.created_at)}</span>
+                  <span>Seed {run.seed ?? '-'}</span>
+                  {run.is_active && <span>Active</span>}
+                </div>
+                <div className="optimizer-run-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => void fetchContext(run.schedule_version, { optimizerRunId: run.id, quiet: true })}
+                    disabled={isMutatingBuild}
+                  >
+                    View
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => void activateOptimizerRun(run.id)}
+                    disabled={isMutatingBuild || run.is_active || run.status !== 'COMPLETED'}
+                  >
+                    Activate
+                  </button>
+                  <a
+                    className="secondary build-workspace-link-button"
+                    href={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
+                  >
+                    Violations
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {optimizerSummary && (
         <div className="optimizer-summary-panel" aria-live="polite">
