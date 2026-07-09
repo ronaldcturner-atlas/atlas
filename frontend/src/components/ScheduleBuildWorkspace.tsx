@@ -212,6 +212,10 @@ function formatScore(value: string | number | null | undefined) {
   return Number(value).toFixed(1)
 }
 
+function optimizerRunLabel(run: OptimizerRun) {
+  return `Run ${run.run_number} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+}
+
 function formatTime(value: string) {
   const [hoursRaw, minutesRaw] = value.split(':')
   const hours = Number(hoursRaw)
@@ -317,6 +321,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
+  const [runSelectorId, setRunSelectorId] = useState<number | null>(null)
+  const [showRunHistory, setShowRunHistory] = useState(false)
+  const [showScoreDetails, setShowScoreDetails] = useState(false)
   const [showWorkloadDetails, setShowWorkloadDetails] = useState(false)
   const [showOptimizerDebug, setShowOptimizerDebug] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -395,6 +402,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const selectedOptimizerRun = context?.selected_optimizer_run ?? null
   const optimizerRuns = context?.optimizer_runs ?? []
+  const selectedRunForActions = optimizerRuns.find((run) => run.id === runSelectorId) ?? selectedOptimizerRun
 
   const updateOptimizerRunUrl = (runId: number | null) => {
     const url = new URL(window.location.href)
@@ -489,6 +497,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       optimizerRunId: optimizerRunId ? Number(optimizerRunId) : undefined,
     })
   }, [blockId])
+
+  useEffect(() => {
+    if (selectedOptimizerRun) {
+      setRunSelectorId(selectedOptimizerRun.id)
+    } else if (optimizerRuns.length) {
+      setRunSelectorId(optimizerRuns[0].id)
+    } else {
+      setRunSelectorId(null)
+    }
+  }, [selectedOptimizerRun?.id, optimizerRuns])
 
   useEffect(() => {
     if (!assignmentTarget) {
@@ -621,6 +639,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setError(null)
       setNotice(null)
       setOptimizerSummary(null)
+      setShowScoreDetails(false)
       setShowWorkloadDetails(false)
       setShowOptimizerDebug(false)
       const response = await fetch(
@@ -977,192 +996,164 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
         <button
           type="button"
-          className="secondary"
+          className="secondary danger-action"
           onClick={() => void clearScheduleAssignments('all')}
           disabled={!canClearAssignments || isMutatingBuild}
         >
           {clearingAction === 'all' ? 'Clearing...' : 'Clear All Assignments'}
         </button>
 
-        {context.selected_version && (
-          <a
-            className="secondary build-workspace-link-button"
-            href={`/schedule-versions/${context.selected_version.id}/violations${selectedOptimizerRun ? `?optimizer_run_id=${selectedOptimizerRun.id}` : ''}`}
-          >
-            View Violation Report
-          </a>
-        )}
       </div>
 
-      {optimizerRuns.length > 0 && (
-        <div className="optimizer-runs-panel">
-          <div className="optimizer-runs-heading">
-            <h3>Optimizer Runs</h3>
-            {selectedOptimizerRun && (
-              <span>Viewing Run {selectedOptimizerRun.run_number}</span>
-            )}
-          </div>
-          <div className="optimizer-runs-list">
-            {optimizerRuns.map((run) => (
-              <div
-                className={`optimizer-run-row${selectedOptimizerRun?.id === run.id ? ' optimizer-run-row-selected' : ''}`}
-                key={run.id}
+      {optimizerRuns.length > 0 && selectedRunForActions && (
+        <div className="optimizer-run-selector-panel">
+          <div className="optimizer-run-selector-main">
+            <label className="facility-field optimizer-run-select">
+              <span>Viewing optimizer run</span>
+              <select
+                value={runSelectorId ?? ''}
+                onChange={(event) => setRunSelectorId(Number(event.target.value))}
+                disabled={isMutatingBuild}
               >
-                <div>
+                {optimizerRuns.map((run) => (
+                  <option key={run.id} value={run.id}>
+                    {optimizerRunLabel(run)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="optimizer-run-status">
+              {selectedOptimizerRun && (
+                <span>Viewing Run {selectedOptimizerRun.run_number}</span>
+              )}
+              {selectedRunForActions.is_active && <strong>Active</strong>}
+              {!selectedRunForActions.is_active && <span>Inactive</span>}
+            </div>
+            <div className="optimizer-run-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => void viewOptimizerRun(selectedRunForActions)}
+                disabled={isMutatingBuild || selectedOptimizerRun?.id === selectedRunForActions.id}
+              >
+                View
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => void activateOptimizerRun(selectedRunForActions.id)}
+                disabled={isMutatingBuild || selectedRunForActions.is_active || selectedRunForActions.status !== 'COMPLETED'}
+              >
+                Activate
+              </button>
+              <a
+                className="secondary build-workspace-link-button"
+                href={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
+              >
+                Violations
+              </a>
+              {!selectedRunForActions.is_active && (
+                <button
+                  type="button"
+                  className="secondary danger-action"
+                  onClick={() => void deleteOptimizerRun(selectedRunForActions)}
+                  disabled={isMutatingBuild}
+                >
+                  {deletingRunId === selectedRunForActions.id ? 'Deleting...' : 'Delete'}
+                </button>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="secondary optimizer-history-toggle"
+            onClick={() => setShowRunHistory((current) => !current)}
+            aria-expanded={showRunHistory}
+          >
+            {showRunHistory ? 'Hide run history' : `Show run history (${optimizerRuns.length})`}
+          </button>
+          {showRunHistory && (
+            <div className="optimizer-runs-list">
+              {optimizerRuns.map((run) => (
+                <div
+                  className={`optimizer-run-row${selectedOptimizerRun?.id === run.id ? ' optimizer-run-row-selected' : ''}`}
+                  key={run.id}
+                >
                   <strong>Run {run.run_number}</strong>
                   <span>{formatScore(run.final_score)} final</span>
                   <span>{formatTimestamp(run.created_at)}</span>
                   <span>Seed {run.seed ?? '-'}</span>
                   <span>{run.is_active ? 'Active' : 'Inactive'}</span>
                 </div>
-                <div className="optimizer-run-actions">
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => void viewOptimizerRun(run)}
-                    disabled={isMutatingBuild}
-                  >
-                    View
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => void activateOptimizerRun(run.id)}
-                    disabled={isMutatingBuild || run.is_active || run.status !== 'COMPLETED'}
-                  >
-                    Activate
-                  </button>
-                  {!run.is_active && (
-                    <button
-                      type="button"
-                      className="secondary"
-                      onClick={() => void deleteOptimizerRun(run)}
-                      disabled={isMutatingBuild}
-                    >
-                      {deletingRunId === run.id ? 'Deleting...' : 'Delete'}
-                    </button>
-                  )}
-                  <a
-                    className="secondary build-workspace-link-button"
-                    href={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
-                  >
-                    Violations
-                  </a>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
       {optimizerSummary && (
-        <div className="optimizer-summary-panel" aria-live="polite">
-          <div>
-            <span>Initial score</span>
-            <strong>{(optimizerSummary.initial_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Final score</span>
-            <strong>{(optimizerSummary.final_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Improvements</span>
-            <strong>{optimizerSummary.improvement_count ?? 0}</strong>
-          </div>
-          <div>
-            <span>Iterations</span>
-            <strong>{optimizerSummary.iterations_run ?? 0}</strong>
-          </div>
-          <div>
-            <span>Assignments made</span>
-            <strong>{optimizerSummary.assignments_made}</strong>
-          </div>
-          {optimizerSummary.assignments_cleared !== undefined && (
+        <section className="optimizer-summary-card" aria-live="polite">
+          <div className="optimizer-summary-grid">
             <div>
-              <span>Assignments cleared</span>
-              <strong>{optimizerSummary.assignments_cleared}</strong>
+              <span>Initial score</span>
+              <strong>{(optimizerSummary.initial_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
             </div>
-          )}
-          <div>
-            <span>Unfilled shifts</span>
-            <strong>{optimizerSummary.unfilled_shift_count}</strong>
-          </div>
-          {optimizerSummary.request_violations_summary && (
             <div>
-              <span>Request violations</span>
-              <strong>{optimizerSummary.request_violations_summary.violations}</strong>
+              <span>Final score</span>
+              <strong>{(optimizerSummary.final_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
             </div>
-          )}
-          <div>
-            <span>Final rest violations</span>
-            <strong>{optimizerSummary.final_rest_violations ?? 0}</strong>
+            <div>
+              <span>Improvements</span>
+              <strong>{optimizerSummary.improvement_count ?? 0}</strong>
+            </div>
+            <div>
+              <span>Iterations</span>
+              <strong>{optimizerSummary.iterations_run ?? 0}</strong>
+            </div>
+            <div>
+              <span>Assignments made</span>
+              <strong>{optimizerSummary.assignments_made}</strong>
+            </div>
+            <div>
+              <span>Unfilled shifts</span>
+              <strong>{optimizerSummary.unfilled_shift_count}</strong>
+            </div>
+            <div>
+              <span>Request score</span>
+              <strong>{(optimizerSummary.score_breakdown?.request_score ?? 0).toFixed(1)}</strong>
+            </div>
+            <div>
+              <span>Workload score</span>
+              <strong>{(optimizerSummary.score_breakdown?.workload_score ?? 0).toFixed(1)}</strong>
+            </div>
+            <div>
+              <span>Night score</span>
+              <strong>{(optimizerSummary.score_breakdown?.night_score ?? 0).toFixed(1)}</strong>
+            </div>
+            <div>
+              <span>Same shift score</span>
+              <strong>{(optimizerSummary.score_breakdown?.same_shift_score ?? 0).toFixed(1)}</strong>
+            </div>
+            <div>
+              <span>Coverage score</span>
+              <strong>{(optimizerSummary.score_breakdown?.coverage_score ?? 0).toFixed(1)}</strong>
+            </div>
+            <div>
+              <span>Rest / overlap</span>
+              <strong>{optimizerSummary.final_rest_violations ?? 0} / {optimizerSummary.final_overlap_violations ?? 0}</strong>
+            </div>
           </div>
-          <div>
-            <span>Final overlap violations</span>
-            <strong>{optimizerSummary.final_overlap_violations ?? 0}</strong>
-          </div>
-          <div>
-            <span>Workload score</span>
-            <strong>{(optimizerSummary.score_breakdown?.workload_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Underutilization score</span>
-            <strong>{(optimizerSummary.score_breakdown?.underutilization_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Request score</span>
-            <strong>{(optimizerSummary.score_breakdown?.request_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Coverage score</span>
-            <strong>{(optimizerSummary.score_breakdown?.coverage_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Consecutive days score</span>
-            <strong>{(optimizerSummary.score_breakdown?.consecutive_days_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Same shift score</span>
-            <strong>{(optimizerSummary.score_breakdown?.same_shift_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Same shift violations</span>
-            <strong>{optimizerSummary.same_shift_violations_count ?? 0}</strong>
-          </div>
-          <div>
-            <span>Night score</span>
-            <strong>{(optimizerSummary.score_breakdown?.night_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Night violations</span>
-            <strong>{optimizerSummary.night_violations_count ?? 0}</strong>
-          </div>
-          <div>
-            <span>Total night shifts</span>
-            <strong>{optimizerSummary.total_night_shifts ?? 0}</strong>
-          </div>
-          <div>
-            <span>Max nights assigned</span>
-            <strong>{optimizerSummary.max_nights_assigned_to_one_physician ?? 0}</strong>
-          </div>
-          <div>
-            <span>Night fixes kept</span>
-            <strong>{optimizerSummary.night_fix_improvements ?? 0}</strong>
-          </div>
-          <div>
-            <span>Weekend score</span>
-            <strong>{(optimizerSummary.score_breakdown?.weekend_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Facility distribution score</span>
-            <strong>{(optimizerSummary.score_breakdown?.facility_distribution_score ?? 0).toFixed(1)}</strong>
-          </div>
-          <div>
-            <span>Candidate rest rejections</span>
-            <strong>{optimizerSummary.candidate_rest_rejections ?? optimizerSummary.rest_violations_blocked ?? 0}</strong>
-          </div>
-          {optimizerSummary.workload_summary?.length ? (
-            <div className="optimizer-workload-summary">
+
+          <div className="optimizer-detail-actions">
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setShowScoreDetails((current) => !current)}
+              aria-expanded={showScoreDetails}
+            >
+              {showScoreDetails ? 'Hide score details' : 'Show score details'}
+            </button>
+            {optimizerSummary.workload_summary?.length ? (
               <button
                 type="button"
                 className="secondary"
@@ -1171,19 +1162,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               >
                 {showWorkloadDetails ? 'Hide workload details' : 'Show workload details'}
               </button>
-              {showWorkloadDetails && (
-                <ul>
-                  {optimizerSummary.workload_summary.map((item) => (
-                    <li key={item.physician_id}>
-                      {item.physician_name}: {item.assigned_shifts} shifts, {item.assigned_hours.toFixed(1)}h, {item.night_shifts ?? 0} night
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          ) : null}
-          {optimizerSummary.debug && (
-            <div className="optimizer-workload-summary">
+            ) : null}
+            {optimizerSummary.debug && (
               <button
                 type="button"
                 className="secondary"
@@ -1192,14 +1172,95 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               >
                 {showOptimizerDebug ? 'Hide optimizer debug' : 'Show optimizer debug'}
               </button>
-              {showOptimizerDebug && (
-                <pre className="optimizer-debug-details">
-                  {JSON.stringify(optimizerSummary.debug, null, 2)}
-                </pre>
+            )}
+          </div>
+
+          {showScoreDetails && (
+            <div className="optimizer-extra-grid">
+              <div>
+                <span>Underutilization score</span>
+                <strong>{(optimizerSummary.score_breakdown?.underutilization_score ?? 0).toFixed(1)}</strong>
+              </div>
+              <div>
+                <span>Consecutive days score</span>
+                <strong>{(optimizerSummary.score_breakdown?.consecutive_days_score ?? 0).toFixed(1)}</strong>
+              </div>
+              <div>
+                <span>Weekend score</span>
+                <strong>{(optimizerSummary.score_breakdown?.weekend_score ?? 0).toFixed(1)}</strong>
+              </div>
+              <div>
+                <span>Facility score</span>
+                <strong>{(optimizerSummary.score_breakdown?.facility_distribution_score ?? 0).toFixed(1)}</strong>
+              </div>
+              <div>
+                <span>Request violations</span>
+                <strong>{optimizerSummary.request_violations_summary?.violations ?? 0}</strong>
+              </div>
+              <div>
+                <span>Same shift violations</span>
+                <strong>{optimizerSummary.same_shift_violations_count ?? 0}</strong>
+              </div>
+              <div>
+                <span>Night violations</span>
+                <strong>{optimizerSummary.night_violations_count ?? 0}</strong>
+              </div>
+              <div>
+                <span>Total night shifts</span>
+                <strong>{optimizerSummary.total_night_shifts ?? 0}</strong>
+              </div>
+              <div>
+                <span>Max nights assigned</span>
+                <strong>{optimizerSummary.max_nights_assigned_to_one_physician ?? 0}</strong>
+              </div>
+              <div>
+                <span>Night fixes kept</span>
+                <strong>{optimizerSummary.night_fix_improvements ?? 0}</strong>
+              </div>
+              <div>
+                <span>Rest rejections</span>
+                <strong>{optimizerSummary.candidate_rest_rejections ?? optimizerSummary.rest_violations_blocked ?? 0}</strong>
+              </div>
+              {optimizerSummary.assignments_cleared !== undefined && (
+                <div>
+                  <span>Assignments cleared</span>
+                  <strong>{optimizerSummary.assignments_cleared}</strong>
+                </div>
               )}
             </div>
           )}
-        </div>
+
+          {showWorkloadDetails && optimizerSummary.workload_summary?.length ? (
+            <div className="optimizer-workload-table-wrap">
+              <table className="optimizer-workload-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Shifts</th>
+                    <th>Hours</th>
+                    <th>Nights</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {optimizerSummary.workload_summary.map((item) => (
+                    <tr key={item.physician_id}>
+                      <td>{item.physician_name}</td>
+                      <td>{item.assigned_shifts}</td>
+                      <td>{item.assigned_hours.toFixed(1)}</td>
+                      <td>{item.night_shifts ?? 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+
+          {showOptimizerDebug && optimizerSummary.debug && (
+            <pre className="optimizer-debug-details">
+              {JSON.stringify(optimizerSummary.debug, null, 2)}
+            </pre>
+          )}
+        </section>
       )}
 
       {!context.shift_instances.length ? (
