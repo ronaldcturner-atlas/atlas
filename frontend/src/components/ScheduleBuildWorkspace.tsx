@@ -1231,27 +1231,20 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           )}
 
           {showWorkloadDetails && optimizerSummary.workload_summary?.length ? (
-            <div className="optimizer-workload-table-wrap">
-              <table className="optimizer-workload-table">
-                <thead>
-                  <tr>
-                    <th>Name</th>
-                    <th>Shifts</th>
-                    <th>Hours</th>
-                    <th>Nights</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {optimizerSummary.workload_summary.map((item) => (
-                    <tr key={item.physician_id}>
-                      <td>{item.physician_name}</td>
-                      <td>{item.assigned_shifts}</td>
-                      <td>{item.assigned_hours.toFixed(1)}</td>
-                      <td>{item.night_shifts ?? 0}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="optimizer-workload-grid">
+              {[...optimizerSummary.workload_summary]
+                .sort((left, right) => left.physician_name.localeCompare(right.physician_name))
+                .map((item) => {
+                  const nightCount = item.night_shifts ?? 0
+                  return (
+                    <div className="optimizer-workload-item" key={item.physician_id}>
+                      <strong>{item.physician_name}</strong>
+                      <span>
+                        {item.assigned_shifts} shifts, {item.assigned_hours.toFixed(1)}h, {nightCount} {nightCount === 1 ? 'night' : 'nights'}
+                      </span>
+                    </div>
+                  )
+                })}
             </div>
           ) : null}
 
