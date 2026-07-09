@@ -42,6 +42,8 @@ type ViolationRow = {
   shift_template: string | null
   previous_assignment?: AssignmentDetail | null
   next_assignment?: AssignmentDetail | null
+  contract_id?: number | null
+  contract_name?: string | null
   configured_limit: number | string | null
   actual_value: number | string | null
   penalty_weight: number | null
@@ -340,6 +342,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                   <thead>
                     <tr>
                       <th>Type</th>
+                      <th>Contract</th>
                       <th>Dates</th>
                       <th>Shift/Facility</th>
                       <th>Configured</th>
@@ -353,6 +356,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                     {user.violations.map((violation, index) => (
                       <tr key={`${violation.violation_type}-${index}`}>
                         <td>{prettyType(violation.violation_type)}</td>
+                        <td>{violation.contract_name ?? '-'}</td>
                         <td>{violation.dates_involved.map(formatDate).join(', ') || '-'}</td>
                         <td>{shiftFacilityLabel(violation)}</td>
                         <td>{formatValue(violation.configured_limit)}</td>

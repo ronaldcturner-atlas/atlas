@@ -936,9 +936,16 @@ def _active_optimizer_run(version):
     return version.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
 
 
+def _default_optimizer_run(version):
+    active_run = _active_optimizer_run(version)
+    if active_run is not None:
+        return active_run
+    return version.optimizer_runs.order_by('-run_number').first()
+
+
 def _get_optimizer_run_for_version(version, run_id):
     if not run_id:
-        return _active_optimizer_run(version)
+        return _default_optimizer_run(version)
     try:
         parsed_run_id = int(run_id)
     except (TypeError, ValueError):
@@ -1168,7 +1175,7 @@ def schedule_version_run_optimizer(request, version_id):
     return Response(summary)
 
 
-@api_view(['GET'])
+@api_view(['GET', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_detail(request, run_id):
@@ -1179,6 +1186,24 @@ def optimizer_run_detail(request, run_id):
         OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
         id=run_id,
     )
+    if request.method == 'DELETE':
+        if optimizer_run.is_active:
+            return Response(
+                {'detail': 'Cannot delete active optimizer run. Activate another run first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            deleted_assignment_count, _ = ScheduleShiftAssignment.objects.filter(
+                optimizer_run=optimizer_run,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            ).delete()
+            optimizer_run.delete()
+        return Response(
+            {
+                'message': f'Deleted optimizer run and {deleted_assignment_count} optimizer assignment(s).',
+                'assignments_deleted': deleted_assignment_count,
+            }
+        )
     return Response(OptimizerRunSerializer(optimizer_run).data)
 
 

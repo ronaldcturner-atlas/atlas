@@ -712,6 +712,71 @@ def _night_settings(contract):
     return contract.night_settings if isinstance(contract.night_settings, dict) else {}
 
 
+def _contract_rule_identity(contract):
+    if contract is None:
+        return {
+            'contract_id': None,
+            'contract_name': None,
+        }
+    return {
+        'contract_id': contract.id,
+        'contract_name': contract.name,
+    }
+
+
+def _night_rules_debug_payload(contract):
+    settings = _night_settings(contract)
+    return {
+        'contract_id': contract.id,
+        'contract_name': contract.name,
+        'period_rules': _unique_night_period_rules(settings),
+        'min_consecutive_night_shifts': _configured_positive_int(
+            settings,
+            'min_consecutive_night_shifts',
+        ),
+        'min_consecutive_night_shifts_penalty_weight': float(
+            _configured_positive_penalty(
+                settings,
+                'min_consecutive_night_shifts_penalty_weight',
+                DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
+            )
+        ),
+        'max_consecutive_night_shifts': _configured_positive_int(
+            settings,
+            'max_consecutive_night_shifts',
+        ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS,
+        'max_consecutive_night_shifts_penalty_weight': float(
+            _configured_positive_penalty(
+                settings,
+                'max_consecutive_night_shifts_penalty_weight',
+                DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
+            )
+        ),
+        'days_off_after_night_block': _configured_positive_int(
+            settings,
+            'days_off_after_night_block',
+        ),
+        'days_off_after_night_block_penalty_weight': float(
+            _configured_positive_penalty(
+                settings,
+                'days_off_after_night_block_penalty_weight',
+                DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
+            )
+        ),
+        'days_off_before_next_night_shift': _configured_positive_int(
+            settings,
+            'days_off_before_next_night_shift',
+        ),
+        'days_off_before_next_night_shift_penalty_weight': float(
+            _configured_positive_penalty(
+                settings,
+                'days_off_before_next_night_shift_penalty_weight',
+                DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
+            )
+        ),
+    }
+
+
 def _unique_night_period_rules(settings):
     rules = []
     seen = set()
@@ -827,6 +892,8 @@ def _dedupe_night_minimum_rows(rows):
             {
                 'physician_id': row['physician_id'],
                 'physician': row['physician'],
+                'contract_id': row.get('contract_id'),
+                'contract_name': row.get('contract_name'),
                 'suppressed_period_type': row['period_type'],
                 'kept_period_type': kept['period_type'],
                 'configured_minimum': row['minimum'],
@@ -865,6 +932,7 @@ def _night_minimum_rule_evaluation(instances, physicians, state, contract_by_phy
                     {
                         'physician_id': physician.id,
                         'physician': _physician_display_name(physician),
+                        **_contract_rule_identity(contract),
                         'period_type': rule['period_type'],
                         'period_start': window_start.isoformat(),
                         'period_end': window_end.isoformat(),
@@ -951,6 +1019,10 @@ def _night_block_extension_bonus(instances_by_id, state, contract_by_physician, 
         settings,
         'max_consecutive_night_shifts',
     ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+    min_consecutive = _configured_positive_int(
+        settings,
+        'min_consecutive_night_shifts',
+    )
     projected_blocks = _night_blocks([*physician_nights, instance])
     for block in projected_blocks:
         dates = {item.date for item in block}
@@ -968,9 +1040,20 @@ def _night_block_extension_bonus(instances_by_id, state, contract_by_physician, 
                 'days_off_after_night_block_penalty_weight',
                 DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
             )
+            min_consecutive_penalty = _configured_positive_penalty(
+                settings,
+                'min_consecutive_night_shifts_penalty_weight',
+                DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
+            )
+            min_consecutive_bonus = (
+                min_consecutive_penalty * Decimal(max(min_consecutive - len(block), 1))
+                if min_consecutive is not None and len(block) <= min_consecutive
+                else Decimal('0')
+            )
             return -max(
                 DEFAULT_NIGHT_BLOCK_EXTENSION_BONUS,
                 days_after_penalty * Decimal(min(days_after, max_consecutive)),
+                min_consecutive_bonus,
             )
     return Decimal('0')
 
@@ -1062,6 +1145,7 @@ def _night_violation_report(
                 {
                     'physician_id': physician_id,
                     'physician': _physician_display_name(physician),
+                    **_contract_rule_identity(contract),
                     'violation_type': 'NIGHT_UNDER_MINIMUM',
                     'dates_involved': [],
                     'night_block_dates': [],
@@ -1101,6 +1185,7 @@ def _night_violation_report(
                         {
                             'physician_id': physician_id,
                             'physician': _physician_display_name(physician),
+                            **_contract_rule_identity(contract),
                             'violation_type': 'NIGHT_OVER_MAXIMUM',
                             'dates_involved': [
                                 instance.date.isoformat()
@@ -1147,12 +1232,45 @@ def _night_violation_report(
             settings,
             'max_consecutive_night_shifts',
         ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+        min_consecutive = _configured_positive_int(
+            settings,
+            'min_consecutive_night_shifts',
+        )
+        min_consecutive_penalty = _configured_positive_penalty(
+            settings,
+            'min_consecutive_night_shifts_penalty_weight',
+            DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
+        )
         consecutive_penalty = _configured_positive_penalty(
             settings,
             'max_consecutive_night_shifts_penalty_weight',
             DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
         )
         for block in night_blocks:
+            if min_consecutive is not None and len(block) < min_consecutive:
+                shortfall = min_consecutive - len(block)
+                penalty = Decimal(shortfall) * min_consecutive_penalty
+                score += penalty
+                violations.append(
+                    {
+                        'physician_id': physician_id,
+                        'physician': _physician_display_name(physician),
+                        **_contract_rule_identity(contract),
+                        'violation_type': 'MIN_CONSECUTIVE_NIGHTS',
+                        'dates_involved': _block_dates(block),
+                        'night_block_dates': _block_dates(block),
+                        'night_block_assignments': [
+                            _assignment_debug_payload(instance)
+                            for instance in block
+                        ],
+                        'shift_instance_ids': [instance.id for instance in block],
+                        'configured_limit': min_consecutive,
+                        'actual_value': len(block),
+                        'penalty_weight': float(min_consecutive_penalty),
+                        'penalty': float(penalty),
+                        'explanation': 'Night block is shorter than the configured minimum consecutive nights.',
+                    }
+                )
             if len(block) > max_consecutive:
                 excess = len(block) - max_consecutive
                 penalty = Decimal(excess) * consecutive_penalty
@@ -1161,6 +1279,7 @@ def _night_violation_report(
                     {
                         'physician_id': physician_id,
                         'physician': _physician_display_name(physician),
+                        **_contract_rule_identity(contract),
                         'violation_type': 'MAX_CONSECUTIVE_NIGHTS',
                         'dates_involved': _block_dates(block),
                         'night_block_dates': _block_dates(block),
@@ -1180,7 +1299,7 @@ def _night_violation_report(
                 include_internal_heuristics
                 and
                 len(block) == 1
-                and max_consecutive > 1
+                and (min_consecutive or max_consecutive) > 1
                 and (
                     block[0].date - timedelta(days=1) in assigned_night_dates
                     or block[0].date + timedelta(days=1) in assigned_night_dates
@@ -1231,6 +1350,7 @@ def _night_violation_report(
                         {
                             'physician_id': physician_id,
                             'physician': _physician_display_name(physician),
+                            **_contract_rule_identity(contract),
                             'violation_type': 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
                             'dates_involved': [
                                 *_block_dates(block),
@@ -1280,6 +1400,7 @@ def _night_violation_report(
                         {
                             'physician_id': physician_id,
                             'physician': _physician_display_name(physician),
+                            **_contract_rule_identity(contract),
                             'violation_type': 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK',
                             'dates_involved': [
                                 *_block_dates(prior_block),
@@ -1333,6 +1454,81 @@ def _night_violation_report(
         }
         for physician in physicians
     ]
+    contracts_used_by_physician = [
+        {
+            'physician_id': physician.id,
+            'physician': _physician_display_name(physician),
+            **_contract_rule_identity(contract_by_physician.get(physician.id)),
+        }
+        for physician in physicians
+    ]
+    physicians_without_contract = [
+        {
+            'physician_id': physician.id,
+            'physician': _physician_display_name(physician),
+        }
+        for physician in physicians
+        if contract_by_physician.get(physician.id) is None
+    ]
+    contracts_by_id = {
+        contract.id: contract
+        for contract in contract_by_physician.values()
+        if contract is not None
+    }
+    night_rules_by_contract = [
+        _night_rules_debug_payload(contract)
+        for contract in sorted(contracts_by_id.values(), key=lambda item: (item.name.lower(), item.id))
+    ]
+    night_block_candidates_by_physician = []
+    for physician in physicians:
+        contract = contract_by_physician.get(physician.id)
+        settings = _night_settings(contract) if contract is not None else {}
+        blocks = _night_blocks(night_instances_by_physician[physician.id])
+        night_block_candidates_by_physician.append(
+            {
+                'physician_id': physician.id,
+                'physician': _physician_display_name(physician),
+                **_contract_rule_identity(contract),
+                'min_consecutive_night_shifts': _configured_positive_int(
+                    settings,
+                    'min_consecutive_night_shifts',
+                ),
+                'max_consecutive_night_shifts': _configured_positive_int(
+                    settings,
+                    'max_consecutive_night_shifts',
+                ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS,
+                'assigned_blocks': [
+                    {
+                        'dates': _block_dates(block),
+                        'length': len(block),
+                        'shift_instance_ids': [instance.id for instance in block],
+                    }
+                    for block in blocks
+                ],
+            }
+        )
+
+    def violations_by_contract(violation_type):
+        rows = defaultdict(lambda: {
+            'contract_id': None,
+            'contract_name': None,
+            'violations': 0,
+            'penalty': 0.0,
+        })
+        for violation in violations:
+            if violation['violation_type'] != violation_type:
+                continue
+            key = violation.get('contract_id')
+            row = rows[key]
+            row['contract_id'] = violation.get('contract_id')
+            row['contract_name'] = violation.get('contract_name')
+            row['violations'] += 1
+            row['penalty'] += float(violation.get('penalty', 0))
+        return sorted(
+            rows.values(),
+            key=lambda item: ((item['contract_name'] or '').lower(), item['contract_id'] or 0),
+        )
+
     violation_types = {violation['violation_type'] for violation in violations}
     unresolved_reasons = []
     if 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT' in violation_types:
@@ -1357,6 +1553,28 @@ def _night_violation_report(
         'max_nights_assigned_to_one_physician': max(night_counts.values()) if night_counts else 0,
         'night_minimum_rules_applied': night_minimum_rules_applied,
         'night_minimum_rules_suppressed_as_duplicates': night_minimum_rules_suppressed_as_duplicates,
+        'contracts_used_by_physician': contracts_used_by_physician,
+        'night_rules_by_contract': night_rules_by_contract,
+        'physicians_without_contract': physicians_without_contract,
+        'night_block_candidates_by_physician': night_block_candidates_by_physician,
+        'night_minimum_violations_by_contract': violations_by_contract('NIGHT_UNDER_MINIMUM'),
+        'night_maximum_violations_by_contract': violations_by_contract('NIGHT_OVER_MAXIMUM'),
+        'min_consecutive_night_violations': [
+            violation for violation in violations
+            if violation['violation_type'] == 'MIN_CONSECUTIVE_NIGHTS'
+        ],
+        'max_consecutive_night_violations': [
+            violation for violation in violations
+            if violation['violation_type'] == 'MAX_CONSECUTIVE_NIGHTS'
+        ],
+        'post_night_to_non_night_recovery_violations': [
+            violation for violation in violations
+            if violation['violation_type'] == 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT'
+        ],
+        'post_night_to_next_night_block_recovery_violations': [
+            violation for violation in violations
+            if violation['violation_type'] == 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK'
+        ],
     }
 
 
@@ -1399,6 +1617,7 @@ def _night_block_debug(instances, physicians, state, contract_by_physician):
                 {
                     'physician_id': physician.id,
                     'physician': _physician_display_name(physician),
+                    **_contract_rule_identity(contract_by_physician.get(physician.id)),
                     'blocks': blocks,
                 }
             )
@@ -1421,6 +1640,7 @@ def _night_block_debug(instances, physicians, state, contract_by_physician):
     )
     return {
         'night_blocks_by_physician': blocks_by_physician,
+        'night_blocks_assigned': blocks_by_physician,
         'isolated_night_count': isolated_night_count,
         'night_blocks_count': len(block_lengths),
         'average_night_block_length': (
@@ -2323,6 +2543,7 @@ def _violation_explanation(violation_type):
         'SAME_SHIFT_STREAK': 'Physician is assigned to too many consecutive occurrences of the same shift template.',
         'NIGHT_UNDER_MINIMUM': 'Physician is below the configured minimum night-shift count for the period.',
         'NIGHT_OVER_MAXIMUM': 'Physician is above the configured maximum night-shift count for the period.',
+        'MIN_CONSECUTIVE_NIGHTS': 'Physician is assigned to fewer consecutive night shifts than configured.',
         'MAX_CONSECUTIVE_NIGHTS': 'Physician is assigned to more consecutive night shifts than configured.',
         'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT': 'Physician returned to a non-night shift too soon after a night block.',
         'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK': 'Physician started another night block too soon after the prior night block.',
@@ -2358,6 +2579,8 @@ def _report_violation_row(violation, violation_type=None):
         'period_type': violation.get('period_type'),
         'period_start': violation.get('period_start'),
         'period_end': violation.get('period_end'),
+        'contract_id': violation.get('contract_id'),
+        'contract_name': violation.get('contract_name'),
         'request_id': violation.get('request_id'),
         'request_type': violation.get('request_type'),
         'request_scope': violation.get('request_scope'),
@@ -2737,6 +2960,22 @@ def build_violation_report(schedule_version, optimizer_run=None):
             'violations_recomputed_from_final_assignments': True,
             'stale_violation_rows_dropped': night_report['stale_violation_rows_dropped'],
             'violation_assignment_validation_errors': night_report['violation_assignment_validation_errors'],
+            'contracts_used_by_physician': night_report['contracts_used_by_physician'],
+            'night_rules_by_contract': night_report['night_rules_by_contract'],
+            'physicians_without_contract': night_report['physicians_without_contract'],
+            'night_block_candidates_by_physician': night_report['night_block_candidates_by_physician'],
+            'night_blocks_assigned': _night_block_debug(
+                instances,
+                physicians,
+                state,
+                contract_by_physician,
+            )['night_blocks_assigned'],
+            'night_minimum_violations_by_contract': night_report['night_minimum_violations_by_contract'],
+            'night_maximum_violations_by_contract': night_report['night_maximum_violations_by_contract'],
+            'min_consecutive_night_violations': night_report['min_consecutive_night_violations'],
+            'max_consecutive_night_violations': night_report['max_consecutive_night_violations'],
+            'post_night_to_non_night_recovery_violations': night_report['post_night_to_non_night_recovery_violations'],
+            'post_night_to_next_night_block_recovery_violations': night_report['post_night_to_next_night_block_recovery_violations'],
             'night_minimum_rules_applied': night_report['night_minimum_rules_applied'],
             'night_minimum_rules_suppressed_as_duplicates': night_report['night_minimum_rules_suppressed_as_duplicates'],
             'night_minimum_violations_count': sum(
@@ -4453,6 +4692,16 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             'night_violations_count': final_night_report['night_violations_count'],
             'night_violations': final_night_report['night_violations'],
             'night_unresolved_reasons': final_night_report['night_unresolved_reasons'],
+            'contracts_used_by_physician': final_night_report['contracts_used_by_physician'],
+            'night_rules_by_contract': final_night_report['night_rules_by_contract'],
+            'physicians_without_contract': final_night_report['physicians_without_contract'],
+            'night_block_candidates_by_physician': final_night_report['night_block_candidates_by_physician'],
+            'night_minimum_violations_by_contract': final_night_report['night_minimum_violations_by_contract'],
+            'night_maximum_violations_by_contract': final_night_report['night_maximum_violations_by_contract'],
+            'min_consecutive_night_violations': final_night_report['min_consecutive_night_violations'],
+            'max_consecutive_night_violations': final_night_report['max_consecutive_night_violations'],
+            'post_night_to_non_night_recovery_violations': final_night_report['post_night_to_non_night_recovery_violations'],
+            'post_night_to_next_night_block_recovery_violations': final_night_report['post_night_to_next_night_block_recovery_violations'],
             'night_score_initial': float(initial_night_report['score']),
             'night_score_final': float(final_night_report['score']),
             'night_block_debug_initial': initial_night_block_debug,

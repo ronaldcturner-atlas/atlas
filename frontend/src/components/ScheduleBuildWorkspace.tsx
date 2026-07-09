@@ -315,6 +315,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isGenerating, setIsGenerating] = useState(false)
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
+  const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
   const [showWorkloadDetails, setShowWorkloadDetails] = useState(false)
   const [showOptimizerDebug, setShowOptimizerDebug] = useState(false)
@@ -395,6 +396,29 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const selectedOptimizerRun = context?.selected_optimizer_run ?? null
   const optimizerRuns = context?.optimizer_runs ?? []
 
+  const updateOptimizerRunUrl = (runId: number | null) => {
+    const url = new URL(window.location.href)
+    if (runId) {
+      url.searchParams.set('optimizer_run_id', String(runId))
+    } else {
+      url.searchParams.delete('optimizer_run_id')
+    }
+    window.history.replaceState(null, '', `${url.pathname}${url.search}`)
+  }
+
+  const viewOptimizerRun = async (run: OptimizerRun) => {
+    try {
+      closeAssignments()
+      setError(null)
+      setNotice(null)
+      await fetchContext(run.schedule_version, { optimizerRunId: run.id, quiet: true })
+      updateOptimizerRunUrl(run.id)
+      setNotice(`Viewing Run ${run.run_number}.`)
+    } catch (viewError) {
+      setError(viewError instanceof Error ? viewError.message : 'Unable to view optimizer run.')
+    }
+  }
+
   const activateOptimizerRun = async (runId: number) => {
     const versionId = context?.selected_version?.id
     if (!versionId) {
@@ -414,8 +438,47 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       }
       setNotice(`Run ${(data as OptimizerRun).run_number} is active.`)
       await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
+      updateOptimizerRunUrl(runId)
     } catch (activateError) {
       setError(activateError instanceof Error ? activateError.message : 'Unable to activate optimizer run.')
+    }
+  }
+
+  const deleteOptimizerRun = async (run: OptimizerRun) => {
+    const versionId = context?.selected_version?.id
+    if (!versionId || run.is_active) {
+      return
+    }
+    const confirmed = window.confirm(`Delete Run ${run.run_number}? This removes only that run and its optimizer-created assignments.`)
+    if (!confirmed) {
+      return
+    }
+    try {
+      closeAssignments()
+      setDeletingRunId(run.id)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(`${API_BASE}/optimizer-runs/${run.id}/`, {
+        method: 'DELETE',
+        credentials: 'include',
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to delete optimizer run.'))
+      }
+      const fallbackRun = optimizerRuns.find((item) => item.is_active && item.id !== run.id)
+        ?? optimizerRuns.find((item) => item.id !== run.id)
+        ?? null
+      await fetchContext(versionId, {
+        optimizerRunId: fallbackRun?.id,
+        quiet: true,
+      })
+      updateOptimizerRunUrl(fallbackRun?.id ?? null)
+      setNotice(data?.message ?? `Run ${run.run_number} deleted.`)
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete optimizer run.')
+    } finally {
+      setDeletingRunId(null)
     }
   }
 
@@ -535,6 +598,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       setNotice(data.message)
       await fetchContext(data.schedule_version.id)
+      updateOptimizerRunUrl(null)
     } catch (generateError) {
       setError(generateError instanceof Error ? generateError.message : 'Unable to generate shift instances.')
     } finally {
@@ -586,6 +650,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           rethrow: true,
           optimizerRunId: completedOptimizerRunId,
         })
+        if (completedOptimizerRunId) {
+          updateOptimizerRunUrl(completedOptimizerRunId)
+        }
       } catch {
         if (!optimizeErrorMessage) {
           setError('Optimizer completed, but the Schedule Build Workspace could not refresh.')
@@ -823,7 +890,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     && context.selected_version?.status === 'BUILD'
   const canOptimize = canEditAssignments && context.shift_instances.length > 0
   const canClearAssignments = canEditAssignments && context.shift_instances.length > 0
-  const isMutatingBuild = isGenerating || isOptimizing || clearingAction !== null
+  const isMutatingBuild = isGenerating || isOptimizing || clearingAction !== null || deletingRunId !== null
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -931,22 +998,28 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         <div className="optimizer-runs-panel">
           <div className="optimizer-runs-heading">
             <h3>Optimizer Runs</h3>
+            {selectedOptimizerRun && (
+              <span>Viewing Run {selectedOptimizerRun.run_number}</span>
+            )}
           </div>
           <div className="optimizer-runs-list">
             {optimizerRuns.map((run) => (
-              <div className="optimizer-run-row" key={run.id}>
+              <div
+                className={`optimizer-run-row${selectedOptimizerRun?.id === run.id ? ' optimizer-run-row-selected' : ''}`}
+                key={run.id}
+              >
                 <div>
                   <strong>Run {run.run_number}</strong>
                   <span>{formatScore(run.final_score)} final</span>
                   <span>{formatTimestamp(run.created_at)}</span>
                   <span>Seed {run.seed ?? '-'}</span>
-                  {run.is_active && <span>Active</span>}
+                  <span>{run.is_active ? 'Active' : 'Inactive'}</span>
                 </div>
                 <div className="optimizer-run-actions">
                   <button
                     type="button"
                     className="secondary"
-                    onClick={() => void fetchContext(run.schedule_version, { optimizerRunId: run.id, quiet: true })}
+                    onClick={() => void viewOptimizerRun(run)}
                     disabled={isMutatingBuild}
                   >
                     View
@@ -959,6 +1032,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   >
                     Activate
                   </button>
+                  {!run.is_active && (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void deleteOptimizerRun(run)}
+                      disabled={isMutatingBuild}
+                    >
+                      {deletingRunId === run.id ? 'Deleting...' : 'Delete'}
+                    </button>
+                  )}
                   <a
                     className="secondary build-workspace-link-button"
                     href={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
