@@ -75,6 +75,9 @@ type OptimizerSummary = {
   final_score?: number
   improvement_count?: number
   iterations_run?: number
+  runtime_seconds?: number
+  timed_out?: boolean
+  stopped_reason?: string
   unfilled_shift_count: number
   assignments_made: number
   candidate_rest_rejections?: number
@@ -104,7 +107,7 @@ type OptimizerSummary = {
     facility_distribution_score?: number
     total_score: number
   }
-  debug?: Record<string, unknown>
+  debug?: Record<string, unknown> | string
   request_violations_summary?: {
     violations: number
     rewards: number
@@ -112,11 +115,24 @@ type OptimizerSummary = {
   workload_summary?: Array<{
     physician_id: number
     physician_name: string
+    contract_name?: string | null
     assigned_hours: number
     assigned_shifts: number
     night_shifts?: number
     target_units: 'HOURS' | 'SHIFTS' | null
     target: number | null
+    effective_workload_range?: {
+      period_type: string
+      period_start: string
+      period_end: string
+      units: 'HOURS' | 'SHIFTS'
+      min_value: number | null
+      max_value: number | null
+      debug_warning?: string | null
+    } | null
+    deviation?: number
+    deviation_direction?: string
+    score_contribution?: number
   }>
 }
 
@@ -131,6 +147,7 @@ type OptimizerRun = {
   final_score: string | number | null
   is_active: boolean
   optimizer_summary?: OptimizerSummary
+  optimizer_debug?: OptimizerSummary['debug']
 }
 
 type PopoverPosition = {
@@ -212,8 +229,44 @@ function formatScore(value: string | number | null | undefined) {
   return Number(value).toFixed(1)
 }
 
+function isCompletedOptimizerRun(run: OptimizerRun) {
+  return run.status === 'COMPLETED'
+}
+
+function isTimedOutOptimizerRun(run: OptimizerRun) {
+  return Boolean(run.optimizer_summary?.timed_out || run.optimizer_debug?.timed_out)
+}
+
+function optimizerRunStatusLabel(run: OptimizerRun) {
+  if (isTimedOutOptimizerRun(run)) {
+    return 'FAILED/TIMEOUT'
+  }
+  return run.status
+}
+
+function optimizerRunScoreLabel(run: OptimizerRun) {
+  if (!isCompletedOptimizerRun(run)) {
+    return run.final_score === null || run.final_score === undefined
+      ? 'No completed score'
+      : `${formatScore(run.final_score)} partial score`
+  }
+  return `${formatScore(run.final_score)} final score`
+}
+
 function optimizerRunLabel(run: OptimizerRun) {
+  if (!isCompletedOptimizerRun(run)) {
+    return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+  }
   return `Run ${run.run_number} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+}
+
+function workloadRangeLabel(range: OptimizerSummary['workload_summary'][number]['effective_workload_range']) {
+  if (!range) {
+    return 'No workload range'
+  }
+  const minValue = range.min_value === null || range.min_value === undefined ? '-' : range.min_value
+  const maxValue = range.max_value === null || range.max_value === undefined ? '-' : range.max_value
+  return `${range.period_type} ${minValue}-${maxValue} ${range.units.toLowerCase()}`
 }
 
 function formatTime(value: string) {
@@ -321,11 +374,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
-  const [runSelectorId, setRunSelectorId] = useState<number | null>(null)
+  const [selectedOptimizerRunId, setSelectedOptimizerRunIdState] = useState<number | null>(null)
   const [showRunHistory, setShowRunHistory] = useState(false)
   const [showScoreDetails, setShowScoreDetails] = useState(false)
   const [showWorkloadDetails, setShowWorkloadDetails] = useState(false)
   const [showOptimizerDebug, setShowOptimizerDebug] = useState(false)
+  const [debugCopyStatus, setDebugCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const [summaryCopyStatus, setSummaryCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [assignmentContext, setAssignmentContext] = useState<AssignmentContext | null>(null)
@@ -338,6 +393,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const assignmentPopoverRef = useRef<HTMLDivElement | null>(null)
   const assignmentTriggerRef = useRef<HTMLButtonElement | null>(null)
   const assignmentLoadIdRef = useRef(0)
+  const selectedOptimizerRunIdRef = useRef<number | null>(null)
+
+  const setSelectedOptimizerRunId = (runId: number | null) => {
+    selectedOptimizerRunIdRef.current = runId
+    setSelectedOptimizerRunIdState(runId)
+  }
 
   const closeAssignments = () => {
     assignmentLoadIdRef.current += 1
@@ -349,9 +410,97 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     assignmentTriggerRef.current = null
   }
 
+  const updateOptimizerRunUrl = (runId: number | null) => {
+    const url = new URL(window.location.href)
+    if (runId) {
+      url.searchParams.set('optimizer_run_id', String(runId))
+    } else {
+      url.searchParams.delete('optimizer_run_id')
+    }
+    window.history.replaceState(null, '', `${url.pathname}${url.search}`)
+  }
+
+  const copyTextToClipboard = async (text: string) => {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return
+    }
+
+    const textArea = document.createElement('textarea')
+    textArea.value = text
+    textArea.setAttribute('readonly', 'true')
+    textArea.style.position = 'fixed'
+    textArea.style.left = '-9999px'
+    textArea.style.top = '0'
+    document.body.appendChild(textArea)
+    textArea.focus()
+    textArea.select()
+    const copied = document.execCommand('copy')
+    document.body.removeChild(textArea)
+    if (!copied) {
+      throw new Error('Copy command failed.')
+    }
+  }
+
+  const debugJsonText = () => {
+    if (!optimizerSummary?.debug) {
+      return ''
+    }
+    return typeof optimizerSummary.debug === 'string'
+      ? optimizerSummary.debug
+      : JSON.stringify(optimizerSummary.debug, null, 2)
+  }
+
+  const scoreSummaryText = () => {
+    if (!optimizerSummary) {
+      return ''
+    }
+    const breakdown = optimizerSummary.score_breakdown ?? {}
+    const debug = typeof optimizerSummary.debug === 'string' ? {} : optimizerSummary.debug ?? {}
+    const rows = [
+      ['run id', optimizerSummary.optimizer_run_id ?? selectedOptimizerRunId ?? ''],
+      ['seed', optimizerSummary.seed ?? debug.seed ?? ''],
+      ['initial score', optimizerSummary.initial_score ?? optimizerSummary.total_score],
+      ['final score', optimizerSummary.final_score ?? optimizerSummary.total_score],
+      ['iterations', optimizerSummary.iterations_run ?? 0],
+      ['runtime seconds', optimizerSummary.runtime_seconds ?? debug.runtime_seconds ?? ''],
+      ['request score', breakdown.request_score ?? 0],
+      ['workload score', breakdown.workload_score ?? 0],
+      ['night score', breakdown.night_score ?? 0],
+      ['same shift score', breakdown.same_shift_score ?? 0],
+      ['coverage score', breakdown.coverage_score ?? 0],
+      ['rest / overlap score', `${breakdown.rest_score ?? 0} / ${breakdown.overlap_score ?? 0}`],
+      ['unfilled shifts', optimizerSummary.unfilled_shift_count],
+      ['assignments made', optimizerSummary.assignments_made],
+      ['timed out', optimizerSummary.timed_out ?? debug.timed_out ?? false],
+      ['stopped reason', optimizerSummary.stopped_reason ?? debug.stopped_reason ?? ''],
+    ]
+    return rows.map(([label, value]) => `${label}: ${String(value)}`).join('\n')
+  }
+
+  const copyOptimizerDebug = async () => {
+    try {
+      await copyTextToClipboard(debugJsonText())
+      setDebugCopyStatus('copied')
+      window.setTimeout(() => setDebugCopyStatus('idle'), 1600)
+    } catch {
+      setDebugCopyStatus('failed')
+    }
+  }
+
+  const copyScoreSummary = async () => {
+    try {
+      await copyTextToClipboard(scoreSummaryText())
+      setSummaryCopyStatus('copied')
+      window.setTimeout(() => setSummaryCopyStatus('idle'), 1600)
+    } catch {
+      setSummaryCopyStatus('failed')
+    }
+  }
+
   const fetchContext = async (
     versionId?: number,
-    options: { preserveError?: boolean; quiet?: boolean; rethrow?: boolean; optimizerRunId?: number } = {},
+    options: { preserveError?: boolean; quiet?: boolean; rethrow?: boolean; optimizerRunId?: number | null } = {},
   ) => {
     try {
       if (!options.quiet) {
@@ -364,10 +513,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       if (versionId) {
         params.set('version_id', String(versionId))
       }
-      if (options.optimizerRunId) {
-        params.set('optimizer_run_id', String(options.optimizerRunId))
+      const requestedOptimizerRunId = (
+        options.optimizerRunId !== undefined
+          ? options.optimizerRunId
+          : selectedOptimizerRunIdRef.current
+      )
+      if (requestedOptimizerRunId) {
+        params.set('optimizer_run_id', String(requestedOptimizerRunId))
       }
       const query = params.toString() ? `?${params.toString()}` : ''
+      console.info('Fetching workspace for optimizer_run_id', requestedOptimizerRunId ?? 'active/default')
       const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/${query}`, {
         credentials: 'include',
         cache: 'no-store',
@@ -380,6 +535,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       const nextContext = data as BuildContext
       setContext(nextContext)
       setOptimizerSummary(nextContext.optimizer_summary ?? null)
+      const returnedRunId = nextContext.selected_optimizer_run?.id ?? null
+      if (requestedOptimizerRunId !== undefined || selectedOptimizerRunIdRef.current === null) {
+        setSelectedOptimizerRunId(returnedRunId)
+      }
+      if (requestedOptimizerRunId !== undefined && returnedRunId !== requestedOptimizerRunId) {
+        updateOptimizerRunUrl(returnedRunId)
+      }
       setSelectedDomainId(
         nextContext.selected_version?.domain
         ?? nextContext.domains[0]?.id
@@ -402,25 +564,22 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const selectedOptimizerRun = context?.selected_optimizer_run ?? null
   const optimizerRuns = context?.optimizer_runs ?? []
-  const selectedRunForActions = optimizerRuns.find((run) => run.id === runSelectorId) ?? selectedOptimizerRun
+  const completedOptimizerRuns = optimizerRuns.filter(isCompletedOptimizerRun)
+  const selectedRunForActions = completedOptimizerRuns.find((run) => run.id === selectedOptimizerRunId)
+    ?? selectedOptimizerRun
+  const activeOptimizerRun = optimizerRuns.find((run) => run.is_active) ?? null
 
-  const updateOptimizerRunUrl = (runId: number | null) => {
-    const url = new URL(window.location.href)
-    if (runId) {
-      url.searchParams.set('optimizer_run_id', String(runId))
-    } else {
-      url.searchParams.delete('optimizer_run_id')
+  const selectOptimizerRun = async (run: OptimizerRun) => {
+    if (!isCompletedOptimizerRun(run)) {
+      return
     }
-    window.history.replaceState(null, '', `${url.pathname}${url.search}`)
-  }
-
-  const viewOptimizerRun = async (run: OptimizerRun) => {
     try {
       closeAssignments()
+      setSelectedOptimizerRunId(run.id)
+      updateOptimizerRunUrl(run.id)
       setError(null)
       setNotice(null)
       await fetchContext(run.schedule_version, { optimizerRunId: run.id, quiet: true })
-      updateOptimizerRunUrl(run.id)
       setNotice(`Viewing Run ${run.run_number}.`)
     } catch (viewError) {
       setError(viewError instanceof Error ? viewError.message : 'Unable to view optimizer run.')
@@ -445,8 +604,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         throw new Error(apiError(data, 'Unable to activate optimizer run.'))
       }
       setNotice(`Run ${(data as OptimizerRun).run_number} is active.`)
-      await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
+      setSelectedOptimizerRunId(runId)
       updateOptimizerRunUrl(runId)
+      await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
     } catch (activateError) {
       setError(activateError instanceof Error ? activateError.message : 'Unable to activate optimizer run.')
     }
@@ -457,7 +617,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     if (!versionId || run.is_active) {
       return
     }
-    const confirmed = window.confirm(`Delete Run ${run.run_number}? This removes only that run and its optimizer-created assignments.`)
+    const confirmed = window.confirm('Delete this optimizer run? This cannot be undone.')
     if (!confirmed) {
       return
     }
@@ -474,14 +634,18 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       if (!response.ok) {
         throw new Error(apiError(data, 'Unable to delete optimizer run.'))
       }
-      const fallbackRun = optimizerRuns.find((item) => item.is_active && item.id !== run.id)
-        ?? optimizerRuns.find((item) => item.id !== run.id)
+      const deletedSelectedRun = selectedOptimizerRunId === run.id
+      const currentRun = completedOptimizerRuns.find((item) => item.id === selectedOptimizerRunId && item.id !== run.id)
+      const fallbackRun = completedOptimizerRuns.find((item) => item.is_active && item.id !== run.id)
+        ?? completedOptimizerRuns.find((item) => item.id !== run.id)
         ?? null
+      const nextRun = deletedSelectedRun ? fallbackRun : currentRun
+      setSelectedOptimizerRunId(nextRun?.id ?? null)
+      updateOptimizerRunUrl(nextRun?.id ?? null)
       await fetchContext(versionId, {
-        optimizerRunId: fallbackRun?.id,
+        optimizerRunId: nextRun?.id,
         quiet: true,
       })
-      updateOptimizerRunUrl(fallbackRun?.id ?? null)
       setNotice(data?.message ?? `Run ${run.run_number} deleted.`)
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete optimizer run.')
@@ -493,20 +657,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   useEffect(() => {
     closeAssignments()
     const optimizerRunId = new URLSearchParams(window.location.search).get('optimizer_run_id')
+    const parsedOptimizerRunId = optimizerRunId && Number.isFinite(Number(optimizerRunId))
+      ? Number(optimizerRunId)
+      : null
+    setSelectedOptimizerRunId(parsedOptimizerRunId)
     void fetchContext(undefined, {
-      optimizerRunId: optimizerRunId ? Number(optimizerRunId) : undefined,
+      optimizerRunId: parsedOptimizerRunId,
     })
   }, [blockId])
 
   useEffect(() => {
-    if (selectedOptimizerRun) {
-      setRunSelectorId(selectedOptimizerRun.id)
-    } else if (optimizerRuns.length) {
-      setRunSelectorId(optimizerRuns[0].id)
-    } else {
-      setRunSelectorId(null)
-    }
-  }, [selectedOptimizerRun?.id, optimizerRuns])
+    setDebugCopyStatus('idle')
+    setSummaryCopyStatus('idle')
+  }, [optimizerSummary?.optimizer_run_id, optimizerSummary?.seed])
 
   useEffect(() => {
     if (!assignmentTarget) {
@@ -615,8 +778,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       }
 
       setNotice(data.message)
-      await fetchContext(data.schedule_version.id)
+      setSelectedOptimizerRunId(null)
       updateOptimizerRunUrl(null)
+      await fetchContext(data.schedule_version.id, { optimizerRunId: null })
     } catch (generateError) {
       setError(generateError instanceof Error ? generateError.message : 'Unable to generate shift instances.')
     } finally {
@@ -656,6 +820,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       const summary = data as OptimizerSummary
       completedOptimizerRunId = summary.optimizer_run_id
+      setSelectedOptimizerRunId(completedOptimizerRunId ?? null)
+      updateOptimizerRunUrl(completedOptimizerRunId ?? null)
       setOptimizerSummary(summary)
       setNotice((data as OptimizerSummary).message ?? 'Optimizer v0 completed.')
     } catch (optimizeError) {
@@ -669,9 +835,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           rethrow: true,
           optimizerRunId: completedOptimizerRunId,
         })
-        if (completedOptimizerRunId) {
-          updateOptimizerRunUrl(completedOptimizerRunId)
-        }
       } catch {
         if (!optimizeErrorMessage) {
           setError('Optimizer completed, but the Schedule Build Workspace could not refresh.')
@@ -955,7 +1118,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           <span>Schedule Version</span>
           <select
             value={context.selected_version?.id ?? ''}
-            onChange={(event) => void fetchContext(Number(event.target.value))}
+            onChange={(event) => {
+              setSelectedOptimizerRunId(null)
+              updateOptimizerRunUrl(null)
+              void fetchContext(Number(event.target.value), { optimizerRunId: null })
+            }}
             disabled={!context.versions.length}
           >
             {!context.versions.length && <option value="">No version generated</option>}
@@ -1005,65 +1172,73 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       </div>
 
-      {optimizerRuns.length > 0 && selectedRunForActions && (
+      {optimizerRuns.length > 0 && (
         <div className="optimizer-run-selector-panel">
-          <div className="optimizer-run-selector-main">
-            <label className="facility-field optimizer-run-select">
-              <span>Viewing optimizer run</span>
-              <select
-                value={runSelectorId ?? ''}
-                onChange={(event) => setRunSelectorId(Number(event.target.value))}
-                disabled={isMutatingBuild}
-              >
-                {optimizerRuns.map((run) => (
-                  <option key={run.id} value={run.id}>
-                    {optimizerRunLabel(run)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="optimizer-run-status">
-              {selectedOptimizerRun && (
-                <span>Viewing Run {selectedOptimizerRun.run_number}</span>
-              )}
-              {selectedRunForActions.is_active && <strong>Active</strong>}
-              {!selectedRunForActions.is_active && <span>Inactive</span>}
-            </div>
-            <div className="optimizer-run-actions">
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => void viewOptimizerRun(selectedRunForActions)}
-                disabled={isMutatingBuild || selectedOptimizerRun?.id === selectedRunForActions.id}
-              >
-                View
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => void activateOptimizerRun(selectedRunForActions.id)}
-                disabled={isMutatingBuild || selectedRunForActions.is_active || selectedRunForActions.status !== 'COMPLETED'}
-              >
-                Activate
-              </button>
-              <a
-                className="secondary build-workspace-link-button"
-                href={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
-              >
-                Violations
-              </a>
-              {!selectedRunForActions.is_active && (
-                <button
-                  type="button"
-                  className="secondary danger-action"
-                  onClick={() => void deleteOptimizerRun(selectedRunForActions)}
+          {selectedRunForActions && completedOptimizerRuns.length > 0 && (
+            <div className="optimizer-run-selector-main">
+              <label className="facility-field optimizer-run-select">
+                <span>Viewing optimizer run</span>
+                <select
+                  value={selectedRunForActions.id}
+                  onChange={(event) => {
+                    const nextRun = completedOptimizerRuns.find((run) => run.id === Number(event.target.value))
+                    if (nextRun) {
+                      void selectOptimizerRun(nextRun)
+                    }
+                  }}
                   disabled={isMutatingBuild}
                 >
-                  {deletingRunId === selectedRunForActions.id ? 'Deleting...' : 'Delete'}
+                  {completedOptimizerRuns.map((run) => (
+                    <option key={run.id} value={run.id}>
+                      {optimizerRunLabel(run)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="optimizer-run-status">
+                <span>Viewing Run {selectedRunForActions.run_number}</span>
+                {selectedRunForActions.is_active ? (
+                  <strong>Active</strong>
+                ) : (
+                  <span>Active Run {activeOptimizerRun?.run_number ?? '-'}</span>
+                )}
+              </div>
+              <div className="optimizer-run-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void selectOptimizerRun(selectedRunForActions)}
+                  disabled={isMutatingBuild || selectedOptimizerRunId === selectedRunForActions.id}
+                >
+                  View
                 </button>
-              )}
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void activateOptimizerRun(selectedRunForActions.id)}
+                  disabled={isMutatingBuild || selectedRunForActions.is_active}
+                >
+                  Activate
+                </button>
+                <a
+                  className="secondary build-workspace-link-button"
+                  href={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
+                >
+                  Violations
+                </a>
+                {!selectedRunForActions.is_active && (
+                  <button
+                    type="button"
+                    className="secondary danger-action"
+                    onClick={() => void deleteOptimizerRun(selectedRunForActions)}
+                    disabled={isMutatingBuild}
+                  >
+                    {deletingRunId === selectedRunForActions.id ? 'Deleting...' : 'Delete'}
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+          )}
           <button
             type="button"
             className="secondary optimizer-history-toggle"
@@ -1076,14 +1251,57 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             <div className="optimizer-runs-list">
               {optimizerRuns.map((run) => (
                 <div
-                  className={`optimizer-run-row${selectedOptimizerRun?.id === run.id ? ' optimizer-run-row-selected' : ''}`}
+                  className={`optimizer-run-row${selectedOptimizerRunId === run.id ? ' optimizer-run-row-selected' : ''}`}
                   key={run.id}
                 >
-                  <strong>Run {run.run_number}</strong>
-                  <span>{formatScore(run.final_score)} final</span>
-                  <span>{formatTimestamp(run.created_at)}</span>
-                  <span>Seed {run.seed ?? '-'}</span>
-                  <span>{run.is_active ? 'Active' : 'Inactive'}</span>
+                  <div>
+                    <strong>Run {run.run_number}</strong>
+                    <span>{optimizerRunStatusLabel(run)}</span>
+                    <span>{optimizerRunScoreLabel(run)}</span>
+                    <span>{formatTimestamp(run.created_at)}</span>
+                    <span>Seed {run.seed ?? '-'}</span>
+                    <span>{run.is_active ? 'Active' : 'Inactive'}</span>
+                  </div>
+                  <div className="optimizer-run-row-actions">
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void selectOptimizerRun(run)}
+                      disabled={isMutatingBuild || !isCompletedOptimizerRun(run) || selectedOptimizerRunId === run.id}
+                    >
+                      View
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void activateOptimizerRun(run.id)}
+                      disabled={isMutatingBuild || !isCompletedOptimizerRun(run) || run.is_active}
+                    >
+                      Activate
+                    </button>
+                    {isCompletedOptimizerRun(run) ? (
+                      <a
+                        className="secondary build-workspace-link-button"
+                        href={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
+                      >
+                        Violations
+                      </a>
+                    ) : (
+                      <button type="button" className="secondary" disabled>
+                        Violations
+                      </button>
+                    )}
+                  {!run.is_active && (
+                    <button
+                      type="button"
+                      className="secondary danger-action"
+                      onClick={() => void deleteOptimizerRun(run)}
+                      disabled={isMutatingBuild || run.status === 'RUNNING'}
+                    >
+                      {deletingRunId === run.id ? 'Deleting...' : 'Delete'}
+                    </button>
+                  )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1238,10 +1456,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   const nightCount = item.night_shifts ?? 0
                   return (
                     <div className="optimizer-workload-item" key={item.physician_id}>
-                      <strong>{item.physician_name}</strong>
-                      <span>
-                        {item.assigned_shifts} shifts, {item.assigned_hours.toFixed(1)}h, {nightCount} {nightCount === 1 ? 'night' : 'nights'}
-                      </span>
+                      <div>
+                        <strong>{item.physician_name}</strong>
+                        <span>
+                          {item.assigned_shifts} shifts, {item.assigned_hours.toFixed(1)}h, {nightCount} {nightCount === 1 ? 'night' : 'nights'}
+                        </span>
+                      </div>
+                      <small>
+                        {item.contract_name ?? 'No contract'} · {workloadRangeLabel(item.effective_workload_range)}
+                        {item.score_contribution !== undefined ? ` · score ${item.score_contribution.toFixed(1)}` : ''}
+                      </small>
                     </div>
                   )
                 })}
@@ -1249,9 +1473,35 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           ) : null}
 
           {showOptimizerDebug && optimizerSummary.debug && (
-            <pre className="optimizer-debug-details">
-              {JSON.stringify(optimizerSummary.debug, null, 2)}
-            </pre>
+            <div className="optimizer-debug-panel">
+              <div className="optimizer-debug-toolbar">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void copyOptimizerDebug()}
+                >
+                  {debugCopyStatus === 'copied'
+                    ? 'Copied'
+                    : debugCopyStatus === 'failed'
+                      ? 'Copy failed'
+                      : 'Copy Debug JSON'}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void copyScoreSummary()}
+                >
+                  {summaryCopyStatus === 'copied'
+                    ? 'Copied'
+                    : summaryCopyStatus === 'failed'
+                      ? 'Copy failed'
+                      : 'Copy Score Summary'}
+                </button>
+              </div>
+              <pre className="optimizer-debug-details">
+                {debugJsonText()}
+              </pre>
+            </div>
           )}
         </section>
       )}

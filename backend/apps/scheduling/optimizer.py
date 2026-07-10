@@ -1,5 +1,5 @@
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from datetime import timedelta
 from math import ceil
 import random
@@ -49,7 +49,12 @@ DEFAULT_REQUEST_WEIGHTS = {
 MAX_PHASE_PASSES = 25
 MAX_CANDIDATES_PER_REPAIR = 250
 MAX_GENERAL_SWAPS = 25000
+SAFE_BASELINE_PHASE_PASSES = 1
+SAFE_BASELINE_CANDIDATES_PER_REPAIR = 40
+SAFE_BASELINE_GENERAL_SWAPS = 50
 MAX_RUNTIME_SECONDS = 60
+NIGHT_BLOCK_BUILDER_ENABLED = False
+NIGHT_BLOCK_BUILDER_DISABLED_REASON = 'Disabled after runtime regression'
 
 
 def _physician_display_name(physician):
@@ -153,11 +158,15 @@ def _contract_target(contract, default_hours_target, default_shift_target):
             'units': primary['units'],
             'target': target,
             'rules': rules,
+            'contract_id': contract.id,
+            'contract_name': contract.name,
         }
     return {
         'units': 'HOURS',
         'target': default_hours_target or default_shift_target,
         'rules': [],
+        'contract_id': contract.id,
+        'contract_name': contract.name,
     }
 
 
@@ -385,6 +394,72 @@ def _workload_schedule_score(target, assigned_hours, assigned_shifts):
     return score
 
 
+def _workload_score_for_instances(all_instances, assigned_instances, target):
+    score = Decimal('0')
+    for rule in target.get('rules') or []:
+        for window_start, window_end in _period_windows(all_instances, rule['period_type']):
+            effective_rule = _effective_workload_rule(rule, window_start, window_end)
+            window_instances = [
+                instance
+                for instance in assigned_instances
+                if window_start <= instance.date <= window_end
+            ]
+            assigned_value = (
+                Decimal(len(window_instances))
+                if effective_rule['units'] == 'SHIFTS'
+                else sum((_shift_hours(instance) for instance in window_instances), Decimal('0'))
+            )
+            if effective_rule['min_value'] is not None and assigned_value < effective_rule['min_value']:
+                score += (
+                    effective_rule['min_value'] - assigned_value
+                ) * effective_rule['min_penalty_weight']
+            if effective_rule['max_value'] is not None and assigned_value > effective_rule['max_value']:
+                score += (
+                    assigned_value - effective_rule['max_value']
+                ) * effective_rule['max_penalty_weight']
+    return score
+
+
+def _workload_rule_delta_for_candidate(instances, state, instances_by_id, physician_id, instance, target):
+    if not target.get('rules'):
+        return Decimal('0')
+    assigned_instances = [
+        instances_by_id[assigned_instance_id]
+        for assigned_instance_id, physician_ids in state.items()
+        if physician_id in physician_ids
+        and assigned_instance_id in instances_by_id
+    ]
+    before = _workload_score_for_instances(instances, assigned_instances, target)
+    after = _workload_score_for_instances(instances, [*assigned_instances, instance], target)
+    return after - before
+
+
+def _workload_rule_delta_for_reassignment(instances, state, instances_by_id, from_physician_id, to_physician_id, instance_id, targets):
+    trial_state = _copy_state(state)
+    _replace_in_state(trial_state, instance_id, from_physician_id, to_physician_id)
+    score_before = Decimal('0')
+    score_after = Decimal('0')
+    for physician_id in {from_physician_id, to_physician_id}:
+        target = targets.get(physician_id, {})
+        if not target.get('rules'):
+            continue
+        before_instances = [
+            instances_by_id[assigned_instance_id]
+            for assigned_instance_id, physician_ids in state.items()
+            if physician_id in physician_ids
+            and assigned_instance_id in instances_by_id
+        ]
+        after_instances = [
+            instances_by_id[assigned_instance_id]
+            for assigned_instance_id, physician_ids in trial_state.items()
+            if physician_id in physician_ids
+            and assigned_instance_id in instances_by_id
+        ]
+        score_before += _workload_score_for_instances(instances, before_instances, target)
+        score_after += _workload_score_for_instances(instances, after_instances, target)
+    return score_after - score_before
+
+
 def _workload_score_rows(physicians, instances, state, physician_hours, physician_shifts, physician_night_shifts, targets):
     rows = []
     assigned_by_physician = defaultdict(list)
@@ -403,6 +478,7 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
         rules = (target or {}).get('rules') or []
         for rule in rules:
             for window_start, window_end in _period_windows(instances, rule['period_type']):
+                effective_rule = _effective_workload_rule(rule, window_start, window_end)
                 window_instances = [
                     instance
                     for instance in assigned_by_physician[physician.id]
@@ -410,21 +486,21 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
                 ]
                 assigned_value = (
                     Decimal(len(window_instances))
-                    if rule['units'] == 'SHIFTS'
+                    if effective_rule['units'] == 'SHIFTS'
                     else sum((_shift_hours(instance) for instance in window_instances), Decimal('0'))
                 )
                 deviation = Decimal('0')
                 penalty_weight = Decimal('0')
                 direction = 'inside_range'
                 contribution = Decimal('0')
-                if rule['min_value'] is not None and assigned_value < rule['min_value']:
-                    deviation = rule['min_value'] - assigned_value
-                    penalty_weight = rule['min_penalty_weight']
+                if effective_rule['min_value'] is not None and assigned_value < effective_rule['min_value']:
+                    deviation = effective_rule['min_value'] - assigned_value
+                    penalty_weight = effective_rule['min_penalty_weight']
                     contribution = deviation * penalty_weight
                     direction = 'below_minimum'
-                elif rule['max_value'] is not None and assigned_value > rule['max_value']:
-                    deviation = assigned_value - rule['max_value']
-                    penalty_weight = rule['max_penalty_weight']
+                elif effective_rule['max_value'] is not None and assigned_value > effective_rule['max_value']:
+                    deviation = assigned_value - effective_rule['max_value']
+                    penalty_weight = effective_rule['max_penalty_weight']
                     contribution = deviation * penalty_weight
                     direction = 'above_maximum'
                 score += contribution
@@ -433,10 +509,16 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
                         'period_type': rule['period_type'],
                         'period_start': window_start.isoformat(),
                         'period_end': window_end.isoformat(),
-                        'units': rule['units'],
+                        'units': effective_rule['units'],
                         'assigned_value': float(assigned_value),
-                        'min_value': float(rule['min_value']) if rule['min_value'] is not None else None,
-                        'max_value': float(rule['max_value']) if rule['max_value'] is not None else None,
+                        'raw_min_value': float(effective_rule['raw_min_value']) if effective_rule['raw_min_value'] is not None else None,
+                        'raw_max_value': float(effective_rule['raw_max_value']) if effective_rule['raw_max_value'] is not None else None,
+                        'min_value': float(effective_rule['min_value']) if effective_rule['min_value'] is not None else None,
+                        'max_value': float(effective_rule['max_value']) if effective_rule['max_value'] is not None else None,
+                        'effective_min_value': float(effective_rule['min_value']) if effective_rule['min_value'] is not None else None,
+                        'effective_max_value': float(effective_rule['max_value']) if effective_rule['max_value'] is not None else None,
+                        'proration': effective_rule['proration'],
+                        'debug_warning': effective_rule['debug_warning'],
                         'deviation': float(deviation),
                         'deviation_direction': direction,
                         'penalty_weight': float(penalty_weight),
@@ -449,6 +531,8 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
             {
                 'physician_id': physician.id,
                 'physician': _physician_display_name(physician),
+                'contract_id': target.get('contract_id') if target else None,
+                'contract_name': target.get('contract_name') if target else None,
                 'assigned_shifts': assigned_shifts,
                 'assigned_hours': float(assigned_hours),
                 'night_shifts': physician_night_shifts[physician.id],
@@ -494,15 +578,39 @@ def _build_workload_summary(physicians, physician_hours, physician_shifts, physi
         target = targets.get(physician.id)
         target_value = target['target'] if target else None
         workload_row = workload_rows_by_physician.get(physician.id)
+        primary_rule = (
+            workload_row.get('rule_rows', [None])[0]
+            if workload_row and workload_row.get('rule_rows')
+            else None
+        )
         summary.append(
             {
                 'physician_id': physician.id,
                 'physician_name': _physician_display_name(physician),
+                'contract_id': target.get('contract_id') if target else None,
+                'contract_name': target.get('contract_name') if target else None,
                 'assigned_hours': float(physician_hours[physician.id]),
                 'assigned_shifts': physician_shifts[physician.id],
                 'night_shifts': physician_night_shifts[physician.id],
                 'target_units': target['units'] if target else None,
                 'target': float(target_value) if target_value is not None else None,
+                'raw_workload_rule': primary_rule,
+                'effective_workload_range': (
+                    {
+                        'period_type': primary_rule['period_type'],
+                        'period_start': primary_rule['period_start'],
+                        'period_end': primary_rule['period_end'],
+                        'units': primary_rule['units'],
+                        'min_value': primary_rule['effective_min_value'],
+                        'max_value': primary_rule['effective_max_value'],
+                        'proration': primary_rule['proration'],
+                        'debug_warning': primary_rule['debug_warning'],
+                    }
+                    if primary_rule
+                    else None
+                ),
+                'deviation': workload_row.get('deviation') if workload_row else 0.0,
+                'deviation_direction': workload_row.get('deviation_direction') if workload_row else 'inside_range',
                 'score_contribution': (
                     workload_row['score_contribution']
                     if workload_row is not None
@@ -838,8 +946,13 @@ def _period_contains_date(period_type, period_start, period_end, current_date):
 def _period_windows(instances, period_type):
     if not instances:
         return []
-    period_start = min(instance.date for instance in instances)
-    period_end = max(instance.date for instance in instances)
+    schedule_block = getattr(instances[0], 'schedule_block', None)
+    if schedule_block is not None:
+        period_start = schedule_block.start_date
+        period_end = schedule_block.end_date
+    else:
+        period_start = min(instance.date for instance in instances)
+        period_end = max(instance.date for instance in instances)
     windows = []
     seen = set()
     for instance in instances:
@@ -854,6 +967,56 @@ def _period_windows(instances, period_type):
             seen.add(key)
             windows.append(key)
     return sorted(windows)
+
+
+def _month_bounds(current_date):
+    month_start = current_date.replace(day=1)
+    next_month = (
+        current_date.replace(year=current_date.year + 1, month=1, day=1)
+        if current_date.month == 12
+        else current_date.replace(month=current_date.month + 1, day=1)
+    )
+    return month_start, next_month - timedelta(days=1)
+
+
+def _prorated_decimal(value, ratio, units, bound_type):
+    if value is None:
+        return None
+    prorated = value * ratio
+    if units == 'SHIFTS':
+        rounding = ROUND_FLOOR if bound_type == 'min' else ROUND_CEILING
+        return prorated.to_integral_value(rounding=rounding)
+    return prorated.quantize(Decimal('0.01'))
+
+
+def _effective_workload_rule(rule, window_start, window_end):
+    effective_min = rule['min_value']
+    effective_max = rule['max_value']
+    proration = None
+    debug_warning = None
+    if rule['period_type'] == 'MONTH':
+        month_start, month_end = _month_bounds(window_start)
+        if window_start != month_start or window_end != month_end:
+            days_in_window = Decimal((window_end - window_start).days + 1)
+            days_in_month = Decimal((month_end - month_start).days + 1)
+            ratio = days_in_window / days_in_month
+            effective_min = _prorated_decimal(rule['min_value'], ratio, rule['units'], 'min')
+            effective_max = _prorated_decimal(rule['max_value'], ratio, rule['units'], 'max')
+            proration = {
+                'period_days_in_schedule_block': int(days_in_window),
+                'days_in_month': int(days_in_month),
+                'ratio': float(ratio),
+            }
+            debug_warning = 'Month workload rule prorated for partial-month schedule block.'
+    return {
+        **rule,
+        'raw_min_value': rule['min_value'],
+        'raw_max_value': rule['max_value'],
+        'min_value': effective_min,
+        'max_value': effective_max,
+        'proration': proration,
+        'debug_warning': debug_warning,
+    }
 
 
 def _night_minimum_period_priority(period_type):
@@ -3165,9 +3328,335 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         rest_violations_blocked = 0
         night_block_assignment_attempts = 0
         night_block_assignment_successes = 0
+        night_block_builder_candidates_created = 0
+        night_block_builder_rejections_by_reason = defaultdict(int)
+        night_block_builder_assigned_blocks = []
+        night_block_builder_lengths_assigned = []
+        night_block_builder_score_before = None
+        night_block_builder_score_after = None
+        physicians_below_night_min_before_night_build = []
+        physicians_below_night_min_after_night_build = []
+        night_recovery_conflicts_after_night_build = 0
+        night_distribution_by_physician_after_build = []
         nonnight_assignments_blocked_by_recovery = 0
         nonnight_assignments_allowed_despite_recovery = 0
         open_slots_available = _unfilled_slot_count(instances, state)
+        optimizer_search_started_at = monotonic()
+        timed_out = False
+        phase_running_when_stopped = None
+        candidates_considered_before_timeout = 0
+
+        night_instances = [
+            instance for instance in instances
+            if instance.shift_template.night_shift
+        ]
+        non_night_instances = [
+            instance for instance in instances
+            if not instance.shift_template.night_shift
+        ]
+
+        def night_recovery_conflict_count(report):
+            return sum(
+                1
+                for violation in report['night_violations']
+                if violation['violation_type'] in (
+                    'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
+                    'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK',
+                )
+            )
+
+        def night_distribution_rows(report):
+            return [
+                {
+                    'physician_id': row['physician_id'],
+                    'physician': row['physician'],
+                    'night_shifts': row['night_shifts'],
+                }
+                for row in report['night_shifts_by_physician']
+            ]
+
+        def runtime_seconds_elapsed():
+            return monotonic() - optimizer_search_started_at
+
+        def runtime_exceeded():
+            return runtime_seconds_elapsed() >= MAX_RUNTIME_SECONDS
+
+        def mark_timeout(phase):
+            nonlocal timed_out
+            nonlocal stopped_reason
+            nonlocal phase_running_when_stopped
+            timed_out = True
+            stopped_reason = 'runtime_limit'
+            if phase_running_when_stopped is None:
+                phase_running_when_stopped = phase
+            return True
+
+        def night_rule_window_deficit(status_rows):
+            return sum(
+                max(row['minimum'] - row['actual'], 0)
+                for row in status_rows
+            )
+
+        def block_candidate_lengths(physician_id, available_instances):
+            contract = contract_by_physician.get(physician_id)
+            settings = _night_settings(contract) if contract is not None else {}
+            min_consecutive = _configured_positive_int(
+                settings,
+                'min_consecutive_night_shifts',
+            ) or 1
+            max_consecutive = _configured_positive_int(
+                settings,
+                'max_consecutive_night_shifts',
+            ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+            max_feasible = min(max_consecutive, len(available_instances))
+            preferred = [
+                length
+                for length in range(max_feasible, 0, -1)
+                if min_consecutive <= length <= max_consecutive
+            ]
+            fallback = [
+                length
+                for length in range(max_feasible, 0, -1)
+                if length < min_consecutive
+            ]
+            return preferred + fallback
+
+        def consecutive_night_windows(ordered_night_instances):
+            windows = []
+            ordered = sorted(
+                ordered_night_instances,
+                key=lambda item: (item.date, item.facility.name, item.start_datetime, item.id),
+            )
+            for start_index, start_instance in enumerate(ordered):
+                current = [start_instance]
+                windows.append(list(current))
+                previous = start_instance
+                for next_instance in ordered[start_index + 1:]:
+                    if next_instance.date != previous.date + timedelta(days=1):
+                        break
+                    current.append(next_instance)
+                    windows.append(list(current))
+                    previous = next_instance
+            return windows
+
+        def build_night_blocks():
+            nonlocal assignments_made
+            nonlocal rest_violations_blocked
+            nonlocal night_block_assignment_attempts
+            nonlocal night_block_assignment_successes
+            nonlocal night_block_builder_candidates_created
+            nonlocal night_block_builder_score_before
+            nonlocal night_block_builder_score_after
+            nonlocal physicians_below_night_min_before_night_build
+            nonlocal physicians_below_night_min_after_night_build
+            nonlocal night_recovery_conflicts_after_night_build
+            nonlocal night_distribution_by_physician_after_build
+
+            before_scoring = _score_schedule(
+                instances,
+                physicians,
+                state,
+                targets,
+                contract_by_physician,
+                requests_by_physician_date,
+                eligible_facilities_by_physician,
+                minimum_rest_by_physician,
+                include_internal_night_heuristics=True,
+            )
+            night_block_builder_score_before = float(before_scoring['score'])
+            before_status = _night_minimum_status(
+                instances,
+                physicians,
+                state,
+                contract_by_physician,
+            )
+            physicians_below_night_min_before_night_build = before_status['physicians_under_night_minimum']
+
+            while True:
+                if runtime_exceeded():
+                    mark_timeout('night_block_builder')
+                    break
+                unfilled_nights = [
+                    instance for instance in night_instances
+                    if len(state[instance.id]) < instance.required_staffing
+                ]
+                if not unfilled_nights:
+                    break
+
+                minimum_status = _night_minimum_status(
+                    instances,
+                    physicians,
+                    state,
+                    contract_by_physician,
+                )
+                under_minimum_ids = {
+                    row['physician_id']
+                    for row in minimum_status['physicians_under_night_minimum']
+                }
+                current_under_deficit = night_rule_window_deficit(
+                    minimum_status['physicians_under_night_minimum']
+                )
+                candidates = []
+                windows = shuffle(consecutive_night_windows(unfilled_nights))
+                for physician in shuffle(physicians):
+                    if runtime_exceeded():
+                        mark_timeout('night_block_builder')
+                        break
+                    physician_windows = shuffle(windows)
+                    for window in physician_windows:
+                        if runtime_exceeded():
+                            mark_timeout('night_block_builder')
+                            break
+                        for length in block_candidate_lengths(physician.id, window):
+                            if runtime_exceeded():
+                                mark_timeout('night_block_builder')
+                                break
+                            block = window[:length]
+                            if not block:
+                                continue
+                            night_block_assignment_attempts += 1
+                            trial_state = _copy_state(state)
+                            rejected = None
+                            for instance in block:
+                                if len(trial_state[instance.id]) >= instance.required_staffing:
+                                    rejected = 'filled'
+                                    break
+                                if physician.id in trial_state[instance.id]:
+                                    rejected = 'duplicate'
+                                    break
+                                if instance.facility_id not in eligible_facilities_by_physician.get(physician.id, set()):
+                                    rejected = 'facility_ineligible'
+                                    break
+                                if not _can_assign_in_state(
+                                    trial_state,
+                                    instances_by_id,
+                                    instance,
+                                    physician.id,
+                                    eligible_facilities_by_physician,
+                                    minimum_rest_by_physician,
+                                ):
+                                    rejected = 'rest_or_overlap'
+                                    rest_violations_blocked += 1
+                                    break
+                                _add_to_state(trial_state, instance.id, physician.id)
+                            if rejected is not None:
+                                night_block_builder_rejections_by_reason[rejected] += 1
+                                continue
+
+                            night_block_builder_candidates_created += 1
+                            trial_scoring = _score_schedule(
+                                instances,
+                                physicians,
+                                trial_state,
+                                targets,
+                                contract_by_physician,
+                                requests_by_physician_date,
+                                eligible_facilities_by_physician,
+                                minimum_rest_by_physician,
+                                include_internal_night_heuristics=True,
+                            )
+                            trial_status = _night_minimum_status(
+                                instances,
+                                physicians,
+                                trial_state,
+                                contract_by_physician,
+                            )
+                            trial_report = _night_violation_report(
+                                instances,
+                                physicians,
+                                trial_state,
+                                contract_by_physician,
+                            )
+                            trial_under_deficit = night_rule_window_deficit(
+                                trial_status['physicians_under_night_minimum']
+                            )
+                            candidates.append(
+                                (
+                                    0 if physician.id in under_minimum_ids else 1,
+                                    trial_under_deficit,
+                                    night_recovery_conflict_count(trial_report),
+                                    -len(block),
+                                    trial_scoring['score'],
+                                    rng.random(),
+                                    physician,
+                                    block,
+                                    trial_state,
+                                )
+                            )
+
+                if not candidates:
+                    break
+
+                under_candidates = [
+                    candidate for candidate in candidates
+                    if candidate[0] == 0
+                ]
+                candidate_pool = under_candidates or candidates
+                improving_minimum_candidates = [
+                    candidate for candidate in candidate_pool
+                    if candidate[1] < current_under_deficit
+                ]
+                if improving_minimum_candidates:
+                    candidate_pool = improving_minimum_candidates
+
+                (
+                    _under_priority,
+                    _trial_under_deficit,
+                    _recovery_conflicts,
+                    _negative_length,
+                    _trial_score,
+                    _tie_breaker,
+                    selected_physician,
+                    selected_block,
+                    selected_state,
+                ) = min(candidate_pool)
+                state.clear()
+                state.update(selected_state)
+                assignments_made += len(selected_block)
+                night_block_assignment_successes += len(selected_block)
+                night_block_builder_lengths_assigned.append(len(selected_block))
+                night_block_builder_assigned_blocks.append(
+                    {
+                        'physician_id': selected_physician.id,
+                        'physician': _physician_display_name(selected_physician),
+                        **_contract_rule_identity(contract_by_physician.get(selected_physician.id)),
+                        'length': len(selected_block),
+                        'dates': _block_dates(selected_block),
+                        'shift_instance_ids': [instance.id for instance in selected_block],
+                        'facilities': sorted({
+                            instance.facility.short_name or instance.facility.name
+                            for instance in selected_block
+                        }),
+                    }
+                )
+
+            after_scoring = _score_schedule(
+                instances,
+                physicians,
+                state,
+                targets,
+                contract_by_physician,
+                requests_by_physician_date,
+                eligible_facilities_by_physician,
+                minimum_rest_by_physician,
+                include_internal_night_heuristics=True,
+            )
+            night_block_builder_score_after = float(after_scoring['score'])
+            after_status = _night_minimum_status(
+                instances,
+                physicians,
+                state,
+                contract_by_physician,
+            )
+            physicians_below_night_min_after_night_build = after_status['physicians_under_night_minimum']
+            after_report = _night_violation_report(
+                instances,
+                physicians,
+                state,
+                contract_by_physician,
+            )
+            night_recovery_conflicts_after_night_build = night_recovery_conflict_count(after_report)
+            night_distribution_by_physician_after_build = night_distribution_rows(after_report)
 
         def fill_open_instances(ordered_instances, phase):
             nonlocal assignments_made
@@ -3176,9 +3665,16 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             nonlocal night_block_assignment_successes
             nonlocal nonnight_assignments_blocked_by_recovery
             nonlocal nonnight_assignments_allowed_despite_recovery
+            nonlocal candidates_considered_before_timeout
 
             for instance in ordered_instances:
+                if runtime_exceeded():
+                    mark_timeout(phase)
+                    break
                 while len(state[instance.id]) < instance.required_staffing:
+                    if runtime_exceeded():
+                        mark_timeout(phase)
+                        break
                     if phase == 'night':
                         night_block_assignment_attempts += 1
                     candidates = []
@@ -3195,6 +3691,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                         include_internal_night_heuristics=True,
                     )
                     for physician in shuffle(physicians):
+                        candidates_considered_before_timeout += 1
+                        if runtime_exceeded():
+                            mark_timeout(phase)
+                            break
                         if physician.id in state[instance.id]:
                             continue
                         if instance.facility_id not in eligible_facilities_by_physician.get(physician.id, set()):
@@ -3215,6 +3715,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                         next_hours = current_scoring['physician_hours'][physician.id] + _shift_hours(instance)
                         next_shifts = current_scoring['physician_shifts'][physician.id] + 1
                         workload_score = _workload_candidate_score(target, next_hours, next_shifts)
+                        workload_rule_delta = _workload_rule_delta_for_candidate(
+                            instances,
+                            state,
+                            instances_by_id,
+                            physician.id,
+                            instance,
+                            target,
+                        )
                         same_shift_delta = _same_shift_candidate_delta(
                             instances,
                             physicians,
@@ -3223,36 +3731,42 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                             physician.id,
                             instance,
                         )
-                        night_delta = _night_candidate_delta(
-                            instances,
-                            physicians,
-                            state,
-                            contract_by_physician,
-                            physician.id,
-                            instance,
-                        )
-                        night_block_bonus = _night_block_extension_bonus(
-                            instances_by_id,
-                            state,
-                            contract_by_physician,
-                            physician.id,
-                            instance,
-                        )
-                        night_minimum_bonus = _night_minimum_candidate_bonus(
-                            instances,
-                            state,
-                            contract_by_physician,
-                            physician.id,
-                            instance,
-                        )
-                        recovery_penalty = _night_recovery_candidate_penalty(
-                            instances,
-                            physicians,
-                            state,
-                            contract_by_physician,
-                            physician.id,
-                            instance,
-                        )
+                        if NIGHT_BLOCK_BUILDER_ENABLED:
+                            night_delta = _night_candidate_delta(
+                                instances,
+                                physicians,
+                                state,
+                                contract_by_physician,
+                                physician.id,
+                                instance,
+                            )
+                            night_block_bonus = _night_block_extension_bonus(
+                                instances_by_id,
+                                state,
+                                contract_by_physician,
+                                physician.id,
+                                instance,
+                            )
+                            night_minimum_bonus = _night_minimum_candidate_bonus(
+                                instances,
+                                state,
+                                contract_by_physician,
+                                physician.id,
+                                instance,
+                            )
+                            recovery_penalty = _night_recovery_candidate_penalty(
+                                instances,
+                                physicians,
+                                state,
+                                contract_by_physician,
+                                physician.id,
+                                instance,
+                            )
+                        else:
+                            night_delta = Decimal('0')
+                            night_block_bonus = Decimal('0')
+                            night_minimum_bonus = Decimal('0')
+                            recovery_penalty = Decimal('0')
                         if recovery_penalty > 0:
                             recovery_conflict_candidates += 1
 
@@ -3268,6 +3782,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                         candidates.append(
                             (
                                 recovery_penalty > 0,
+                                workload_rule_delta,
                                 workload_score
                                 + request_score
                                 + same_shift_delta
@@ -3280,7 +3795,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                             )
                         )
 
-                    if not candidates:
+                    if timed_out or not candidates:
                         break
 
                     clean_candidates = [
@@ -3296,6 +3811,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
                     (
                         _has_recovery_conflict,
+                        _workload_rule_delta,
                         _candidate_score,
                         _tie_breaker,
                         selected_physician,
@@ -3305,18 +3821,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                     if phase == 'night':
                         night_block_assignment_successes += 1
 
-        night_instances = [
-            instance for instance in instances
-            if instance.shift_template.night_shift
-        ]
-        non_night_instances = [
-            instance for instance in instances
-            if not instance.shift_template.night_shift
-        ]
+        if NIGHT_BLOCK_BUILDER_ENABLED:
+            build_night_blocks()
         night_instances = shuffle(night_instances)
         non_night_instances = shuffle(non_night_instances)
-        fill_open_instances(night_instances, 'night')
-        fill_open_instances(non_night_instances, 'non_night')
+        if not timed_out:
+            fill_open_instances(night_instances, 'night')
+        if not timed_out:
+            fill_open_instances(non_night_instances, 'non_night')
 
         initial_scoring = _score_schedule(
             instances,
@@ -3347,8 +3859,21 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         final_score = initial_score
         improvement_count = 0
         iterations_run = 0
-        max_passes = MAX_PHASE_PASSES
-        max_swap_attempts_per_pass = MAX_GENERAL_SWAPS
+        max_passes = (
+            MAX_PHASE_PASSES
+            if NIGHT_BLOCK_BUILDER_ENABLED
+            else SAFE_BASELINE_PHASE_PASSES
+        )
+        max_candidates_per_repair = (
+            MAX_CANDIDATES_PER_REPAIR
+            if NIGHT_BLOCK_BUILDER_ENABLED
+            else SAFE_BASELINE_CANDIDATES_PER_REPAIR
+        )
+        max_swap_attempts_per_pass = (
+            MAX_GENERAL_SWAPS
+            if NIGHT_BLOCK_BUILDER_ENABLED
+            else SAFE_BASELINE_GENERAL_SWAPS
+        )
         physician_ids = [physician.id for physician in physicians]
         phase_order = [
             'request_repair',
@@ -3395,13 +3920,6 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         consecutive_day_break_improvements = 0
         swap_attempts = 0
         swap_improvements = 0
-
-        optimizer_search_started_at = None
-
-        def runtime_exceeded():
-            if optimizer_search_started_at is None:
-                return False
-            return monotonic() - optimizer_search_started_at >= MAX_RUNTIME_SECONDS
 
         def score_is_zero():
             current = _score_schedule(
@@ -3526,11 +4044,18 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 include_internal_night_heuristics=True,
             ), trial_state
 
-        minimum_status = _night_minimum_status(
-            instances,
-            physicians,
-            state,
-            contract_by_physician,
+        minimum_status = (
+            _night_minimum_status(
+                instances,
+                physicians,
+                state,
+                contract_by_physician,
+            )
+            if NIGHT_BLOCK_BUILDER_ENABLED
+            else {
+                'physicians_under_night_minimum': [],
+                'physicians_over_night_minimum': [],
+            }
         )
         under_minimum_ids = {
             row['physician_id']
@@ -3541,6 +4066,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             for row in minimum_status['physicians_over_night_minimum']
         }
         for to_physician_id in shuffle(sorted(under_minimum_ids)):
+            if runtime_exceeded():
+                mark_timeout('night_minimum_pre_repair')
+                break
             improved_minimum = False
             night_sources = [
                 (instance_id, from_physician_id)
@@ -3550,6 +4078,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             ]
             night_sources = shuffle(night_sources)
             for instance_id, from_physician_id in night_sources:
+                candidates_considered_before_timeout += 1
+                if runtime_exceeded():
+                    mark_timeout('night_minimum_pre_repair')
+                    break
                 night_minimum_fix_attempts += 1
                 result = try_reassign(instance_id, from_physician_id, to_physician_id)
                 if result is None:
@@ -3595,9 +4127,16 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             non_night_pairs = shuffle(non_night_pairs)
             donor_night_pairs = shuffle(donor_night_pairs)
             for non_night_instance_id, under_physician_id in non_night_pairs:
+                if runtime_exceeded():
+                    mark_timeout('night_minimum_pre_repair')
+                    break
                 if improved_minimum:
                     break
                 for night_instance_id, donor_physician_id in donor_night_pairs:
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('night_minimum_pre_repair')
+                        break
                     night_minimum_fix_attempts += 1
                     trial_state = _copy_state(state)
                     _replace_in_state(
@@ -3668,11 +4207,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                         }
                         break
 
-        optimizer_search_started_at = monotonic()
         for _pass_number in range(max_passes):
             phase_passes_run += 1
-            if _pass_number > 0 and runtime_exceeded():
-                stopped_reason = 'runtime_limit'
+            if runtime_exceeded():
+                mark_timeout('phase_pass')
                 break
             if score_is_zero():
                 stopped_reason = 'score_zero'
@@ -3689,8 +4227,11 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 requests_by_physician_date,
             )
             request_candidates = shuffle(request_candidates)
-            for from_physician_id, instance_id in request_candidates[:MAX_CANDIDATES_PER_REPAIR]:
-                if improved or (_pass_number > 0 and runtime_exceeded()):
+            for from_physician_id, instance_id in request_candidates[:max_candidates_per_repair]:
+                if improved:
+                    break
+                if runtime_exceeded():
+                    mark_timeout('request_repair')
                     break
                 instance = instances_by_id[instance_id]
                 current_for_request = _score_schedule(
@@ -3708,6 +4249,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                     physicians,
                     key=lambda physician: (
                         bool(_requests_for_shift(requests_by_physician_date, physician.id, instance)),
+                        _workload_rule_delta_for_candidate(
+                            instances,
+                            state,
+                            instances_by_id,
+                            physician.id,
+                            instance,
+                            targets[physician.id],
+                        ),
                         _workload_candidate_score(
                             targets[physician.id],
                             current_for_request['physician_hours'][physician.id] + _shift_hours(instance),
@@ -3715,7 +4264,11 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                         ),
                     ),
                 )
-                for physician in ordered_recipients[:MAX_CANDIDATES_PER_REPAIR]:
+                for physician in ordered_recipients[:max_candidates_per_repair]:
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('request_repair')
+                        break
                     if physician.id == from_physician_id:
                         continue
                     iterations_run += 1
@@ -3737,10 +4290,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
             improved = False
             workload_search_improved = True
-            workload_candidate_budget = MAX_CANDIDATES_PER_REPAIR
+            workload_candidate_budget = max_candidates_per_repair
             while workload_search_improved and workload_candidate_budget > 0:
                 if runtime_exceeded():
-                    stopped_reason = 'runtime_limit'
+                    mark_timeout('workload_range_repair')
                     break
                 workload_search_improved = False
                 current_scoring = _score_schedule(
@@ -3762,8 +4315,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 )
                 workload_candidates = shuffle(workload_candidates)
                 for high_physician_id, low_physician_id, instance_id in workload_candidates[:workload_candidate_budget]:
+                    candidates_considered_before_timeout += 1
                     if runtime_exceeded():
-                        stopped_reason = 'runtime_limit'
+                        mark_timeout('workload_range_repair')
                         break
                     if low_physician_id in state[instance_id]:
                         continue
@@ -3813,8 +4367,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 )
                 workload_swap_candidates = shuffle(workload_swap_candidates)
                 for high_physician_id, low_physician_id, high_instance_id, low_instance_id in workload_swap_candidates[:workload_candidate_budget]:
+                    candidates_considered_before_timeout += 1
                     if runtime_exceeded():
-                        stopped_reason = 'runtime_limit'
+                        mark_timeout('workload_range_repair')
                         break
                     iterations_run += 1
                     workload_candidate_budget -= 1
@@ -3846,13 +4401,16 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
             improved = False
 
-            night_sources, night_counts = _night_fix_sources(
-                instances_by_id,
-                physicians,
-                state,
-                manual_pairs,
-                contract_by_physician,
-            )
+            if NIGHT_BLOCK_BUILDER_ENABLED:
+                night_sources, night_counts = _night_fix_sources(
+                    instances_by_id,
+                    physicians,
+                    state,
+                    manual_pairs,
+                    contract_by_physician,
+                )
+            else:
+                night_sources, night_counts = [], {}
             low_night_physicians = [
                 physician.id
                 for physician in random_tie_sorted(
@@ -3865,6 +4423,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             night_sources = shuffle(night_sources)
             for from_physician_id, instance_id in night_sources:
                 if improved:
+                    break
+                if runtime_exceeded():
+                    mark_timeout('night_minimum_repair')
                     break
                 night_instance = instances_by_id[instance_id]
                 ordered_night_recipients = random_tie_sorted(
@@ -3881,6 +4442,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                     ),
                 )
                 for to_physician_id in ordered_night_recipients:
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('night_minimum_repair')
+                        break
                     iterations_run += 1
                     night_fix_attempts += 1
                     phase_attempts['night_minimum_repair'] += 1
@@ -3909,7 +4474,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 for from_physician_id, night_instance_id in night_sources:
                     if improved:
                         break
+                    if runtime_exceeded():
+                        mark_timeout('night_minimum_repair')
+                        break
                     for non_night_instance_id, low_physician_id in non_night_pairs:
+                        candidates_considered_before_timeout += 1
+                        if runtime_exceeded():
+                            mark_timeout('night_minimum_repair')
+                            break
                         if low_physician_id == from_physician_id:
                             continue
                         if night_counts.get(low_physician_id, 0) >= night_counts.get(from_physician_id, 0):
@@ -3994,17 +4566,28 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                     key=lambda row: row[0],
                 )
             ]
-            recovery_conflict_pairs = shuffle(_night_recovery_conflict_pairs(
-                instances,
-                physicians,
-                state,
-                manual_pairs,
-                contract_by_physician,
-            ))
+            recovery_conflict_pairs = (
+                shuffle(_night_recovery_conflict_pairs(
+                    instances,
+                    physicians,
+                    state,
+                    manual_pairs,
+                    contract_by_physician,
+                ))
+                if NIGHT_BLOCK_BUILDER_ENABLED
+                else []
+            )
             for from_physician_id, instance_id in recovery_conflict_pairs:
                 if improved:
                     break
+                if runtime_exceeded():
+                    mark_timeout('post_night_recovery_repair')
+                    break
                 for to_physician_id in low_workload_physicians:
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('post_night_recovery_repair')
+                        break
                     iterations_run += 1
                     night_fix_attempts += 1
                     post_night_recovery_repair_attempts += 1
@@ -4055,7 +4638,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             for from_physician_id, instance_id in same_shift_candidates:
                 if improved:
                     break
+                if runtime_exceeded():
+                    mark_timeout('same_shift_repair')
+                    break
                 for to_physician_id in low_workload_physicians:
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('same_shift_repair')
+                        break
                     iterations_run += 1
                     same_shift_break_attempts += 1
                     phase_attempts['same_shift_repair'] += 1
@@ -4103,7 +4693,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             for from_physician_id, instance_id in consecutive_day_candidates:
                 if improved:
                     break
+                if runtime_exceeded():
+                    mark_timeout('consecutive_day_repair')
+                    break
                 for to_physician_id in low_workload_physicians:
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('consecutive_day_repair')
+                        break
                     iterations_run += 1
                     consecutive_day_break_attempts += 1
                     phase_attempts['consecutive_day_repair'] += 1
@@ -4127,14 +4724,15 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             pairs = shuffle(pairs)
             swap_attempts_this_pass = 0
             for left_index, (left_instance_id, left_physician_id) in enumerate(pairs):
-                if general_swap_attempts > 0 and runtime_exceeded():
-                    stopped_reason = 'runtime_limit'
+                if runtime_exceeded():
+                    mark_timeout('general_hill_climb_swaps')
                     break
                 if swap_attempts_this_pass >= max_swap_attempts_per_pass:
                     break
                 for right_instance_id, right_physician_id in pairs[left_index + 1:]:
-                    if general_swap_attempts > 0 and runtime_exceeded():
-                        stopped_reason = 'runtime_limit'
+                    candidates_considered_before_timeout += 1
+                    if runtime_exceeded():
+                        mark_timeout('general_hill_climb_swaps')
                         break
                     if swap_attempts_this_pass >= max_swap_attempts_per_pass:
                         break
@@ -4324,14 +4922,20 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 return None
             return trial_scoring, trial_state
 
-        repair_status = _night_minimum_status(
-            instances,
-            physicians,
-            state,
-            contract_by_physician,
-        )
-        under_rows = shuffle(repair_status['physicians_under_night_minimum'])
+        if NIGHT_BLOCK_BUILDER_ENABLED:
+            repair_status = _night_minimum_status(
+                instances,
+                physicians,
+                state,
+                contract_by_physician,
+            )
+            under_rows = shuffle(repair_status['physicians_under_night_minimum'])
+        else:
+            under_rows = []
         for under_row in under_rows:
+            if runtime_exceeded():
+                mark_timeout('night_minimum_repair_debug')
+                break
             to_physician_id = under_row['physician_id']
             debug_row = repair_rejection_state(to_physician_id)
             current_scoring = _score_schedule(
@@ -4380,6 +4984,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
             repaired = False
             for _night_count, night_instance_id, donor_physician_id in donor_night_pairs:
+                candidates_considered_before_timeout += 1
+                if runtime_exceeded():
+                    mark_timeout('night_minimum_repair_debug')
+                    break
                 night_minimum_fix_attempts += 1
                 night_minimum_direct_reassignment_attempts += 1
                 phase_attempts['night_minimum_repair'] += 1
@@ -4431,7 +5039,14 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 for non_night_instance_id, under_physician_id in non_night_pairs:
                     if repaired:
                         break
+                    if runtime_exceeded():
+                        mark_timeout('night_minimum_repair_debug')
+                        break
                     for _night_count, night_instance_id, donor_physician_id in donor_night_pairs:
+                        candidates_considered_before_timeout += 1
+                        if runtime_exceeded():
+                            mark_timeout('night_minimum_repair_debug')
+                            break
                         night_minimum_fix_attempts += 1
                         night_minimum_swap_attempts += 1
                         phase_attempts['night_minimum_repair'] += 1
@@ -4561,7 +5176,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
         unfilled_shift_count = _unfilled_slot_count(instances, state)
 
-    if open_slots_available == 0:
+    if timed_out:
+        message = 'Optimizer stopped after runtime limit. Previous active run preserved.'
+    elif open_slots_available == 0:
         message = 'No open slots were available; manual assignments were preserved.'
     elif assignments_made == 0:
         message = 'Optimizer completed, but no eligible open slots could be assigned.'
@@ -4595,9 +5212,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         final_request_rows,
     )
     runtime_seconds = (
-        monotonic() - optimizer_search_started_at
-        if optimizer_search_started_at is not None
-        else 0
+        runtime_seconds_elapsed()
     )
 
     summary = {
@@ -4608,6 +5223,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         'total_score': float(final_score),
         'initial_score': float(initial_score),
         'final_score': float(final_score),
+        'timed_out': timed_out,
+        'stopped_reason': stopped_reason,
+        'runtime_seconds': runtime_seconds,
         'score_breakdown': final_breakdown,
         'same_shift_violations_count': same_shift_violations_final,
         'night_violations_count': final_night_report['night_violations_count'],
@@ -4673,6 +5291,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             'general_swap_improvements': general_swap_improvements,
             'stopped_reason': stopped_reason,
             'runtime_seconds': runtime_seconds,
+            'timed_out': timed_out,
+            'phase_running_when_stopped': phase_running_when_stopped,
+            'candidates_considered_before_timeout': candidates_considered_before_timeout,
+            'partial_result_preserved': timed_out,
             **final_validation,
             'improvement_count': improvement_count,
             'iterations_run': iterations_run,
@@ -4706,6 +5328,24 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             'night_score_final': float(final_night_report['score']),
             'night_block_debug_initial': initial_night_block_debug,
             **final_night_block_debug,
+            'night_block_builder_enabled': NIGHT_BLOCK_BUILDER_ENABLED,
+            'night_block_builder_skipped': not NIGHT_BLOCK_BUILDER_ENABLED,
+            'night_block_builder_disabled_reason': (
+                None
+                if NIGHT_BLOCK_BUILDER_ENABLED
+                else NIGHT_BLOCK_BUILDER_DISABLED_REASON
+            ),
+            'night_shift_instances_considered': len(night_instances),
+            'night_block_candidates_created': night_block_builder_candidates_created,
+            'night_block_builder_blocks_assigned': night_block_builder_assigned_blocks,
+            'night_block_lengths_assigned': night_block_builder_lengths_assigned,
+            'night_block_assignment_rejections_by_reason': dict(night_block_builder_rejections_by_reason),
+            'physicians_below_night_min_before_night_build': physicians_below_night_min_before_night_build,
+            'physicians_below_night_min_after_night_build': physicians_below_night_min_after_night_build,
+            'night_recovery_conflicts_after_night_build': night_recovery_conflicts_after_night_build,
+            'night_distribution_by_physician': night_distribution_by_physician_after_build,
+            'night_block_builder_score_before': night_block_builder_score_before,
+            'night_block_builder_score_after': night_block_builder_score_after,
             'night_minimum_required': final_night_minimum_status['night_minimum_required'],
             'night_minimum_period': final_night_minimum_status['night_minimum_period'],
             'eligible_physicians_for_nights': len(physicians),
@@ -4770,14 +5410,21 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         ),
     }
     with transaction.atomic():
-        OptimizerRun.objects.filter(schedule_version=version, is_active=True).exclude(id=optimizer_run.id).update(is_active=False)
-        optimizer_run.status = OptimizerRun.Status.COMPLETED
+        if not timed_out:
+            OptimizerRun.objects.filter(schedule_version=version, is_active=True).exclude(id=optimizer_run.id).update(is_active=False)
+        optimizer_run.status = (
+            OptimizerRun.Status.FAILED
+            if timed_out
+            else OptimizerRun.Status.COMPLETED
+        )
         optimizer_run.initial_score = summary['initial_score']
         optimizer_run.final_score = summary['final_score']
         optimizer_run.score_breakdown = summary['score_breakdown']
         optimizer_run.optimizer_summary = summary
         optimizer_run.optimizer_debug = summary.get('debug', {})
-        optimizer_run.is_active = True
+        optimizer_run.is_active = not timed_out
+        if timed_out:
+            optimizer_run.notes = 'Optimizer stopped after runtime limit. Previous active run preserved.'
         optimizer_run.save(update_fields=[
             'status',
             'initial_score',
@@ -4787,7 +5434,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             'optimizer_debug',
             'seed',
             'is_active',
+            'notes',
         ])
-        version.optimizer_summary = summary
-        version.save(update_fields=['optimizer_summary', 'updated_at'])
+        if not timed_out:
+            version.optimizer_summary = summary
+            version.save(update_fields=['optimizer_summary', 'updated_at'])
     return summary

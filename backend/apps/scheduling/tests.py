@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
@@ -1465,7 +1466,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertIn('workload_summary', context_payload['optimizer_summary'])
 
-    def test_optimizer_builds_night_block_and_protects_recovery_window(self):
+    def test_optimizer_skips_disabled_night_block_builder_and_keeps_night_debug(self):
         self.block.start_date = date(2026, 7, 1)
         self.block.end_date = date(2026, 7, 4)
         self.block.build_status = ScheduleBlock.BuildStatus.PRE_BUILD
@@ -1538,14 +1539,20 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             ScheduleShiftAssignment.objects.filter(shift_instance__in=day_instances)
             .values_list('physician_id', flat=True)
         )
-        self.assertEqual(len(night_physician_ids), 1)
-        self.assertTrue(night_physician_ids.isdisjoint(day_physician_ids))
-        self.assertEqual(payload['debug']['isolated_night_count'], 0)
-        self.assertEqual(payload['debug']['night_blocks_count'], 1)
-        self.assertEqual(payload['debug']['max_night_block_length'], 2)
-        self.assertEqual(payload['debug']['post_night_recovery_violations_count'], 0)
-        self.assertGreater(payload['debug']['night_block_assignment_attempts'], 0)
-        self.assertGreater(payload['debug']['nonnight_assignments_blocked_by_recovery'], 0)
+        self.assertGreaterEqual(len(night_physician_ids), 1)
+        self.assertGreaterEqual(len(day_physician_ids), 1)
+        self.assertFalse(payload['debug']['night_block_builder_enabled'])
+        self.assertTrue(payload['debug']['night_block_builder_skipped'])
+        self.assertEqual(
+            payload['debug']['night_block_builder_disabled_reason'],
+            'Disabled after runtime regression',
+        )
+        self.assertEqual(payload['debug']['night_block_candidates_created'], 0)
+        self.assertEqual(payload['debug']['night_block_lengths_assigned'], [])
+        self.assertIn('isolated_night_count', payload['debug'])
+        self.assertIn('night_blocks_count', payload['debug'])
+        self.assertIn('max_night_block_length', payload['debug'])
+        self.assertIn('post_night_recovery_violations_count', payload['debug'])
 
     def test_optimizer_prioritizes_configured_night_minimum(self):
         self.block.start_date = date(2026, 7, 1)
@@ -1616,6 +1623,233 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(payload['debug']['night_minimum_required'], 1)
         self.assertEqual(payload['debug']['night_minimum_period'], 'SCHEDULE_BLOCK')
         self.assertGreater(payload['debug']['night_block_assignment_attempts'], 0)
+
+    def test_night_block_builder_is_disabled_by_default_after_safety_rollback(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 3))
+        night_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(19, 0),
+            end_time=time(7, 0),
+            active_days_of_week=['Wednesday', 'Thursday', 'Friday'],
+            weekend_days=[],
+            night_shift=True,
+            default_staffing_count=1,
+            active=True,
+        )
+        block_physician = self._create_assignment_physician(
+            'night.builder.block@example.com',
+            'Night Builder Block',
+            facilities=[self.facility],
+        )
+        optional_physician = self._create_assignment_physician(
+            'night.builder.optional@example.com',
+            'Night Builder Optional',
+            facilities=[self.facility],
+        )
+        block_contract = Contract.objects.get(user_assignments__physician=block_physician)
+        block_contract.night_settings = {
+            'period_rules': [
+                {
+                    'period_type': 'SCHEDULE_BLOCK',
+                    'min_shifts': '2',
+                    'min_penalty_weight': '50000',
+                }
+            ],
+            'min_consecutive_night_shifts': '2',
+            'max_consecutive_night_shifts': '3',
+        }
+        block_contract.save(update_fields=['night_settings', 'updated_at'])
+        optional_contract = Contract.objects.get(user_assignments__physician=optional_physician)
+        optional_contract.night_settings = {
+            'period_rules': [
+                {
+                    'period_type': 'SCHEDULE_BLOCK',
+                    'min_shifts': '0',
+                    'min_penalty_weight': '50000',
+                }
+            ],
+            'min_consecutive_night_shifts': '2',
+            'max_consecutive_night_shifts': '3',
+        }
+        optional_contract.save(update_fields=['night_settings', 'updated_at'])
+        for day in [1, 2, 3]:
+            self._create_shift_instance(version, night_template, date(2026, 7, day))
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 606},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload['debug']['night_block_builder_enabled'])
+        self.assertTrue(payload['debug']['night_block_builder_skipped'])
+        self.assertEqual(
+            payload['debug']['night_block_builder_disabled_reason'],
+            'Disabled after runtime regression',
+        )
+        self.assertEqual(payload['debug']['night_shift_instances_considered'], 3)
+        self.assertEqual(payload['debug']['night_block_candidates_created'], 0)
+        self.assertGreater(payload['debug']['night_block_assignment_successes'], 0)
+        self.assertEqual(payload['debug']['night_block_lengths_assigned'], [])
+        block_night_dates = set(
+            ScheduleShiftAssignment.objects.filter(
+                shift_instance__schedule_version=version,
+                shift_instance__shift_template=night_template,
+                physician=block_physician,
+            ).values_list('shift_instance__date', flat=True)
+        )
+        self.assertTrue({date(2026, 7, 1), date(2026, 7, 2)}.issubset(block_night_dates) or {
+            date(2026, 7, 2),
+            date(2026, 7, 3),
+        }.issubset(block_night_dates))
+        optional_night_count = ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_version=version,
+            shift_instance__shift_template=night_template,
+            physician=optional_physician,
+        ).count()
+        self.assertLessEqual(optional_night_count, 1)
+        self.assertEqual(payload['debug']['score_audit']['warnings'], [])
+
+    def test_night_block_builder_respects_max_consecutive_and_facility_eligibility(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 4))
+        night_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(19, 0),
+            end_time=time(7, 0),
+            active_days_of_week=['Wednesday', 'Thursday', 'Friday', 'Saturday'],
+            weekend_days=[],
+            night_shift=True,
+            default_staffing_count=1,
+            active=True,
+        )
+        first = self._create_assignment_physician(
+            'night.builder.max.first@example.com',
+            'Night Builder Max First',
+            facilities=[self.facility],
+        )
+        second = self._create_assignment_physician(
+            'night.builder.max.second@example.com',
+            'Night Builder Max Second',
+            facilities=[self.facility],
+        )
+        ineligible = self._create_assignment_physician(
+            'night.builder.max.ineligible@example.com',
+            'Night Builder Max Ineligible',
+            facilities=[],
+        )
+        for physician in [first, second, ineligible]:
+            contract = Contract.objects.get(user_assignments__physician=physician)
+            contract.night_settings = {
+                'period_rules': [
+                    {
+                        'period_type': 'SCHEDULE_BLOCK',
+                        'min_shifts': '2' if physician != ineligible else '0',
+                        'min_penalty_weight': '50000',
+                    }
+                ],
+                'min_consecutive_night_shifts': '2',
+                'max_consecutive_night_shifts': '2',
+                'max_consecutive_night_shifts_penalty_weight': '50000',
+            }
+            contract.save(update_fields=['night_settings', 'updated_at'])
+        for day in [1, 2, 3, 4]:
+            self._create_shift_instance(version, night_template, date(2026, 7, day))
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 707},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload['unfilled_shift_count'], 0)
+        for physician in [first, second]:
+            night_dates = list(
+                ScheduleShiftAssignment.objects.filter(
+                    shift_instance__schedule_version=version,
+                    shift_instance__shift_template=night_template,
+                    physician=physician,
+                )
+                .order_by('shift_instance__date')
+                .values_list('shift_instance__date', flat=True)
+            )
+            self.assertEqual(len(night_dates), 2)
+            self.assertEqual(night_dates[1], night_dates[0] + timedelta(days=1))
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(
+                shift_instance__schedule_version=version,
+                shift_instance__shift_template=night_template,
+                physician=ineligible,
+            ).exists()
+        )
+        self.assertEqual(payload['debug']['max_consecutive_night_violations'], [])
+        self.assertEqual(payload['debug']['night_block_assignment_rejections_by_reason'], {})
+
+    def test_night_block_builder_preserves_manual_night_assignment(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 3))
+        night_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(19, 0),
+            end_time=time(7, 0),
+            active_days_of_week=['Wednesday', 'Thursday', 'Friday'],
+            weekend_days=[],
+            night_shift=True,
+            default_staffing_count=1,
+            active=True,
+        )
+        manual = self._create_assignment_physician(
+            'night.builder.manual@example.com',
+            'Night Builder Manual',
+            facilities=[self.facility],
+        )
+        backup = self._create_assignment_physician(
+            'night.builder.backup@example.com',
+            'Night Builder Backup',
+            facilities=[self.facility],
+        )
+        for physician in [manual, backup]:
+            contract = Contract.objects.get(user_assignments__physician=physician)
+            contract.night_settings = {
+                'period_rules': [
+                    {
+                        'period_type': 'SCHEDULE_BLOCK',
+                        'min_shifts': '2',
+                        'min_penalty_weight': '50000',
+                    }
+                ],
+                'min_consecutive_night_shifts': '2',
+                'max_consecutive_night_shifts': '3',
+            }
+            contract.save(update_fields=['night_settings', 'updated_at'])
+        first_night = self._create_shift_instance(version, night_template, date(2026, 7, 1))
+        for day in [2, 3]:
+            self._create_shift_instance(version, night_template, date(2026, 7, day))
+        manual_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=first_night,
+            physician=manual,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 808},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        manual_assignment.refresh_from_db()
+        self.assertEqual(manual_assignment.shift_instance_id, first_night.id)
+        self.assertEqual(manual_assignment.physician_id, manual.id)
+        manual_night_count = ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_version=version,
+            shift_instance__shift_template=night_template,
+            physician=manual,
+        ).count()
+        self.assertGreaterEqual(manual_night_count, 1)
 
     def test_optimizer_reruns_create_history_and_active_view_does_not_overstaff(self):
         self.client.post(
@@ -1996,6 +2230,203 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertTrue(OptimizerRun.objects.filter(id=active_run.id).exists())
 
+    def test_delete_failed_optimizer_run_succeeds_without_touching_active_run(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(4):
+            self._create_assignment_physician(
+                f'failed-delete{index}@example.com',
+                f'Failed Delete {index}',
+                facilities=[self.facility],
+            )
+        completed_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 451},
+            format='json',
+        )
+        active_run = OptimizerRun.objects.get(id=completed_response.json()['optimizer_run_id'])
+        active_assignment_count = ScheduleShiftAssignment.objects.filter(optimizer_run=active_run).count()
+        failed_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=active_run.run_number + 1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.FAILED,
+            seed=452,
+        )
+        failed_assignment = ScheduleShiftAssignment.objects.filter(optimizer_run=active_run).first()
+        if failed_assignment is not None:
+            failed_assignment.id = None
+            failed_assignment.optimizer_run = failed_run
+            failed_assignment.assignment_source = ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+            failed_assignment.save()
+
+        delete_response = self.client.delete(f'/api/optimizer-runs/{failed_run.id}/')
+
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertFalse(OptimizerRun.objects.filter(id=failed_run.id).exists())
+        active_run.refresh_from_db()
+        self.assertTrue(active_run.is_active)
+        self.assertEqual(ScheduleShiftAssignment.objects.filter(optimizer_run=active_run).count(), active_assignment_count)
+
+    def test_delete_fresh_running_optimizer_run_is_blocked(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        running_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            seed=453,
+        )
+
+        delete_response = self.client.delete(f'/api/optimizer-runs/{running_run.id}/')
+
+        self.assertEqual(delete_response.status_code, 400)
+        self.assertTrue(OptimizerRun.objects.filter(id=running_run.id).exists())
+
+    def test_build_context_ignores_failed_latest_optimizer_run(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(4):
+            self._create_assignment_physician(
+                f'failed-latest{index}@example.com',
+                f'Failed Latest {index}',
+                facilities=[self.facility],
+            )
+        completed_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 501},
+            format='json',
+        )
+        active_run = OptimizerRun.objects.get(id=completed_response.json()['optimizer_run_id'])
+        failed_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=active_run.run_number + 1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.FAILED,
+            seed=999,
+        )
+
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?optimizer_run_id={failed_run.id}'
+        )
+
+        self.assertEqual(context_response.status_code, 200)
+        payload = context_response.json()
+        self.assertEqual(payload['selected_optimizer_run']['id'], active_run.id)
+        self.assertNotEqual(payload['selected_optimizer_run']['id'], failed_run.id)
+        active_run.refresh_from_db()
+        self.assertTrue(active_run.is_active)
+
+    def test_stale_running_optimizer_run_is_marked_failed_and_ignored(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        stale_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            seed=111,
+        )
+        OptimizerRun.objects.filter(id=stale_run.id).update(
+            created_at=timezone.now() - timedelta(minutes=11)
+        )
+
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/')
+
+        self.assertEqual(context_response.status_code, 200)
+        stale_run.refresh_from_db()
+        self.assertEqual(stale_run.status, OptimizerRun.Status.FAILED)
+        self.assertFalse(stale_run.is_active)
+        self.assertIsNone(context_response.json()['selected_optimizer_run'])
+
+    def test_concurrent_optimizer_run_is_blocked(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        running_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            seed=222,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['optimizer_run_id'], running_run.id)
+        running_run.refresh_from_db()
+        self.assertEqual(running_run.status, OptimizerRun.Status.RUNNING)
+
+    def test_optimizer_timeout_does_not_replace_previous_active_run(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(4):
+            self._create_assignment_physician(
+                f'timeout-safe{index}@example.com',
+                f'Timeout Safe {index}',
+                facilities=[self.facility],
+            )
+        completed_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 601},
+            format='json',
+        )
+        active_run = OptimizerRun.objects.get(id=completed_response.json()['optimizer_run_id'])
+
+        with patch('apps.scheduling.optimizer.MAX_RUNTIME_SECONDS', 0):
+            timeout_response = self.client.post(
+                f'/api/schedule-versions/{version.id}/run-optimizer/',
+                data={'seed': 602},
+                format='json',
+            )
+
+        self.assertEqual(timeout_response.status_code, 200)
+        timeout_payload = timeout_response.json()
+        self.assertTrue(timeout_payload['timed_out'])
+        self.assertEqual(
+            timeout_payload['message'],
+            'Optimizer stopped after runtime limit. Previous active run preserved.',
+        )
+        self.assertFalse(timeout_payload['debug']['night_block_builder_enabled'])
+        self.assertTrue(timeout_payload['debug']['night_block_builder_skipped'])
+        self.assertEqual(
+            timeout_payload['debug']['night_block_builder_disabled_reason'],
+            'Disabled after runtime regression',
+        )
+        timeout_run = OptimizerRun.objects.get(id=timeout_payload['optimizer_run_id'])
+        self.assertEqual(timeout_run.status, OptimizerRun.Status.FAILED)
+        self.assertFalse(timeout_run.is_active)
+        active_run.refresh_from_db()
+        self.assertTrue(active_run.is_active)
+
     def test_optimizer_balances_unbalanced_workload_scoring(self):
         self.day_template.default_staffing_count = 1
         self.day_template.save(update_fields=['default_staffing_count'])
@@ -2235,6 +2666,146 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(workload_rows[physicians[2].id]['deviation'], 8.0)
         self.assertEqual(workload_rows[physicians[2].id]['score_contribution'], 80000.0)
         self.assertEqual(float(scoring['breakdown']['workload_score']), 80000.0)
+
+    def test_lower_workload_contract_limits_initial_allocation(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 6))
+        day_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(16, 0),
+            active_days_of_week=['Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday', 'Monday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        low = self._create_assignment_physician(
+            'lower.contract@example.com',
+            'Lower Contract',
+            facilities=[self.facility],
+        )
+        full_one = self._create_assignment_physician(
+            'full.contract.one@example.com',
+            'Full Contract One',
+            facilities=[self.facility],
+        )
+        full_two = self._create_assignment_physician(
+            'full.contract.two@example.com',
+            'Full Contract Two',
+            facilities=[self.facility],
+        )
+        low_contract = Contract.objects.get(user_assignments__physician=low)
+        low_contract.workload_settings = {
+            'period_rules': [
+                {
+                    'period_type': 'SCHEDULE_BLOCK',
+                    'units': 'SHIFTS',
+                    'min_value': '0',
+                    'max_value': '1',
+                    'max_penalty_weight': '50000',
+                }
+            ]
+        }
+        low_contract.save(update_fields=['workload_settings', 'updated_at'])
+        for physician in [full_one, full_two]:
+            contract = Contract.objects.get(user_assignments__physician=physician)
+            contract.workload_settings = {
+                'period_rules': [
+                    {
+                        'period_type': 'SCHEDULE_BLOCK',
+                        'units': 'SHIFTS',
+                        'min_value': '2',
+                        'max_value': '6',
+                        'max_penalty_weight': '50000',
+                    }
+                ]
+            }
+            contract.save(update_fields=['workload_settings', 'updated_at'])
+        for day in range(1, 7):
+            self._create_shift_instance(version, day_template, date(2026, 7, day))
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 901},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        counts = dict(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run_id=response.json()['optimizer_run_id'],
+            )
+            .values('physician_id')
+            .annotate(row_count=Count('id'))
+            .values_list('physician_id', 'row_count')
+        )
+        self.assertLessEqual(counts.get(low.id, 0), 1)
+        self.assertGreaterEqual(counts.get(full_one.id, 0) + counts.get(full_two.id, 0), 5)
+        summary = {
+            row['physician_id']: row
+            for row in response.json()['workload_summary']
+        }
+        self.assertEqual(summary[low.id]['contract_name'], 'Lower Contract Contract')
+        self.assertEqual(summary[low.id]['effective_workload_range']['max_value'], 1.0)
+
+    def test_month_workload_rule_is_prorated_for_partial_schedule_block(self):
+        version = self._create_build_version(date(2026, 11, 1), date(2026, 11, 14))
+        day_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(16, 0),
+            active_days_of_week=['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        physician = self._create_assignment_physician(
+            'month.prorated@example.com',
+            'Month Prorated',
+            facilities=[self.facility],
+        )
+        contract = Contract.objects.get(user_assignments__physician=physician)
+        contract.workload_settings = {
+            'period_rules': [
+                {
+                    'period_type': 'MONTH',
+                    'units': 'SHIFTS',
+                    'min_value': '20',
+                    'max_value': '35',
+                },
+                {
+                    'period_type': 'SCHEDULE_BLOCK',
+                    'units': 'SHIFTS',
+                    'min_value': '1',
+                    'max_value': '14',
+                },
+            ]
+        }
+        contract.save(update_fields=['workload_settings', 'updated_at'])
+        for day in range(1, 11):
+            self._create_shift_instance(version, day_template, date(2026, 11, day))
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 902},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        row = response.json()['debug']['workload_score_rows'][0]
+        month_rule = next(item for item in row['rule_rows'] if item['period_type'] == 'MONTH')
+        block_rule = next(item for item in row['rule_rows'] if item['period_type'] == 'SCHEDULE_BLOCK')
+        self.assertEqual(month_rule['raw_min_value'], 20.0)
+        self.assertEqual(month_rule['raw_max_value'], 35.0)
+        self.assertEqual(month_rule['effective_min_value'], 9.0)
+        self.assertEqual(month_rule['effective_max_value'], 17.0)
+        self.assertIsNotNone(month_rule['proration'])
+        self.assertEqual(block_rule['effective_min_value'], 1.0)
+        self.assertEqual(block_rule['effective_max_value'], 14.0)
+        summary_row = response.json()['workload_summary'][0]
+        self.assertEqual(summary_row['contract_name'], 'Month Prorated Contract')
+        self.assertEqual(summary_row['effective_workload_range']['min_value'], 9.0)
 
     def test_night_days_off_after_scores_next_assignment_once(self):
         self.block.start_date = date(2026, 7, 1)

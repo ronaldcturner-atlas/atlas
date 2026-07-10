@@ -40,6 +40,9 @@ from .serializers import (
 )
 
 
+STALE_OPTIMIZER_RUN_MINUTES = 10
+
+
 class CsrfExemptSessionAuthentication(SessionAuthentication):
     def enforce_csrf(self, request):
         return
@@ -933,14 +936,40 @@ def _schedule_version_queryset(block):
 
 
 def _active_optimizer_run(version):
-    return version.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
+    return version.optimizer_runs.filter(
+        is_active=True,
+        status=OptimizerRun.Status.COMPLETED,
+    ).order_by('-run_number').first()
+
+
+def _cleanup_stale_optimizer_runs(version):
+    stale_before = timezone.now() - timedelta(minutes=STALE_OPTIMIZER_RUN_MINUTES)
+    stale_runs = OptimizerRun.objects.filter(
+        schedule_version=version,
+        status=OptimizerRun.Status.RUNNING,
+        created_at__lt=stale_before,
+    )
+    stale_count = stale_runs.count()
+    if stale_count:
+        stale_runs.update(
+            status=OptimizerRun.Status.FAILED,
+            is_active=False,
+            notes='Optimizer marked failed after exceeding stale running threshold.',
+        )
+    return stale_count
+
+
+def _blocking_optimizer_run(version):
+    _cleanup_stale_optimizer_runs(version)
+    return version.optimizer_runs.filter(status=OptimizerRun.Status.RUNNING).order_by('-run_number').first()
 
 
 def _default_optimizer_run(version):
+    _cleanup_stale_optimizer_runs(version)
     active_run = _active_optimizer_run(version)
     if active_run is not None:
         return active_run
-    return version.optimizer_runs.order_by('-run_number').first()
+    return version.optimizer_runs.filter(status=OptimizerRun.Status.COMPLETED).order_by('-run_number').first()
 
 
 def _get_optimizer_run_for_version(version, run_id):
@@ -950,7 +979,12 @@ def _get_optimizer_run_for_version(version, run_id):
         parsed_run_id = int(run_id)
     except (TypeError, ValueError):
         return None
-    return OptimizerRun.objects.filter(id=parsed_run_id, schedule_version=version).first()
+    run = OptimizerRun.objects.filter(id=parsed_run_id, schedule_version=version).first()
+    if run is None:
+        return None
+    if run.status != OptimizerRun.Status.COMPLETED:
+        return _default_optimizer_run(version)
+    return run
 
 
 def _visible_assignment_filter(optimizer_run):
@@ -1128,6 +1162,15 @@ def schedule_version_optimize(request, block_id, version_id):
     seed, seed_error = _parse_optimizer_seed(request)
     if seed_error:
         return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    running_run = _blocking_optimizer_run(version)
+    if running_run is not None:
+        return Response(
+            {
+                'detail': 'An optimizer run is already running for this schedule version.',
+                'optimizer_run_id': running_run.id,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
     try:
         summary = optimize_schedule_version(version, created_by=request.user, seed=seed)
     except ValueError as optimizer_error:
@@ -1147,6 +1190,7 @@ def schedule_version_optimizer_runs(request, version_id):
         return _build_workspace_forbidden_response()
 
     version = get_object_or_404(ScheduleVersion, id=version_id)
+    _cleanup_stale_optimizer_runs(version)
     runs = OptimizerRun.objects.filter(schedule_version=version).order_by('-run_number')
     return Response(OptimizerRunSerializer(runs, many=True).data)
 
@@ -1165,6 +1209,15 @@ def schedule_version_run_optimizer(request, version_id):
     seed, seed_error = _parse_optimizer_seed(request)
     if seed_error:
         return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    running_run = _blocking_optimizer_run(version)
+    if running_run is not None:
+        return Response(
+            {
+                'detail': 'An optimizer run is already running for this schedule version.',
+                'optimizer_run_id': running_run.id,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
     try:
         summary = optimize_schedule_version(version, created_by=request.user, seed=seed)
     except ValueError as optimizer_error:
@@ -1192,6 +1245,14 @@ def optimizer_run_detail(request, run_id):
                 {'detail': 'Cannot delete active optimizer run. Activate another run first.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if optimizer_run.status == OptimizerRun.Status.RUNNING:
+            _cleanup_stale_optimizer_runs(optimizer_run.schedule_version)
+            optimizer_run.refresh_from_db()
+            if optimizer_run.status == OptimizerRun.Status.RUNNING:
+                return Response(
+                    {'detail': 'Cannot delete a running optimizer run until it is stale or failed.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         with transaction.atomic():
             deleted_assignment_count, _ = ScheduleShiftAssignment.objects.filter(
                 optimizer_run=optimizer_run,
