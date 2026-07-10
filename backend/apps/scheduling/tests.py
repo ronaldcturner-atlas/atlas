@@ -25,11 +25,61 @@ from .models import (
     ScheduleVersion,
     ShiftTemplate,
 )
-from .optimizer import _night_violation_report, _score_schedule, _validated_night_report_for_current_assignments
+from .optimizer import (
+    _initial_fill_workload_guard,
+    _night_violation_report,
+    _score_schedule,
+    _validated_night_report_for_current_assignments,
+)
 from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
+    def test_initial_fill_workload_guard_ranks_above_max_below_inside_range(self):
+        window_start = date(2026, 7, 1)
+        window_end = date(2026, 7, 31)
+        range_row = {
+            'period_type': 'SCHEDULE_BLOCK',
+            'units': 'SHIFTS',
+            'min_value': Decimal('2'),
+            'max_value': Decimal('4'),
+            'window_start': window_start,
+            'window_end': window_end,
+        }
+        reduced_rank, reduced_debug = _initial_fill_workload_guard(
+            [range_row],
+            {'date': window_start, 'values': {(window_start, window_end, 'SHIFTS'): Decimal('4')}},
+            Decimal('8'),
+        )
+        full_rank, _full_debug = _initial_fill_workload_guard(
+            [{**range_row, 'max_value': Decimal('8')}],
+            {'date': window_start, 'values': {(window_start, window_end, 'SHIFTS'): Decimal('4')}},
+            Decimal('8'),
+        )
+
+        self.assertGreater(reduced_rank, full_rank)
+        self.assertEqual(reduced_debug['after'], 5.0)
+
+    def test_initial_fill_workload_guard_does_not_block_only_valid_candidate(self):
+        window_start = date(2026, 7, 1)
+        window_end = date(2026, 7, 31)
+        rank, debug = _initial_fill_workload_guard(
+            [{
+                'period_type': 'SCHEDULE_BLOCK',
+                'units': 'HOURS',
+                'min_value': Decimal('0'),
+                'max_value': Decimal('8'),
+                'window_start': window_start,
+                'window_end': window_end,
+            }],
+            {'date': window_start, 'values': {(window_start, window_end, 'HOURS'): Decimal('8')}},
+            Decimal('8'),
+        )
+
+        valid_candidates = [(rank, 'reduced-contract-physician')]
+        self.assertEqual(min(valid_candidates)[1], 'reduced-contract-physician')
+        self.assertEqual(debug['ranking_penalty'], 2)
+
     def test_shift_template_generated_name_uses_facility_short_name(self):
         facility = Facility.objects.create(name='Berkeley Hospital', short_name='Berkeley')
         template = ShiftTemplate.objects.create(

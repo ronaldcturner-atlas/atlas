@@ -434,6 +434,42 @@ def _workload_rule_delta_for_candidate(instances, state, instances_by_id, physic
     return after - before
 
 
+def _initial_fill_workload_guard(range_rows, totals, shift_hours):
+    """Return an ordinal rank and debug details for one initial-fill candidate."""
+    applicable = [
+        row for row in range_rows
+        if row['window_start'] <= totals['date'] <= row['window_end']
+    ]
+    if not applicable:
+        return 1, None
+
+    evaluations = []
+    for row in applicable:
+        key = (row['window_start'], row['window_end'], row['units'])
+        before = totals['values'].get(key, Decimal('0'))
+        after = before + (Decimal('1') if row['units'] == 'SHIFTS' else shift_hours)
+        evaluations.append((row, before, after))
+
+    above = [item for item in evaluations if item[0]['max_value'] is not None and item[2] > item[0]['max_value']]
+    below = [item for item in evaluations if item[0]['min_value'] is not None and item[1] < item[0]['min_value']]
+    selected = (above or below or evaluations)[0]
+    row, before, after = selected
+    penalty = 2 if above else (0 if below else 1)
+    return penalty, {
+        'before': float(before),
+        'after': float(after),
+        'effective_range': {
+            'period_type': row['period_type'],
+            'period_start': row['window_start'].isoformat(),
+            'period_end': row['window_end'].isoformat(),
+            'units': row['units'],
+            'min_value': float(row['min_value']) if row['min_value'] is not None else None,
+            'max_value': float(row['max_value']) if row['max_value'] is not None else None,
+        },
+        'ranking_penalty': penalty,
+    }
+
+
 def _workload_rule_delta_for_reassignment(instances, state, instances_by_id, from_physician_id, to_physician_id, instance_id, targets):
     trial_state = _copy_state(state)
     _replace_in_state(trial_state, instance_id, from_physician_id, to_physician_id)
@@ -3309,6 +3345,28 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             )
             for physician in physicians
         }
+        workload_ranges_by_physician = {}
+        workload_totals_by_physician = {}
+        for physician in physicians:
+            range_rows = []
+            values = defaultdict(lambda: Decimal('0'))
+            for rule in targets[physician.id].get('rules') or []:
+                for window_start, window_end in _period_windows(instances, rule['period_type']):
+                    effective_rule = _effective_workload_rule(rule, window_start, window_end)
+                    range_rows.append({
+                        **effective_rule,
+                        'window_start': window_start,
+                        'window_end': window_end,
+                    })
+            for instance in instances:
+                if physician.id not in state[instance.id]:
+                    continue
+                for row in range_rows:
+                    if row['window_start'] <= instance.date <= row['window_end']:
+                        key = (row['window_start'], row['window_end'], row['units'])
+                        values[key] += Decimal('1') if row['units'] == 'SHIFTS' else _shift_hours(instance)
+            workload_ranges_by_physician[physician.id] = range_rows
+            workload_totals_by_physician[physician.id] = values
 
         requests = (
             ScheduleRequest.objects.filter(
@@ -3345,6 +3403,9 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         timed_out = False
         phase_running_when_stopped = None
         candidates_considered_before_timeout = 0
+        initial_fill_workload_guard_candidates_above_max = 0
+        initial_fill_workload_guard_candidates_deprioritized = 0
+        initial_fill_workload_guard_examples = []
 
         night_instances = [
             instance for instance in instances
@@ -3666,6 +3727,8 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             nonlocal nonnight_assignments_blocked_by_recovery
             nonlocal nonnight_assignments_allowed_despite_recovery
             nonlocal candidates_considered_before_timeout
+            nonlocal initial_fill_workload_guard_candidates_above_max
+            nonlocal initial_fill_workload_guard_candidates_deprioritized
 
             for instance in ordered_instances:
                 if runtime_exceeded():
@@ -3712,7 +3775,8 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
                         contract = contract_by_physician[physician.id]
                         target = targets[physician.id]
-                        next_hours = current_scoring['physician_hours'][physician.id] + _shift_hours(instance)
+                        shift_hours = _shift_hours(instance)
+                        next_hours = current_scoring['physician_hours'][physician.id] + shift_hours
                         next_shifts = current_scoring['physician_shifts'][physician.id] + 1
                         workload_score = _workload_candidate_score(target, next_hours, next_shifts)
                         workload_rule_delta = _workload_rule_delta_for_candidate(
@@ -3779,12 +3843,31 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                             matching_requests,
                             contract,
                         )
+                        workload_rank, workload_debug = _initial_fill_workload_guard(
+                            workload_ranges_by_physician[physician.id],
+                            {
+                                'date': instance.date,
+                                'values': workload_totals_by_physician[physician.id],
+                            },
+                            shift_hours,
+                        )
+                        if workload_rank == 2:
+                            initial_fill_workload_guard_candidates_above_max += 1
+                            initial_fill_workload_guard_candidates_deprioritized += 1
+                            if len(initial_fill_workload_guard_examples) < 10:
+                                initial_fill_workload_guard_examples.append({
+                                    'physician_id': physician.id,
+                                    'physician': _physician_display_name(physician),
+                                    **_contract_rule_identity(contract),
+                                    **workload_debug,
+                                })
                         candidates.append(
                             (
                                 recovery_penalty > 0,
+                                request_score,
+                                workload_rank,
                                 workload_rule_delta,
                                 workload_score
-                                + request_score
                                 + same_shift_delta
                                 + night_delta
                                 + night_block_bonus
@@ -3811,12 +3894,20 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
 
                     (
                         _has_recovery_conflict,
+                        _request_score_value,
+                        _workload_rank,
                         _workload_rule_delta,
                         _candidate_score,
                         _tie_breaker,
                         selected_physician,
                     ) = min(candidate_pool)
                     _add_to_state(state, instance.id, selected_physician.id)
+                    for row in workload_ranges_by_physician[selected_physician.id]:
+                        if row['window_start'] <= instance.date <= row['window_end']:
+                            key = (row['window_start'], row['window_end'], row['units'])
+                            workload_totals_by_physician[selected_physician.id][key] += (
+                                Decimal('1') if row['units'] == 'SHIFTS' else _shift_hours(instance)
+                            )
                     assignments_made += 1
                     if phase == 'night':
                         night_block_assignment_successes += 1
@@ -5265,6 +5356,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             'final_score_breakdown': final_breakdown,
             'score_audit': final_score_audit,
             'score_audit_warnings': final_score_audit['warnings'],
+            'initial_fill_workload_guard_enabled': True,
+            'initial_fill_workload_guard_candidates_above_max': initial_fill_workload_guard_candidates_above_max,
+            'initial_fill_workload_guard_candidates_deprioritized': initial_fill_workload_guard_candidates_deprioritized,
+            'initial_fill_workload_guard_examples': initial_fill_workload_guard_examples,
             'phase_order': phase_order,
             'phase_passes_run': phase_passes_run,
             'phase_attempts': {phase: phase_attempts.get(phase, 0) for phase in phase_order},
