@@ -61,6 +61,10 @@ type WorkloadScoreRow = {
   target_shifts: number | null
   target_hours: number | null
   expected_target: number | null
+  contract_name?: string | null
+  period_type?: string | null
+  raw_allowed_min?: number | null
+  raw_allowed_max?: number | null
   allowed_min: number | null
   allowed_max: number | null
   allowed_units: string | null
@@ -184,11 +188,13 @@ function workloadUnitsLabel(units: string | null | undefined) {
   return units === 'SHIFTS' ? 'shifts' : 'hours'
 }
 
-function workloadRangeLabel(row: WorkloadScoreRow) {
-  if (row.allowed_min !== null || row.allowed_max !== null) {
-    const lower = row.allowed_min === null ? 'No min' : formatNumber(row.allowed_min)
-    const upper = row.allowed_max === null ? 'No max' : formatNumber(row.allowed_max)
-    return `Allowed range: ${lower}-${upper} ${workloadUnitsLabel(row.allowed_units)}`
+function workloadRangeLabel(row: WorkloadScoreRow, raw = false) {
+  const minimum = raw ? row.raw_allowed_min : row.allowed_min
+  const maximum = raw ? row.raw_allowed_max : row.allowed_max
+  if (minimum !== null && minimum !== undefined || maximum !== null && maximum !== undefined) {
+    const lower = minimum === null || minimum === undefined ? 'No min' : formatNumber(minimum)
+    const upper = maximum === null || maximum === undefined ? 'No max' : formatNumber(maximum)
+    return `${raw ? 'Raw' : 'Effective'} allowed range: ${lower}–${upper} ${workloadUnitsLabel(row.allowed_units)}`
   }
   return row.target_units === 'SHIFTS'
     ? `Target: ${formatNumber(row.target_shifts)} shifts`
@@ -375,7 +381,10 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
               <div className="violation-workload-score">
                 <h4>Workload balancing score</h4>
                 <div className="violation-user-metrics">
+                  <span>Contract: {user.workload_score.contract_name ?? 'No contract'}</span>
+                  <span>Period: {user.workload_score.period_type ?? 'Not configured'}</span>
                   <span>Assigned: {user.workload_score.assigned_shifts} shifts, {user.workload_score.assigned_hours.toFixed(1)} hours</span>
+                  <span>{workloadRangeLabel(user.workload_score, true)}</span>
                   <span>{workloadRangeLabel(user.workload_score)}</span>
                   <span>Deviation: {workloadDeviationLabel(user.workload_score)}</span>
                   <span>Penalty weight: {user.workload_score.penalty_weight.toFixed(1)}</span>

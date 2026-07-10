@@ -47,6 +47,23 @@ type ContractRecord = {
 type PeriodType = 'WEEK' | 'MONTH' | 'SCHEDULE_BLOCK'
 type RuleUnits = 'HOURS' | 'SHIFTS'
 
+const workloadPeriodLabels: Record<PeriodType, string> = {
+  WEEK: 'Week',
+  MONTH: 'Month',
+  SCHEDULE_BLOCK: 'Schedule Block',
+}
+
+function workloadRuleSummary(rule: MinMaxRule) {
+  const units = rule.units === 'HOURS' ? 'hours' : 'shifts'
+  const period = rule.period_type === 'SCHEDULE_BLOCK' ? 'schedule block' : rule.period_type.toLowerCase()
+  const behavior = rule.period_type === 'MONTH'
+    ? 'Prorated when schedule block covers partial month'
+    : rule.period_type === 'WEEK'
+      ? 'Evaluated by calendar week overlap'
+      : 'Not prorated'
+  return { units, period, behavior }
+}
+
 type MinMaxRule = {
   id: string
   period_type: PeriodType
@@ -923,9 +940,18 @@ export default function ContractsView() {
               {activeTab === 'workload' && (
                 <div className="contract-section-stack">
                   <h3>Expected Workload Rules</h3>
+                  <div className="request-existing-note">Schedule Block rules apply to the whole schedule block. Month rules are prorated when the schedule block covers only part of a month. Week rules are evaluated by week.</div>
                   <div className="contract-rule-grid">
-                    {formState.workload_settings.period_rules.map((rule, index) => (
-                      <div key={rule.id} className="contract-rule-row">
+                    {formState.workload_settings.period_rules.map((rule, index) => {
+                      const summary = workloadRuleSummary(rule)
+                      return <div key={rule.id} className="contract-rule-row">
+                        <div className="request-existing-note">
+                          <div><strong>Period:</strong> {workloadPeriodLabels[rule.period_type]}</div>
+                          <div><strong>Units:</strong> {rule.units === 'HOURS' ? 'Hours' : 'Shifts'}</div>
+                          <div><strong>Range:</strong> {rule.min_value || 'No min'}–{rule.max_value || 'No max'} {summary.units} per {summary.period}</div>
+                          <div><strong>Penalty:</strong> min {rule.min_penalty_weight || '0'} / max {rule.max_penalty_weight || '0'}</div>
+                          <div><strong>Effective behavior:</strong> {summary.behavior}</div>
+                        </div>
                         <div className="contract-minmax-columns">
                           <div className="contract-minmax-column">
                             <div className="contract-minmax-title">Min</div>
@@ -945,7 +971,7 @@ export default function ContractsView() {
                         </div>
                         <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.filter((_, itemIndex) => itemIndex !== index) } }))} disabled={formState.workload_settings.period_rules.length === 1}>Remove</button>
                       </div>
-                    ))}
+                    } )}
                   </div>
                   <button type="button" className="primary-action" onClick={() => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: [...current.workload_settings.period_rules, makeMinMaxRule('MONTH')] } }))}>Add Workload Period Rule</button>
 

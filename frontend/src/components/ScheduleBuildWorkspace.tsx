@@ -126,6 +126,8 @@ type OptimizerSummary = {
       period_start: string
       period_end: string
       units: 'HOURS' | 'SHIFTS'
+      raw_min_value: number | null
+      raw_max_value: number | null
       min_value: number | null
       max_value: number | null
       debug_warning?: string | null
@@ -264,9 +266,9 @@ function workloadRangeLabel(range: OptimizerSummary['workload_summary'][number][
   if (!range) {
     return 'No workload range'
   }
-  const minValue = range.min_value === null || range.min_value === undefined ? '-' : range.min_value
-  const maxValue = range.max_value === null || range.max_value === undefined ? '-' : range.max_value
-  return `${range.period_type} ${minValue}-${maxValue} ${range.units.toLowerCase()}`
+  const value = (item: number | null | undefined) => item === null || item === undefined ? '-' : item
+  const units = range.units === 'HOURS' ? 'h' : ' shifts'
+  return `${range.period_type} raw ${value(range.raw_min_value)}–${value(range.raw_max_value)}${units} · effective ${value(range.min_value)}–${value(range.max_value)}${units}`
 }
 
 function formatTime(value: string) {

@@ -2853,9 +2853,20 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertIsNotNone(month_rule['proration'])
         self.assertEqual(block_rule['effective_min_value'], 1.0)
         self.assertEqual(block_rule['effective_max_value'], 14.0)
+        self.assertEqual(block_rule['raw_min_value'], block_rule['effective_min_value'])
+        self.assertEqual(block_rule['raw_max_value'], block_rule['effective_max_value'])
         summary_row = response.json()['workload_summary'][0]
         self.assertEqual(summary_row['contract_name'], 'Month Prorated Contract')
+        self.assertEqual(summary_row['effective_workload_range']['period_type'], 'MONTH')
+        self.assertEqual(summary_row['effective_workload_range']['raw_min_value'], 20.0)
+        self.assertEqual(summary_row['effective_workload_range']['raw_max_value'], 35.0)
         self.assertEqual(summary_row['effective_workload_range']['min_value'], 9.0)
+        self.assertEqual(row['contract_name'], 'Month Prorated Contract')
+        self.assertEqual(row['period_type'], 'MONTH')
+        self.assertEqual(row['raw_allowed_min'], 20.0)
+        self.assertEqual(row['raw_allowed_max'], 35.0)
+        self.assertEqual(row['allowed_min'], 9.0)
+        self.assertEqual(row['allowed_max'], 17.0)
 
     def test_night_days_off_after_scores_next_assignment_once(self):
         self.block.start_date = date(2026, 7, 1)
@@ -4396,6 +4407,10 @@ class ContractApiTests(TestCase):
         self.assertEqual(payload['name'], 'Full Time 120 Hours')
         self.assertEqual(payload['domain'], self.domain.id)
         self.assertEqual(len(payload['workload_settings']['period_rules']), 3)
+        self.assertEqual(
+            [rule['period_type'] for rule in payload['workload_settings']['period_rules']],
+            ['SCHEDULE_BLOCK', 'MONTH', 'WEEK'],
+        )
         self.assertEqual(payload['assigned_users_count'], 1)
 
     def test_edit_contract_updates_name_and_assignments(self):
