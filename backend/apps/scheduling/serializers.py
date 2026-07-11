@@ -356,6 +356,8 @@ class ScheduleShiftAssignmentSerializer(serializers.ModelSerializer):
             'shift_instance',
             'physician',
             'physician_name',
+            'assignment_source',
+            'is_locked',
             'created_by',
             'created_at',
             'updated_at',
@@ -403,6 +405,7 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
             'open_count',
             'is_open',
             'status',
+            'is_locked_open',
             'created_at',
             'updated_at',
         ]

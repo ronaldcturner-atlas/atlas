@@ -260,6 +260,7 @@ class ScheduleShiftInstance(models.Model):
     end_datetime = models.DateTimeField()
     required_staffing = models.PositiveIntegerField(default=1)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
+    is_locked_open = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -312,6 +313,7 @@ class ScheduleShiftAssignment(models.Model):
         null=True,
         blank=True,
     )
+    is_locked = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

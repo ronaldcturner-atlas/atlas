@@ -682,7 +682,10 @@ def _state_from_assignments(assignments):
     manual_pairs = set()
     for assignment in assignments:
         state[assignment.shift_instance_id].append(assignment.physician_id)
-        if assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL:
+        if (
+            assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+            and assignment.is_locked
+        ):
             manual_pairs.add((assignment.shift_instance_id, assignment.physician_id))
     return state, manual_pairs
 
@@ -3286,6 +3289,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             1
             for assignment in assignments
             if assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+            and assignment.is_locked
         )
         duplicate_shift_instances = list(
             _version_shift_instances_queryset(version)
@@ -5245,6 +5249,17 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             }
             for row in final_night_minimum_status['physicians_under_night_minimum']
         ]
+
+        locked_open_instance_ids = {instance.id for instance in instances if instance.is_locked_open}
+        for instance_id in locked_open_instance_ids:
+            state[instance_id] = []
+        unlocked_manual_ids = [
+            assignment.id for assignment in assignments
+            if assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+            and not assignment.is_locked
+        ]
+        if unlocked_manual_ids:
+            ScheduleShiftAssignment.objects.filter(id__in=unlocked_manual_ids).delete()
 
         for instance in instances:
             optimizer_physician_ids = [

@@ -40,6 +40,7 @@ type ShiftInstance = {
   open_count: number
   is_open: boolean
   status: 'OPEN' | 'ASSIGNED'
+  is_locked_open: boolean
   assignments: ShiftAssignment[]
 }
 
@@ -47,6 +48,8 @@ type ShiftAssignment = {
   id: number
   physician: number
   physician_name: string
+  assignment_source: 'MANUAL' | 'OPTIMIZER'
+  is_locked: boolean
 }
 
 type EligiblePhysician = {
@@ -292,10 +295,12 @@ function shiftLabel(instance: ShiftInstance) {
     ? `${names[0]}${names.length > 1 ? ` +${names.length - 1}` : ''}`
     : ''
   const openLabel = instance.is_open ? 'Open ' : ''
+  const lockedLabel = instance.is_locked_open || instance.assignments.some((assignment) => assignment.is_locked) ? 'Locked' : ''
   return [
     instance.facility_short_name,
     `${formatTime(instance.template_start_time)}-${formatTime(instance.template_end_time)}`,
     assignedLabel,
+    lockedLabel,
     `${openLabel}${staffing}`,
   ].filter(Boolean).join(' ')
 }
@@ -391,6 +396,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isAssignmentSaving, setIsAssignmentSaving] = useState(false)
   const [assignmentError, setAssignmentError] = useState<string | null>(null)
   const [physicianSearch, setPhysicianSearch] = useState('')
+  const [editingAssignmentId, setEditingAssignmentId] = useState<number | null>(null)
+  const [selectedPhysicianId, setSelectedPhysicianId] = useState<number | null>(null)
+  const [lockAssignment, setLockAssignment] = useState(false)
+  const [lockOpen, setLockOpen] = useState(false)
   const [popoverPosition, setPopoverPosition] = useState<PopoverPosition | null>(null)
   const assignmentPopoverRef = useRef<HTMLDivElement | null>(null)
   const assignmentTriggerRef = useRef<HTMLButtonElement | null>(null)
@@ -408,6 +417,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     setAssignmentContext(null)
     setAssignmentError(null)
     setPhysicianSearch('')
+    setEditingAssignmentId(null)
+    setSelectedPhysicianId(null)
+    setLockAssignment(false)
+    setLockOpen(false)
     setPopoverPosition(null)
     assignmentTriggerRef.current = null
   }
@@ -970,6 +983,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         return
       }
       setAssignmentContext(data as AssignmentContext)
+      const loaded = data as AssignmentContext
+      const firstAssignment = loaded.shift_instance.assignments[0]
+      setEditingAssignmentId(firstAssignment?.id ?? null)
+      setSelectedPhysicianId(firstAssignment?.physician ?? null)
+      setLockAssignment(firstAssignment?.is_locked ?? loaded.shift_instance.is_locked_open)
+      setLockOpen(loaded.shift_instance.is_locked_open)
     } catch (assignmentLoadError) {
       if (assignmentLoadIdRef.current !== loadId) {
         return
@@ -1055,6 +1074,49 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const saveAssignment = async () => {
+    if (!assignmentContext || !selectedPhysicianId) return
+    try {
+      setIsAssignmentSaving(true)
+      setAssignmentError(null)
+      const base = `${API_BASE}/schedule-blocks/${blockId}/build/shift-instances/${assignmentContext.shift_instance.id}/assignments/`
+      const response = await fetch(editingAssignmentId ? `${base}${editingAssignmentId}/` : base, {
+        method: editingAssignmentId ? 'PATCH' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ physician_id: selectedPhysicianId, assignment_source: 'MANUAL', is_locked: lockAssignment }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to save assignment.'))
+      applyAssignmentContext(data as AssignmentContext)
+      closeAssignments()
+      await fetchContext(context?.selected_version?.id, { quiet: true, preserveError: true })
+      setNotice('Manual assignment saved.')
+    } catch (saveError) {
+      setAssignmentError(saveError instanceof Error ? saveError.message : 'Unable to save assignment.')
+    } finally {
+      setIsAssignmentSaving(false)
+    }
+  }
+
+  const markOpen = async () => {
+    if (!assignmentContext) return
+    try {
+      setIsAssignmentSaving(true)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/shift-instances/${assignmentContext.shift_instance.id}/assignments/`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ physician_id: null, is_locked_open: lockOpen }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to mark shift open.'))
+      closeAssignments()
+      await fetchContext(context?.selected_version?.id, { quiet: true, preserveError: true })
+      setNotice(lockOpen ? 'Shift marked open and locked.' : 'Shift marked open.')
+    } catch (openError) {
+      setAssignmentError(openError instanceof Error ? openError.message : 'Unable to mark shift open.')
+    } finally { setIsAssignmentSaving(false) }
+  }
+
   if (isLoading && !context) {
     return <div className="scheduler-loading">Loading Schedule Build Workspace...</div>
   }
@@ -1072,6 +1134,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     || context.schedule_block.build_status === 'BUILD'
   const canEditAssignments = context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
+    && (!context.selected_optimizer_run || context.selected_optimizer_run.is_active)
   const canOptimize = canEditAssignments && context.shift_instances.length > 0
   const canClearAssignments = canEditAssignments && context.shift_instances.length > 0
   const isMutatingBuild = isGenerating || isOptimizing || clearingAction !== null || deletingRunId !== null
@@ -1580,10 +1643,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       )}
 
       {displayedShift && popoverPosition && (
-        <div
+        <div className="assignment-modal-backdrop"><div
           ref={assignmentPopoverRef}
-          className="assignment-popover"
-          style={popoverPosition}
+          className="assignment-popover assignment-modal"
           role="dialog"
           aria-label={`Assignments for ${displayedShift.shift_template_name}`}
         >
@@ -1612,59 +1674,43 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             <div className="assignment-popover-state">Loading assignments...</div>
           ) : assignmentContext && (
             <>
-              {displayedShift.assignments.length > 0 && (
-                <div className="assignment-popover-current">
-                  <span className="assignment-popover-label">Assigned</span>
-                  {displayedShift.assignments.map((assignment) => (
-                    <div key={assignment.id} className="assignment-popover-assignment">
-                      <span>{assignment.physician_name}</span>
-                      <button
-                        type="button"
-                        disabled={isAssignmentSaving || !canEditAssignments}
-                        onClick={() => void removeAssignment(assignment.id)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <div className="assignment-modal-details">
+                <span>Shift</span><strong>{displayedShift.shift_template_name}</strong>
+                <span>Facility</span><strong>{displayedShift.facility_short_name}</strong>
+                <span>Time</span><strong>{formatTime(displayedShift.template_start_time)}–{formatTime(displayedShift.template_end_time)}</strong>
+                <span>Staffing</span><strong>{displayedShift.assigned_count}/{displayedShift.required_staffing}</strong>
+                <span>Source</span><strong>{displayedShift.assignments.find((item) => item.id === editingAssignmentId)?.assignment_source ?? 'OPEN'}</strong>
+              </div>
 
               {!canEditAssignments ? (
                 <div className="assignment-popover-state">
                   Assignments can only be edited in a BUILD Schedule Version.
                 </div>
-              ) : displayedShift.open_count > 0 && (
+              ) : (
                 <div className="assignment-popover-picker">
-                  <input
-                    type="search"
-                    value={physicianSearch}
-                    onChange={(event) => setPhysicianSearch(event.target.value)}
-                    placeholder="Search eligible physicians"
-                    aria-label="Search eligible physicians"
-                    autoFocus
-                  />
-                  <div className="assignment-popover-options">
-                    {filteredPhysicians.length ? filteredPhysicians.map((physician) => (
-                      <button
-                        key={physician.id}
-                        type="button"
-                        disabled={isAssignmentSaving}
-                        onClick={() => void assignPhysician(physician.id)}
-                      >
-                        {physician.name}
-                      </button>
-                    )) : <div className="assignment-popover-state">
-                      {eligiblePhysicians.length
-                        ? 'No matching eligible physicians.'
-                        : 'No eligible physicians.'}
-                    </div>}
+                  {displayedShift.assignments.length > 1 && <label>Assignment slot<select value={editingAssignmentId ?? ''} onChange={(event) => {
+                    const assignment = displayedShift.assignments.find((item) => item.id === Number(event.target.value))
+                    setEditingAssignmentId(assignment?.id ?? null); setSelectedPhysicianId(assignment?.physician ?? null)
+                    setLockAssignment(assignment?.is_locked ?? false)
+                  }}>{displayedShift.assignments.map((assignment) => <option key={assignment.id} value={assignment.id}>{assignment.physician_name}</option>)}</select></label>}
+                  <label>Assigned physician<select value={selectedPhysicianId ?? ''} onChange={(event) => setSelectedPhysicianId(Number(event.target.value) || null)}>
+                    <option value="">Select physician</option>
+                    {assignmentContext.eligible_physicians.filter((physician) => physician.can_assign || physician.id === selectedPhysicianId).map((physician) => <option key={physician.id} value={physician.id}>{physician.name}</option>)}
+                  </select></label>
+                  <label className="assignment-lock-option"><input type="checkbox" checked={lockAssignment} onChange={(event) => setLockAssignment(event.target.checked)} />
+                    Lock this assignment during optimizer runs
+                  </label>
+                  <label className="assignment-lock-option"><input type="checkbox" checked={lockOpen} onChange={(event) => setLockOpen(event.target.checked)} />Lock open during optimizer runs</label>
+                  <div className="assignment-modal-actions">
+                    <button type="button" className="primary-action" disabled={!selectedPhysicianId || isAssignmentSaving} onClick={() => void saveAssignment()}>Save Assignment</button>
+                    <button type="button" className="secondary" disabled={isAssignmentSaving} onClick={() => void markOpen()}>Mark Open</button>
+                    <button type="button" className="secondary" disabled={isAssignmentSaving} onClick={closeAssignments}>Cancel</button>
                   </div>
                 </div>
               )}
             </>
           )}
-        </div>
+        </div></div>
       )}
     </div>
   )

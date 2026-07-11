@@ -1509,17 +1509,21 @@ def _physician_display_name(physician):
     return physician.display_name or physician.user.get_full_name() or physician.user.username
 
 
-def _overlapping_assignment_for_physician(physician, shift_instance):
+def _overlapping_assignment_for_physician(physician, shift_instance, exclude_assignment_id=None):
     active_run = _active_optimizer_run(shift_instance.schedule_version)
-    return (
-        ScheduleShiftAssignment.objects.filter(
+    query = ScheduleShiftAssignment.objects.filter(
             _visible_assignment_filter(active_run),
             physician=physician,
             shift_instance__schedule_version=shift_instance.schedule_version,
             shift_instance__start_datetime__lt=shift_instance.end_datetime,
             shift_instance__end_datetime__gt=shift_instance.start_datetime,
         )
-        .exclude(shift_instance=shift_instance)
+    if exclude_assignment_id is not None:
+        query = query.exclude(id=exclude_assignment_id)
+    else:
+        query = query.exclude(shift_instance=shift_instance)
+    return (
+        query
         .select_related(
             'shift_instance__facility',
             'shift_instance__schedule_version',
@@ -1622,6 +1626,17 @@ def _assignment_context_payload(shift_instance):
                 **eligibility,
             }
         )
+    listed_ids = {item['id'] for item in eligible_physicians}
+    for assignment in shift_instance.assignments.filter(_visible_assignment_filter(active_run)):
+        physician = assignment.physician
+        if physician.id not in listed_ids:
+            eligibility = _physician_assignment_eligibility(physician, shift_instance)
+            eligible_physicians.append({
+                'id': physician.id,
+                'name': _physician_display_name(physician),
+                'already_assigned': True,
+                **eligibility,
+            })
 
     return {
         'shift_instance': ScheduleShiftInstanceSerializer(
@@ -1632,7 +1647,7 @@ def _assignment_context_payload(shift_instance):
     }
 
 
-@api_view(['GET', 'POST'])
+@api_view(['GET', 'POST', 'PATCH'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_shift_assignments(request, block_id, shift_instance_id):
@@ -1660,6 +1675,16 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             {'detail': 'Physicians can only be assigned in a BUILD Schedule Version.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    if request.method == 'PATCH' and request.data.get('physician_id') is None:
+        with transaction.atomic():
+            locked_instance = ScheduleShiftInstance.objects.select_for_update().get(id=shift_instance.id)
+            active_run = _active_optimizer_run(locked_instance.schedule_version)
+            locked_instance.assignments.filter(_visible_assignment_filter(active_run)).delete()
+            locked_instance.is_locked_open = bool(request.data.get('is_locked_open', False))
+            locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
+            _sync_shift_instance_status(locked_instance)
+        return Response(_assignment_context_payload(locked_instance))
 
     try:
         physician_id = int(request.data.get('physician_id'))
@@ -1723,7 +1748,11 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             physician=physician,
             created_by=request.user,
             assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=bool(request.data.get('is_locked', False)),
         )
+        if locked_instance.is_locked_open:
+            locked_instance.is_locked_open = False
+            locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
         _sync_shift_instance_status(locked_instance)
 
     return Response(
@@ -1732,7 +1761,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
     )
 
 
-@api_view(['DELETE'])
+@api_view(['PATCH', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assignment_id):
@@ -1759,6 +1788,57 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
         id=assignment_id,
         shift_instance=shift_instance,
     )
+    if request.method == 'PATCH':
+        try:
+            physician_id = int(request.data.get('physician_id'))
+        except (TypeError, ValueError):
+            return Response(
+                {'physician_id': 'physician_id is required and must be a valid integer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        physician = get_object_or_404(Physician.objects.select_related('user'), id=physician_id)
+        if not physician.active:
+            return Response(
+                {'physician_id': 'Physician is inactive.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        eligibility = _physician_assignment_eligibility(physician, shift_instance)
+        if not eligibility['can_assign']:
+            return Response(
+                {'physician_id': eligibility['ineligibility_reason'] or 'Physician is not eligible for this shift instance.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            locked_assignment = ScheduleShiftAssignment.objects.select_for_update().get(id=assignment.id)
+            duplicate = ScheduleShiftAssignment.objects.filter(
+                shift_instance=shift_instance,
+                physician=physician,
+            ).exclude(id=locked_assignment.id).exists()
+            if duplicate:
+                return Response(
+                    {'physician_id': 'Physician is already assigned to this shift instance.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            overlapping_assignment = _overlapping_assignment_for_physician(
+                physician,
+                shift_instance,
+                exclude_assignment_id=locked_assignment.id,
+            )
+            if overlapping_assignment:
+                return Response(
+                    {'physician_id': _overlapping_assignment_message(physician, overlapping_assignment)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            locked_assignment.physician = physician
+            locked_assignment.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
+            locked_assignment.optimizer_run = None
+            locked_assignment.is_locked = bool(request.data.get('is_locked', False))
+            locked_assignment.created_by = request.user
+            locked_assignment.save()
+            if shift_instance.is_locked_open:
+                shift_instance.is_locked_open = False
+                shift_instance.save(update_fields=['is_locked_open', 'updated_at'])
+        return Response(_assignment_context_payload(shift_instance))
     assignment.delete()
     _sync_shift_instance_status(shift_instance)
     return Response(_assignment_context_payload(shift_instance))

@@ -132,7 +132,7 @@ The latest Optimizer v0 summary/debug payload is stored on the selected Schedule
 
 The Schedule Build Workspace can open an Optimizer Violation Report for the selected Schedule Version. The report reuses Optimizer v0 scoring data, lists every eligible physician, and breaks visible penalty totals into per-user violation rows. It is informational only and does not change Contract rules, assignments, Schedule Version lifecycle, preview, publication, or Live Schedule behavior.
 
-Schedule Shift Assignments record their source as either `MANUAL` or `OPTIMIZER`. Manual assignments are preserved by default and remain fixed during optimizer improvement. Optimizer-generated assignments are replaceable: each optimizer run clears previous `OPTIMIZER` assignments for the selected Schedule Version, keeps `MANUAL` assignments locked, recalculates remaining open slots, and writes new `OPTIMIZER` assignments into that same version.
+Schedule Shift Assignments record their source as either `MANUAL` or `OPTIMIZER`. Manual assignments may be explicitly locked for preservation during optimizer runs; unlocked manual assignments seed the next optimizer search and may be reassigned. A Shift Instance may likewise be explicitly locked open so the optimizer leaves it unassigned; an unlocked open instance may be filled. Optimizer-generated assignments are replaceable: each optimizer run starts a new search, keeps only explicitly locked manual assignments fixed, honors locked-open instances, and writes its assignments for that run into the same Schedule Version. Fixed requests remain high-penalty preferences rather than hard constraints.
 
 During the MVP build phase, the Schedule Build Workspace includes development clear actions for schedulers/admins:
 

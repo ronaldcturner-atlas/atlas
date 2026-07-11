@@ -1057,6 +1057,35 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(len(shifts_response.json()), 2)
         self.assertEqual(shifts_response.json()[0]['assigned_count'], 0)
 
+    def test_manual_assignment_and_locked_open_state_persist_in_context(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        shift_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        physician = self._create_assignment_physician(
+            'locked.manual@example.com', 'Locked Manual', facilities=[self.facility]
+        )
+        url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{shift_instance.id}/assignments/'
+        )
+        assigned = self.client.post(
+            url, data={'physician_id': physician.id, 'is_locked': True}, format='json'
+        )
+        self.assertEqual(assigned.status_code, 201)
+        self.assertTrue(assigned.json()['shift_instance']['assignments'][0]['is_locked'])
+
+        opened = self.client.patch(
+            url, data={'physician_id': None, 'is_locked_open': True}, format='json'
+        )
+        self.assertEqual(opened.status_code, 200)
+        self.assertEqual(opened.json()['shift_instance']['assignments'], [])
+        self.assertTrue(opened.json()['shift_instance']['is_locked_open'])
+        refreshed = self.client.get(url)
+        self.assertTrue(refreshed.json()['shift_instance']['is_locked_open'])
+
     def test_generate_rejects_preview_or_archived_block(self):
         self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
         self.block.save(update_fields=['build_status', 'updated_at'])
@@ -1444,6 +1473,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             shift_instance=day_instance,
             physician=manual,
             created_by=self.scheduler_user,
+            is_locked=True,
         )
 
         response = self.client.post(
@@ -1882,6 +1912,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             physician=manual,
             created_by=self.scheduler_user,
             assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
         )
 
         response = self.client.post(
