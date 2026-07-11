@@ -187,6 +187,10 @@ class OptimizerRun(models.Model):
         COMPLETED = 'COMPLETED', 'Completed'
         FAILED = 'FAILED', 'Failed'
 
+    class StartMode(models.TextChoices):
+        CURRENT_SCHEDULE = 'CURRENT_SCHEDULE', 'Current schedule'
+        FRESH_FILL = 'FRESH_FILL', 'Fresh fill'
+
     schedule_version = models.ForeignKey(
         ScheduleVersion,
         on_delete=models.CASCADE,
@@ -216,6 +220,9 @@ class OptimizerRun(models.Model):
     )
     run_kind = models.CharField(max_length=20, default='OPTIMIZER')
     locked_open_shift_instance_ids = models.JSONField(default=list, blank=True)
+    start_mode = models.CharField(
+        max_length=24, choices=StartMode.choices, default=StartMode.FRESH_FILL,
+    )
 
     def __str__(self):
         return f'{self.schedule_version_id}: Run {self.run_number}'

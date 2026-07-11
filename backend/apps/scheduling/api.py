@@ -1173,6 +1173,24 @@ def _parse_optimizer_seed(request):
         return None, {'seed': 'seed must be an integer.'}
 
 
+def _optimizer_start_options(request, version):
+    start_mode = request.data.get('start_mode', OptimizerRun.StartMode.FRESH_FILL)
+    if start_mode not in OptimizerRun.StartMode.values:
+        return None, None, {'start_mode': 'Use CURRENT_SCHEDULE or FRESH_FILL.'}
+    run_id = request.data.get('currently_viewed_run_id') or request.data.get('optimizer_run_id')
+    source_run = None
+    if run_id not in (None, ''):
+        try:
+            source_run = OptimizerRun.objects.get(
+                id=int(run_id),
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+            )
+        except (TypeError, ValueError, OptimizerRun.DoesNotExist):
+            return None, None, {'currently_viewed_run_id': 'Select a completed run in this schedule version.'}
+    return start_mode, source_run, None
+
+
 @api_view(['POST'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -1189,6 +1207,9 @@ def schedule_version_optimize(request, block_id, version_id):
     seed, seed_error = _parse_optimizer_seed(request)
     if seed_error:
         return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    start_mode, source_run, start_error = _optimizer_start_options(request, version)
+    if start_error:
+        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
     running_run = _blocking_optimizer_run(version)
     if running_run is not None:
         return Response(
@@ -1199,7 +1220,10 @@ def schedule_version_optimize(request, block_id, version_id):
             status=status.HTTP_409_CONFLICT,
         )
     try:
-        summary = optimize_schedule_version(version, created_by=request.user, seed=seed)
+        summary = optimize_schedule_version(
+            version, created_by=request.user, seed=seed,
+            start_mode=start_mode, source_run=source_run,
+        )
     except ValueError as optimizer_error:
         return Response(
             {'detail': str(optimizer_error)},
@@ -1236,6 +1260,9 @@ def schedule_version_run_optimizer(request, version_id):
     seed, seed_error = _parse_optimizer_seed(request)
     if seed_error:
         return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    start_mode, source_run, start_error = _optimizer_start_options(request, version)
+    if start_error:
+        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
     running_run = _blocking_optimizer_run(version)
     if running_run is not None:
         return Response(
@@ -1246,7 +1273,10 @@ def schedule_version_run_optimizer(request, version_id):
             status=status.HTTP_409_CONFLICT,
         )
     try:
-        summary = optimize_schedule_version(version, created_by=request.user, seed=seed)
+        summary = optimize_schedule_version(
+            version, created_by=request.user, seed=seed,
+            start_mode=start_mode, source_run=source_run,
+        )
     except ValueError as optimizer_error:
         return Response(
             {'detail': str(optimizer_error)},
@@ -1324,6 +1354,7 @@ def optimizer_run_save_copy(request, run_id):
             copied_from_run=source,
             run_kind='COPY',
             locked_open_shift_instance_ids=locked_open_ids,
+            start_mode=source.start_mode,
         )
         source_assignments = ScheduleShiftAssignment.objects.filter(
             _visible_assignment_filter(source),

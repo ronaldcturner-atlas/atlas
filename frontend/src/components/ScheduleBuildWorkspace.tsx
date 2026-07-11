@@ -157,6 +157,7 @@ type OptimizerRun = {
   copied_from_run_number: number | null
   run_kind: 'OPTIMIZER' | 'COPY'
   locked_open_shift_instance_ids: number[]
+  start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
 }
@@ -266,10 +267,11 @@ function optimizerRunScoreLabel(run: OptimizerRun) {
 
 function optimizerRunLabel(run: OptimizerRun) {
   const copyLabel = run.copied_from_run_number ? ` - Copy of Run ${run.copied_from_run_number}` : ''
+  const startLabel = run.start_mode === 'CURRENT_SCHEDULE' ? 'Current schedule' : 'Fresh fill'
   if (!isCompletedOptimizerRun(run)) {
     return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
   }
-  return `Run ${run.run_number}${copyLabel} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${copyLabel} - ${startLabel} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
 }
 
 function workloadRangeLabel(range: OptimizerSummary['workload_summary'][number]['effective_workload_range']) {
@@ -385,6 +387,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isOptimizing, setIsOptimizing] = useState(false)
+  const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
@@ -696,6 +699,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   }, [optimizerSummary?.optimizer_run_id, optimizerSummary?.seed])
 
   useEffect(() => {
+    const hasViewedAssignments = (context?.shift_instances ?? []).some((instance) => instance.assignments.length > 0)
+    setOptimizerStartMode(hasViewedAssignments ? 'CURRENT_SCHEDULE' : 'FRESH_FILL')
+  }, [context?.selected_optimizer_run?.id, context?.selected_version?.id])
+
+  useEffect(() => {
     if (!assignmentTarget) {
       return undefined
     }
@@ -834,7 +842,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         `${API_BASE}/schedule-versions/${versionId}/run-optimizer/`,
         {
           method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
+          body: JSON.stringify({
+            schedule_version_id: versionId,
+            currently_viewed_run_id: selectedOptimizerRunId,
+            start_mode: optimizerStartMode,
+          }),
         },
       )
       const data = await response.json().catch(() => null)
@@ -1268,13 +1282,27 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           {isGenerating ? 'Generating...' : 'Generate Shift Instances'}
         </button>
 
-        <button
-          type="button"
-          className="primary-action"
-          onClick={runOptimizer}
-          disabled={!canOptimize || isMutatingBuild}
-        >
-          {isOptimizing ? 'Running...' : 'Run Optimizer v0'}
+        <div className="optimizer-start-control">
+          <label className="facility-field">
+            <span>Optimizer Start</span>
+            <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as 'CURRENT_SCHEDULE' | 'FRESH_FILL')} disabled={isMutatingBuild}>
+              <option value="CURRENT_SCHEDULE">Current Viewed Schedule</option>
+              <option value="FRESH_FILL">Fresh Fill</option>
+            </select>
+          </label>
+          <small>
+            {optimizerStartMode === 'CURRENT_SCHEDULE'
+              ? 'Uses the currently displayed assignments as the optimizer starting point. Locked edits are preserved; unlocked edits may change.'
+              : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
+          </small>
+        </div>
+
+        <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || isMutatingBuild}>
+          {isOptimizing
+            ? 'Running...'
+            : optimizerStartMode === 'CURRENT_SCHEDULE'
+              ? 'Run Optimizer from Current Schedule'
+              : 'Run Optimizer from Fresh Fill'}
         </button>
 
         <button
@@ -1394,6 +1422,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   <div>
                     <strong>Run {run.run_number}</strong>
                     <span>{optimizerRunStatusLabel(run)}</span>
+                    <span>{run.start_mode === 'CURRENT_SCHEDULE' ? 'Current schedule' : 'Fresh fill'}</span>
                     <span>{optimizerRunScoreLabel(run)}</span>
                     <span>{formatTimestamp(run.created_at)}</span>
                     <span>Seed {run.seed ?? '-'}</span>

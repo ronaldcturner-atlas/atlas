@@ -349,6 +349,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'copied_from_run_number',
             'run_kind',
             'locked_open_shift_instance_ids',
+            'start_mode',
         ]
         read_only_fields = fields
 

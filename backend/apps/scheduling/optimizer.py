@@ -3272,7 +3272,14 @@ def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
     return summary, report
 
 
-def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=None, seed=None):
+def optimize_schedule_version(
+    schedule_version,
+    created_by=None,
+    optimizer_run=None,
+    seed=None,
+    start_mode=OptimizerRun.StartMode.FRESH_FILL,
+    source_run=None,
+):
     if schedule_version.status != ScheduleVersion.Status.BUILD:
         raise ValueError('Optimizer can only run on a BUILD Schedule Version.')
     if schedule_version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD:
@@ -3284,11 +3291,23 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             .select_related('schedule_block', 'domain')
             .get(id=schedule_version.id)
         )
-        copy_seed_run = version.optimizer_runs.filter(
-            is_active=True,
-            status=OptimizerRun.Status.COMPLETED,
-            run_kind='COPY',
-        ).first()
+        if start_mode not in OptimizerRun.StartMode.values:
+            raise ValueError('Invalid optimizer start mode.')
+        if source_run is not None:
+            source_run = OptimizerRun.objects.select_for_update().get(
+                id=source_run.id,
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+            )
+        source_locked_open_ids = (
+            list(source_run.locked_open_shift_instance_ids or [])
+            if source_run is not None
+            else list(
+                ScheduleShiftInstance.objects.filter(
+                    schedule_version=version, is_locked_open=True,
+                ).values_list('id', flat=True)
+            )
+        )
         if optimizer_run is None:
             latest_run_number = (
                 OptimizerRun.objects.filter(schedule_version=version)
@@ -3305,6 +3324,8 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
                 created_by=created_by,
                 status=OptimizerRun.Status.RUNNING,
                 seed=seed,
+                start_mode=start_mode,
+                locked_open_shift_instance_ids=source_locked_open_ids,
             )
         else:
             optimizer_run = OptimizerRun.objects.select_for_update().get(
@@ -3339,6 +3360,11 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             shift_instance__date__lte=version.schedule_block.end_date,
         ).count()
         optimizer_assignments_deleted = 0
+        ScheduleShiftInstance.objects.filter(schedule_version=version).update(is_locked_open=False)
+        ScheduleShiftInstance.objects.filter(
+            schedule_version=version,
+            id__in=source_locked_open_ids,
+        ).update(is_locked_open=True)
         instances = list(
             _version_shift_instances_queryset(version)
             .select_for_update()
@@ -3346,38 +3372,58 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             .prefetch_related('assignments__physician__user')
             .order_by('date', 'facility__name', 'start_datetime', 'id')
         )
-        if copy_seed_run is not None:
-            copied_seed_assignments = list(
-                _assignments_for_optimizer_run(version, copy_seed_run)
+        if source_run is not None:
+            source_assignments = list(
+                _assignments_for_optimizer_run(version, source_run)
                 .select_related('shift_instance', 'physician__user')
             )
-            manual_seed_rows = [
-                ScheduleShiftAssignment(
-                    shift_instance_id=row.shift_instance_id,
-                    physician_id=row.physician_id,
-                    created_by=created_by,
-                    assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-                    optimizer_run=optimizer_run,
-                    is_locked=row.is_locked,
-                )
-                for row in copied_seed_assignments
-                if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
-            ]
-            ScheduleShiftAssignment.objects.bulk_create(manual_seed_rows)
-            assignments = [
-                row for row in copied_seed_assignments
-                if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
-            ] + list(
-                ScheduleShiftAssignment.objects.filter(
-                    optimizer_run=optimizer_run,
-                    assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-                ).select_related('shift_instance', 'physician__user')
-            )
         else:
-            assignments = list(
+            source_assignments = list(
                 _assignments_for_optimizer_run(version, None)
                 .select_related('shift_instance', 'physician__user')
             )
+
+        if source_assignments:
+            source_assignment_count = len(source_assignments)
+            if source_run is None:
+                assignments = [
+                    row for row in source_assignments
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE or row.is_locked
+                ]
+            else:
+                manual_seed_rows = [
+                    ScheduleShiftAssignment(
+                        shift_instance_id=row.shift_instance_id,
+                        physician_id=row.physician_id,
+                        created_by=created_by,
+                        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                        optimizer_run=optimizer_run,
+                        is_locked=row.is_locked,
+                    )
+                    for row in source_assignments
+                    if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+                    and (
+                        start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                        or row.is_locked
+                    )
+                ]
+                ScheduleShiftAssignment.objects.bulk_create(manual_seed_rows)
+                assignments = (
+                    [
+                        row for row in source_assignments
+                        if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                    ]
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    else []
+                ) + list(
+                    ScheduleShiftAssignment.objects.filter(
+                        optimizer_run=optimizer_run,
+                        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                    ).select_related('shift_instance', 'physician__user')
+                )
+        else:
+            source_assignment_count = 0
+            assignments = []
         manual_assignments_preserved = sum(
             1
             for assignment in assignments
@@ -5423,6 +5469,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         'message': message,
         'optimizer_run_id': optimizer_run.id,
         'optimizer_run_number': optimizer_run.run_number,
+        'start_mode': start_mode,
         'seed': seed,
         'total_score': float(final_score),
         'initial_score': float(initial_score),
@@ -5450,6 +5497,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         'rest_violations_blocked': rest_violations_blocked,
         'debug': {
             'seed': seed,
+            'start_mode': start_mode,
+            'source_optimizer_run_id': source_run.id if source_run is not None else None,
+            'source_assignment_count': source_assignment_count,
+            'seeded_assignment_count': len(assignments),
             'schedule_version_id': version.id,
             'schedule_block_id': version.schedule_block_id,
             'schedule_block_start_date': version.schedule_block.start_date.isoformat(),
