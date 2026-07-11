@@ -295,3 +295,37 @@ The following roadmap items are deferred, not permanently prohibited: the schedu
 - Optimization, schedule version branching, penalties, comments, reports, and exports remain roadmap work.
 
 These gaps require explicit product decisions. Their absence is not permission to infer policy.
+
+## Local Development
+
+### Start Atlas locally
+
+From the project root in PowerShell, run:
+
+```powershell
+.\start-atlas.ps1
+```
+
+This starts the Docker services in the background and runs the Vite frontend development server. Open Atlas at [http://localhost:5173](http://localhost:5173). The frontend runs in the foreground, so keep that PowerShell terminal open while using Atlas. Press `Ctrl+C` to stop the frontend server; the Docker services remain running in the background.
+
+The equivalent npm convenience command is:
+
+```powershell
+npm run dev
+```
+
+### Run scheduling tests
+
+With the Docker services running, run this from the project root:
+
+```powershell
+.\test-scheduling.ps1
+```
+
+The equivalent npm convenience command is:
+
+```powershell
+npm run test:scheduling
+```
+
+Both test commands run `docker compose exec backend python manage.py test apps.scheduling -v 2`.

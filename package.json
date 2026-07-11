@@ -1,0 +1,8 @@
+{
+  "name": "atlas-development",
+  "private": true,
+  "scripts": {
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ./start-atlas.ps1",
+    "test:scheduling": "powershell -NoProfile -ExecutionPolicy Bypass -File ./test-scheduling.ps1"
+  }
+}
