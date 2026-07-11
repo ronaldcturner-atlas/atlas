@@ -324,6 +324,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
 
 class OptimizerRunSerializer(serializers.ModelSerializer):
     schedule_version_name = serializers.CharField(source='schedule_version.name', read_only=True)
+    copied_from_run_number = serializers.IntegerField(source='copied_from_run.run_number', read_only=True)
 
     class Meta:
         model = OptimizerRun
@@ -344,6 +345,10 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'notes',
             'is_active',
             'score_is_stale',
+            'copied_from_run',
+            'copied_from_run_number',
+            'run_kind',
+            'locked_open_shift_instance_ids',
         ]
         read_only_fields = fields
 
@@ -384,6 +389,7 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
     open_count = serializers.SerializerMethodField()
     is_open = serializers.SerializerMethodField()
     assignments = serializers.SerializerMethodField()
+    is_locked_open = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleShiftInstance
@@ -428,18 +434,33 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
     def get_assignments(self, obj):
         return ScheduleShiftAssignmentSerializer(self._visible_assignments(obj), many=True).data
 
+    def get_is_locked_open(self, obj):
+        optimizer_run_id = self.context.get('optimizer_run_id')
+        if optimizer_run_id:
+            locked_ids = self.context.get('locked_open_shift_instance_ids')
+            if locked_ids is None:
+                locked_ids = OptimizerRun.objects.filter(id=optimizer_run_id).values_list(
+                    'locked_open_shift_instance_ids', flat=True
+                ).first() or []
+                self.context['locked_open_shift_instance_ids'] = locked_ids
+            return obj.id in locked_ids
+        return obj.is_locked_open
+
     def _visible_assignments(self, obj):
         optimizer_run_id = self.context.get('optimizer_run_id')
         query = obj.assignments.select_related('physician__user')
         if optimizer_run_id:
+            run_kind = self.context.get('optimizer_run_kind')
+            if run_kind is None:
+                run_kind = OptimizerRun.objects.filter(id=optimizer_run_id).values_list('run_kind', flat=True).first()
+                self.context['optimizer_run_kind'] = run_kind
+            if run_kind == 'COPY':
+                return query.filter(optimizer_run_id=optimizer_run_id)
             return query.filter(
-                models.Q(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
-                | models.Q(
-                    assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
-                    optimizer_run_id=optimizer_run_id,
-                )
+                models.Q(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL, optimizer_run__isnull=True)
+                | models.Q(optimizer_run_id=optimizer_run_id)
             )
-        return query.filter(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
+        return query.filter(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL, optimizer_run__isnull=True)
 
 
 class ScheduleRequestSerializer(serializers.ModelSerializer):

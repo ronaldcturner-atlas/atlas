@@ -1588,6 +1588,98 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             float(optimizer_run.final_score),
             rescore.json()['violation_report']['total_score'],
         )
+
+    def test_save_copy_isolates_assignments_and_supports_reports_and_rescore(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        physicians = [
+            self._create_assignment_physician(
+                f'copy{index}@example.com', f'Copy {index}', facilities=[self.facility]
+            )
+            for index in range(4)
+        ]
+        optimized = self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+        self.assertEqual(optimized.status_code, 200)
+        source = OptimizerRun.objects.get(id=optimized.json()['optimizer_run_id'])
+        day = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        source_day = list(ScheduleShiftAssignment.objects.filter(optimizer_run=source, shift_instance=day).order_by('id'))
+        self.assertEqual(len(source_day), 2)
+        assignment_url = f'/api/schedule-blocks/{self.block.id}/build/shift-instances/{day.id}/assignments/'
+        for assignment, locked in zip(source_day, (True, False)):
+            response = self.client.patch(
+                f'{assignment_url}{assignment.id}/',
+                data={'physician_id': assignment.physician_id, 'is_locked': locked}, format='json',
+            )
+            self.assertEqual(response.status_code, 200)
+        overnight = ScheduleShiftInstance.objects.get(shift_template=self.overnight_template)
+        self.client.patch(
+            f'/api/schedule-blocks/{self.block.id}/build/shift-instances/{overnight.id}/assignments/',
+            data={'physician_id': None, 'is_locked_open': True}, format='json',
+        )
+
+        source_rows = list(ScheduleShiftAssignment.objects.filter(optimizer_run=source).order_by('shift_instance_id', 'physician_id').values_list(
+            'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked'
+        ))
+        copied_response = self.client.post(f'/api/optimizer-runs/{source.id}/save-copy/', format='json')
+        self.assertEqual(copied_response.status_code, 201)
+        copied = OptimizerRun.objects.get(id=copied_response.json()['id'])
+        self.assertEqual(copied.run_number, source.run_number + 1)
+        self.assertEqual(copied.copied_from_run, source)
+        self.assertEqual(copied.run_kind, 'COPY')
+        self.assertTrue(copied.is_active)
+        source.refresh_from_db()
+        self.assertFalse(source.is_active)
+        self.assertIn(overnight.id, copied.locked_open_shift_instance_ids)
+        copied_rows = list(ScheduleShiftAssignment.objects.filter(optimizer_run=copied).order_by('shift_instance_id', 'physician_id').values_list(
+            'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked'
+        ))
+        self.assertEqual(copied_rows, source_rows)
+        self.assertIn(True, [row[3] for row in copied_rows])
+        self.assertIn(False, [row[3] for row in copied_rows])
+
+        copied_assignment = ScheduleShiftAssignment.objects.filter(optimizer_run=copied, shift_instance=day).order_by('id').first()
+        used_ids = {row[1] for row in copied_rows}
+        replacement = next(physician for physician in physicians if physician.id not in used_ids)
+        edited = self.client.patch(
+            f'{assignment_url}{copied_assignment.id}/',
+            data={'physician_id': replacement.id, 'is_locked': copied_assignment.is_locked}, format='json',
+        )
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(
+            list(ScheduleShiftAssignment.objects.filter(optimizer_run=source).order_by('shift_instance_id', 'physician_id').values_list(
+                'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked'
+            )),
+            source_rows,
+        )
+
+        report = self.client.get(f'/api/optimizer-runs/{copied.id}/violations/')
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.json()['optimizer_run']['id'], copied.id)
+        rescored = self.client.post(
+            f'/api/schedule-versions/{version.id}/recalculate-score/',
+            data={'optimizer_run_id': copied.id}, format='json',
+        )
+        self.assertEqual(rescored.status_code, 200)
+        self.assertEqual(rescored.json()['violation_report']['optimizer_run']['id'], copied.id)
+        history = self.client.get(f'/api/schedule-versions/{version.id}/optimizer-runs/')
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual([row['id'] for row in history.json()[:2]], [copied.id, source.id])
+        copied_before_optimize = list(
+            ScheduleShiftAssignment.objects.filter(optimizer_run=copied).order_by('id').values_list(
+                'id', 'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked'
+            )
+        )
+        rerun = self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
+        self.assertEqual(rerun.status_code, 200)
+        self.assertEqual(
+            list(ScheduleShiftAssignment.objects.filter(optimizer_run=copied).order_by('id').values_list(
+                'id', 'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked'
+            )),
+            copied_before_optimize,
+        )
     def test_optimizer_summary_persists_and_build_context_reloads_it(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',

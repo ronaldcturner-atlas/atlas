@@ -211,6 +211,11 @@ class OptimizerRun(models.Model):
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=False)
     score_is_stale = models.BooleanField(default=False)
+    copied_from_run = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, related_name='copies', null=True, blank=True,
+    )
+    run_kind = models.CharField(max_length=20, default='OPTIMIZER')
+    locked_open_shift_instance_ids = models.JSONField(default=list, blank=True)
 
     def __str__(self):
         return f'{self.schedule_version_id}: Run {self.run_number}'
@@ -327,8 +332,13 @@ class ScheduleShiftAssignment(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=['shift_instance', 'physician'],
-                condition=models.Q(assignment_source='MANUAL'),
-                name='unique_manual_physician_per_schedule_shift_instance',
+                condition=models.Q(assignment_source='MANUAL', optimizer_run__isnull=True),
+                name='unique_legacy_manual_physician_per_shift_instance',
+            ),
+            models.UniqueConstraint(
+                fields=['shift_instance', 'physician', 'optimizer_run'],
+                condition=models.Q(assignment_source='MANUAL', optimizer_run__isnull=False),
+                name='unique_manual_run_physician_per_shift_instance',
             ),
             models.UniqueConstraint(
                 fields=['shift_instance', 'physician', 'optimizer_run'],

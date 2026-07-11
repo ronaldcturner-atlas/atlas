@@ -2938,12 +2938,15 @@ def _score_audit(scoring, night_report, request_rows):
 
 
 def _assignments_for_optimizer_run(version, optimizer_run=None):
-    query = Q(assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL)
-    if optimizer_run is not None:
-        query |= Q(
-            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
-            optimizer_run=optimizer_run,
+    if optimizer_run is not None and optimizer_run.run_kind == 'COPY':
+        query = Q(optimizer_run=optimizer_run)
+    else:
+        query = Q(
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run__isnull=True,
         )
+        if optimizer_run is not None:
+            query |= Q(optimizer_run=optimizer_run)
     return ScheduleShiftAssignment.objects.filter(
         query,
         shift_instance__schedule_version=version,
@@ -3281,6 +3284,11 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             .select_related('schedule_block', 'domain')
             .get(id=schedule_version.id)
         )
+        copy_seed_run = version.optimizer_runs.filter(
+            is_active=True,
+            status=OptimizerRun.Status.COMPLETED,
+            run_kind='COPY',
+        ).first()
         if optimizer_run is None:
             latest_run_number = (
                 OptimizerRun.objects.filter(schedule_version=version)
@@ -3338,10 +3346,38 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             .prefetch_related('assignments__physician__user')
             .order_by('date', 'facility__name', 'start_datetime', 'id')
         )
-        assignments = list(
-            _assignments_for_optimizer_run(version, None)
-            .select_related('shift_instance', 'physician__user')
-        )
+        if copy_seed_run is not None:
+            copied_seed_assignments = list(
+                _assignments_for_optimizer_run(version, copy_seed_run)
+                .select_related('shift_instance', 'physician__user')
+            )
+            manual_seed_rows = [
+                ScheduleShiftAssignment(
+                    shift_instance_id=row.shift_instance_id,
+                    physician_id=row.physician_id,
+                    created_by=created_by,
+                    assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                    optimizer_run=optimizer_run,
+                    is_locked=row.is_locked,
+                )
+                for row in copied_seed_assignments
+                if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+            ]
+            ScheduleShiftAssignment.objects.bulk_create(manual_seed_rows)
+            assignments = [
+                row for row in copied_seed_assignments
+                if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+            ] + list(
+                ScheduleShiftAssignment.objects.filter(
+                    optimizer_run=optimizer_run,
+                    assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                ).select_related('shift_instance', 'physician__user')
+            )
+        else:
+            assignments = list(
+                _assignments_for_optimizer_run(version, None)
+                .select_related('shift_instance', 'physician__user')
+            )
         manual_assignments_preserved = sum(
             1
             for assignment in assignments

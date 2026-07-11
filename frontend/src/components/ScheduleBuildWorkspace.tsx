@@ -153,6 +153,10 @@ type OptimizerRun = {
   final_score: string | number | null
   is_active: boolean
   score_is_stale: boolean
+  copied_from_run: number | null
+  copied_from_run_number: number | null
+  run_kind: 'OPTIMIZER' | 'COPY'
+  locked_open_shift_instance_ids: number[]
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
 }
@@ -261,10 +265,11 @@ function optimizerRunScoreLabel(run: OptimizerRun) {
 }
 
 function optimizerRunLabel(run: OptimizerRun) {
+  const copyLabel = run.copied_from_run_number ? ` - Copy of Run ${run.copied_from_run_number}` : ''
   if (!isCompletedOptimizerRun(run)) {
     return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
   }
-  return `Run ${run.run_number} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${copyLabel} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
 }
 
 function workloadRangeLabel(range: OptimizerSummary['workload_summary'][number]['effective_workload_range']) {
@@ -381,6 +386,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isGenerating, setIsGenerating] = useState(false)
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
+  const [isSavingCopy, setIsSavingCopy] = useState(false)
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
@@ -887,6 +893,30 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const saveRunCopy = async () => {
+    const source = selectedRunForActions
+    if (!source) return
+    try {
+      setIsSavingCopy(true)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(`${API_BASE}/optimizer-runs/${source.id}/save-copy/`, {
+        method: 'POST', credentials: 'include',
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to save a copy of this run.'))
+      const copied = data as OptimizerRun
+      setSelectedOptimizerRunId(copied.id)
+      updateOptimizerRunUrl(copied.id)
+      await fetchContext(copied.schedule_version, { optimizerRunId: copied.id, quiet: true })
+      setNotice(`Viewing Run ${copied.run_number} — Copy of Run ${source.run_number}.`)
+    } catch (copyError) {
+      setError(copyError instanceof Error ? copyError.message : 'Unable to save a copy of this run.')
+    } finally {
+      setIsSavingCopy(false)
+    }
+  }
+
   const clearScheduleAssignments = async (clearType: 'optimizer' | 'all') => {
     const versionId = context.selected_version?.id
     if (!versionId) {
@@ -1167,7 +1197,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     && (!context.selected_optimizer_run || context.selected_optimizer_run.is_active)
   const canOptimize = canEditAssignments && context.shift_instances.length > 0
   const canClearAssignments = canEditAssignments && context.shift_instances.length > 0
-  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || clearingAction !== null || deletingRunId !== null
+  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || clearingAction !== null || deletingRunId !== null
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -1300,7 +1330,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 </select>
               </label>
               <div className="optimizer-run-status">
-                <span>Viewing Run {selectedRunForActions.run_number}</span>
+                <span>Viewing Run {selectedRunForActions.run_number}{selectedRunForActions.copied_from_run_number ? ` — Copy of Run ${selectedRunForActions.copied_from_run_number}` : ''}</span>
                 {selectedRunForActions.is_active ? (
                   <strong>Active</strong>
                 ) : (
@@ -1308,6 +1338,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 )}
               </div>
               <div className="optimizer-run-actions">
+                <button type="button" className="secondary" onClick={() => void saveRunCopy()} disabled={isMutatingBuild}>
+                  {isSavingCopy ? 'Saving...' : 'Save Copy'}
+                </button>
                 <button
                   type="button"
                   className="secondary"

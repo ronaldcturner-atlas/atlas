@@ -27,6 +27,7 @@ urlpatterns = [
     path("schedule-versions/<int:version_id>/violation-report/", api.schedule_version_violation_report, name="schedule_version_violation_report"),
     path("optimizer-runs/<int:run_id>/", api.optimizer_run_detail, name="optimizer_run_detail"),
     path("optimizer-runs/<int:run_id>/activate/", api.optimizer_run_activate, name="optimizer_run_activate"),
+    path("optimizer-runs/<int:run_id>/save-copy/", api.optimizer_run_save_copy, name="optimizer_run_save_copy"),
     path("optimizer-runs/<int:run_id>/violations/", api.optimizer_run_violations, name="optimizer_run_violations"),
     path("schedule-blocks/<int:block_id>/build/shift-instances/<int:shift_instance_id>/assignments/", api.schedule_shift_assignments, name="schedule_shift_assignments"),
     path("schedule-blocks/<int:block_id>/build/shift-instances/<int:shift_instance_id>/assignments/<int:assignment_id>/", api.schedule_shift_assignment_detail, name="schedule_shift_assignment_detail"),
