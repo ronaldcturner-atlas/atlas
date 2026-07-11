@@ -23,6 +23,7 @@ urlpatterns = [
     path("schedule-blocks/<int:block_id>/build/versions/<int:version_id>/clear-all-assignments/", api.schedule_version_clear_all_assignments, name="schedule_version_clear_all_assignments"),
     path("schedule-versions/<int:version_id>/optimizer-runs/", api.schedule_version_optimizer_runs, name="schedule_version_optimizer_runs"),
     path("schedule-versions/<int:version_id>/run-optimizer/", api.schedule_version_run_optimizer, name="schedule_version_run_optimizer"),
+    path("schedule-versions/<int:version_id>/recalculate-score/", api.schedule_version_recalculate_score, name="schedule_version_recalculate_score"),
     path("schedule-versions/<int:version_id>/violation-report/", api.schedule_version_violation_report, name="schedule_version_violation_report"),
     path("optimizer-runs/<int:run_id>/", api.optimizer_run_detail, name="optimizer_run_detail"),
     path("optimizer-runs/<int:run_id>/activate/", api.optimizer_run_activate, name="optimizer_run_activate"),

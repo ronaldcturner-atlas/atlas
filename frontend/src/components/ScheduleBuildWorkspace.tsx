@@ -24,6 +24,7 @@ type ScheduleVersion = {
   name: string
   status: 'BUILD' | 'PREVIEW' | 'ARCHIVED'
   shift_instance_count: number
+  score_is_stale: boolean
 }
 
 type ShiftInstance = {
@@ -151,6 +152,7 @@ type OptimizerRun = {
   initial_score: string | number | null
   final_score: string | number | null
   is_active: boolean
+  score_is_stale: boolean
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
 }
@@ -378,6 +380,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isOptimizing, setIsOptimizing] = useState(false)
+  const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
@@ -859,6 +862,31 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const recalculateScore = async () => {
+    const versionId = context?.selected_version?.id
+    const runId = selectedRunForActions?.id
+    if (!versionId || !runId) return
+    try {
+      setIsRecalculatingScore(true)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(`${API_BASE}/schedule-versions/${versionId}/recalculate-score/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ optimizer_run_id: runId }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to recalculate score.'))
+      await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
+      setNotice('Score, workload details, and violations recalculated.')
+    } catch (recalculateError) {
+      setError(recalculateError instanceof Error ? recalculateError.message : 'Unable to recalculate score.')
+    } finally {
+      setIsRecalculatingScore(false)
+    }
+  }
+
   const clearScheduleAssignments = async (clearType: 'optimizer' | 'all') => {
     const versionId = context.selected_version?.id
     if (!versionId) {
@@ -1027,6 +1055,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       }
       const nextAssignmentContext = data as AssignmentContext
       applyAssignmentContext(nextAssignmentContext)
+      await fetchContext(context?.selected_version?.id, { quiet: true, preserveError: true })
       setPhysicianSearch('')
       if (nextAssignmentContext.shift_instance.open_count === 0) {
         closeAssignments()
@@ -1063,6 +1092,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         throw new Error(apiError(data, 'Unable to remove physician.'))
       }
       applyAssignmentContext(data as AssignmentContext)
+      await fetchContext(context?.selected_version?.id, { quiet: true, preserveError: true })
     } catch (assignmentSaveError) {
       setAssignmentError(
         assignmentSaveError instanceof Error
@@ -1137,7 +1167,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     && (!context.selected_optimizer_run || context.selected_optimizer_run.is_active)
   const canOptimize = canEditAssignments && context.shift_instances.length > 0
   const canClearAssignments = canEditAssignments && context.shift_instances.length > 0
-  const isMutatingBuild = isGenerating || isOptimizing || clearingAction !== null || deletingRunId !== null
+  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || clearingAction !== null || deletingRunId !== null
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -1215,6 +1245,15 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           disabled={!canOptimize || isMutatingBuild}
         >
           {isOptimizing ? 'Running...' : 'Run Optimizer v0'}
+        </button>
+
+        <button
+          type="button"
+          className="secondary"
+          onClick={() => void recalculateScore()}
+          disabled={!selectedRunForActions || isMutatingBuild}
+        >
+          {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
         </button>
 
         <button
@@ -1376,6 +1415,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       {optimizerSummary && (
         <section className="optimizer-summary-card" aria-live="polite">
+          {selectedRunForActions?.score_is_stale && (
+            <div className="optimizer-score-stale" role="status">
+              Score may be outdated after manual edits. Recalculate Score to refresh.
+            </div>
+          )}
           <div className="optimizer-summary-grid">
             <div>
               <span>Initial score</span>

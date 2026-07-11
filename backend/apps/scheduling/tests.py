@@ -1509,6 +1509,85 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(day_instance.assignments.count(), day_instance.required_staffing)
 
+    def test_manual_edits_mark_score_stale_and_rescore_preserves_schedule_state(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        physicians = [
+            self._create_assignment_physician(
+                f'rescore{index}@example.com', f'Rescore {index}', facilities=[self.facility]
+            )
+            for index in range(3)
+        ]
+        optimize = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/', format='json'
+        )
+        self.assertEqual(optimize.status_code, 200)
+        optimizer_run = OptimizerRun.objects.get(id=optimize.json()['optimizer_run_id'])
+        run_count = OptimizerRun.objects.filter(schedule_version=version).count()
+        day_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        day_assignments = list(
+            ScheduleShiftAssignment.objects.filter(
+                shift_instance=day_instance, optimizer_run=optimizer_run
+            ).order_by('id')
+        )
+        self.assertEqual(len(day_assignments), 2)
+
+        detail_base = (
+            f'/api/schedule-blocks/{self.block.id}/build/shift-instances/'
+            f'{day_instance.id}/assignments/'
+        )
+        for assignment, is_locked in zip(day_assignments, (True, False)):
+            response = self.client.patch(
+                f'{detail_base}{assignment.id}/',
+                data={'physician_id': assignment.physician_id, 'is_locked': is_locked},
+                format='json',
+            )
+            self.assertEqual(response.status_code, 200)
+
+        overnight = ScheduleShiftInstance.objects.get(shift_template=self.overnight_template)
+        opened = self.client.patch(
+            f'/api/schedule-blocks/{self.block.id}/build/shift-instances/{overnight.id}/assignments/',
+            data={'physician_id': None, 'is_locked_open': True},
+            format='json',
+        )
+        self.assertEqual(opened.status_code, 200)
+        optimizer_run.refresh_from_db()
+        version.refresh_from_db()
+        self.assertTrue(optimizer_run.score_is_stale)
+        self.assertTrue(version.score_is_stale)
+
+        assignment_snapshot = list(
+            ScheduleShiftAssignment.objects.filter(shift_instance__schedule_version=version)
+            .order_by('id').values_list(
+                'id', 'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked', 'optimizer_run_id'
+            )
+        )
+        rescore = self.client.post(
+            f'/api/schedule-versions/{version.id}/recalculate-score/',
+            data={'optimizer_run_id': optimizer_run.id},
+            format='json',
+        )
+        self.assertEqual(rescore.status_code, 200)
+        self.assertEqual(OptimizerRun.objects.filter(schedule_version=version).count(), run_count)
+        self.assertEqual(
+            list(ScheduleShiftAssignment.objects.filter(shift_instance__schedule_version=version)
+                 .order_by('id').values_list(
+                     'id', 'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked', 'optimizer_run_id'
+                 )),
+            assignment_snapshot,
+        )
+        overnight.refresh_from_db()
+        self.assertTrue(overnight.is_locked_open)
+        optimizer_run.refresh_from_db()
+        self.assertFalse(optimizer_run.score_is_stale)
+        self.assertEqual(
+            float(optimizer_run.final_score),
+            rescore.json()['violation_report']['total_score'],
+        )
     def test_optimizer_summary_persists_and_build_context_reloads_it(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',

@@ -215,6 +215,7 @@ select option:checked{
 .optimizer-run-row span{color:var(--muted);font-size:12px}
 .optimizer-run-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
 .optimizer-summary-grid,.optimizer-extra-grid{display:grid;grid-template-columns:repeat(6,minmax(104px,1fr));gap:6px}
+.optimizer-score-stale{justify-self:start;padding:4px 8px;border:1px solid rgba(251,191,36,0.42);border-radius:999px;background:rgba(251,191,36,0.1);color:#fde68a;font-size:11px}
 .optimizer-summary-grid>div,.optimizer-extra-grid>div{display:grid;gap:2px;min-width:0;padding:6px 8px;border:1px solid rgba(255,255,255,0.07);border-radius:6px;background:rgba(255,255,255,0.025)}
 .optimizer-summary-grid span,.optimizer-extra-grid span{color:var(--muted);font-size:10px;line-height:1.2}
 .optimizer-summary-grid strong,.optimizer-extra-grid strong{font-size:14px;line-height:1.2}

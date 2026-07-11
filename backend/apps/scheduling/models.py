@@ -162,6 +162,7 @@ class ScheduleVersion(models.Model):
     name = models.CharField(max_length=120)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.BUILD)
     optimizer_summary = models.JSONField(default=dict, blank=True)
+    score_is_stale = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -209,6 +210,7 @@ class OptimizerRun(models.Model):
     optimizer_debug = models.JSONField(default=dict, blank=True)
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=False)
+    score_is_stale = models.BooleanField(default=False)
 
     def __str__(self):
         return f'{self.schedule_version_id}: Run {self.run_number}'

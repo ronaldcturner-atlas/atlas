@@ -301,6 +301,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'name',
             'status',
             'optimizer_summary',
+            'score_is_stale',
             'active_optimizer_run',
             'shift_instance_count',
             'created_at',
@@ -342,6 +343,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'optimizer_debug',
             'notes',
             'is_active',
+            'score_is_stale',
         ]
         read_only_fields = fields
 

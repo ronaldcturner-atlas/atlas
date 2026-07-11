@@ -27,7 +27,11 @@ from .models import (
     Shift,
     ShiftTemplate,
 )
-from .optimizer import build_violation_report, optimize_schedule_version
+from .optimizer import (
+    build_violation_report,
+    optimize_schedule_version,
+    recalculate_schedule_version_score,
+)
 from .serializers import (
     ContractSerializer,
     OptimizerRunSerializer,
@@ -942,6 +946,14 @@ def _active_optimizer_run(version):
     ).order_by('-run_number').first()
 
 
+def _mark_schedule_score_stale(version):
+    ScheduleVersion.objects.filter(id=version.id).update(score_is_stale=True)
+    OptimizerRun.objects.filter(
+        schedule_version=version,
+        status=OptimizerRun.Status.COMPLETED,
+    ).update(score_is_stale=True)
+
+
 def _cleanup_stale_optimizer_runs(version):
     stale_before = timezone.now() - timedelta(minutes=STALE_OPTIMIZER_RUN_MINUTES)
     stale_runs = OptimizerRun.objects.filter(
@@ -1226,6 +1238,33 @@ def schedule_version_run_optimizer(request, version_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
     return Response(summary)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_recalculate_score(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+    )
+    run_id = request.data.get('optimizer_run_id') or request.query_params.get('optimizer_run_id')
+    optimizer_run = _get_optimizer_run_for_version(version, run_id)
+    if optimizer_run is None or optimizer_run.status != OptimizerRun.Status.COMPLETED:
+        return Response(
+            {'detail': 'Select a completed optimizer run to recalculate its score.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    summary, report = recalculate_schedule_version_score(version, optimizer_run)
+    return Response({
+        'optimizer_summary': summary,
+        'optimizer_run': OptimizerRunSerializer(
+            OptimizerRun.objects.get(id=optimizer_run.id)
+        ).data,
+        'violation_report': report,
+    })
 
 
 @api_view(['GET', 'DELETE'])
@@ -1684,6 +1723,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             locked_instance.is_locked_open = bool(request.data.get('is_locked_open', False))
             locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
             _sync_shift_instance_status(locked_instance)
+            _mark_schedule_score_stale(locked_instance.schedule_version)
         return Response(_assignment_context_payload(locked_instance))
 
     try:
@@ -1754,6 +1794,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             locked_instance.is_locked_open = False
             locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
         _sync_shift_instance_status(locked_instance)
+        _mark_schedule_score_stale(locked_instance.schedule_version)
 
     return Response(
         _assignment_context_payload(locked_instance),
@@ -1838,9 +1879,11 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
             if shift_instance.is_locked_open:
                 shift_instance.is_locked_open = False
                 shift_instance.save(update_fields=['is_locked_open', 'updated_at'])
+            _mark_schedule_score_stale(shift_instance.schedule_version)
         return Response(_assignment_context_payload(shift_instance))
     assignment.delete()
     _sync_shift_instance_status(shift_instance)
+    _mark_schedule_score_stale(shift_instance.schedule_version)
     return Response(_assignment_context_payload(shift_instance))
 
 

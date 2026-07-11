@@ -3212,6 +3212,63 @@ def build_violation_report(schedule_version, optimizer_run=None):
     }
 
 
+def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
+    """Refresh persisted scoring for the current assignments without optimizing."""
+    report = build_violation_report(schedule_version, optimizer_run=optimizer_run)
+    workload_summary = []
+    for user in report['users']:
+        workload = user.get('workload_score') or {}
+        workload_summary.append({
+            'physician_id': user['user_id'],
+            'physician_name': user['display_name'],
+            'contract_name': workload.get('contract_name'),
+            'assigned_hours': user['hours'],
+            'assigned_shifts': user['shifts'],
+            'night_shifts': user['night_shifts'],
+            'target_units': workload.get('target_units'),
+            'target': workload.get('target'),
+            'effective_workload_range': workload.get('effective_workload_range'),
+            'deviation': workload.get('deviation'),
+            'deviation_direction': workload.get('deviation_direction'),
+            'score_contribution': workload.get('score_contribution', 0),
+        })
+
+    run = optimizer_run
+    existing = dict((run.optimizer_summary if run else schedule_version.optimizer_summary) or {})
+    debug = dict(existing.get('debug') or {})
+    debug.update(report['debug'])
+    debug['score_audit'] = report['score_audit']
+    debug['score_recalculated_from_current_assignments'] = True
+    breakdown = report['score_breakdown']
+    summary = {
+        **existing,
+        'total_score': report['total_score'],
+        'final_score': report['total_score'],
+        'score_breakdown': breakdown,
+        'unfilled_shift_count': int(breakdown.get('coverage_score', 0) / COVERAGE_PENALTY),
+        'workload_summary': workload_summary,
+        'debug': debug,
+    }
+
+    with transaction.atomic():
+        version = ScheduleVersion.objects.select_for_update().get(id=schedule_version.id)
+        version.optimizer_summary = summary
+        version.score_is_stale = False
+        version.save(update_fields=['optimizer_summary', 'score_is_stale', 'updated_at'])
+        if run is not None:
+            locked_run = OptimizerRun.objects.select_for_update().get(id=run.id)
+            locked_run.final_score = report['total_score']
+            locked_run.score_breakdown = breakdown
+            locked_run.optimizer_summary = summary
+            locked_run.optimizer_debug = debug
+            locked_run.score_is_stale = False
+            locked_run.save(update_fields=[
+                'final_score', 'score_breakdown', 'optimizer_summary',
+                'optimizer_debug', 'score_is_stale',
+            ])
+    return summary, report
+
+
 def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=None, seed=None):
     if schedule_version.status != ScheduleVersion.Status.BUILD:
         raise ValueError('Optimizer can only run on a BUILD Schedule Version.')
@@ -5537,6 +5594,7 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
         optimizer_run.score_breakdown = summary['score_breakdown']
         optimizer_run.optimizer_summary = summary
         optimizer_run.optimizer_debug = summary.get('debug', {})
+        optimizer_run.score_is_stale = False
         optimizer_run.is_active = not timed_out
         if timed_out:
             optimizer_run.notes = 'Optimizer stopped after runtime limit. Previous active run preserved.'
@@ -5550,8 +5608,10 @@ def optimize_schedule_version(schedule_version, created_by=None, optimizer_run=N
             'seed',
             'is_active',
             'notes',
+            'score_is_stale',
         ])
         if not timed_out:
             version.optimizer_summary = summary
-            version.save(update_fields=['optimizer_summary', 'updated_at'])
+            version.score_is_stale = False
+            version.save(update_fields=['optimizer_summary', 'score_is_stale', 'updated_at'])
     return summary
