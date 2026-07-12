@@ -2478,6 +2478,12 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(context_response.status_code, 200)
         payload = context_response.json()
         self.assertEqual(payload['selected_optimizer_run']['id'], run_one.id)
+        self.assertEqual(payload['run_state']['viewed_run_id'], run_one.id)
+        self.assertEqual(payload['run_state']['active_run_id'], run_two.id)
+        self.assertFalse(payload['run_state']['viewed_run_is_editable'])
+        self.assertTrue(payload['run_state']['viewed_run_can_activate'])
+        self.assertTrue(payload['run_state']['viewed_run_can_copy'])
+        self.assertTrue(payload['run_state']['viewed_run_can_be_optimizer_source'])
         self.assertEqual(payload['optimizer_summary']['optimizer_run_id'], run_one.id)
         self.assertEqual(
             {
@@ -2515,6 +2521,9 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(context_response.status_code, 200)
         self.assertEqual(context_response.json()['selected_optimizer_run']['id'], active_run.id)
+        self.assertEqual(context_response.json()['run_state']['viewed_run_id'], active_run.id)
+        self.assertEqual(context_response.json()['run_state']['active_run_id'], active_run.id)
+        self.assertTrue(context_response.json()['run_state']['viewed_run_is_editable'])
 
     def test_delete_inactive_optimizer_run_removes_only_that_run_assignments(self):
         self.client.post(

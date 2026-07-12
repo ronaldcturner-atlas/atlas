@@ -32,6 +32,13 @@ from .optimizer import (
     optimize_schedule_version,
     recalculate_schedule_version_score,
 )
+from .run_state import (
+    get_active_optimizer_run,
+    get_viewed_optimizer_run,
+    resolve_build_workspace_run_context,
+    serialize_run_state,
+    visible_assignment_filter,
+)
 from .serializers import (
     ContractSerializer,
     OptimizerRunSerializer,
@@ -940,18 +947,13 @@ def _schedule_version_queryset(block):
 
 
 def _active_optimizer_run(version):
-    return version.optimizer_runs.filter(
-        is_active=True,
-        status=OptimizerRun.Status.COMPLETED,
-    ).order_by('-run_number').first()
+    return get_active_optimizer_run(version)
 
 
-def _mark_schedule_score_stale(version):
+def _mark_schedule_score_stale(version, viewed_run=None):
     ScheduleVersion.objects.filter(id=version.id).update(score_is_stale=True)
-    OptimizerRun.objects.filter(
-        schedule_version=version,
-        status=OptimizerRun.Status.COMPLETED,
-    ).update(score_is_stale=True)
+    if viewed_run is not None:
+        OptimizerRun.objects.filter(id=viewed_run.id).update(score_is_stale=True)
 
 
 def _cleanup_stale_optimizer_runs(version):
@@ -985,30 +987,23 @@ def _default_optimizer_run(version):
 
 
 def _get_optimizer_run_for_version(version, run_id):
-    if not run_id:
-        return _default_optimizer_run(version)
-    try:
-        parsed_run_id = int(run_id)
-    except (TypeError, ValueError):
-        return None
-    run = OptimizerRun.objects.filter(id=parsed_run_id, schedule_version=version).first()
-    if run is None:
-        return None
-    if run.status != OptimizerRun.Status.COMPLETED:
-        return _default_optimizer_run(version)
-    return run
+    return get_viewed_optimizer_run(version, run_id)
 
 
 def _visible_assignment_filter(optimizer_run):
-    if optimizer_run is not None and optimizer_run.run_kind == 'COPY':
-        return Q(optimizer_run=optimizer_run)
-    query = Q(
-        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-        optimizer_run__isnull=True,
-    )
-    if optimizer_run is not None:
-        query |= Q(optimizer_run=optimizer_run)
-    return query
+    return visible_assignment_filter(optimizer_run)
+
+
+def _requested_editable_run(request, version):
+    requested_id = request.data.get('optimizer_run_id') or request.query_params.get('optimizer_run_id')
+    context = resolve_build_workspace_run_context(version, requested_id)
+    if requested_id not in (None, '') and (
+        context.viewed_run is None or str(context.viewed_run.id) != str(requested_id)
+    ):
+        return None, Response({'detail': 'The viewed optimizer run was not found.'}, status=status.HTTP_400_BAD_REQUEST)
+    if context.viewed_run is not None and not context.viewed_run_is_editable:
+        return None, Response({'detail': 'Manual edits apply only to the viewed active run.'}, status=status.HTTP_409_CONFLICT)
+    return context.viewed_run, None
 
 
 def _set_active_run_locked_open(instance, is_locked_open):
@@ -1076,11 +1071,10 @@ def schedule_block_build_context(request, block_id):
         if requested_optimizer_run is not None:
             selected_version = requested_optimizer_run.schedule_version
 
-    selected_optimizer_run = (
-        _get_optimizer_run_for_version(selected_version, optimizer_run_id)
-        if selected_version
-        else None
-    )
+    if selected_version:
+        _cleanup_stale_optimizer_runs(selected_version)
+    run_context = resolve_build_workspace_run_context(selected_version, optimizer_run_id) if selected_version else None
+    selected_optimizer_run = run_context.viewed_run if run_context else None
     optimizer_summary = None
     if selected_optimizer_run:
         optimizer_summary = selected_optimizer_run.optimizer_summary or None
@@ -1090,7 +1084,7 @@ def schedule_block_build_context(request, block_id):
         ScheduleShiftInstanceSerializer(
             _shift_instance_queryset(selected_version, selected_optimizer_run),
             many=True,
-            context={'optimizer_run_id': selected_optimizer_run.id if selected_optimizer_run else None},
+            context={'optimizer_run_id': selected_optimizer_run.id if selected_optimizer_run else None, 'viewed_run': selected_optimizer_run},
         ).data
         if selected_version
         else []
@@ -1125,6 +1119,11 @@ def schedule_block_build_context(request, block_id):
                 if selected_optimizer_run
                 else None
             ),
+            'run_state': serialize_run_state(run_context) if run_context else {
+                'viewed_run_id': None, 'active_run_id': None,
+                'viewed_run_is_editable': False, 'viewed_run_can_activate': False,
+                'viewed_run_can_copy': False, 'viewed_run_can_be_optimizer_source': False,
+            },
             'shift_instances': shift_instances,
         }
     )
@@ -1191,6 +1190,29 @@ def _optimizer_start_options(request, version):
     return start_mode, source_run, None
 
 
+def _run_optimizer_response(request, version):
+    seed, seed_error = _parse_optimizer_seed(request)
+    if seed_error:
+        return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    start_mode, source_run, start_error = _optimizer_start_options(request, version)
+    if start_error:
+        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    running_run = _blocking_optimizer_run(version)
+    if running_run is not None:
+        return Response({
+            'detail': 'An optimizer run is already running for this schedule version.',
+            'optimizer_run_id': running_run.id,
+        }, status=status.HTTP_409_CONFLICT)
+    try:
+        summary = optimize_schedule_version(
+            version, created_by=request.user, seed=seed,
+            start_mode=start_mode, source_run=source_run,
+        )
+    except ValueError as optimizer_error:
+        return Response({'detail': str(optimizer_error)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(summary)
+
+
 @api_view(['POST'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -1204,33 +1226,7 @@ def schedule_version_optimize(request, block_id, version_id):
         id=version_id,
         schedule_block=block,
     )
-    seed, seed_error = _parse_optimizer_seed(request)
-    if seed_error:
-        return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
-    start_mode, source_run, start_error = _optimizer_start_options(request, version)
-    if start_error:
-        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
-    running_run = _blocking_optimizer_run(version)
-    if running_run is not None:
-        return Response(
-            {
-                'detail': 'An optimizer run is already running for this schedule version.',
-                'optimizer_run_id': running_run.id,
-            },
-            status=status.HTTP_409_CONFLICT,
-        )
-    try:
-        summary = optimize_schedule_version(
-            version, created_by=request.user, seed=seed,
-            start_mode=start_mode, source_run=source_run,
-        )
-    except ValueError as optimizer_error:
-        return Response(
-            {'detail': str(optimizer_error)},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    return Response(summary)
+    return _run_optimizer_response(request, version)
 
 
 @api_view(['GET'])
@@ -1257,32 +1253,7 @@ def schedule_version_run_optimizer(request, version_id):
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
-    seed, seed_error = _parse_optimizer_seed(request)
-    if seed_error:
-        return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
-    start_mode, source_run, start_error = _optimizer_start_options(request, version)
-    if start_error:
-        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
-    running_run = _blocking_optimizer_run(version)
-    if running_run is not None:
-        return Response(
-            {
-                'detail': 'An optimizer run is already running for this schedule version.',
-                'optimizer_run_id': running_run.id,
-            },
-            status=status.HTTP_409_CONFLICT,
-        )
-    try:
-        summary = optimize_schedule_version(
-            version, created_by=request.user, seed=seed,
-            start_mode=start_mode, source_run=source_run,
-        )
-    except ValueError as optimizer_error:
-        return Response(
-            {'detail': str(optimizer_error)},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-    return Response(summary)
+    return _run_optimizer_response(request, version)
 
 
 @api_view(['POST'])
@@ -1295,11 +1266,12 @@ def schedule_version_recalculate_score(request, version_id):
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
-    run_id = request.data.get('optimizer_run_id') or request.query_params.get('optimizer_run_id')
-    optimizer_run = _get_optimizer_run_for_version(version, run_id)
-    if optimizer_run is None or optimizer_run.status != OptimizerRun.Status.COMPLETED:
+    optimizer_run, run_error = _requested_editable_run(request, version)
+    if run_error:
+        return run_error
+    if optimizer_run is None:
         return Response(
-            {'detail': 'Select a completed optimizer run to recalculate its score.'},
+            {'detail': 'Select the viewed active optimizer run to recalculate its score.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
     summary, report = recalculate_schedule_version_score(version, optimizer_run)
@@ -1334,8 +1306,6 @@ def optimizer_run_save_copy(request, run_id):
             ScheduleShiftInstance.objects.filter(schedule_version=version, is_locked_open=True)
             .values_list('id', flat=True)
         ) if source.is_active else list(source.locked_open_shift_instance_ids or [])
-        source.locked_open_shift_instance_ids = locked_open_ids
-        source.save(update_fields=['locked_open_shift_instance_ids'])
         OptimizerRun.objects.filter(schedule_version=version, is_active=True).update(is_active=False)
         copied = OptimizerRun.objects.create(
             schedule_version=version,
@@ -1824,6 +1794,10 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
     if request.method == 'GET':
         return Response(_assignment_context_payload(shift_instance))
 
+    viewed_run, run_error = _requested_editable_run(request, shift_instance.schedule_version)
+    if run_error:
+        return run_error
+
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or shift_instance.schedule_version.status != ScheduleVersion.Status.BUILD
@@ -1842,7 +1816,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
             _set_active_run_locked_open(locked_instance, locked_instance.is_locked_open)
             _sync_shift_instance_status(locked_instance)
-            _mark_schedule_score_stale(locked_instance.schedule_version)
+            _mark_schedule_score_stale(locked_instance.schedule_version, viewed_run)
         return Response(_assignment_context_payload(locked_instance))
 
     try:
@@ -1916,7 +1890,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
             _set_active_run_locked_open(locked_instance, False)
         _sync_shift_instance_status(locked_instance)
-        _mark_schedule_score_stale(locked_instance.schedule_version)
+        _mark_schedule_score_stale(locked_instance.schedule_version, viewed_run)
 
     return Response(
         _assignment_context_payload(locked_instance),
@@ -1946,8 +1920,12 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    viewed_run, run_error = _requested_editable_run(request, shift_instance.schedule_version)
+    if run_error:
+        return run_error
+
     assignment = get_object_or_404(
-        ScheduleShiftAssignment,
+        ScheduleShiftAssignment.objects.filter(_visible_assignment_filter(viewed_run)),
         id=assignment_id,
         shift_instance=shift_instance,
     )
@@ -2004,11 +1982,11 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
                 shift_instance.is_locked_open = False
                 shift_instance.save(update_fields=['is_locked_open', 'updated_at'])
                 _set_active_run_locked_open(shift_instance, False)
-            _mark_schedule_score_stale(shift_instance.schedule_version)
+            _mark_schedule_score_stale(shift_instance.schedule_version, viewed_run)
         return Response(_assignment_context_payload(shift_instance))
     assignment.delete()
     _sync_shift_instance_status(shift_instance)
-    _mark_schedule_score_stale(shift_instance.schedule_version)
+    _mark_schedule_score_stale(shift_instance.schedule_version, viewed_run)
     return Response(_assignment_context_payload(shift_instance))
 
 

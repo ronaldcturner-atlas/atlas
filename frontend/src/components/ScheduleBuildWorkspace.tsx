@@ -1090,7 +1090,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'include',
-          body: JSON.stringify({ physician_id: physicianId }),
+          body: JSON.stringify({ physician_id: physicianId, optimizer_run_id: selectedOptimizerRunId }),
         },
       )
       const data = await response.json().catch(() => null)
@@ -1158,7 +1158,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         method: editingAssignmentId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ physician_id: selectedPhysicianId, assignment_source: 'MANUAL', is_locked: lockAssignment }),
+        body: JSON.stringify({ physician_id: selectedPhysicianId, assignment_source: 'MANUAL', is_locked: lockAssignment, optimizer_run_id: selectedOptimizerRunId }),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(apiError(data, 'Unable to save assignment.'))
@@ -1179,7 +1179,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setIsAssignmentSaving(true)
       const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/shift-instances/${assignmentContext.shift_instance.id}/assignments/`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
-        body: JSON.stringify({ physician_id: null, is_locked_open: lockOpen }),
+        body: JSON.stringify({ physician_id: null, is_locked_open: lockOpen, optimizer_run_id: selectedOptimizerRunId }),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(apiError(data, 'Unable to mark shift open.'))

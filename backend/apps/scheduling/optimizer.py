@@ -18,6 +18,7 @@ from .models import (
     ScheduleShiftInstance,
     ScheduleVersion,
 )
+from .run_state import visible_assignment_filter
 
 
 COVERAGE_PENALTY = 1000
@@ -2938,17 +2939,8 @@ def _score_audit(scoring, night_report, request_rows):
 
 
 def _assignments_for_optimizer_run(version, optimizer_run=None):
-    if optimizer_run is not None and optimizer_run.run_kind == 'COPY':
-        query = Q(optimizer_run=optimizer_run)
-    else:
-        query = Q(
-            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-            optimizer_run__isnull=True,
-        )
-        if optimizer_run is not None:
-            query |= Q(optimizer_run=optimizer_run)
     return ScheduleShiftAssignment.objects.filter(
-        query,
+        visible_assignment_filter(optimizer_run),
         shift_instance__schedule_version=version,
         shift_instance__date__gte=version.schedule_block.start_date,
         shift_instance__date__lte=version.schedule_block.end_date,
