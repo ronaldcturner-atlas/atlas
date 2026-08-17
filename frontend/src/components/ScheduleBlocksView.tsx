@@ -525,7 +525,7 @@ export default function ScheduleBlocksView({
                 <td>{formatDateTime(block.published_at)}</td>
                 <td>
                   <div className="facility-actions">
-                    <button type="button" onClick={() => openBlock(block, block.build_status === 'ARCHIVE')}>
+                    <button type="button" onClick={() => onOpenBuild?.(block.id)}>
                       Open
                     </button>
                     <button type="button" onClick={() => openRequests(block)}>
