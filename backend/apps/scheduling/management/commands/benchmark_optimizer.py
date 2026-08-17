@@ -1,0 +1,527 @@
+import csv
+import json
+from contextlib import nullcontext
+from pathlib import Path
+from statistics import mean, median
+from time import monotonic
+from unittest.mock import patch
+
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+
+from apps.scheduling import optimizer
+from apps.scheduling.models import OptimizerRun, ScheduleVersion
+
+
+TRIAL_FIELDS = (
+    'run_index', 'source_run_id', 'stored_source_score', 'source_score', 'candidate_run_id',
+    'candidate_score', 'score_delta', 'accepted_as_new_best',
+    'best_score_so_far', 'runtime_seconds', 'seed', 'stopped_reason',
+    'optimizer_initial_score', 'initial_matches_source',
+    'source_recomputed_reported_score', 'score_audit_total_score',
+    'final_matches_score_audit',
+    'assignments_same_at_start', 'source_assignments_copied',
+    'assignments_changed_before_first_score',
+    'assignments_removed_after_final_scoring',
+    'visible_assignments_added_after_final_scoring',
+    'status', 'run_kind', 'initial_score', 'final_total_score',
+    'assignments_made', 'unfilled_shifts', 'timed_out', 'error',
+)
+
+
+def summarize_trials(trials):
+    successful = [trial for trial in trials if trial['status'] == OptimizerRun.Status.COMPLETED]
+    scores = [trial['final_total_score'] for trial in successful]
+    runtimes = [trial['runtime_seconds'] for trial in successful]
+    improved = sum(
+        trial['final_total_score'] < trial['initial_score'] for trial in successful
+    )
+    return {
+        'attempted_runs': len(trials),
+        'completed_runs': len(successful),
+        'failed_runs': len(trials) - len(successful),
+        'best_final_score': min(scores) if scores else None,
+        'median_final_score': median(scores) if scores else None,
+        'worst_final_score': max(scores) if scores else None,
+        'average_runtime_seconds': mean(runtimes) if runtimes else None,
+        'best_seed': successful[scores.index(min(scores))]['seed'] if scores else None,
+        'score_spread': max(scores) - min(scores) if scores else None,
+        'any_run_improved_from_initial': bool(improved),
+        'improved_runs': improved,
+    }
+
+
+def summarize_best_chain(initial_score, best_score, best_run_id, trials, total_runtime):
+    accepted_scores = [
+        trial['best_score_so_far']
+        for trial in trials
+        if trial['accepted_as_new_best']
+    ]
+    improvement = initial_score - best_score
+    percent = (improvement / initial_score * 100) if initial_score else None
+    monotonic = all(
+        later < earlier
+        for earlier, later in zip(
+            [initial_score, *accepted_scores],
+            accepted_scores,
+        )
+    )
+    return {
+        'initial_score': initial_score,
+        'best_final_score': best_score,
+        'absolute_improvement': improvement,
+        'percent_improvement': percent,
+        'accepted_improvements': len(accepted_scores),
+        'best_run_id': best_run_id,
+        'total_runtime_seconds': total_runtime,
+        'accepted_bests_monotonically_improved': monotonic,
+    }
+
+
+class Command(BaseCommand):
+    help = (
+        'Benchmark optimizer runs against one BUILD or PREVIEW schedule. BENCHMARK '
+        'runs are created inside rollback-only transactions, so persisted workspace '
+        'state is unchanged.'
+    )
+
+    def add_arguments(self, parser):
+        parser.add_argument('--schedule-block-id', type=int, required=True)
+        parser.add_argument('--domain', required=True, help='Domain name (case-insensitive).')
+        parser.add_argument('--runs', type=int, default=25)
+        parser.add_argument(
+            '--mode', choices=('independent', 'best-chain'), default='independent',
+            help='Use best-chain for the primary Atlas schedule-improvement benchmark.',
+        )
+        parser.add_argument(
+            '--start-mode', choices=('fresh_fill', 'current_schedule'),
+            default='fresh_fill',
+            help='Independent mode only.',
+        )
+        parser.add_argument('--time-limit-seconds', type=float)
+        parser.add_argument('--seed-base', type=int, default=1)
+        parser.add_argument('--output-json')
+        parser.add_argument('--output-csv')
+
+    def handle(self, *args, **options):
+        if options['runs'] < 1:
+            raise CommandError('--runs must be at least 1.')
+        if options['time_limit_seconds'] is not None and options['time_limit_seconds'] <= 0:
+            raise CommandError('--time-limit-seconds must be greater than 0.')
+
+        versions = ScheduleVersion.objects.select_related('schedule_block', 'domain').filter(
+            schedule_block_id=options['schedule_block_id'],
+            domain__name__iexact=options['domain'],
+            status=ScheduleVersion.Status.BUILD,
+        )
+        count = versions.count()
+        if count != 1:
+            raise CommandError(
+                f'Expected exactly one BUILD Schedule Version for schedule block '
+                f'{options["schedule_block_id"]} and domain {options["domain"]!r}; found {count}.'
+            )
+        version = versions.get()
+        allowed_block_statuses = (
+            version.schedule_block.BuildStatus.BUILD,
+            version.schedule_block.BuildStatus.PREVIEW,
+        )
+        if version.schedule_block.build_status not in allowed_block_statuses:
+            raise CommandError('Schedule Block must be in BUILD or PREVIEW status.')
+        status_before = version.schedule_block.build_status
+
+        self.stdout.write(
+            'Safety: BENCHMARK runs are real optimizer runs created inside rollback-only '
+            'transactions; no runs or schedule changes are retained.'
+        )
+        self.stdout.write(f'Benchmark mode: {options["mode"]}')
+        self.stdout.write(f'Schedule block status before benchmark: {status_before}')
+
+        limit_context = (
+            patch.object(optimizer, 'MAX_RUNTIME_SECONDS', options['time_limit_seconds'])
+            if options['time_limit_seconds'] is not None
+            else nullcontext()
+        )
+        with limit_context:
+            if options['mode'] == 'best-chain':
+                trials, summary = self._run_best_chain(version, options)
+            else:
+                trials, summary = self._run_independent(version, options)
+
+        version.schedule_block.refresh_from_db(fields=['build_status'])
+        status_after = version.schedule_block.build_status
+        report = {
+            'benchmark_version': 2,
+            'mode': options['mode'],
+            'schedule_block_id': version.schedule_block_id,
+            'schedule_version_id': version.id,
+            'domain': version.domain.name,
+            'runs': options['runs'],
+            'seed_base': options['seed_base'],
+            'time_limit_seconds': options['time_limit_seconds'],
+            'schedule_block_status_before': status_before,
+            'schedule_block_status_after': status_after,
+            'run_kind': 'BENCHMARK',
+            'safety': 'All BENCHMARK runs rolled back; Build Workspace state unchanged.',
+            'summary': summary,
+            'trials': trials,
+        }
+        if options['output_json']:
+            self._write_json(Path(options['output_json']), report)
+        if options['output_csv']:
+            self._write_csv(Path(options['output_csv']), trials)
+
+        self.stdout.write(f'Schedule block status after benchmark: {status_after}')
+        self.stdout.write('\nBenchmark summary')
+        for key, value in summary.items():
+            self.stdout.write(f'{key}: {value}')
+
+    def _optimize(self, version, seed, start_mode, source_run=None):
+        return optimizer.optimize_schedule_version(
+            version,
+            seed=seed,
+            start_mode=start_mode,
+            source_run=source_run,
+            run_kind='BENCHMARK',
+            allow_preview_benchmark=True,
+        )
+
+    def _run_independent(self, version, options):
+        start_mode = {
+            'fresh_fill': OptimizerRun.StartMode.FRESH_FILL,
+            'current_schedule': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+        }[options['start_mode']]
+        source_run = None
+        if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE:
+            source_run = OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+                is_active=True,
+            ).first()
+            if source_run is None:
+                raise CommandError('current_schedule requires an active completed optimizer run.')
+
+        trials = []
+        for run_index in range(1, options['runs'] + 1):
+            seed = options['seed_base'] + run_index - 1
+            started_at = monotonic()
+            try:
+                with transaction.atomic():
+                    payload = self._optimize(version, seed, start_mode, source_run)
+                    created_run = OptimizerRun.objects.get(id=payload['optimizer_run_id'])
+                    trial = self._independent_trial(run_index, seed, payload, created_run, started_at)
+                    transaction.set_rollback(True)
+            except Exception as exc:  # One bad seed must not abort an independent benchmark.
+                trial = self._error_trial(run_index, seed, exc, started_at)
+            trials.append(trial)
+            self.stdout.write(
+                f'run={run_index} kind={trial["run_kind"]} '
+                f'candidate_run_id={trial["candidate_run_id"]} seed={seed} status={trial["status"]} '
+                f'initial={trial["initial_score"]} final={trial["final_total_score"]} '
+                f'seconds={trial["runtime_seconds"]:.3f}'
+            )
+        return trials, summarize_trials(trials)
+
+    def _run_best_chain(self, version, options):
+        trials = []
+        chain_started_at = monotonic()
+        with transaction.atomic():
+            best_run = OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+                is_active=True,
+                final_score__isnull=False,
+            ).first()
+            if best_run is None:
+                initial_payload = self._optimize(
+                    version,
+                    options['seed_base'] - 1,
+                    OptimizerRun.StartMode.FRESH_FILL,
+                )
+                best_run = OptimizerRun.objects.get(id=initial_payload['optimizer_run_id'])
+                if best_run.status != OptimizerRun.Status.COMPLETED:
+                    raise CommandError('Unable to create a completed initial schedule for best-chain.')
+                self.stdout.write(
+                    f'Initial plausible schedule created: run_id={best_run.id} '
+                    f'score={float(best_run.final_score)} seed={best_run.seed}'
+                )
+            else:
+                self.stdout.write(
+                    f'Initial plausible schedule selected: run_id={best_run.id} '
+                    f'score={float(best_run.final_score)}'
+                )
+
+            initial_snapshot = self._source_snapshot(version, best_run)
+            initial_score = initial_snapshot['score']
+            best_score = initial_score
+            for run_index in range(1, options['runs'] + 1):
+                seed = options['seed_base'] + run_index - 1
+                source_run = best_run
+                source_snapshot = self._source_snapshot(version, source_run)
+                source_score = source_snapshot['score']
+                stored_source_score = (
+                    float(source_run.final_score)
+                    if source_run.final_score is not None else None
+                )
+                started_at = monotonic()
+                try:
+                    with transaction.atomic():
+                        payload = self._optimize(
+                            version,
+                            seed,
+                            OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                            source_run,
+                        )
+                        candidate_run = OptimizerRun.objects.get(id=payload['optimizer_run_id'])
+                    candidate_score = float(candidate_run.final_score)
+                    optimizer_initial_score = float(payload['initial_score'])
+                    debug = payload.get('debug') or {}
+                    self._assert_source_start_matches(
+                        source_run=source_run,
+                        stored_source_score=stored_source_score,
+                        source_snapshot=source_snapshot,
+                        optimizer_initial_score=optimizer_initial_score,
+                        debug=debug,
+                    )
+                    candidate_snapshot = self._source_snapshot(version, candidate_run)
+                    if candidate_snapshot['score'] != candidate_score:
+                        raise CommandError(
+                            'Benchmark candidate persisted-state score mismatch: '
+                            f'candidate_run_id={candidate_run.id} '
+                            f'stored_candidate_score={candidate_score} '
+                            f'candidate_recomputed_score={candidate_snapshot["score"]} '
+                            f'candidate_assignment_count={candidate_snapshot["assignment_count"]}.'
+                        )
+                    score_audit_total = (debug.get('score_audit') or {}).get('total_score')
+                    accepted = (
+                        candidate_run.status == OptimizerRun.Status.COMPLETED
+                        and candidate_score < best_score
+                    )
+                    if accepted:
+                        best_run = candidate_run
+                        best_score = candidate_score
+                    trial = {
+                        'run_index': run_index,
+                        'source_run_id': source_run.id,
+                        'source_score': source_score,
+                        'stored_source_score': stored_source_score,
+                        'candidate_run_id': candidate_run.id,
+                        'candidate_score': candidate_score,
+                        'score_delta': candidate_score - source_score,
+                        'accepted_as_new_best': accepted,
+                        'best_score_so_far': best_score,
+                        'runtime_seconds': float(payload.get('runtime_seconds') or (monotonic() - started_at)),
+                        'seed': seed,
+                        'stopped_reason': payload.get('stopped_reason'),
+                        'optimizer_initial_score': optimizer_initial_score,
+                        'initial_matches_source': optimizer_initial_score == source_score,
+                        'source_recomputed_reported_score': debug.get(
+                            'source_state_reported_score_before_pre_score_changes'
+                        ),
+                        'score_audit_total_score': score_audit_total,
+                        'final_matches_score_audit': (
+                            score_audit_total == candidate_score
+                            if score_audit_total is not None else None
+                        ),
+                        'assignments_same_at_start': debug.get('assignments_same_at_start'),
+                        'source_assignments_copied': debug.get('copied_start_assignment_count'),
+                        'assignments_changed_before_first_score': debug.get(
+                            'assignments_changed_before_first_score'
+                        ),
+                        'assignments_removed_after_final_scoring': debug.get(
+                            'assignments_removed_after_final_scoring'
+                        ),
+                        'visible_assignments_added_after_final_scoring': debug.get(
+                            'visible_assignments_added_after_final_scoring'
+                        ),
+                        'status': candidate_run.status,
+                        'run_kind': candidate_run.run_kind,
+                        'initial_score': float(payload['initial_score']),
+                        'final_total_score': candidate_score,
+                        'assignments_made': payload.get('assignments_made'),
+                        'unfilled_shifts': payload.get('unfilled_shift_count'),
+                        'timed_out': bool(payload.get('timed_out')),
+                        'error': None,
+                    }
+                except CommandError:
+                    raise
+                except Exception as exc:
+                    trial = self._error_trial(
+                        run_index, seed, exc, started_at,
+                        source_run_id=source_run.id,
+                        source_score=source_score,
+                        best_score=best_score,
+                    )
+                trials.append(trial)
+                self.stdout.write(
+                    f'iteration={run_index} source_run_id={trial["source_run_id"]} '
+                    f'stored_source_score={trial["stored_source_score"]} '
+                    f'source_recomputed_score={trial["source_score"]} '
+                    f'optimizer_initial_score={trial["optimizer_initial_score"]} '
+                    f'candidate_run_id={trial["candidate_run_id"]} '
+                    f'candidate_score={trial["candidate_score"]} '
+                    f'initial_matches_source={"yes" if trial["initial_matches_source"] else "no"} '
+                    f'source_recomputed_reported_score={trial["source_recomputed_reported_score"]} '
+                    f'score_audit_total_score={trial["score_audit_total_score"]} '
+                    f'final_matches_score_audit={self._yes_no_unknown(trial["final_matches_score_audit"])} '
+                    f'assignments_same_at_start={self._yes_no_unknown(trial["assignments_same_at_start"])} '
+                    f'source_assignments_copied={trial["source_assignments_copied"]} '
+                    f'assignments_changed_before_first_score={trial["assignments_changed_before_first_score"]} '
+                    f'assignments_removed_after_final_scoring={trial["assignments_removed_after_final_scoring"]} '
+                    f'visible_assignments_added_after_final_scoring={trial["visible_assignments_added_after_final_scoring"]} '
+                    f'score_delta={trial["score_delta"]} '
+                    f'accepted_as_new_best={"yes" if trial["accepted_as_new_best"] else "no"} '
+                    f'best_score_so_far={trial["best_score_so_far"]} '
+                    f'runtime_seconds={trial["runtime_seconds"]:.3f} seed={seed} '
+                    f'stopped_reason={trial["stopped_reason"]} error={trial["error"]}'
+                )
+
+            summary = summarize_best_chain(
+                initial_score,
+                best_score,
+                best_run.id,
+                trials,
+                monotonic() - chain_started_at,
+            )
+            transaction.set_rollback(True)
+        return trials, summary
+
+    def _source_snapshot(self, version, source_run):
+        report = optimizer.build_violation_report(version, optimizer_run=source_run)
+        rows = list(
+            optimizer._assignments_for_optimizer_run(version, source_run)
+            .order_by('id')
+            .values('id', 'shift_instance_id', 'physician_id')
+        )
+        return {
+            'score': float(report['total_score']),
+            'assignment_count': len({
+                (row['shift_instance_id'], row['physician_id']) for row in rows
+            }),
+            'assignment_ids': [row['id'] for row in rows],
+            'shift_instance_ids': sorted({row['shift_instance_id'] for row in rows}),
+        }
+
+    def _assert_source_start_matches(
+        self, source_run, stored_source_score, source_snapshot,
+        optimizer_initial_score, debug,
+    ):
+        loaded_count = debug.get('copied_start_assignment_count')
+        source_count = source_snapshot['assignment_count']
+        scores_match = optimizer_initial_score == source_snapshot['score']
+        assignments_match = (
+            debug.get('assignments_same_at_start') is True
+            and loaded_count == source_count
+        )
+        if scores_match and assignments_match:
+            return
+        raise CommandError(
+            'Benchmark source/start correctness guard failed; aborting chain. '
+            f'source_run_id={source_run.id} '
+            f'stored_source_score={stored_source_score} '
+            f'source_recomputed_score={source_snapshot["score"]} '
+            f'optimizer_initial_score={optimizer_initial_score} '
+            f'source_assignment_count={source_count} '
+            f'optimizer_loaded_assignment_count={loaded_count} '
+            f'source_assignment_ids={source_snapshot["assignment_ids"]} '
+            f'source_shift_instance_ids={source_snapshot["shift_instance_ids"]} '
+            f'missing_pairs={debug.get("source_pairs_missing_at_start")} '
+            f'extra_pairs={debug.get("source_pairs_extra_at_start")}.'
+        )
+
+    def _independent_trial(self, run_index, seed, payload, created_run, started_at):
+        final_score = float(payload['final_score'])
+        initial_score = float(payload['initial_score'])
+        return {
+            'run_index': run_index,
+            'source_run_id': None,
+            'stored_source_score': None,
+            'source_score': initial_score,
+            'candidate_run_id': created_run.id,
+            'candidate_score': final_score,
+            'score_delta': final_score - initial_score,
+            'accepted_as_new_best': None,
+            'best_score_so_far': final_score,
+            'runtime_seconds': float(payload.get('runtime_seconds') or (monotonic() - started_at)),
+            'seed': seed,
+            'stopped_reason': payload.get('stopped_reason'),
+            'optimizer_initial_score': initial_score,
+            'initial_matches_source': None,
+            'source_recomputed_reported_score': None,
+            'score_audit_total_score': (payload.get('debug') or {}).get('score_audit', {}).get('total_score'),
+            'final_matches_score_audit': None,
+            'assignments_same_at_start': (payload.get('debug') or {}).get('assignments_same_at_start'),
+            'source_assignments_copied': (payload.get('debug') or {}).get('copied_start_assignment_count'),
+            'assignments_changed_before_first_score': (payload.get('debug') or {}).get(
+                'assignments_changed_before_first_score'
+            ),
+            'assignments_removed_after_final_scoring': (payload.get('debug') or {}).get(
+                'assignments_removed_after_final_scoring'
+            ),
+            'visible_assignments_added_after_final_scoring': (payload.get('debug') or {}).get(
+                'visible_assignments_added_after_final_scoring'
+            ),
+            'status': created_run.status,
+            'run_kind': created_run.run_kind,
+            'initial_score': initial_score,
+            'final_total_score': final_score,
+            'assignments_made': payload.get('assignments_made'),
+            'unfilled_shifts': payload.get('unfilled_shift_count'),
+            'timed_out': bool(payload.get('timed_out')),
+            'error': None,
+        }
+
+    def _error_trial(
+        self, run_index, seed, exc, started_at,
+        source_run_id=None, source_score=None, best_score=None,
+    ):
+        return {
+            'run_index': run_index,
+            'source_run_id': source_run_id,
+            'stored_source_score': None,
+            'source_score': source_score,
+            'candidate_run_id': None,
+            'candidate_score': None,
+            'score_delta': None,
+            'accepted_as_new_best': False,
+            'best_score_so_far': best_score,
+            'runtime_seconds': monotonic() - started_at,
+            'seed': seed,
+            'stopped_reason': 'error',
+            'optimizer_initial_score': None,
+            'initial_matches_source': False,
+            'source_recomputed_reported_score': None,
+            'score_audit_total_score': None,
+            'final_matches_score_audit': None,
+            'assignments_same_at_start': None,
+            'source_assignments_copied': None,
+            'assignments_changed_before_first_score': None,
+            'assignments_removed_after_final_scoring': None,
+            'visible_assignments_added_after_final_scoring': None,
+            'status': 'ERROR',
+            'run_kind': 'BENCHMARK',
+            'initial_score': None,
+            'final_total_score': None,
+            'assignments_made': None,
+            'unfilled_shifts': None,
+            'timed_out': False,
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+
+    @staticmethod
+    def _yes_no_unknown(value):
+        if value is None:
+            return 'unknown'
+        return 'yes' if value else 'no'
+
+    def _write_json(self, path, report):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+        self.stdout.write(self.style.SUCCESS(f'Wrote JSON: {path}'))
+
+    def _write_csv(self, path, trials):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=TRIAL_FIELDS)
+            writer.writeheader()
+            writer.writerows(trials)
+        self.stdout.write(self.style.SUCCESS(f'Wrote CSV: {path}'))

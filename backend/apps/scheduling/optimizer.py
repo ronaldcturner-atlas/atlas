@@ -682,7 +682,8 @@ def _state_from_assignments(assignments):
     state = defaultdict(list)
     manual_pairs = set()
     for assignment in assignments:
-        state[assignment.shift_instance_id].append(assignment.physician_id)
+        if assignment.physician_id not in state[assignment.shift_instance_id]:
+            state[assignment.shift_instance_id].append(assignment.physician_id)
         if (
             assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
             and assignment.is_locked
@@ -3271,11 +3272,24 @@ def optimize_schedule_version(
     seed=None,
     start_mode=OptimizerRun.StartMode.FRESH_FILL,
     source_run=None,
+    run_kind='OPTIMIZER',
+    allow_preview_benchmark=False,
 ):
     if schedule_version.status != ScheduleVersion.Status.BUILD:
         raise ValueError('Optimizer can only run on a BUILD Schedule Version.')
-    if schedule_version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD:
-        raise ValueError('Optimizer can only run while the Schedule Block is in BUILD.')
+    allowed_schedule_block_statuses = (ScheduleBlock.BuildStatus.BUILD,)
+    if allow_preview_benchmark:
+        if run_kind != 'BENCHMARK':
+            raise ValueError('PREVIEW optimizer access is reserved for BENCHMARK runs.')
+        allowed_schedule_block_statuses = (
+            ScheduleBlock.BuildStatus.BUILD,
+            ScheduleBlock.BuildStatus.PREVIEW,
+        )
+    if schedule_version.schedule_block.build_status not in allowed_schedule_block_statuses:
+        allowed_labels = ' or '.join(allowed_schedule_block_statuses)
+        raise ValueError(
+            f'Optimizer can only run while the Schedule Block is in {allowed_labels}.'
+        )
 
     with transaction.atomic():
         version = (
@@ -3317,6 +3331,7 @@ def optimize_schedule_version(
                 status=OptimizerRun.Status.RUNNING,
                 seed=seed,
                 start_mode=start_mode,
+                run_kind=run_kind,
                 locked_open_shift_instance_ids=source_locked_open_ids,
             )
         else:
@@ -3383,8 +3398,18 @@ def optimize_schedule_version(
                     if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE or row.is_locked
                 ]
             else:
-                manual_seed_rows = [
-                    ScheduleShiftAssignment(
+                manual_seed_rows_by_pair = {}
+                for row in source_assignments:
+                    if (
+                        row.assignment_source != ScheduleShiftAssignment.AssignmentSource.MANUAL
+                        or not (
+                            start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                            or row.is_locked
+                        )
+                    ):
+                        continue
+                    pair = (row.shift_instance_id, row.physician_id)
+                    manual_seed_rows_by_pair[pair] = ScheduleShiftAssignment(
                         shift_instance_id=row.shift_instance_id,
                         physician_id=row.physician_id,
                         created_by=created_by,
@@ -3392,13 +3417,7 @@ def optimize_schedule_version(
                         optimizer_run=optimizer_run,
                         is_locked=row.is_locked,
                     )
-                    for row in source_assignments
-                    if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
-                    and (
-                        start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                        or row.is_locked
-                    )
-                ]
+                manual_seed_rows = list(manual_seed_rows_by_pair.values())
                 ScheduleShiftAssignment.objects.bulk_create(manual_seed_rows)
                 assignments = (
                     [
@@ -3457,6 +3476,24 @@ def optimize_schedule_version(
         }
 
         state, manual_pairs = _state_from_assignments(assignments)
+        source_visible_assignment_pairs = {
+            (assignment.shift_instance_id, assignment.physician_id)
+            for assignment in source_assignments
+        }
+        loaded_start_assignment_pairs = {
+            (instance_id, physician_id)
+            for instance_id, physician_ids in state.items()
+            for physician_id in physician_ids
+        }
+        assignments_same_at_start = (
+            loaded_start_assignment_pairs == source_visible_assignment_pairs
+        )
+        source_pairs_missing_at_start = sorted(
+            source_visible_assignment_pairs - loaded_start_assignment_pairs
+        )
+        source_pairs_extra_at_start = sorted(
+            loaded_start_assignment_pairs - source_visible_assignment_pairs
+        )
         instances_by_id = {instance.id: instance for instance in instances}
 
         total_required_hours = sum(
@@ -3521,6 +3558,34 @@ def optimize_schedule_version(
             requests_by_physician_date[
                 (schedule_request.physician_id, schedule_request.date)
             ].append(schedule_request)
+
+        source_state_scoring = _score_schedule(
+            instances,
+            physicians,
+            state,
+            targets,
+            contract_by_physician,
+            requests_by_physician_date,
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+            include_internal_night_heuristics=True,
+        )
+        source_state_score_before_pre_score_changes = source_state_scoring['score']
+        source_state_reported_scoring = _score_schedule(
+            instances,
+            physicians,
+            state,
+            targets,
+            contract_by_physician,
+            requests_by_physician_date,
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+            include_internal_night_heuristics=False,
+        )
+        source_state_reported_score_before_pre_score_changes = (
+            source_state_reported_scoring['score']
+        )
+        assignment_pairs_before_pre_score_changes = set(loaded_start_assignment_pairs)
 
         assignments_made = 0
         rest_violations_blocked = 0
@@ -4061,6 +4126,18 @@ def optimize_schedule_version(
         if not timed_out:
             fill_open_instances(non_night_instances, 'non_night')
 
+        assignment_pairs_at_first_score = {
+            (instance_id, physician_id)
+            for instance_id, physician_ids in state.items()
+            for physician_id in physician_ids
+        }
+        assignment_pairs_added_before_first_score = (
+            assignment_pairs_at_first_score - assignment_pairs_before_pre_score_changes
+        )
+        assignment_pairs_removed_before_first_score = (
+            assignment_pairs_before_pre_score_changes - assignment_pairs_at_first_score
+        )
+
         initial_scoring = _score_schedule(
             instances,
             physicians,
@@ -4072,7 +4149,13 @@ def optimize_schedule_version(
             minimum_rest_by_physician,
             include_internal_night_heuristics=True,
         )
-        initial_score = initial_scoring['score']
+        search_initial_score = initial_scoring['score']
+        reported_initial_score = (
+            source_state_reported_score_before_pre_score_changes
+            if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+            and source_run is not None
+            else search_initial_score
+        )
         same_shift_violations_initial = len(initial_scoring['same_shift_violations'])
         initial_night_report = _night_violation_report(
             instances,
@@ -4087,7 +4170,7 @@ def optimize_schedule_version(
             contract_by_physician,
         )
         initial_workload_range_counts = _workload_range_counts(initial_scoring)
-        final_score = initial_score
+        final_score = search_initial_score
         improvement_count = 0
         iterations_run = 0
         max_passes = (
@@ -5381,9 +5464,22 @@ def optimize_schedule_version(
             for row in final_night_minimum_status['physicians_under_night_minimum']
         ]
 
+        assignment_pairs_at_final_scoring = {
+            (instance_id, physician_id)
+            for instance_id, physician_ids in state.items()
+            for physician_id in physician_ids
+        }
         locked_open_instance_ids = {instance.id for instance in instances if instance.is_locked_open}
         for instance_id in locked_open_instance_ids:
             state[instance_id] = []
+        assignment_pairs_after_locked_open_projection = {
+            (instance_id, physician_id)
+            for instance_id, physician_ids in state.items()
+            for physician_id in physician_ids
+        }
+        assignments_removed_after_final_scoring = len(
+            assignment_pairs_at_final_scoring - assignment_pairs_after_locked_open_projection
+        )
         unlocked_manual_ids = [
             assignment.id for assignment in assignments
             if assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
@@ -5415,6 +5511,18 @@ def optimize_schedule_version(
             if instance.status != next_status:
                 instance.status = next_status
                 instance.save(update_fields=['status', 'updated_at'])
+
+        persisted_visible_assignment_pairs = set(
+            _assignments_for_optimizer_run(version, optimizer_run).values_list(
+                'shift_instance_id', 'physician_id'
+            )
+        )
+        visible_assignments_added_after_final_scoring = len(
+            persisted_visible_assignment_pairs - assignment_pairs_after_locked_open_projection
+        )
+        visible_assignments_missing_after_final_scoring = len(
+            assignment_pairs_after_locked_open_projection - persisted_visible_assignment_pairs
+        )
 
         unfilled_shift_count = _unfilled_slot_count(instances, state)
 
@@ -5464,7 +5572,7 @@ def optimize_schedule_version(
         'start_mode': start_mode,
         'seed': seed,
         'total_score': float(final_score),
-        'initial_score': float(initial_score),
+        'initial_score': float(reported_initial_score),
         'final_score': float(final_score),
         'timed_out': timed_out,
         'stopped_reason': stopped_reason,
@@ -5487,12 +5595,44 @@ def optimize_schedule_version(
         },
         'candidate_rest_rejections': rest_violations_blocked,
         'rest_violations_blocked': rest_violations_blocked,
-        'debug': {
+            'debug': {
             'seed': seed,
             'start_mode': start_mode,
             'source_optimizer_run_id': source_run.id if source_run is not None else None,
             'source_assignment_count': source_assignment_count,
             'seeded_assignment_count': len(assignments),
+            'source_unique_assignment_count': len(source_visible_assignment_pairs),
+            'copied_start_assignment_count': len(loaded_start_assignment_pairs),
+            'assignments_same_at_start': assignments_same_at_start,
+            'source_pairs_missing_at_start': source_pairs_missing_at_start,
+            'source_pairs_extra_at_start': source_pairs_extra_at_start,
+            'source_state_score_before_pre_score_changes': float(
+                source_state_score_before_pre_score_changes
+            ),
+            'source_state_reported_score_before_pre_score_changes': float(
+                source_state_reported_score_before_pre_score_changes
+            ),
+            'initial_score_includes_internal_night_heuristics': True,
+            'final_score_includes_internal_night_heuristics': False,
+            'assignments_added_before_first_score': len(
+                assignment_pairs_added_before_first_score
+            ),
+            'assignments_removed_before_first_score': len(
+                assignment_pairs_removed_before_first_score
+            ),
+            'assignments_changed_before_first_score': len(
+                assignment_pairs_added_before_first_score
+                | assignment_pairs_removed_before_first_score
+            ),
+            'locked_open_shift_instance_count': len(source_locked_open_ids),
+            'assignments_removed_after_final_scoring': assignments_removed_after_final_scoring,
+            'persisted_visible_assignment_count': len(persisted_visible_assignment_pairs),
+            'visible_assignments_added_after_final_scoring': (
+                visible_assignments_added_after_final_scoring
+            ),
+            'visible_assignments_missing_after_final_scoring': (
+                visible_assignments_missing_after_final_scoring
+            ),
             'schedule_version_id': version.id,
             'schedule_block_id': version.schedule_block_id,
             'schedule_block_start_date': version.schedule_block.start_date.isoformat(),
@@ -5503,7 +5643,8 @@ def optimize_schedule_version(
             'manual_assignments_preserved': manual_assignments_preserved,
             'open_slots_considered': open_slots_available,
             'assignments_created': assignments_made,
-            'initial_score': float(initial_score),
+            'initial_score': float(reported_initial_score),
+            'search_initial_score': float(search_initial_score),
             'final_score': float(final_score),
             'initial_score_breakdown': {
                 key: float(value)

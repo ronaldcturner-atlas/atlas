@@ -26,6 +26,7 @@ from .models import (
     ShiftTemplate,
 )
 from .optimizer import (
+    _assignments_for_optimizer_run,
     _initial_fill_workload_guard,
     _night_violation_report,
     _score_schedule,
@@ -1738,6 +1739,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         ).exists())
         self.assertIn(overnight.id, current_run.locked_open_shift_instance_ids)
         self.assertFalse(ScheduleShiftAssignment.objects.filter(optimizer_run=current_run, shift_instance=overnight).exists())
+        self.assertGreater(
+            current.json()['debug']['assignments_removed_after_final_scoring'],
+            0,
+        )
 
         fresh = self.client.post(
             f'/api/schedule-versions/{version.id}/run-optimizer/',
@@ -1770,6 +1775,91 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         history = self.client.get(f'/api/schedule-versions/{version.id}/optimizer-runs/').json()
         self.assertEqual(history[0]['start_mode'], OptimizerRun.StartMode.FRESH_FILL)
         self.assertEqual(history[1]['start_mode'], OptimizerRun.StartMode.CURRENT_SCHEDULE)
+
+    def test_current_schedule_starts_from_source_score_when_no_prefill_changes_are_needed(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for index in range(4):
+            self._create_assignment_physician(
+                f'current-start-{index}@example.com',
+                f'Current Start {index}',
+                facilities=[self.facility],
+            )
+        first = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 303}, format='json',
+        )
+        self.assertEqual(first.status_code, 200)
+        source = OptimizerRun.objects.get(id=first.json()['optimizer_run_id'])
+
+        current = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                'currently_viewed_run_id': source.id,
+                'seed': 404,
+            }, format='json',
+        )
+
+        self.assertEqual(current.status_code, 200)
+        payload = current.json()
+        debug = payload['debug']
+        self.assertTrue(debug['assignments_same_at_start'])
+        self.assertEqual(
+            debug['copied_start_assignment_count'],
+            debug['source_unique_assignment_count'],
+        )
+        self.assertEqual(debug['assignments_changed_before_first_score'], 0)
+        self.assertEqual(
+            debug['source_state_reported_score_before_pre_score_changes'],
+            float(source.final_score),
+        )
+        self.assertEqual(payload['initial_score'], float(source.final_score))
+        self.assertLessEqual(payload['final_score'], payload['initial_score'])
+
+    def test_benchmark_run_visibility_uses_only_run_owned_assignments(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        physician = self._create_assignment_physician(
+            'benchmark-owned@example.com',
+            'Benchmark Owned',
+            facilities=[self.facility],
+        )
+        day = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        overnight = ScheduleShiftInstance.objects.get(shift_template=self.overnight_template)
+        legacy = ScheduleShiftAssignment.objects.create(
+            shift_instance=day,
+            physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+        )
+        benchmark_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            run_kind='BENCHMARK',
+        )
+        owned = ScheduleShiftAssignment.objects.create(
+            shift_instance=overnight,
+            physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=benchmark_run,
+        )
+
+        visible_ids = list(
+            _assignments_for_optimizer_run(version, benchmark_run)
+            .order_by('id')
+            .values_list('id', flat=True)
+        )
+
+        self.assertEqual(visible_ids, [owned.id])
+        self.assertNotIn(legacy.id, visible_ids)
+
     def test_optimizer_summary_persists_and_build_context_reloads_it(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',

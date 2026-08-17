@@ -80,7 +80,7 @@ def resolve_build_workspace_run_context(version, requested_run_id=None):
 
 
 def visible_assignment_filter(viewed_run):
-    if viewed_run is not None and viewed_run.run_kind == 'COPY':
+    if viewed_run is not None and viewed_run.run_kind in ('COPY', 'BENCHMARK'):
         return Q(optimizer_run=viewed_run)
     query = Q(
         assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
