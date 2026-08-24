@@ -3208,6 +3208,66 @@ def build_violation_report(schedule_version, optimizer_run=None):
     }
 
 
+def evaluate_plateau_pairwise_swap(
+    *, instances, physicians, state, instances_by_id, manual_pairs,
+    locked_open_instance_ids, targets, contract_by_physician,
+    requests_by_physician_date, eligible_facilities_by_physician,
+    minimum_rest_by_physician, current_score, left_instance_id,
+    left_physician_id, right_instance_id, right_physician_id,
+):
+    """Evaluate one plateau swap with the official persisted score objective."""
+    if left_instance_id == right_instance_id or left_physician_id == right_physician_id:
+        return {'legal': False, 'reason': 'duplicate_or_noop_swap'}
+    if left_instance_id in locked_open_instance_ids or right_instance_id in locked_open_instance_ids:
+        return {'legal': False, 'reason': 'locked_open'}
+    if (
+        (left_instance_id, left_physician_id) in manual_pairs
+        or (right_instance_id, right_physician_id) in manual_pairs
+    ):
+        return {'legal': False, 'reason': 'locked_assignment'}
+    if (
+        right_physician_id in state[left_instance_id]
+        or left_physician_id in state[right_instance_id]
+    ):
+        return {'legal': False, 'reason': 'duplicate_assignment'}
+
+    left_instance = instances_by_id[left_instance_id]
+    right_instance = instances_by_id[right_instance_id]
+    trial_state = _copy_state(state)
+    _replace_in_state(
+        trial_state, left_instance_id, left_physician_id, right_physician_id,
+    )
+    _replace_in_state(
+        trial_state, right_instance_id, right_physician_id, left_physician_id,
+    )
+    for side, instance, physician_id, exclude_id in (
+        ('left', left_instance, right_physician_id, left_instance_id),
+        ('right', right_instance, left_physician_id, right_instance_id),
+    ):
+        if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+            return {'legal': False, 'reason': 'not_facility_eligible', 'invalid_side': side}
+        intervals = _intervals_for_physician(
+            trial_state, instances_by_id, physician_id, exclude_instance_id=exclude_id,
+        )
+        if _overlaps(instance, intervals):
+            return {'legal': False, 'reason': 'overlap', 'invalid_side': side}
+        if _rest_violation(instance, intervals, minimum_rest_by_physician[physician_id]):
+            return {'legal': False, 'reason': 'rest_violation', 'invalid_side': side}
+    trial_scoring = _score_schedule(
+        instances, physicians, trial_state, targets, contract_by_physician,
+        requests_by_physician_date, eligible_facilities_by_physician,
+        minimum_rest_by_physician,
+    )
+    delta = trial_scoring['score'] - current_score
+    return {
+        'legal': True,
+        'improving': delta < 0,
+        'score_delta': delta,
+        'scoring': trial_scoring,
+        'state': trial_state,
+    }
+
+
 def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
     """Refresh persisted scoring for the current assignments without optimizing."""
     report = build_violation_report(schedule_version, optimizer_run=optimizer_run)
@@ -4197,6 +4257,7 @@ def optimize_schedule_version(
             'same_shift_repair',
             'consecutive_day_repair',
             'general_hill_climb_swaps',
+            'final_plateau_repair',
         ]
         phase_attempts = defaultdict(int)
         phase_improvements = defaultdict(int)
@@ -4234,6 +4295,19 @@ def optimize_schedule_version(
         consecutive_day_break_improvements = 0
         swap_attempts = 0
         swap_improvements = 0
+        final_plateau_repair_attempts = 0
+        final_plateau_repair_accepts = 0
+        workload_micro_repairs_attempted = 0
+        workload_micro_repairs_accepted = 0
+        night_recovery_repairs_attempted = 0
+        night_recovery_repairs_accepted = 0
+        pairwise_swaps_attempted = 0
+        pairwise_swaps_accepted = 0
+        best_pairwise_swap_delta = None
+        accepted_pairwise_swap_details = []
+        score_before_final_plateau_repair = None
+        score_after_final_plateau_repair = None
+        final_plateau_repair_reason = 'not_run'
 
         def score_is_zero():
             current = _score_schedule(
@@ -5423,6 +5497,244 @@ def optimize_schedule_version(
                 )
                 night_minimum_repair_debug.append(debug_row)
 
+        plateau_scoring = _score_schedule(
+            instances,
+            physicians,
+            state,
+            targets,
+            contract_by_physician,
+            requests_by_physician_date,
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+        )
+        final_score = plateau_scoring['score']
+        score_before_final_plateau_repair = float(final_score)
+
+        def try_final_plateau_reassign(instance_id, from_physician_id, to_physician_id):
+            if (
+                to_physician_id == from_physician_id
+                or (instance_id, from_physician_id) in manual_pairs
+                or to_physician_id in state[instance_id]
+            ):
+                return None
+            instance = instances_by_id[instance_id]
+            trial_state = _copy_state(state)
+            _replace_in_state(
+                trial_state, instance_id, from_physician_id, to_physician_id,
+            )
+            if not _can_assign_in_state(
+                trial_state,
+                instances_by_id,
+                instance,
+                to_physician_id,
+                eligible_facilities_by_physician,
+                minimum_rest_by_physician,
+                exclude_instance_id=instance_id,
+            ):
+                return None
+            trial_scoring = _score_schedule(
+                instances,
+                physicians,
+                trial_state,
+                targets,
+                contract_by_physician,
+                requests_by_physician_date,
+                eligible_facilities_by_physician,
+                minimum_rest_by_physician,
+            )
+            if has_hard_invalids(trial_scoring):
+                return None
+            return trial_scoring, trial_state
+
+        plateau_candidate_limit = max_candidates_per_repair * 2
+        plateau_improved = False
+        violating_workload_ids = set()
+        targeted_pairs = []
+        if not runtime_exceeded():
+            final_plateau_repair_reason = 'no_improving_candidate'
+            workload_rows = plateau_scoring.get('workload_score_rows', [])
+            violating_workload_ids = {
+                row['physician_id']
+                for row in workload_rows
+                if row.get('deviation_direction') in {'above_maximum', 'below_minimum'}
+            }
+            workload_candidates = []
+            for instance_id, from_physician_id in _optimizer_pairs(state, manual_pairs):
+                for to_physician_id in physician_ids:
+                    if (
+                        from_physician_id in violating_workload_ids
+                        or to_physician_id in violating_workload_ids
+                    ):
+                        workload_candidates.append(
+                            (instance_id, from_physician_id, to_physician_id)
+                        )
+            for instance_id, from_physician_id, to_physician_id in workload_candidates[:plateau_candidate_limit]:
+                if runtime_exceeded():
+                    mark_timeout('final_plateau_repair')
+                    final_plateau_repair_reason = 'runtime_limit'
+                    break
+                final_plateau_repair_attempts += 1
+                workload_micro_repairs_attempted += 1
+                phase_attempts['final_plateau_repair'] += 1
+                result = try_final_plateau_reassign(
+                    instance_id, from_physician_id, to_physician_id,
+                )
+                if result is None:
+                    continue
+                trial_scoring, trial_state = result
+                if trial_scoring['score'] < final_score:
+                    state = trial_state
+                    plateau_scoring = trial_scoring
+                    final_score = trial_scoring['score']
+                    improvement_count += 1
+                    final_plateau_repair_accepts += 1
+                    workload_micro_repairs_accepted += 1
+                    phase_improvements['final_plateau_repair'] += 1
+                    plateau_improved = True
+                    final_plateau_repair_reason = 'improved'
+
+        recovery_types = {
+            'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
+            'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK',
+        }
+        if not runtime_exceeded():
+            night_report = _night_violation_report(
+                instances, physicians, state, contract_by_physician,
+            )
+            for violation in night_report['night_violations']:
+                if violation['violation_type'] not in recovery_types:
+                    continue
+                physician_id = violation['physician_id']
+                for instance_id in violation.get('shift_instance_ids') or []:
+                    if physician_id in state[instance_id] and (
+                        instance_id, physician_id
+                    ) not in manual_pairs:
+                        targeted_pairs.append((instance_id, physician_id))
+
+            repaired_night = False
+            direct_attempts_for_plateau = 0
+            for instance_id, from_physician_id in targeted_pairs:
+                for to_physician_id in physician_ids:
+                    if direct_attempts_for_plateau >= plateau_candidate_limit:
+                        break
+                    if runtime_exceeded():
+                        mark_timeout('final_plateau_repair')
+                        final_plateau_repair_reason = 'runtime_limit'
+                        break
+                    direct_attempts_for_plateau += 1
+                    final_plateau_repair_attempts += 1
+                    night_recovery_repairs_attempted += 1
+                    phase_attempts['final_plateau_repair'] += 1
+                    result = try_final_plateau_reassign(
+                        instance_id, from_physician_id, to_physician_id,
+                    )
+                    if result is None:
+                        continue
+                    trial_scoring, trial_state = result
+                    if trial_scoring['score'] < final_score:
+                        state = trial_state
+                        plateau_scoring = trial_scoring
+                        final_score = trial_scoring['score']
+                        improvement_count += 1
+                        final_plateau_repair_accepts += 1
+                        night_recovery_repairs_accepted += 1
+                        phase_improvements['final_plateau_repair'] += 1
+                        plateau_improved = True
+                        repaired_night = True
+                        final_plateau_repair_reason = 'improved'
+                if runtime_exceeded():
+                    break
+                if direct_attempts_for_plateau >= plateau_candidate_limit:
+                    break
+
+            if not runtime_exceeded():
+                movable_pairs = _optimizer_pairs(state, manual_pairs)
+                workload_pairs = [
+                    pair for pair in movable_pairs
+                    if pair[1] in violating_workload_ids
+                ]
+                violation_pairs = list(dict.fromkeys([*targeted_pairs, *workload_pairs]))
+                violation_pair_set = set(violation_pairs)
+                prioritized_right_pairs = [
+                    *violation_pairs,
+                    *[pair for pair in movable_pairs if pair not in violation_pair_set],
+                ]
+                swap_attempts_for_plateau = 0
+                accepted_swap = False
+                night_target_pair_set = set(targeted_pairs)
+                for left_instance_id, left_physician_id in violation_pairs:
+                    if accepted_swap:
+                        break
+                    for right_instance_id, right_physician_id in prioritized_right_pairs:
+                        if swap_attempts_for_plateau >= plateau_candidate_limit:
+                            break
+                        if runtime_exceeded():
+                            mark_timeout('final_plateau_repair')
+                            final_plateau_repair_reason = 'runtime_limit'
+                            break
+                        swap_attempts_for_plateau += 1
+                        pairwise_swaps_attempted += 1
+                        final_plateau_repair_attempts += 1
+                        if (left_instance_id, left_physician_id) in night_target_pair_set:
+                            night_recovery_repairs_attempted += 1
+                        phase_attempts['final_plateau_repair'] += 1
+                        result = evaluate_plateau_pairwise_swap(
+                            instances=instances,
+                            physicians=physicians,
+                            state=state,
+                            instances_by_id=instances_by_id,
+                            manual_pairs=manual_pairs,
+                            locked_open_instance_ids=set(source_locked_open_ids),
+                            targets=targets,
+                            contract_by_physician=contract_by_physician,
+                            requests_by_physician_date=requests_by_physician_date,
+                            eligible_facilities_by_physician=eligible_facilities_by_physician,
+                            minimum_rest_by_physician=minimum_rest_by_physician,
+                            current_score=final_score,
+                            left_instance_id=left_instance_id,
+                            left_physician_id=left_physician_id,
+                            right_instance_id=right_instance_id,
+                            right_physician_id=right_physician_id,
+                        )
+                        if not result['legal']:
+                            continue
+                        delta = result['score_delta']
+                        if best_pairwise_swap_delta is None or delta < best_pairwise_swap_delta:
+                            best_pairwise_swap_delta = delta
+                        if result['improving']:
+                            score_before_swap = final_score
+                            state = result['state']
+                            plateau_scoring = result['scoring']
+                            final_score = result['scoring']['score']
+                            improvement_count += 1
+                            final_plateau_repair_accepts += 1
+                            pairwise_swaps_accepted += 1
+                            if (left_instance_id, left_physician_id) in night_target_pair_set:
+                                night_recovery_repairs_accepted += 1
+                            phase_improvements['final_plateau_repair'] += 1
+                            plateau_improved = True
+                            repaired_night = True
+                            accepted_swap = True
+                            accepted_pairwise_swap_details.append({
+                                'left_shift_instance_id': left_instance_id,
+                                'left_physician_id': left_physician_id,
+                                'right_shift_instance_id': right_instance_id,
+                                'right_physician_id': right_physician_id,
+                                'score_before': float(score_before_swap),
+                                'score_after': float(final_score),
+                                'score_delta': float(delta),
+                            })
+                            final_plateau_repair_reason = 'improved'
+                            break
+
+        if not plateau_improved and final_plateau_repair_reason != 'runtime_limit':
+            final_plateau_repair_reason = (
+                'no_target_violations'
+                if not violating_workload_ids and not targeted_pairs
+                else 'no_legal_improving_move_or_swap'
+            )
+        score_after_final_plateau_repair = float(final_score)
+
         final_scoring = _score_schedule(
             instances,
             physicians,
@@ -5679,6 +5991,22 @@ def optimize_schedule_version(
             'workload_swaps_accepted': workload_swaps_accepted,
             'workload_score_initial': float(initial_scoring['breakdown']['workload_score']),
             'workload_score_final': float(final_scoring['breakdown']['workload_score']),
+            'final_plateau_repair_attempts': final_plateau_repair_attempts,
+            'final_plateau_repair_accepts': final_plateau_repair_accepts,
+            'workload_micro_repairs_attempted': workload_micro_repairs_attempted,
+            'workload_micro_repairs_accepted': workload_micro_repairs_accepted,
+            'night_recovery_repairs_attempted': night_recovery_repairs_attempted,
+            'night_recovery_repairs_accepted': night_recovery_repairs_accepted,
+            'pairwise_swaps_attempted': pairwise_swaps_attempted,
+            'pairwise_swaps_accepted': pairwise_swaps_accepted,
+            'best_pairwise_swap_delta': (
+                float(best_pairwise_swap_delta)
+                if best_pairwise_swap_delta is not None else None
+            ),
+            'accepted_pairwise_swap_details': accepted_pairwise_swap_details,
+            'score_before_final_plateau_repair': score_before_final_plateau_repair,
+            'score_after_final_plateau_repair': score_after_final_plateau_repair,
+            'final_plateau_repair_reason': final_plateau_repair_reason,
             'general_swap_attempts': general_swap_attempts,
             'general_swap_improvements': general_swap_improvements,
             'stopped_reason': stopped_reason,
