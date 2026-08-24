@@ -165,11 +165,82 @@ no optimizer or scoring implementation changed.
 
 ## Concrete next algorithm recommendation
 
-Do not add perturbation yet. First resolve whether legacy unscoped manual rows should
-remain visible on run-scoped optimizer results after those assignments move, or
-whether each run must own an isolated assignment snapshot. Then decide whether
-internal night heuristics belong in the official total or must remain search guidance
-that cannot approve a worse official total. Both decisions precede a new strategy.
+The optimizer now includes a narrow `final_plateau_repair` phase after its existing
+repair and hill-climb phases. It uses the official persisted total-score objective
+(without internal night-search heuristics) and targets only remaining workload-range
+deviations, post-night recovery violations, and next-night-block spacing violations.
+It tries legal reassignment candidates and targeted night swaps, preserves coverage,
+locked manual assignments, and locked-open instances, and accepts a candidate only
+when `new_total_score < current_total_score`. Workload ranges and scoring math are
+unchanged.
+
+Debug output records total attempts/accepts, workload and night repair attempts and
+accepts, scores before/after the phase, and a final reason (`improved`,
+`no_target_violations`, `no_legal_improving_move_or_swap`, or `runtime_limit`). This
+is a bounded plateau cleanup, not broad perturbation, simulated annealing, or tabu
+search. Broader strategy changes remain deferred.
+
+### Retained run 279 plateau diagnostic
+
+The read-only command below exhaustively tests violation-involved single-shift
+reassignments and pairwise swaps and emits structured rejection reasons without
+mutating the selected run:
+
+```text
+python manage.py explain_optimizer_plateau --schedule-block-id 5 --domain Physician --optimizer-run-id 279
+```
+
+For retained run 279 (score 60000), the diagnostic found no improving single-shift
+move, but it did find improving pairwise swaps. The best tested delta was -15000 by
+swapping Bauerband's Nov 3 Sawmill night shift (instance 48) with Miller's Nov 6
+Sawmill night shift (instance 96). Therefore the 60000 result is not a local optimum
+under the diagnostic's tested pairwise-swap neighborhood: the bounded final repair
+did not reach a legal improving swap. This finding does not prove a global optimum,
+global impossibility, or overall schedule feasibility.
+
+The optimizer and diagnostic now share the same official-score pairwise-swap
+evaluator. Final plateau repair prioritizes assignments involved in remaining
+violations on both sides of a swap before considering the broader mutable assignment
+set. Its debug payload includes `pairwise_swaps_attempted`,
+`pairwise_swaps_accepted`, `best_pairwise_swap_delta`, and
+`accepted_pairwise_swap_details`.
+
+The required retained best-chain rerun completed from run 279:
+
+```text
+python manage.py benchmark_optimizer --schedule-block-id 5 --domain Physician --runs 10 --mode best-chain --source-run-id 279 --retain-best
+```
+
+Iteration 1 accepted the diagnostic -15000 swap and improved 60000 to 45000.
+Iteration 2 improved to 40000. The remaining eight candidates stayed at 40000.
+The final retained best is run 309, with workload score 20000, night score 20000,
+and every other score component zero. The Schedule Block remained PREVIEW and
+run 279 remained unchanged.
+
+### Workload micro-overage repair from run 319
+
+Final plateau repair now gives workload-specific pairwise swaps a separate,
+duration-aware candidate budget. Over-maximum physicians are paired with
+below-minimum or inside-range receivers, and longer donor shifts are tested
+against shorter receiver shifts. Every candidate is still evaluated using the
+complete official score and is accepted only when the total strictly decreases;
+workload ranges, penalties, and eligibility rules are unchanged. Locked manual
+assignments and locked-open instances remain immutable.
+
+Debug output records the considered over-maximum physicians, workload move and
+swap counts, best total delta, best rejected reason, and accepted workload repair
+details. The plateau diagnostic now reports workload move and swap attempt counts,
+best workload-component and total deltas, and the most common rejection reasons.
+
+The required retained best-chain rerun from run 319 completed on 2026-08-24:
+
+```text
+python manage.py benchmark_optimizer --schedule-block-id 5 --domain Physician --runs 10 --mode best-chain --source-run-id 319 --retain-best
+```
+
+The chain improved 40000 -> 30000 -> 20050 and retained run 329. The remaining
+eight attempts tied at 20050. The Schedule Block remained PREVIEW, the source run
+was not mutated, and only the final best benchmark run was retained.
 
 ## Verification
 

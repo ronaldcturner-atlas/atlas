@@ -3044,6 +3044,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertIn('final_plateau_repair_accepts', payload['debug'])
         self.assertIn('workload_micro_repairs_attempted', payload['debug'])
         self.assertIn('workload_micro_repairs_accepted', payload['debug'])
+        self.assertIn('workload_micro_repair_best_delta', payload['debug'])
+        self.assertIn('workload_micro_repair_best_rejected_reason', payload['debug'])
+        self.assertIn('workload_micro_repair_accepted_details', payload['debug'])
+        self.assertIn('over_max_physicians_considered', payload['debug'])
         self.assertIn('night_recovery_repairs_attempted', payload['debug'])
         self.assertIn('night_recovery_repairs_accepted', payload['debug'])
         self.assertIn('pairwise_swaps_attempted', payload['debug'])
@@ -3168,6 +3172,95 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertLess(
             debug['score_after_final_plateau_repair'],
             debug['score_before_final_plateau_repair'],
+        )
+
+    def test_final_plateau_workload_micro_repair_uses_duration_swap(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 10))
+        templates = {
+            hours: ShiftTemplate.objects.create(
+                facility=self.facility,
+                start_time=time(6, 0),
+                end_time=time(6 + hours, 0),
+                active_days_of_week=['Wednesday'],
+                weekend_days=[],
+                default_staffing_count=1,
+                active=True,
+            )
+            for hours in (7, 8, 12)
+        }
+        donor = self._create_assignment_physician(
+            'plateau.swap.donor@example.com', 'Plateau Swap Donor',
+            facilities=[self.facility],
+        )
+        receiver = self._create_assignment_physician(
+            'plateau.swap.receiver@example.com', 'Plateau Swap Receiver',
+            facilities=[self.facility],
+        )
+        for physician in (donor, receiver):
+            contract = Contract.objects.get(user_assignments__physician=physician)
+            contract.workload_settings = {'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '45', 'max_value': '55',
+                'min_penalty_weight': '10000', 'max_penalty_weight': '10000',
+            }]}
+            contract.save(update_fields=['workload_settings', 'updated_at'])
+        donor_hours = [12, 12, 12, 12, 8]
+        receiver_hours = [12, 12, 12, 7, 8]
+        source = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('10000'), is_active=True,
+        )
+        locked_pair = None
+        for offset, (physician, hours) in enumerate(
+            [(donor, value) for value in donor_hours]
+            + [(receiver, value) for value in receiver_hours]
+        ):
+            instance = self._create_shift_instance(
+                version, templates[hours], date(2026, 7, 1 + offset),
+            )
+            is_locked = physician == donor and hours == 8
+            assignment = ScheduleShiftAssignment.objects.create(
+                shift_instance=instance, physician=physician,
+                assignment_source=(
+                    ScheduleShiftAssignment.AssignmentSource.MANUAL
+                    if is_locked else ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                ),
+                optimizer_run=source, is_locked=is_locked,
+            )
+            if is_locked:
+                locked_pair = (assignment.shift_instance_id, assignment.physician_id)
+
+        with patch('apps.scheduling.optimizer.SAFE_BASELINE_PHASE_PASSES', 0):
+            response = self.client.post(
+                f'/api/schedule-versions/{version.id}/run-optimizer/',
+                data={
+                    'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                    'currently_viewed_run_id': source.id,
+                    'seed': 703,
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        debug = response.json()['debug']
+        self.assertGreater(debug['workload_candidate_swaps_considered'], 0)
+        self.assertGreater(debug['workload_micro_repairs_accepted'], 0)
+        self.assertTrue(any(
+            row['action'] == 'swap'
+            for row in debug['workload_micro_repair_accepted_details']
+        ))
+        self.assertLess(debug['score_after_final_plateau_repair'],
+                        debug['score_before_final_plateau_repair'])
+        candidate_run = OptimizerRun.objects.get(id=response.json()['optimizer_run_id'])
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(
+            optimizer_run=candidate_run,
+            shift_instance_id=locked_pair[0], physician_id=locked_pair[1], is_locked=True,
+        ).exists())
+        self.assertEqual(
+            Contract.objects.get(user_assignments__physician=donor)
+            .workload_settings['period_rules'][0]['max_value'],
+            '55',
         )
 
     def test_final_plateau_night_recovery_reassigns_conflicting_shift(self):

@@ -4299,6 +4299,10 @@ def optimize_schedule_version(
         final_plateau_repair_accepts = 0
         workload_micro_repairs_attempted = 0
         workload_micro_repairs_accepted = 0
+        workload_micro_repair_best_delta = None
+        workload_micro_repair_best_rejected_reason = None
+        workload_micro_repair_accepted_details = []
+        over_max_physicians_considered = []
         night_recovery_repairs_attempted = 0
         night_recovery_repairs_accepted = 0
         pairwise_swaps_attempted = 0
@@ -5553,21 +5557,41 @@ def optimize_schedule_version(
         if not runtime_exceeded():
             final_plateau_repair_reason = 'no_improving_candidate'
             workload_rows = plateau_scoring.get('workload_score_rows', [])
+            over_max_physicians_considered = [
+                {
+                    'physician_id': row['physician_id'],
+                    'physician': row.get('physician'),
+                    'assigned_hours': row.get('assigned_hours'),
+                    'assigned_shifts': row.get('assigned_shifts'),
+                    'allowed_max': row.get('allowed_max'),
+                    'allowed_units': row.get('allowed_units'),
+                    'deviation': row.get('deviation'),
+                }
+                for row in workload_rows
+                if row.get('deviation_direction') == 'above_maximum'
+            ]
             violating_workload_ids = {
                 row['physician_id']
                 for row in workload_rows
                 if row.get('deviation_direction') in {'above_maximum', 'below_minimum'}
             }
-            workload_candidates = []
+            workload_candidates = [
+                (instance_id, from_physician_id, to_physician_id)
+                for from_physician_id, to_physician_id, instance_id
+                in _workload_repair_candidates(
+                    instances, state, manual_pairs, plateau_scoring,
+                )
+            ]
+            below_minimum_ids = {
+                row['physician_id'] for row in workload_rows
+                if row.get('deviation_direction') == 'below_minimum'
+            }
             for instance_id, from_physician_id in _optimizer_pairs(state, manual_pairs):
-                for to_physician_id in physician_ids:
-                    if (
-                        from_physician_id in violating_workload_ids
-                        or to_physician_id in violating_workload_ids
-                    ):
-                        workload_candidates.append(
-                            (instance_id, from_physician_id, to_physician_id)
-                        )
+                for to_physician_id in below_minimum_ids:
+                    workload_candidates.append(
+                        (instance_id, from_physician_id, to_physician_id)
+                    )
+            workload_candidates = list(dict.fromkeys(workload_candidates))
             for instance_id, from_physician_id, to_physician_id in workload_candidates[:plateau_candidate_limit]:
                 if runtime_exceeded():
                     mark_timeout('final_plateau_repair')
@@ -5575,14 +5599,23 @@ def optimize_schedule_version(
                     break
                 final_plateau_repair_attempts += 1
                 workload_micro_repairs_attempted += 1
+                workload_candidate_moves_considered += 1
                 phase_attempts['final_plateau_repair'] += 1
                 result = try_final_plateau_reassign(
                     instance_id, from_physician_id, to_physician_id,
                 )
                 if result is None:
+                    workload_micro_repair_best_rejected_reason = (
+                        workload_micro_repair_best_rejected_reason or 'illegal_or_locked_move'
+                    )
                     continue
                 trial_scoring, trial_state = result
-                if trial_scoring['score'] < final_score:
+                delta = trial_scoring['score'] - final_score
+                if workload_micro_repair_best_delta is None or delta < workload_micro_repair_best_delta:
+                    workload_micro_repair_best_delta = delta
+                if delta < 0:
+                    score_before_move = final_score
+                    workload_before_move = plateau_scoring['breakdown']['workload_score']
                     state = trial_state
                     plateau_scoring = trial_scoring
                     final_score = trial_scoring['score']
@@ -5592,6 +5625,91 @@ def optimize_schedule_version(
                     phase_improvements['final_plateau_repair'] += 1
                     plateau_improved = True
                     final_plateau_repair_reason = 'improved'
+                    workload_micro_repair_accepted_details.append({
+                        'action': 'move',
+                        'shift_instance_id': instance_id,
+                        'from_physician_id': from_physician_id,
+                        'to_physician_id': to_physician_id,
+                        'score_before': float(score_before_move),
+                        'score_after': float(final_score),
+                        'score_delta': float(delta),
+                        'workload_score_delta': float(
+                            trial_scoring['breakdown']['workload_score'] - workload_before_move
+                        ),
+                    })
+                else:
+                    workload_micro_repair_best_rejected_reason = 'would_not_lower_total_score'
+
+            workload_swap_limit = plateau_candidate_limit * 10
+            for (
+                over_physician_id, receiver_physician_id,
+                over_instance_id, receiver_instance_id,
+            ) in _workload_repair_swap_candidates(
+                instances, state, manual_pairs, plateau_scoring,
+            )[:workload_swap_limit]:
+                if runtime_exceeded():
+                    mark_timeout('final_plateau_repair')
+                    final_plateau_repair_reason = 'runtime_limit'
+                    break
+                workload_candidate_swaps_considered += 1
+                workload_micro_repairs_attempted += 1
+                pairwise_swaps_attempted += 1
+                final_plateau_repair_attempts += 1
+                phase_attempts['final_plateau_repair'] += 1
+                result = evaluate_plateau_pairwise_swap(
+                    instances=instances, physicians=physicians, state=state,
+                    instances_by_id=instances_by_id, manual_pairs=manual_pairs,
+                    locked_open_instance_ids=set(source_locked_open_ids), targets=targets,
+                    contract_by_physician=contract_by_physician,
+                    requests_by_physician_date=requests_by_physician_date,
+                    eligible_facilities_by_physician=eligible_facilities_by_physician,
+                    minimum_rest_by_physician=minimum_rest_by_physician,
+                    current_score=final_score, left_instance_id=over_instance_id,
+                    left_physician_id=over_physician_id,
+                    right_instance_id=receiver_instance_id,
+                    right_physician_id=receiver_physician_id,
+                )
+                if not result['legal']:
+                    workload_micro_repair_best_rejected_reason = result['reason']
+                    continue
+                delta = result['score_delta']
+                if best_pairwise_swap_delta is None or delta < best_pairwise_swap_delta:
+                    best_pairwise_swap_delta = delta
+                if workload_micro_repair_best_delta is None or delta < workload_micro_repair_best_delta:
+                    workload_micro_repair_best_delta = delta
+                if not result['improving']:
+                    workload_micro_repair_best_rejected_reason = (
+                        'would_worsen_total_score' if delta > 0 else 'would_not_lower_total_score'
+                    )
+                    continue
+                score_before_swap = final_score
+                workload_before_swap = plateau_scoring['breakdown']['workload_score']
+                state = result['state']
+                plateau_scoring = result['scoring']
+                final_score = result['scoring']['score']
+                improvement_count += 1
+                final_plateau_repair_accepts += 1
+                workload_micro_repairs_accepted += 1
+                pairwise_swaps_accepted += 1
+                phase_improvements['final_plateau_repair'] += 1
+                plateau_improved = True
+                final_plateau_repair_reason = 'improved'
+                detail = {
+                    'action': 'swap',
+                    'left_shift_instance_id': over_instance_id,
+                    'left_physician_id': over_physician_id,
+                    'right_shift_instance_id': receiver_instance_id,
+                    'right_physician_id': receiver_physician_id,
+                    'score_before': float(score_before_swap),
+                    'score_after': float(final_score),
+                    'score_delta': float(delta),
+                    'workload_score_delta': float(
+                        result['scoring']['breakdown']['workload_score'] - workload_before_swap
+                    ),
+                }
+                workload_micro_repair_accepted_details.append(detail)
+                accepted_pairwise_swap_details.append(detail)
+                break
 
         recovery_types = {
             'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
@@ -5995,6 +6113,13 @@ def optimize_schedule_version(
             'final_plateau_repair_accepts': final_plateau_repair_accepts,
             'workload_micro_repairs_attempted': workload_micro_repairs_attempted,
             'workload_micro_repairs_accepted': workload_micro_repairs_accepted,
+            'workload_micro_repair_best_delta': (
+                float(workload_micro_repair_best_delta)
+                if workload_micro_repair_best_delta is not None else None
+            ),
+            'workload_micro_repair_best_rejected_reason': workload_micro_repair_best_rejected_reason,
+            'workload_micro_repair_accepted_details': workload_micro_repair_accepted_details,
+            'over_max_physicians_considered': over_max_physicians_considered,
             'night_recovery_repairs_attempted': night_recovery_repairs_attempted,
             'night_recovery_repairs_accepted': night_recovery_repairs_accepted,
             'pairwise_swaps_attempted': pairwise_swaps_attempted,

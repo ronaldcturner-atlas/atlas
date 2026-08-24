@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 from decimal import Decimal
 
 from . import optimizer
@@ -132,6 +132,14 @@ def _scored_result(current_scoring, trial_scoring):
         'improving': delta < 0,
         'score_delta': float(delta),
         'resulting_total_score': float(trial_scoring['score']),
+        'workload_score_delta': float(
+            trial_scoring['breakdown']['workload_score']
+            - current_scoring['breakdown']['workload_score']
+        ),
+        'night_score_delta': float(
+            trial_scoring['breakdown']['night_score']
+            - current_scoring['breakdown']['night_score']
+        ),
         'rejection_reasons': reasons,
     }
 
@@ -222,6 +230,7 @@ def build_plateau_explanation(version, optimizer_run):
         if workload.get('score_contribution', 0) > 0:
             physician_id = user['user_id']
             attempts = []
+            swaps = []
             for instance_id, assigned_id in assigned_pairs:
                 if assigned_id != physician_id:
                     continue
@@ -231,6 +240,22 @@ def build_plateau_explanation(version, optimizer_run):
                     )
                     attempts.append(result)
                     all_results.append(result)
+                for right_id, right_physician_id in assigned_pairs:
+                    result = _swap(
+                        context, current_scoring, instance_id, physician_id,
+                        right_id, right_physician_id,
+                    )
+                    swaps.append(result)
+                    all_results.append(result)
+            scored_workload_attempts = [
+                row for row in [*attempts, *swaps]
+                if row.get('legal') and row.get('score_delta') is not None
+            ]
+            rejected_reasons = Counter(
+                reason
+                for row in [*attempts, *swaps]
+                for reason in row.get('rejection_reasons', [])
+            )
             violations.append({
                 'category': 'workload',
                 'physician_id': physician_id,
@@ -244,6 +269,21 @@ def build_plateau_explanation(version, optimizer_run):
                 'deviation': workload.get('deviation'),
                 'penalty': workload.get('score_contribution'),
                 'candidate_moves': attempts,
+                'candidate_swaps': swaps,
+                'candidate_moves_attempted': len(attempts),
+                'candidate_swaps_attempted': len(swaps),
+                'best_workload_score_delta_found': min(
+                    (row['workload_score_delta'] for row in scored_workload_attempts),
+                    default=None,
+                ),
+                'best_total_score_delta_found': min(
+                    (row['score_delta'] for row in scored_workload_attempts),
+                    default=None,
+                ),
+                'top_rejected_reasons': [
+                    {'reason': reason, 'count': count}
+                    for reason, count in rejected_reasons.most_common(5)
+                ],
             })
 
         for violation in user['violations']:
