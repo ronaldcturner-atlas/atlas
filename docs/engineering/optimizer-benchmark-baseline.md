@@ -147,6 +147,22 @@ stored and recomputed scores, assignment counts, assignment IDs, shift-instance
 IDs, and missing/extra pairs. Algorithm improvement work remains stopped until
 this run-assignment correctness invariant remains green.
 
+## Verified workload range scoring
+
+Workload range penalties are linear per unit of deviation, not flat once a
+physician leaves the configured range. For each applicable period rule:
+
+- below minimum: `(minimum - assigned value) * minimum penalty weight`;
+- above maximum: `(assigned value - maximum) * maximum penalty weight`;
+- inside the inclusive minimum/maximum range: zero.
+
+The assigned value is hours for an `HOURS` rule and shift count for a `SHIFTS`
+rule. Focused tests verify that an HOURS range of 45-55 with weight 10000 scores
+55/56/57/58 hours as 0/10000/20000/30000 and 44/43 hours as 10000/20000.
+They also verify that one and two shifts outside a SHIFTS range produce one and
+two penalty units in either direction. This documents existing scoring behavior;
+no optimizer or scoring implementation changed.
+
 ## Concrete next algorithm recommendation
 
 Do not add perturbation yet. First resolve whether legacy unscoped manual rows should

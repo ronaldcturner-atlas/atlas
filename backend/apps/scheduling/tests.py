@@ -31,11 +31,71 @@ from .optimizer import (
     _night_violation_report,
     _score_schedule,
     _validated_night_report_for_current_assignments,
+    _workload_schedule_score,
 )
 from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
+    def test_workload_hours_score_is_per_hour_outside_configured_range(self):
+        target = {
+            'rules': [{
+                'units': 'HOURS',
+                'min_value': Decimal('45'),
+                'max_value': Decimal('55'),
+                'min_penalty_weight': Decimal('10000'),
+                'max_penalty_weight': Decimal('10000'),
+            }],
+        }
+        expected_scores = {
+            '55': '0',
+            '56': '10000',
+            '57': '20000',
+            '58': '30000',
+            '44': '10000',
+            '43': '20000',
+        }
+
+        for assigned_hours, expected_score in expected_scores.items():
+            with self.subTest(assigned_hours=assigned_hours):
+                self.assertEqual(
+                    _workload_schedule_score(
+                        target,
+                        assigned_hours=Decimal(assigned_hours),
+                        assigned_shifts=0,
+                    ),
+                    Decimal(expected_score),
+                )
+
+    def test_workload_shifts_score_is_per_shift_outside_configured_range(self):
+        target = {
+            'rules': [{
+                'units': 'SHIFTS',
+                'min_value': Decimal('5'),
+                'max_value': Decimal('7'),
+                'min_penalty_weight': Decimal('10000'),
+                'max_penalty_weight': Decimal('10000'),
+            }],
+        }
+        expected_scores = {
+            7: '0',
+            8: '10000',
+            9: '20000',
+            4: '10000',
+            3: '20000',
+        }
+
+        for assigned_shifts, expected_score in expected_scores.items():
+            with self.subTest(assigned_shifts=assigned_shifts):
+                self.assertEqual(
+                    _workload_schedule_score(
+                        target,
+                        assigned_hours=Decimal('0'),
+                        assigned_shifts=assigned_shifts,
+                    ),
+                    Decimal(expected_score),
+                )
+
     def test_initial_fill_workload_guard_ranks_above_max_below_inside_range(self):
         window_start = date(2026, 7, 1)
         window_end = date(2026, 7, 31)
