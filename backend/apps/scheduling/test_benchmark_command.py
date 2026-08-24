@@ -12,6 +12,7 @@ from apps.domains.models import Domain
 from .management.commands.benchmark_optimizer import summarize_best_chain, summarize_trials
 from .models import OptimizerRun, ScheduleBlock, ScheduleVersion
 from .optimizer import _state_from_assignments
+from .run_state import resolve_build_workspace_run_context
 
 
 class OptimizerBenchmarkCommandTests(TestCase):
@@ -51,6 +52,100 @@ class OptimizerBenchmarkCommandTests(TestCase):
         ):
             self.assertIn(field, output)
         self.assertFalse(OptimizerRun.objects.filter(schedule_version=self.version).exists())
+        self.assertIn('persistence_mode: rollback', output)
+        self.assertIn('retained_best_run_id: None', output)
+        self.assertIn('schedule_changes_retained: no', output)
+
+    def test_retain_best_persists_only_final_best_and_preserves_workspace_state(self):
+        stdout = StringIO()
+        original_summary = {'marker': 'workspace-unchanged'}
+        self.version.optimizer_summary = original_summary
+        self.version.save(update_fields=['optimizer_summary'])
+
+        call_command(
+            'benchmark_optimizer',
+            schedule_block_id=self.block.id,
+            domain='Physician',
+            runs=2,
+            mode='best-chain',
+            retain_best=True,
+            stdout=stdout,
+        )
+
+        self.block.refresh_from_db()
+        self.version.refresh_from_db()
+        runs = list(OptimizerRun.objects.filter(schedule_version=self.version))
+        self.assertEqual(len(runs), 1)
+        retained = runs[0]
+        self.assertEqual(retained.run_kind, 'BENCHMARK')
+        self.assertFalse(retained.is_active)
+        self.assertIn('best-chain', retained.notes)
+        self.assertTrue(retained.optimizer_summary['retained_best'])
+        self.assertEqual(
+            resolve_build_workspace_run_context(self.version, retained.id).viewed_run.id,
+            retained.id,
+        )
+        self.assertEqual(self.version.optimizer_summary, original_summary)
+        self.assertEqual(self.block.build_status, ScheduleBlock.BuildStatus.BUILD)
+        output = stdout.getvalue()
+        self.assertIn('persistence_mode: retain-best', output)
+        self.assertIn(f'retained_best_run_id: {retained.id}', output)
+        self.assertIn('schedule_changes_retained: yes', output)
+
+    def test_source_run_id_is_used_without_mutating_source(self):
+        source = OptimizerRun.objects.create(
+            schedule_version=self.version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            seed=42,
+            initial_score=0,
+            final_score=0,
+            score_breakdown={'marker': 'source'},
+            optimizer_summary={'marker': 'source'},
+            notes='source notes',
+            run_kind='BENCHMARK',
+            is_active=True,
+        )
+        source_values = {
+            'seed': source.seed,
+            'initial_score': source.initial_score,
+            'final_score': source.final_score,
+            'score_breakdown': source.score_breakdown,
+            'optimizer_summary': source.optimizer_summary,
+            'notes': source.notes,
+            'is_active': source.is_active,
+        }
+        stdout = StringIO()
+
+        call_command(
+            'benchmark_optimizer',
+            schedule_block_id=self.block.id,
+            domain='Physician',
+            runs=1,
+            mode='best-chain',
+            source_run_id=source.id,
+            retain_best=True,
+            stdout=stdout,
+        )
+
+        source.refresh_from_db()
+        self.assertEqual(
+            {
+                'seed': source.seed,
+                'initial_score': source.initial_score,
+                'final_score': source.final_score,
+                'score_breakdown': source.score_breakdown,
+                'optimizer_summary': source.optimizer_summary,
+                'notes': source.notes,
+                'is_active': source.is_active,
+            },
+            source_values,
+        )
+        self.assertEqual(
+            list(OptimizerRun.objects.filter(schedule_version=self.version).values_list('id', flat=True)),
+            [source.id],
+        )
+        self.assertIn(f'source_run_id: {source.id}', stdout.getvalue())
 
     def test_preview_block_is_allowed_and_remains_preview(self):
         self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW

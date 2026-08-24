@@ -37,12 +37,39 @@ they are not the main Atlas product benchmark. Atlas needs the lowest total scor
 reachable through repeated improvement of the best known schedule, not the score
 distribution of unrelated fresh fills.
 
-Best-chain executes inside one outer rollback-only database transaction. Every
+Best-chain executes inside one outer database transaction. Every
 candidate is a new optimizer run whose read-only source is the current best run.
 An improving candidate becomes the next source; a non-improving candidate is
-rejected and the previous best remains the next source. The whole chain is rolled
-back after reporting, so no benchmark OptimizerRun, assignment, active-run change,
-or locked-open projection is retained.
+rejected and the previous best remains the next source.
+
+Persistence is explicit:
+
+- The default `persistence_mode` is `rollback`. The whole chain is rolled back
+  after reporting, so no benchmark OptimizerRun, assignment, active-run change,
+  or locked-open projection is retained. Summary output calls the winning ID
+  `temporary_best_run_id`; it is not a durable workspace run.
+- `--retain-best` is available only with `--mode best-chain`. It deletes every
+  losing benchmark run and its run-scoped assignments before commit, retains only
+  the winning benchmark-created run, and reports it as `retained_best_run_id`.
+  The retained run has `run_kind=BENCHMARK`, a best-chain note, and retained-best
+  summary metadata, so it is identifiable and selectable in Build Workspace.
+  The workspace's pre-benchmark active run, version score cache, and locked-open
+  projection are restored; existing/source runs and Schedule Block lifecycle are
+  unchanged. If no candidate beats an already-persisted source, no duplicate run
+  is retained and `retained_best_run_id` is null.
+
+A later best-chain may start from any completed scored run in the selected Schedule
+Version with `--source-run-id <id>`. The source may be active or inactive and is
+read-only. This supports continuing from a retained benchmark result:
+
+```text
+python manage.py benchmark_optimizer --schedule-block-id 5 --domain Physician --runs 10 --mode best-chain --retain-best
+python manage.py benchmark_optimizer --schedule-block-id 5 --domain Physician --runs 10 --mode best-chain --source-run-id <retained_best_run_id> --retain-best
+```
+
+Console and JSON output include `persistence_mode`, `source_run_id`,
+`retained_best_run_id`, and `schedule_changes_retained`. Rollback reports never
+present a temporary winning run ID as durable.
 
 BUILD and PREVIEW Schedule Blocks are accepted. The command prints the Schedule
 Block status before and after the benchmark and never changes lifecycle status.

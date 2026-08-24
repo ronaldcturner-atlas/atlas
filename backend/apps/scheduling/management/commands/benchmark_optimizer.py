@@ -10,7 +10,9 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
 from apps.scheduling import optimizer
-from apps.scheduling.models import OptimizerRun, ScheduleVersion
+from apps.scheduling.models import (
+    OptimizerRun, ScheduleShiftAssignment, ScheduleShiftInstance, ScheduleVersion,
+)
 
 
 TRIAL_FIELDS = (
@@ -81,8 +83,8 @@ def summarize_best_chain(initial_score, best_score, best_run_id, trials, total_r
 class Command(BaseCommand):
     help = (
         'Benchmark optimizer runs against one BUILD or PREVIEW schedule. BENCHMARK '
-        'runs are created inside rollback-only transactions, so persisted workspace '
-        'state is unchanged.'
+        'runs are rollback-only by default. Use --retain-best with best-chain to '
+        'persist only the final best benchmark run.'
     )
 
     def add_arguments(self, parser):
@@ -102,12 +104,24 @@ class Command(BaseCommand):
         parser.add_argument('--seed-base', type=int, default=1)
         parser.add_argument('--output-json')
         parser.add_argument('--output-csv')
+        parser.add_argument(
+            '--retain-best', action='store_true',
+            help='Best-chain only: persist only the final best benchmark-created run.',
+        )
+        parser.add_argument(
+            '--source-run-id', type=int,
+            help='Best-chain only: start from this completed run in the selected Schedule Version.',
+        )
 
     def handle(self, *args, **options):
         if options['runs'] < 1:
             raise CommandError('--runs must be at least 1.')
         if options['time_limit_seconds'] is not None and options['time_limit_seconds'] <= 0:
             raise CommandError('--time-limit-seconds must be greater than 0.')
+        if options['retain_best'] and options['mode'] != 'best-chain':
+            raise CommandError('--retain-best requires --mode best-chain.')
+        if options['source_run_id'] is not None and options['mode'] != 'best-chain':
+            raise CommandError('--source-run-id requires --mode best-chain.')
 
         versions = ScheduleVersion.objects.select_related('schedule_block', 'domain').filter(
             schedule_block_id=options['schedule_block_id'],
@@ -129,9 +143,12 @@ class Command(BaseCommand):
             raise CommandError('Schedule Block must be in BUILD or PREVIEW status.')
         status_before = version.schedule_block.build_status
 
+        persistence_mode = 'retain-best' if options['retain_best'] else 'rollback'
+        self.stdout.write(f'persistence_mode: {persistence_mode}')
         self.stdout.write(
-            'Safety: BENCHMARK runs are real optimizer runs created inside rollback-only '
-            'transactions; no runs or schedule changes are retained.'
+            'Safety: only the final best BENCHMARK run will be retained; source and losing runs '
+            'will not be mutated.' if options['retain_best'] else
+            'Safety: BENCHMARK runs are temporary and rolled back; no runs or schedule changes are retained.'
         )
         self.stdout.write(f'Benchmark mode: {options["mode"]}')
         self.stdout.write(f'Schedule block status before benchmark: {status_before}')
@@ -150,8 +167,9 @@ class Command(BaseCommand):
         version.schedule_block.refresh_from_db(fields=['build_status'])
         status_after = version.schedule_block.build_status
         report = {
-            'benchmark_version': 2,
+            'benchmark_version': 3,
             'mode': options['mode'],
+            'persistence_mode': persistence_mode,
             'schedule_block_id': version.schedule_block_id,
             'schedule_version_id': version.id,
             'domain': version.domain.name,
@@ -161,7 +179,16 @@ class Command(BaseCommand):
             'schedule_block_status_before': status_before,
             'schedule_block_status_after': status_after,
             'run_kind': 'BENCHMARK',
-            'safety': 'All BENCHMARK runs rolled back; Build Workspace state unchanged.',
+            'source_run_id': summary.get('source_run_id'),
+            'retained_best_run_id': summary.get('retained_best_run_id'),
+            'schedule_changes_retained': bool(summary.get('retained_best_run_id')),
+            'safety': (
+                'Only the final best BENCHMARK run was retained; source and losing runs were preserved/removed.'
+                if summary.get('retained_best_run_id') else
+                'No benchmark-created run was retained because the persisted source remained best.'
+                if options['retain_best'] else
+                'All BENCHMARK runs rolled back; Build Workspace state unchanged.'
+            ),
             'summary': summary,
             'trials': trials,
         }
@@ -171,6 +198,11 @@ class Command(BaseCommand):
             self._write_csv(Path(options['output_csv']), trials)
 
         self.stdout.write(f'Schedule block status after benchmark: {status_after}')
+        self.stdout.write(f'source_run_id: {summary.get("source_run_id")}')
+        self.stdout.write(f'retained_best_run_id: {summary.get("retained_best_run_id")}')
+        self.stdout.write(
+            f'schedule_changes_retained: {"yes" if summary.get("retained_best_run_id") else "no"}'
+        )
         self.stdout.write('\nBenchmark summary')
         for key, value in summary.items():
             self.stdout.write(f'{key}: {value}')
@@ -225,12 +257,33 @@ class Command(BaseCommand):
         trials = []
         chain_started_at = monotonic()
         with transaction.atomic():
-            best_run = OptimizerRun.objects.filter(
-                schedule_version=version,
-                status=OptimizerRun.Status.COMPLETED,
+            existing_run_ids = set(version.optimizer_runs.values_list('id', flat=True))
+            original_active_run_id = version.optimizer_runs.filter(
                 is_active=True,
-                final_score__isnull=False,
-            ).first()
+            ).values_list('id', flat=True).first()
+            original_locked_open_ids = list(
+                ScheduleShiftInstance.objects.filter(
+                    schedule_version=version, is_locked_open=True,
+                ).values_list('id', flat=True)
+            )
+            original_version_summary = version.optimizer_summary
+            original_version_score_is_stale = version.score_is_stale
+            if options['source_run_id'] is not None:
+                best_run = OptimizerRun.objects.filter(
+                    id=options['source_run_id'], schedule_version=version,
+                    status=OptimizerRun.Status.COMPLETED, final_score__isnull=False,
+                ).first()
+                if best_run is None:
+                    raise CommandError(
+                        '--source-run-id must identify a completed scored run in the selected Schedule Version.'
+                    )
+            else:
+                best_run = OptimizerRun.objects.filter(
+                    schedule_version=version,
+                    status=OptimizerRun.Status.COMPLETED,
+                    is_active=True,
+                    final_score__isnull=False,
+                ).first()
             if best_run is None:
                 initial_payload = self._optimize(
                     version,
@@ -250,6 +303,7 @@ class Command(BaseCommand):
                     f'score={float(best_run.final_score)}'
                 )
 
+            initial_source_run_id = best_run.id
             initial_snapshot = self._source_snapshot(version, best_run)
             initial_score = initial_snapshot['score']
             best_score = initial_score
@@ -382,8 +436,66 @@ class Command(BaseCommand):
                 trials,
                 monotonic() - chain_started_at,
             )
-            transaction.set_rollback(True)
+            created_run_ids = set(version.optimizer_runs.values_list('id', flat=True)) - existing_run_ids
+            retained_best_run_id = None
+            if options['retain_best'] and best_run.id in created_run_ids:
+                retained_best_run_id = best_run.id
+                losing_ids = created_run_ids - {best_run.id}
+                self._delete_benchmark_runs(version, losing_ids)
+                self._mark_retained_best(best_run)
+            elif options['retain_best']:
+                self._delete_benchmark_runs(version, created_run_ids)
+            if options['retain_best']:
+                self._restore_workspace_state(
+                    version, original_active_run_id, original_locked_open_ids,
+                    original_version_summary, original_version_score_is_stale,
+                )
+            else:
+                transaction.set_rollback(True)
+            summary['source_run_id'] = initial_source_run_id
+            summary['retained_best_run_id'] = retained_best_run_id
+            if options['retain_best']:
+                summary.pop('best_run_id', None)
+            else:
+                summary['temporary_best_run_id'] = summary.pop('best_run_id')
         return trials, summary
+
+    def _delete_benchmark_runs(self, version, run_ids):
+        if not run_ids:
+            return
+        ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_version=version,
+            optimizer_run_id__in=run_ids,
+        ).delete()
+        OptimizerRun.objects.filter(
+            schedule_version=version, id__in=run_ids, run_kind='BENCHMARK',
+        ).delete()
+
+    def _mark_retained_best(self, best_run):
+        best_run.notes = 'Retained optimizer benchmark best-chain result.'
+        best_run.optimizer_summary = {
+            **(best_run.optimizer_summary or {}),
+            'benchmark_result': 'best-chain',
+            'retained_best': True,
+        }
+        best_run.save(update_fields=['notes', 'optimizer_summary'])
+
+    def _restore_workspace_state(
+        self, version, active_run_id, locked_open_ids, optimizer_summary, score_is_stale,
+    ):
+        OptimizerRun.objects.filter(schedule_version=version, is_active=True).update(is_active=False)
+        if active_run_id is not None:
+            OptimizerRun.objects.filter(
+                schedule_version=version, id=active_run_id,
+            ).update(is_active=True)
+        ScheduleShiftInstance.objects.filter(schedule_version=version).update(is_locked_open=False)
+        ScheduleShiftInstance.objects.filter(
+            schedule_version=version,
+            id__in=locked_open_ids,
+        ).update(is_locked_open=True)
+        version.optimizer_summary = optimizer_summary
+        version.score_is_stale = score_is_stale
+        version.save(update_fields=['optimizer_summary', 'score_is_stale', 'updated_at'])
 
     def _source_snapshot(self, version, source_run):
         report = optimizer.build_violation_report(version, optimizer_run=source_run)
