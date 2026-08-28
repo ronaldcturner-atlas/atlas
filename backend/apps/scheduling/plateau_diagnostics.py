@@ -144,6 +144,14 @@ def _scored_result(current_scoring, trial_scoring):
     }
 
 
+def _best_scored(rows):
+    scored = [
+        row for row in rows
+        if row.get('legal') and row.get('score_delta') is not None
+    ]
+    return min(scored, key=lambda row: row['score_delta']) if scored else None
+
+
 def _single_move(context, current_scoring, instance_id, from_id, to_id):
     instance = context['instances_by_id'][instance_id]
     base = {
@@ -313,6 +321,16 @@ def build_plateau_explanation(version, optimizer_run):
                 row['score_delta'] for row in [*moves, *swaps]
                 if row['legal'] and row['score_delta'] is not None
             ]
+            night_ids = {
+                instance_id for instance_id in involved_ids
+                if instance_id in context['instances_by_id']
+                and context['instances_by_id'][instance_id].shift_template.night_shift
+            }
+            conflicting_non_night_ids = {
+                instance_id for instance_id in involved_ids
+                if instance_id in context['instances_by_id']
+                and not context['instances_by_id'][instance_id].shift_template.night_shift
+            }
             violations.append({
                 'category': 'scoring_violation',
                 'physician_id': physician_id,
@@ -327,6 +345,21 @@ def build_plateau_explanation(version, optimizer_run):
                 'move_attempts': moves,
                 'swap_attempts': swaps,
                 'best_legal_score_delta': min(legal_deltas) if legal_deltas else None,
+                'best_move_involving_night_shift': _best_scored([
+                    row for row in moves if row['shift']['shift_instance_id'] in night_ids
+                ]),
+                'best_move_involving_conflicting_non_night_shift': _best_scored([
+                    row for row in moves
+                    if row['shift']['shift_instance_id'] in conflicting_non_night_ids
+                ]),
+                'best_swap_involving_night_shift': _best_scored([
+                    row for row in swaps
+                    if row['left_shift']['shift_instance_id'] in night_ids
+                ]),
+                'best_swap_involving_conflicting_non_night_shift': _best_scored([
+                    row for row in swaps
+                    if row['left_shift']['shift_instance_id'] in conflicting_non_night_ids
+                ]),
             })
 
     move_deltas = [
@@ -360,6 +393,10 @@ def build_plateau_explanation(version, optimizer_run):
         'source_run_mutated': False,
         'total_score': report['total_score'],
         'component_scores': report['score_breakdown'],
+        'nonzero_component_scores': {
+            key: value for key, value in report['score_breakdown'].items()
+            if key != 'total_score' and value
+        },
         'violations': violations,
         'summary': {
             'tested_neighborhood': 'violation-involved single-shift reassignments and pairwise swaps',
@@ -367,6 +404,14 @@ def build_plateau_explanation(version, optimizer_run):
             'swap_attempts': sum(row['action'] == 'swap' for row in all_results),
             'best_single_move_delta': min(move_deltas) if move_deltas else None,
             'best_pairwise_swap_delta': min(swap_deltas) if swap_deltas else None,
+            'best_single_move': _best_scored([
+                row for row in all_results if row['action'] == 'move'
+            ]),
+            'best_pairwise_swap': _best_scored([
+                row for row in all_results if row['action'] == 'swap'
+            ]),
+            'local_optimum_under_single_moves': improving_single_count == 0,
+            'local_optimum_under_pairwise_swaps': improving_swap_count == 0,
             'legal_improving_moves_found': improving_count,
             'legal_improving_single_moves_found': improving_single_count,
             'legal_improving_pairwise_swaps_found': improving_swap_count,
