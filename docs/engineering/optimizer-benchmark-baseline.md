@@ -242,6 +242,32 @@ The chain improved 40000 -> 30000 -> 20050 and retained run 329. The remaining
 eight attempts tied at 20050. The Schedule Block remained PREVIEW, the source run
 was not mutated, and only the final best benchmark run was retained.
 
+### Pairwise night-recovery rescan from run 339
+
+Final plateau repair now rebuilds post-night recovery violations and its targeted
+pairwise candidate set after every accepted swap. The pairwise pass prioritizes
+violation-involved assignments and other assignments owned by the involved
+physicians. It covers the broader movable assignment set only for small schedules,
+and remains bounded by the optimizer runtime guard, a total attempt cap, and a
+round cap. Every accepted swap still must strictly lower the complete official
+score and pass the existing lock, coverage, eligibility, overlap, and rest checks.
+
+Debug output records rescan rounds, candidates considered, candidates skipped by
+the cap, why candidates may have remained unevaluated, and accepts after a rescan.
+
+The required retained best-chain rerun from run 339 completed on 2026-08-28:
+
+```text
+python manage.py benchmark_optimizer --schedule-block-id 5 --domain Physician --runs 10 --mode best-chain --source-run-id 339 --retain-best
+```
+
+Iteration 1 improved 20050 -> 50 and retained run 358. Final plateau repair
+accepted four night-recovery swaps over four rounds, including three accepts after
+a rescan. It considered 632 targeted pairwise candidates, skipped none by the cap,
+and reported no missed candidate. The remaining nine attempts tied at 50. The
+Schedule Block remained PREVIEW, run 339 remained unchanged, assignment snapshots
+matched at optimizer start, and only run 358 was retained.
+
 ## Verification
 
 `python manage.py test apps.scheduling -v 1` passed all 102 scheduling tests after

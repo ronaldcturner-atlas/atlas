@@ -2922,6 +2922,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             timeout_payload['debug']['night_block_builder_disabled_reason'],
             'Disabled after runtime regression',
         )
+        self.assertEqual(timeout_payload['debug']['pairwise_rescan_rounds'], 0)
+        self.assertEqual(timeout_payload['debug']['pairwise_candidates_considered'], 0)
         timeout_run = OptimizerRun.objects.get(id=timeout_payload['optimizer_run_id'])
         self.assertEqual(timeout_run.status, OptimizerRun.Status.FAILED)
         self.assertFalse(timeout_run.is_active)
@@ -3367,6 +3369,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(debug['pairwise_swaps_accepted'], 1)
         self.assertLess(debug['best_pairwise_swap_delta'], 0)
         self.assertTrue(debug['accepted_pairwise_swap_details'])
+        self.assertGreaterEqual(debug['pairwise_rescan_rounds'], 1)
+        self.assertGreater(debug['pairwise_candidates_considered'], 0)
+        self.assertEqual(debug['pairwise_candidates_skipped_by_cap'], 0)
+        self.assertIsNone(debug['pairwise_best_missed_candidate_if_any'])
         self.assertLess(
             debug['score_after_final_plateau_repair'],
             debug['score_before_final_plateau_repair'],
@@ -3378,6 +3384,93 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             ).values_list('shift_instance_id', 'physician_id')),
             locked_snapshot,
         )
+
+    def test_final_plateau_rescans_and_accepts_second_night_recovery_swap(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 12))
+        groups = []
+        for index, offset in enumerate((0, 6), start=1):
+            facility = Facility.objects.create(
+                name=f'Rescan Hospital {index}', short_name=f'Rescan{index}',
+                timezone='UTC',
+            )
+            night_template = ShiftTemplate.objects.create(
+                facility=facility, start_time=time(19), end_time=time(7),
+                active_days_of_week=['Wednesday'], weekend_days=[], night_shift=True,
+                default_staffing_count=1, active=True,
+            )
+            day_template = ShiftTemplate.objects.create(
+                facility=facility, start_time=time(8), end_time=time(16),
+                active_days_of_week=['Friday'], weekend_days=[], night_shift=False,
+                default_staffing_count=1, active=True,
+            )
+            strict = self._create_assignment_physician(
+                f'plateau.rescan.strict{index}@example.com',
+                f'Plateau Rescan Strict {index}', facilities=[facility],
+            )
+            receiver = self._create_assignment_physician(
+                f'plateau.rescan.receiver{index}@example.com',
+                f'Plateau Rescan Receiver {index}', facilities=[facility],
+            )
+            strict_contract = Contract.objects.get(user_assignments__physician=strict)
+            strict_contract.night_settings = {
+                'days_off_after_night_block': '2',
+                'days_off_after_night_block_penalty_weight': '5000',
+            }
+            strict_contract.save(update_fields=['night_settings', 'updated_at'])
+            night = self._create_shift_instance(
+                version, night_template, date(2026, 7, 1) + timedelta(days=offset),
+            )
+            day = self._create_shift_instance(
+                version, day_template, date(2026, 7, 3) + timedelta(days=offset),
+            )
+            replacement_night = self._create_shift_instance(
+                version, night_template, date(2026, 7, 5) + timedelta(days=offset),
+            )
+            groups.append((strict, receiver, night, day, replacement_night))
+
+        source = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=Decimal('10000'),
+            is_active=True,
+        )
+        for strict, receiver, night, day, replacement_night in groups:
+            for instance, physician, assignment_source, is_locked in (
+                (night, strict, ScheduleShiftAssignment.AssignmentSource.OPTIMIZER, False),
+                (day, strict, ScheduleShiftAssignment.AssignmentSource.MANUAL, True),
+                (replacement_night, receiver,
+                 ScheduleShiftAssignment.AssignmentSource.OPTIMIZER, False),
+            ):
+                ScheduleShiftAssignment.objects.create(
+                    shift_instance=instance, physician=physician,
+                    assignment_source=assignment_source, optimizer_run=source,
+                    is_locked=is_locked,
+                )
+
+        with (
+            patch('apps.scheduling.optimizer.SAFE_BASELINE_PHASE_PASSES', 0),
+            patch('apps.scheduling.optimizer.SAFE_BASELINE_CANDIDATES_PER_REPAIR', 1),
+            patch('apps.scheduling.optimizer._can_assign_in_state', return_value=False),
+        ):
+            response = self.client.post(
+                f'/api/schedule-versions/{version.id}/run-optimizer/',
+                data={
+                    'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                    'currently_viewed_run_id': source.id,
+                    'seed': 703,
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        debug = response.json()['debug']
+        self.assertGreaterEqual(debug['pairwise_swaps_accepted'], 2, debug)
+        self.assertGreaterEqual(debug['pairwise_rescan_rounds'], 2)
+        self.assertGreaterEqual(debug['pairwise_accepts_after_rescan'], 1)
+        self.assertGreater(debug['pairwise_candidates_considered'], 2)
+        accepted_scores = [
+            detail['score_after'] for detail in debug['accepted_pairwise_swap_details']
+        ]
+        self.assertEqual(accepted_scores, sorted(accepted_scores, reverse=True))
 
     def test_workload_min_max_range_scores_only_outside_range(self):
         self.block.start_date = date(2026, 7, 1)

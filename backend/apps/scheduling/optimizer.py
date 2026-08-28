@@ -4309,6 +4309,11 @@ def optimize_schedule_version(
         pairwise_swaps_accepted = 0
         best_pairwise_swap_delta = None
         accepted_pairwise_swap_details = []
+        pairwise_rescan_rounds = 0
+        pairwise_candidates_considered = 0
+        pairwise_candidates_skipped_by_cap = 0
+        pairwise_best_missed_candidate_if_any = None
+        pairwise_accepts_after_rescan = 0
         score_before_final_plateau_repair = None
         score_after_final_plateau_repair = None
         final_plateau_repair_reason = 'not_run'
@@ -5716,18 +5721,23 @@ def optimize_schedule_version(
             'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK',
         }
         if not runtime_exceeded():
-            night_report = _night_violation_report(
-                instances, physicians, state, contract_by_physician,
-            )
-            for violation in night_report['night_violations']:
-                if violation['violation_type'] not in recovery_types:
-                    continue
-                physician_id = violation['physician_id']
-                for instance_id in violation.get('shift_instance_ids') or []:
-                    if physician_id in state[instance_id] and (
-                        instance_id, physician_id
-                    ) not in manual_pairs:
-                        targeted_pairs.append((instance_id, physician_id))
+            def current_recovery_target_pairs():
+                current_targets = []
+                current_night_report = _night_violation_report(
+                    instances, physicians, state, contract_by_physician,
+                )
+                for violation in current_night_report['night_violations']:
+                    if violation['violation_type'] not in recovery_types:
+                        continue
+                    physician_id = violation['physician_id']
+                    for instance_id in violation.get('shift_instance_ids') or []:
+                        if physician_id in state[instance_id] and (
+                            instance_id, physician_id
+                        ) not in manual_pairs:
+                            current_targets.append((instance_id, physician_id))
+                return list(dict.fromkeys(current_targets))
+
+            targeted_pairs = current_recovery_target_pairs()
 
             repaired_night = False
             direct_attempts_for_plateau = 0
@@ -5766,31 +5776,75 @@ def optimize_schedule_version(
                     break
 
             if not runtime_exceeded():
-                movable_pairs = _optimizer_pairs(state, manual_pairs)
-                workload_pairs = [
-                    pair for pair in movable_pairs
-                    if pair[1] in violating_workload_ids
-                ]
-                violation_pairs = list(dict.fromkeys([*targeted_pairs, *workload_pairs]))
-                violation_pair_set = set(violation_pairs)
-                prioritized_right_pairs = [
-                    *violation_pairs,
-                    *[pair for pair in movable_pairs if pair not in violation_pair_set],
-                ]
-                swap_attempts_for_plateau = 0
-                accepted_swap = False
-                night_target_pair_set = set(targeted_pairs)
-                for left_instance_id, left_physician_id in violation_pairs:
-                    if accepted_swap:
+                pairwise_attempt_limit = min(
+                    10000, max(4000, plateau_candidate_limit * 50),
+                )
+                pairwise_round_limit = 8
+                accepted_swap_count_at_start = pairwise_swaps_accepted
+                while pairwise_rescan_rounds < pairwise_round_limit:
+                    if runtime_exceeded():
+                        mark_timeout('final_plateau_repair')
+                        final_plateau_repair_reason = 'runtime_limit'
                         break
-                    for right_instance_id, right_physician_id in prioritized_right_pairs:
-                        if swap_attempts_for_plateau >= plateau_candidate_limit:
-                            break
+                    targeted_pairs = current_recovery_target_pairs()
+                    workload_rows = plateau_scoring.get('workload_score_rows', [])
+                    violating_workload_ids = {
+                        row['physician_id'] for row in workload_rows
+                        if row.get('deviation_direction') in {'above_maximum', 'below_minimum'}
+                    }
+                    movable_pairs = _optimizer_pairs(state, manual_pairs)
+                    workload_pairs = [
+                        pair for pair in movable_pairs
+                        if pair[1] in violating_workload_ids
+                    ]
+                    violation_pairs = list(dict.fromkeys([*targeted_pairs, *workload_pairs]))
+                    if not violation_pairs:
+                        break
+                    pairwise_rescan_rounds += 1
+                    violation_pair_set = set(violation_pairs)
+                    involved_physician_ids = {pair[1] for pair in violation_pairs}
+                    nearby_pairs = [
+                        pair for pair in movable_pairs
+                        if pair[1] in involved_physician_ids and pair not in violation_pair_set
+                    ]
+                    nearby_pair_set = set(nearby_pairs)
+                    other_pairs = [
+                        pair for pair in movable_pairs
+                        if pair not in violation_pair_set and pair not in nearby_pair_set
+                    ]
+                    # A normal one-month build is small enough to cover the same
+                    # violation-involved neighborhood as explain_optimizer_plateau.
+                    # Larger schedules stay focused on violating physicians.
+                    prioritized_right_pairs = [*violation_pairs, *nearby_pairs]
+                    if len(movable_pairs) <= 250:
+                        prioritized_right_pairs.extend(other_pairs)
+                    candidates = [
+                        (left_instance_id, left_physician_id,
+                         right_instance_id, right_physician_id)
+                        for left_instance_id, left_physician_id in violation_pairs
+                        for right_instance_id, right_physician_id in prioritized_right_pairs
+                    ]
+                    remaining_budget = pairwise_attempt_limit - pairwise_candidates_considered
+                    if remaining_budget <= 0:
+                        pairwise_candidates_skipped_by_cap += len(candidates)
+                        pairwise_best_missed_candidate_if_any = {
+                            'reason': 'not_evaluated_due_to_attempt_cap',
+                            'remaining_candidate_count': len(candidates),
+                        }
+                        break
+                    round_candidates = candidates[:remaining_budget]
+                    skipped_this_round = len(candidates) - len(round_candidates)
+                    accepted_swap = False
+                    night_target_pair_set = set(targeted_pairs)
+                    for (
+                        left_instance_id, left_physician_id,
+                        right_instance_id, right_physician_id,
+                    ) in round_candidates:
                         if runtime_exceeded():
                             mark_timeout('final_plateau_repair')
                             final_plateau_repair_reason = 'runtime_limit'
                             break
-                        swap_attempts_for_plateau += 1
+                        pairwise_candidates_considered += 1
                         pairwise_swaps_attempted += 1
                         final_plateau_repair_attempts += 1
                         if (left_instance_id, left_physician_id) in night_target_pair_set:
@@ -5844,6 +5898,33 @@ def optimize_schedule_version(
                             })
                             final_plateau_repair_reason = 'improved'
                             break
+                    if accepted_swap:
+                        if pairwise_rescan_rounds > 1:
+                            pairwise_accepts_after_rescan += 1
+                        continue
+                    if skipped_this_round:
+                        pairwise_candidates_skipped_by_cap += skipped_this_round
+                        first_skipped = candidates[len(round_candidates)]
+                        pairwise_best_missed_candidate_if_any = {
+                            'reason': 'not_evaluated_due_to_attempt_cap',
+                            'remaining_candidate_count': skipped_this_round,
+                            'first_skipped_candidate': {
+                                'left_shift_instance_id': first_skipped[0],
+                                'left_physician_id': first_skipped[1],
+                                'right_shift_instance_id': first_skipped[2],
+                                'right_physician_id': first_skipped[3],
+                            },
+                        }
+                    break
+                if (
+                    pairwise_rescan_rounds >= pairwise_round_limit
+                    and pairwise_swaps_accepted > accepted_swap_count_at_start
+                ):
+                    pairwise_best_missed_candidate_if_any = (
+                        pairwise_best_missed_candidate_if_any or {
+                            'reason': 'not_evaluated_due_to_round_cap',
+                        }
+                    )
 
         if not plateau_improved and final_plateau_repair_reason != 'runtime_limit':
             final_plateau_repair_reason = (
@@ -6129,6 +6210,11 @@ def optimize_schedule_version(
                 if best_pairwise_swap_delta is not None else None
             ),
             'accepted_pairwise_swap_details': accepted_pairwise_swap_details,
+            'pairwise_rescan_rounds': pairwise_rescan_rounds,
+            'pairwise_candidates_considered': pairwise_candidates_considered,
+            'pairwise_candidates_skipped_by_cap': pairwise_candidates_skipped_by_cap,
+            'pairwise_best_missed_candidate_if_any': pairwise_best_missed_candidate_if_any,
+            'pairwise_accepts_after_rescan': pairwise_accepts_after_rescan,
             'score_before_final_plateau_repair': score_before_final_plateau_repair,
             'score_after_final_plateau_repair': score_after_final_plateau_repair,
             'final_plateau_repair_reason': final_plateau_repair_reason,
