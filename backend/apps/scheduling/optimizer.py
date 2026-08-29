@@ -1463,6 +1463,11 @@ def _night_violation_report(
                                 for instance in night_instances
                                 if window_start <= instance.date <= window_end
                             ],
+                            'shift_instance_ids': [
+                                instance.id
+                                for instance in night_instances
+                                if window_start <= instance.date <= window_end
+                            ],
                             'night_block_dates': [
                                 _block_dates(block)
                                 for block in night_blocks
@@ -6031,28 +6036,32 @@ def optimize_schedule_version(
                 accepted_pairwise_swap_details.append(detail)
                 break
 
-        recovery_types = {
+        targeted_night_types = {
             'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
             'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK',
+            'NIGHT_OVER_MAXIMUM',
         }
         if not runtime_exceeded():
-            def current_recovery_target_pairs():
+            def current_night_target_pairs():
                 current_targets = []
+                includes_night_maximum = False
                 current_night_report = _night_violation_report(
                     instances, physicians, state, contract_by_physician,
                 )
                 for violation in current_night_report['night_violations']:
-                    if violation['violation_type'] not in recovery_types:
+                    if violation['violation_type'] not in targeted_night_types:
                         continue
+                    if violation['violation_type'] == 'NIGHT_OVER_MAXIMUM':
+                        includes_night_maximum = True
                     physician_id = violation['physician_id']
                     for instance_id in violation.get('shift_instance_ids') or []:
                         if physician_id in state[instance_id] and (
                             instance_id, physician_id
                         ) not in manual_pairs:
                             current_targets.append((instance_id, physician_id))
-                return list(dict.fromkeys(current_targets))
+                return list(dict.fromkeys(current_targets)), includes_night_maximum
 
-            targeted_pairs = current_recovery_target_pairs()
+            targeted_pairs, includes_night_maximum = current_night_target_pairs()
 
             repaired_night = False
             direct_attempts_for_plateau = 0
@@ -6101,7 +6110,7 @@ def optimize_schedule_version(
                         mark_timeout('final_plateau_repair')
                         final_plateau_repair_reason = 'runtime_limit'
                         break
-                    targeted_pairs = current_recovery_target_pairs()
+                    targeted_pairs, includes_night_maximum = current_night_target_pairs()
                     workload_rows = plateau_scoring.get('workload_score_rows', [])
                     violating_workload_ids = {
                         row['physician_id'] for row in workload_rows
@@ -6131,7 +6140,7 @@ def optimize_schedule_version(
                     # violation-involved neighborhood as explain_optimizer_plateau.
                     # Larger schedules stay focused on violating physicians.
                     prioritized_right_pairs = [*violation_pairs, *nearby_pairs]
-                    if len(movable_pairs) <= 250:
+                    if len(movable_pairs) <= 250 or includes_night_maximum:
                         prioritized_right_pairs.extend(other_pairs)
                     candidates = [
                         (left_instance_id, left_physician_id,

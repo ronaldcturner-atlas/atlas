@@ -4311,6 +4311,11 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         contract = Contract.objects.get(user_assignments__physician=physician)
         contract.night_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK',
+                'max_shifts': '2',
+                'max_penalty_weight': '5000',
+            }],
             'max_consecutive_night_shifts': '2',
             'max_consecutive_night_shifts_penalty_weight': '1200',
         }
@@ -4339,6 +4344,11 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(max_rows[0]['actual_value'], 3)
         self.assertEqual(max_rows[0]['penalty'], 1200.0)
         self.assertEqual(len(report['max_consecutive_night_violations']), 1)
+        volume_row = next(
+            violation for violation in report['night_violations']
+            if violation['violation_type'] == 'NIGHT_OVER_MAXIMUM'
+        )
+        self.assertEqual(volume_row['shift_instance_ids'], [night.id for night in nights])
 
     def test_post_night_recovery_uses_each_physician_contract(self):
         version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 4))

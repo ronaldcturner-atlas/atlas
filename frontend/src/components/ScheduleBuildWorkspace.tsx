@@ -1383,6 +1383,15 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const canManageRunDeletion = context.can_manage_build_workspace
     && context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
+  const canManageRunActions = context.can_manage_build_workspace
+    && context.schedule_block.build_status === 'BUILD'
+    && context.selected_version?.status === 'BUILD'
+  const selectedRunCanCopy = context.run_state
+    ? context.run_state.viewed_run_can_copy
+    : Boolean(selectedRunForActions && isCompletedOptimizerRun(selectedRunForActions))
+  const selectedRunCanActivate = context.run_state
+    ? context.run_state.viewed_run_can_activate
+    : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
   const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
@@ -1550,22 +1559,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 )}
               </div>
               <div className="optimizer-run-actions">
-                <button type="button" className="secondary" onClick={() => void saveRunCopy()} disabled={!canEditAssignments || isMutatingBuild}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => void saveRunCopy()}
+                  disabled={!canManageRunActions || !selectedRunCanCopy || isMutatingBuild}
+                >
                   {isSavingCopy ? 'Saving...' : 'Save Copy'}
                 </button>
                 <button
                   type="button"
                   className="secondary"
-                  onClick={() => void selectOptimizerRun(selectedRunForActions)}
-                  disabled={isMutatingBuild || selectedOptimizerRunId === selectedRunForActions.id}
-                >
-                  View
-                </button>
-                <button
-                  type="button"
-                  className="secondary"
                   onClick={() => void activateOptimizerRun(selectedRunForActions.id)}
-                  disabled={!canEditAssignments || isMutatingBuild || selectedRunForActions.is_active}
+                  disabled={!canManageRunActions || !selectedRunCanActivate || isMutatingBuild}
                 >
                   Activate
                 </button>
@@ -1663,7 +1669,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       type="button"
                       className="secondary"
                       onClick={() => void activateOptimizerRun(run.id)}
-                      disabled={!canEditAssignments || isMutatingBuild || !isCompletedOptimizerRun(run) || run.is_active}
+                      disabled={!canManageRunActions || isMutatingBuild || !isCompletedOptimizerRun(run) || run.is_active}
                     >
                       Activate
                     </button>
