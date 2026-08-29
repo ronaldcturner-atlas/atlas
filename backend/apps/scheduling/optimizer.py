@@ -464,6 +464,70 @@ def _workload_rule_delta_for_candidate(instances, state, instances_by_id, physic
     return after - before
 
 
+def _workload_rule_delta_from_totals(range_rows, totals, instance_date, shift_hours):
+    """Calculate an initial-fill workload delta from maintained window totals."""
+    delta = Decimal('0')
+    for row in range_rows:
+        if not (row['window_start'] <= instance_date <= row['window_end']):
+            continue
+        key = (row['window_start'], row['window_end'], row['units'])
+        before = totals.get(key, Decimal('0'))
+        increment = Decimal('1') if row['units'] == 'SHIFTS' else shift_hours
+        after = before + increment
+
+        def penalty(value):
+            score = Decimal('0')
+            if row['min_value'] is not None and value < row['min_value']:
+                score += (row['min_value'] - value) * row['min_penalty_weight']
+            if row['max_value'] is not None and value > row['max_value']:
+                score += (value - row['max_value']) * row['max_penalty_weight']
+            return score
+
+        delta += penalty(after) - penalty(before)
+    return delta
+
+
+def _night_volume_delta_from_totals(range_rows, totals, instance_date):
+    """Calculate a night-volume delta from maintained period counts."""
+    delta = Decimal('0')
+    for row in range_rows:
+        if not (row['window_start'] <= instance_date <= row['window_end']):
+            continue
+        key = (row['window_start'], row['window_end'])
+        before = totals.get(key, Decimal('0'))
+        after = before + Decimal('1')
+
+        def penalty(value):
+            score = Decimal('0')
+            if row['min_shifts'] is not None and value < row['min_shifts']:
+                score += (row['min_shifts'] - value) * row['min_penalty_weight']
+            if row['max_shifts'] is not None and value > row['max_shifts']:
+                score += (value - row['max_shifts']) * row['max_penalty_weight']
+            return score
+
+        delta += penalty(after) - penalty(before)
+    return delta
+
+
+def _night_volume_pressure_from_totals(range_rows, totals, instance_date):
+    """Rank night candidates by proportional use of their configured capacity."""
+    applicable = [
+        row for row in range_rows
+        if row['window_start'] <= instance_date <= row['window_end']
+    ]
+    if not applicable:
+        return Decimal('0')
+    pressures = []
+    for row in applicable:
+        key = (row['window_start'], row['window_end'])
+        count = totals.get(key, Decimal('0'))
+        if row['max_shifts'] is not None and row['max_shifts'] > 0:
+            pressures.append(count / row['max_shifts'])
+        else:
+            pressures.append(count)
+    return max(pressures, default=Decimal('0'))
+
+
 def _initial_fill_workload_guard(range_rows, totals, shift_hours):
     """Return an ordinal rank and debug details for one initial-fill candidate."""
     applicable = [
@@ -1844,10 +1908,6 @@ def _night_violation_report(
         unresolved_reasons.append(
             'Configured days off after night blocks before another night block are still violated by the final draft.'
         )
-    if violations and total_night_shifts > len(physicians):
-        unresolved_reasons.append(
-            'Total night assignments exceed active eligible physician count, so some night concentration may be unavoidable.'
-        )
     return {
         'score': score,
         'total_night_shifts': total_night_shifts,
@@ -2267,6 +2327,28 @@ def _same_shift_candidate_delta(instances, physicians, state, contract_by_physic
         sorted(current_indexes + [occurrence_index]),
         max_streak,
         penalty,
+    )
+    return projected_score - current_score
+
+
+def _same_shift_candidate_delta_from_indexes(
+    contract, positions, indexes_by_physician_template, physician_id, instance,
+):
+    """Calculate same-shift delta without rebuilding occurrence positions or assignment history."""
+    current_position = positions.get(instance.id)
+    if contract is None or current_position is None:
+        return Decimal('0')
+    shift_template_id, occurrence_index = current_position
+    current_indexes = indexes_by_physician_template.get(
+        (physician_id, shift_template_id),
+        [],
+    )
+    max_streak, penalty = _same_shift_rule(contract)
+    current_score, _streaks = _same_shift_streak_score(
+        sorted(current_indexes), max_streak, penalty,
+    )
+    projected_score, _streaks = _same_shift_streak_score(
+        sorted([*current_indexes, occurrence_index]), max_streak, penalty,
     )
     return projected_score - current_score
 
@@ -3235,6 +3317,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
                 'initial_score': float(optimizer_run.initial_score) if optimizer_run.initial_score is not None else None,
                 'final_score': float(optimizer_run.final_score) if optimizer_run.final_score is not None else None,
                 'is_active': optimizer_run.is_active,
+                'score_is_stale': optimizer_run.score_is_stale,
             }
             if optimizer_run is not None
             else None
@@ -3677,6 +3760,8 @@ def optimize_schedule_version(
         }
         workload_ranges_by_physician = {}
         workload_totals_by_physician = {}
+        night_ranges_by_physician = {}
+        night_totals_by_physician = {}
         for physician in physicians:
             range_rows = []
             values = defaultdict(lambda: Decimal('0'))
@@ -3697,6 +3782,38 @@ def optimize_schedule_version(
                         values[key] += Decimal('1') if row['units'] == 'SHIFTS' else _shift_hours(instance)
             workload_ranges_by_physician[physician.id] = range_rows
             workload_totals_by_physician[physician.id] = values
+
+            night_range_rows = []
+            night_values = defaultdict(lambda: Decimal('0'))
+            for rule in _unique_night_period_rules(_night_settings(contract_by_physician[physician.id])):
+                min_shifts = _decimal_or_none(rule.get('min_shifts'))
+                max_shifts = _decimal_or_none(rule.get('max_shifts'))
+                if min_shifts is None and max_shifts is None:
+                    continue
+                for window_start, window_end in _period_windows(instances, rule.get('period_type') or 'SCHEDULE_BLOCK'):
+                    night_range_rows.append({
+                        'window_start': window_start,
+                        'window_end': window_end,
+                        'min_shifts': min_shifts,
+                        'max_shifts': max_shifts,
+                        'min_penalty_weight': _configured_positive_penalty(
+                            rule, 'min_penalty_weight', DEFAULT_NIGHT_BALANCE_PENALTY,
+                        ),
+                        'max_penalty_weight': _configured_positive_penalty(
+                            rule, 'max_penalty_weight', DEFAULT_NIGHT_BALANCE_PENALTY,
+                        ),
+                    })
+            for assigned_instance in instances:
+                if (
+                    physician.id not in state[assigned_instance.id]
+                    or not assigned_instance.shift_template.night_shift
+                ):
+                    continue
+                for row in night_range_rows:
+                    if row['window_start'] <= assigned_instance.date <= row['window_end']:
+                        night_values[(row['window_start'], row['window_end'])] += Decimal('1')
+            night_ranges_by_physician[physician.id] = night_range_rows
+            night_totals_by_physician[physician.id] = night_values
 
         requests = (
             ScheduleRequest.objects.filter(
@@ -4077,6 +4194,24 @@ def optimize_schedule_version(
             night_recovery_conflicts_after_night_build = night_recovery_conflict_count(after_report)
             night_distribution_by_physician_after_build = night_distribution_rows(after_report)
 
+        initial_fill_hours = defaultdict(lambda: Decimal('0'))
+        initial_fill_shifts = defaultdict(int)
+        initial_fill_template_indexes = defaultdict(list)
+        initial_fill_template_positions = _template_occurrence_positions(instances)
+
+        def sync_initial_fill_counters():
+            initial_fill_hours.clear()
+            initial_fill_shifts.clear()
+            initial_fill_template_indexes.clear()
+            for assigned_instance in instances:
+                position = initial_fill_template_positions.get(assigned_instance.id)
+                for physician_id in state[assigned_instance.id]:
+                    initial_fill_hours[physician_id] += _shift_hours(assigned_instance)
+                    initial_fill_shifts[physician_id] += 1
+                    if position is not None:
+                        template_id, occurrence_index = position
+                        initial_fill_template_indexes[(physician_id, template_id)].append(occurrence_index)
+
         def fill_open_instances(ordered_instances, phase):
             nonlocal assignments_made
             nonlocal rest_violations_blocked
@@ -4100,17 +4235,6 @@ def optimize_schedule_version(
                         night_block_assignment_attempts += 1
                     candidates = []
                     recovery_conflict_candidates = 0
-                    current_scoring = _score_schedule(
-                        instances,
-                        physicians,
-                        state,
-                        targets,
-                        contract_by_physician,
-                        requests_by_physician_date,
-                        eligible_facilities_by_physician,
-                        minimum_rest_by_physician,
-                        include_internal_night_heuristics=True,
-                    )
                     for physician in shuffle(physicians):
                         candidates_considered_before_timeout += 1
                         if runtime_exceeded():
@@ -4134,27 +4258,38 @@ def optimize_schedule_version(
                         contract = contract_by_physician[physician.id]
                         target = targets[physician.id]
                         shift_hours = _shift_hours(instance)
-                        next_hours = current_scoring['physician_hours'][physician.id] + shift_hours
-                        next_shifts = current_scoring['physician_shifts'][physician.id] + 1
+                        next_hours = initial_fill_hours[physician.id] + shift_hours
+                        next_shifts = initial_fill_shifts[physician.id] + 1
                         workload_score = _workload_candidate_score(target, next_hours, next_shifts)
-                        workload_rule_delta = _workload_rule_delta_for_candidate(
-                            instances,
-                            state,
-                            instances_by_id,
-                            physician.id,
-                            instance,
-                            target,
+                        workload_rule_delta = _workload_rule_delta_from_totals(
+                            workload_ranges_by_physician[physician.id],
+                            workload_totals_by_physician[physician.id],
+                            instance.date,
+                            shift_hours,
                         )
-                        same_shift_delta = _same_shift_candidate_delta(
-                            instances,
-                            physicians,
-                            state,
-                            contract_by_physician,
+                        same_shift_delta = _same_shift_candidate_delta_from_indexes(
+                            contract,
+                            initial_fill_template_positions,
+                            initial_fill_template_indexes,
                             physician.id,
                             instance,
                         )
+                        if phase == 'night':
+                            night_delta = _night_volume_delta_from_totals(
+                                night_ranges_by_physician[physician.id],
+                                night_totals_by_physician[physician.id],
+                                instance.date,
+                            )
+                            night_pressure = _night_volume_pressure_from_totals(
+                                night_ranges_by_physician[physician.id],
+                                night_totals_by_physician[physician.id],
+                                instance.date,
+                            )
+                        else:
+                            night_delta = Decimal('0')
+                            night_pressure = Decimal('0')
                         if NIGHT_BLOCK_BUILDER_ENABLED:
-                            night_delta = _night_candidate_delta(
+                            night_delta += _night_candidate_delta(
                                 instances,
                                 physicians,
                                 state,
@@ -4185,7 +4320,6 @@ def optimize_schedule_version(
                                 instance,
                             )
                         else:
-                            night_delta = Decimal('0')
                             night_block_bonus = Decimal('0')
                             night_minimum_bonus = Decimal('0')
                             recovery_penalty = Decimal('0')
@@ -4223,6 +4357,8 @@ def optimize_schedule_version(
                             (
                                 recovery_penalty > 0,
                                 request_score,
+                                night_delta,
+                                night_pressure,
                                 workload_rank,
                                 workload_rule_delta,
                                 workload_score
@@ -4253,6 +4389,8 @@ def optimize_schedule_version(
                     (
                         _has_recovery_conflict,
                         _request_score_value,
+                        _night_delta_value,
+                        _night_pressure_value,
                         _workload_rank,
                         _workload_rule_delta,
                         _candidate_score,
@@ -4260,18 +4398,32 @@ def optimize_schedule_version(
                         selected_physician,
                     ) = min(candidate_pool)
                     _add_to_state(state, instance.id, selected_physician.id)
+                    initial_fill_hours[selected_physician.id] += _shift_hours(instance)
+                    initial_fill_shifts[selected_physician.id] += 1
+                    selected_position = initial_fill_template_positions.get(instance.id)
+                    if selected_position is not None:
+                        template_id, occurrence_index = selected_position
+                        initial_fill_template_indexes[(selected_physician.id, template_id)].append(
+                            occurrence_index
+                        )
                     for row in workload_ranges_by_physician[selected_physician.id]:
                         if row['window_start'] <= instance.date <= row['window_end']:
                             key = (row['window_start'], row['window_end'], row['units'])
                             workload_totals_by_physician[selected_physician.id][key] += (
                                 Decimal('1') if row['units'] == 'SHIFTS' else _shift_hours(instance)
                             )
+                    if phase == 'night':
+                        for row in night_ranges_by_physician[selected_physician.id]:
+                            if row['window_start'] <= instance.date <= row['window_end']:
+                                key = (row['window_start'], row['window_end'])
+                                night_totals_by_physician[selected_physician.id][key] += Decimal('1')
                     assignments_made += 1
                     if phase == 'night':
                         night_block_assignment_successes += 1
 
         if NIGHT_BLOCK_BUILDER_ENABLED:
             build_night_blocks()
+        sync_initial_fill_counters()
         night_instances = shuffle(night_instances)
         non_night_instances = shuffle(non_night_instances)
         if not timed_out:
@@ -6064,6 +6216,7 @@ def optimize_schedule_version(
         if not runtime_exceeded():
             def current_night_target_pairs():
                 current_targets = []
+                maximum_targets = []
                 includes_night_maximum = False
                 current_night_report = _night_violation_report(
                     instances, physicians, state, contract_by_physician,
@@ -6079,14 +6232,35 @@ def optimize_schedule_version(
                             instance_id, physician_id
                         ) not in manual_pairs:
                             current_targets.append((instance_id, physician_id))
-                return list(dict.fromkeys(current_targets)), includes_night_maximum
+                            if violation['violation_type'] == 'NIGHT_OVER_MAXIMUM':
+                                maximum_targets.append((instance_id, physician_id))
+                return (
+                    list(dict.fromkeys(current_targets)),
+                    includes_night_maximum,
+                    list(dict.fromkeys(maximum_targets)),
+                )
 
-            targeted_pairs, includes_night_maximum = current_night_target_pairs()
+            targeted_pairs, includes_night_maximum, maximum_target_pairs = current_night_target_pairs()
+
+            def current_night_counts():
+                counts = defaultdict(int)
+                for assigned_instance_id, assigned_physician_ids in state.items():
+                    assigned_instance = instances_by_id.get(assigned_instance_id)
+                    if assigned_instance is None or not assigned_instance.shift_template.night_shift:
+                        continue
+                    for assigned_physician_id in assigned_physician_ids:
+                        counts[assigned_physician_id] += 1
+                return counts
 
             repaired_night = False
             direct_attempts_for_plateau = 0
             for instance_id, from_physician_id in targeted_pairs:
-                for to_physician_id in physician_ids:
+                night_counts = current_night_counts()
+                ordered_recipient_ids = sorted(
+                    physician_ids,
+                    key=lambda candidate_id: (night_counts[candidate_id], candidate_id),
+                )
+                for to_physician_id in ordered_recipient_ids:
                     if direct_attempts_for_plateau >= plateau_candidate_limit:
                         break
                     if runtime_exceeded():
@@ -6119,6 +6293,267 @@ def optimize_schedule_version(
                 if direct_attempts_for_plateau >= plateau_candidate_limit:
                     break
 
+            def legal_swap_state(base_state, left_instance_id, left_physician_id,
+                                 right_instance_id, right_physician_id):
+                if (
+                    left_instance_id == right_instance_id
+                    or left_physician_id == right_physician_id
+                    or (left_instance_id, left_physician_id) in manual_pairs
+                    or (right_instance_id, right_physician_id) in manual_pairs
+                    or left_instance_id in source_locked_open_ids
+                    or right_instance_id in source_locked_open_ids
+                    or right_physician_id in base_state[left_instance_id]
+                    or left_physician_id in base_state[right_instance_id]
+                ):
+                    return None
+                trial_state = _copy_state(base_state)
+                _replace_in_state(
+                    trial_state, left_instance_id, left_physician_id, right_physician_id,
+                )
+                _replace_in_state(
+                    trial_state, right_instance_id, right_physician_id, left_physician_id,
+                )
+                for candidate_instance_id, candidate_physician_id in (
+                    (left_instance_id, right_physician_id),
+                    (right_instance_id, left_physician_id),
+                ):
+                    candidate_instance = instances_by_id[candidate_instance_id]
+                    if candidate_instance.facility_id not in eligible_facilities_by_physician.get(
+                        candidate_physician_id, set(),
+                    ):
+                        return None
+                    if not _can_assign_in_state(
+                        trial_state,
+                        instances_by_id,
+                        candidate_instance,
+                        candidate_physician_id,
+                        eligible_facilities_by_physician,
+                        minimum_rest_by_physician,
+                        exclude_instance_id=candidate_instance_id,
+                    ):
+                        return None
+                return trial_state
+
+            # Build several coordinated exchanges before invoking the expensive
+            # complete score. This can cross the multi-move neighborhood that a
+            # concentrated two-month schedule requires, while the full official
+            # objective still decides whether the entire batch is retained.
+            batch_round_limit = 4
+            batch_swap_limit = 48
+            for _batch_round in range(batch_round_limit):
+                if runtime_exceeded():
+                    break
+                (
+                    targeted_pairs,
+                    includes_night_maximum,
+                    maximum_target_pairs,
+                ) = current_night_target_pairs()
+                if not maximum_target_pairs:
+                    break
+                batch_state = _copy_state(state)
+                batch_counts = current_night_counts()
+                batch_swaps = []
+                ordered_maximum_pairs = sorted(
+                    maximum_target_pairs,
+                    key=lambda pair: (-batch_counts[pair[1]], pair[1], pair[0]),
+                )
+                for night_instance_id, donor_id in ordered_maximum_pairs:
+                    if len(batch_swaps) >= batch_swap_limit:
+                        break
+                    night_instance = instances_by_id[night_instance_id]
+                    recipient_ids = sorted(
+                        (
+                            candidate_id for candidate_id in physician_ids
+                            if candidate_id != donor_id
+                            and batch_counts[candidate_id] + 1 < batch_counts[donor_id]
+                        ),
+                        key=lambda candidate_id: (batch_counts[candidate_id], candidate_id),
+                    )
+                    accepted_batch_swap = False
+                    for recipient_id in recipient_ids:
+                        recipient_day_pairs = sorted(
+                            (
+                                (candidate_instance_id, candidate_owner_id)
+                                for candidate_instance_id, candidate_owner_id in _optimizer_pairs(batch_state, manual_pairs)
+                                if candidate_owner_id == recipient_id
+                                and not instances_by_id[candidate_instance_id].shift_template.night_shift
+                                and candidate_instance_id not in source_locked_open_ids
+                            ),
+                            key=lambda pair: (
+                                abs(_shift_hours(instances_by_id[pair[0]]) - _shift_hours(night_instance)),
+                                abs((instances_by_id[pair[0]].date - night_instance.date).days),
+                                pair[0],
+                            ),
+                        )
+                        for day_instance_id, _owner_id in recipient_day_pairs:
+                            trial_batch_state = legal_swap_state(
+                                batch_state,
+                                night_instance_id,
+                                donor_id,
+                                day_instance_id,
+                                recipient_id,
+                            )
+                            if trial_batch_state is None:
+                                continue
+                            batch_state = trial_batch_state
+                            batch_counts[donor_id] -= 1
+                            batch_counts[recipient_id] += 1
+                            batch_swaps.append((
+                                night_instance_id, donor_id, day_instance_id, recipient_id,
+                            ))
+                            accepted_batch_swap = True
+                            break
+                        if accepted_batch_swap:
+                            break
+                if not batch_swaps:
+                    break
+                batch_scoring = _score_schedule(
+                    instances,
+                    physicians,
+                    batch_state,
+                    targets,
+                    contract_by_physician,
+                    requests_by_physician_date,
+                    eligible_facilities_by_physician,
+                    minimum_rest_by_physician,
+                )
+                if has_hard_invalids(batch_scoring) or batch_scoring['score'] >= final_score:
+                    break
+                score_before_batch = final_score
+                state = batch_state
+                plateau_scoring = batch_scoring
+                final_score = batch_scoring['score']
+                improvement_count += 1
+                final_plateau_repair_accepts += len(batch_swaps)
+                pairwise_swaps_accepted += len(batch_swaps)
+                night_recovery_repairs_accepted += len(batch_swaps)
+                phase_attempts['final_plateau_repair'] += len(batch_swaps)
+                phase_improvements['final_plateau_repair'] += len(batch_swaps)
+                plateau_improved = True
+                repaired_night = True
+                final_plateau_repair_reason = 'improved'
+                accepted_pairwise_swap_details.append({
+                    'action': 'night_day_redistribution_batch',
+                    'swap_count': len(batch_swaps),
+                    'score_before': float(score_before_batch),
+                    'score_after': float(final_score),
+                    'score_delta': float(final_score - score_before_batch),
+                })
+
+            # A concentrated night fill is often not repairable by a direct
+            # reassignment because the low-night recipient already owns a day
+            # shift that overlaps or violates rest.  Try the coordinated move
+            # the scheduler actually needs: give that day shift to the night
+            # donor while transferring the night to the low-night physician.
+            # The official complete score remains the acceptance rule.
+            redistribution_round_limit = 64
+            redistribution_attempt_limit = 2000
+            redistribution_rounds = 0
+            redistribution_attempts = 0
+            while (
+                not runtime_exceeded()
+                and redistribution_rounds < redistribution_round_limit
+                and redistribution_attempts < redistribution_attempt_limit
+            ):
+                (
+                    targeted_pairs,
+                    includes_night_maximum,
+                    maximum_target_pairs,
+                ) = current_night_target_pairs()
+                if not maximum_target_pairs:
+                    break
+                night_counts = current_night_counts()
+                ordered_maximum_pairs = sorted(
+                    maximum_target_pairs,
+                    key=lambda pair: (-night_counts[pair[1]], pair[1], pair[0]),
+                )
+                accepted_redistribution = False
+                for night_instance_id, donor_id in ordered_maximum_pairs:
+                    night_instance = instances_by_id[night_instance_id]
+                    recipient_ids = sorted(
+                        (
+                            candidate_id for candidate_id in physician_ids
+                            if candidate_id != donor_id
+                            and night_counts[candidate_id] < night_counts[donor_id]
+                        ),
+                        key=lambda candidate_id: (night_counts[candidate_id], candidate_id),
+                    )
+                    for recipient_id in recipient_ids:
+                        recipient_day_pairs = sorted(
+                            (
+                                (candidate_instance_id, candidate_owner_id)
+                                for candidate_instance_id, candidate_owner_id in _optimizer_pairs(state, manual_pairs)
+                                if candidate_owner_id == recipient_id
+                                and not instances_by_id[candidate_instance_id].shift_template.night_shift
+                                and candidate_instance_id not in source_locked_open_ids
+                            ),
+                            key=lambda pair: (
+                                abs(_shift_hours(instances_by_id[pair[0]]) - _shift_hours(night_instance)),
+                                abs((instances_by_id[pair[0]].date - night_instance.date).days),
+                                pair[0],
+                            ),
+                        )
+                        for day_instance_id, _recipient_owner_id in recipient_day_pairs:
+                            if runtime_exceeded() or redistribution_attempts >= redistribution_attempt_limit:
+                                break
+                            redistribution_attempts += 1
+                            pairwise_candidates_considered += 1
+                            pairwise_swaps_attempted += 1
+                            final_plateau_repair_attempts += 1
+                            night_recovery_repairs_attempted += 1
+                            phase_attempts['final_plateau_repair'] += 1
+                            result = evaluate_plateau_pairwise_swap(
+                                instances=instances,
+                                physicians=physicians,
+                                state=state,
+                                instances_by_id=instances_by_id,
+                                manual_pairs=manual_pairs,
+                                locked_open_instance_ids=set(source_locked_open_ids),
+                                targets=targets,
+                                contract_by_physician=contract_by_physician,
+                                requests_by_physician_date=requests_by_physician_date,
+                                eligible_facilities_by_physician=eligible_facilities_by_physician,
+                                minimum_rest_by_physician=minimum_rest_by_physician,
+                                current_score=final_score,
+                                left_instance_id=night_instance_id,
+                                left_physician_id=donor_id,
+                                right_instance_id=day_instance_id,
+                                right_physician_id=recipient_id,
+                            )
+                            if not result['legal'] or not result['improving']:
+                                continue
+                            score_before_swap = final_score
+                            state = result['state']
+                            plateau_scoring = result['scoring']
+                            final_score = result['scoring']['score']
+                            improvement_count += 1
+                            final_plateau_repair_accepts += 1
+                            pairwise_swaps_accepted += 1
+                            night_recovery_repairs_accepted += 1
+                            phase_improvements['final_plateau_repair'] += 1
+                            plateau_improved = True
+                            repaired_night = True
+                            accepted_redistribution = True
+                            final_plateau_repair_reason = 'improved'
+                            accepted_pairwise_swap_details.append({
+                                'action': 'night_day_redistribution',
+                                'left_shift_instance_id': night_instance_id,
+                                'left_physician_id': donor_id,
+                                'right_shift_instance_id': day_instance_id,
+                                'right_physician_id': recipient_id,
+                                'score_before': float(score_before_swap),
+                                'score_after': float(final_score),
+                                'score_delta': float(result['score_delta']),
+                            })
+                            break
+                        if accepted_redistribution or runtime_exceeded():
+                            break
+                    if accepted_redistribution or runtime_exceeded():
+                        break
+                if not accepted_redistribution:
+                    break
+                redistribution_rounds += 1
+
             if not runtime_exceeded():
                 pairwise_attempt_limit = min(
                     10000, max(4000, plateau_candidate_limit * 50),
@@ -6130,7 +6565,11 @@ def optimize_schedule_version(
                         mark_timeout('final_plateau_repair')
                         final_plateau_repair_reason = 'runtime_limit'
                         break
-                    targeted_pairs, includes_night_maximum = current_night_target_pairs()
+                    (
+                        targeted_pairs,
+                        includes_night_maximum,
+                        maximum_target_pairs,
+                    ) = current_night_target_pairs()
                     workload_rows = plateau_scoring.get('workload_score_rows', [])
                     violating_workload_ids = {
                         row['physician_id'] for row in workload_rows
@@ -6156,12 +6595,25 @@ def optimize_schedule_version(
                         pair for pair in movable_pairs
                         if pair not in violation_pair_set and pair not in nearby_pair_set
                     ]
+                    night_counts = current_night_counts()
+                    other_pairs.sort(key=lambda pair: (
+                        night_counts[pair[1]],
+                        0 if not instances_by_id[pair[0]].shift_template.night_shift else 1,
+                        pair[1],
+                        instances_by_id[pair[0]].date,
+                        pair[0],
+                    ))
                     # A normal one-month build is small enough to cover the same
                     # violation-involved neighborhood as explain_optimizer_plateau.
                     # Larger schedules stay focused on violating physicians.
-                    prioritized_right_pairs = [*violation_pairs, *nearby_pairs]
-                    if len(movable_pairs) <= 250 or includes_night_maximum:
+                    prioritized_right_pairs = (
+                        [*other_pairs, *nearby_pairs, *violation_pairs]
+                        if includes_night_maximum
+                        else [*violation_pairs, *nearby_pairs]
+                    )
+                    if len(movable_pairs) <= 250 and not includes_night_maximum:
                         prioritized_right_pairs.extend(other_pairs)
+                    prioritized_right_pairs = list(dict.fromkeys(prioritized_right_pairs))
                     candidates = [
                         (left_instance_id, left_physician_id,
                          right_instance_id, right_physician_id)

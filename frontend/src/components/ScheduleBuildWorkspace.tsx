@@ -198,6 +198,23 @@ type BuildContext = {
     physicians_without_hour_ranges: string[]
     total_generated_shift_instances: number
     has_workload_hour_overrides: boolean
+    night_feasibility: {
+      status: 'feasible' | 'penalty_unavoidable'
+      fixed_manual_night_shifts: number
+      scope_note: string
+      periods: Array<{
+        period_type: string
+        period_start: string
+        period_end: string
+        required_night_shifts: number
+        fixed_manual_night_shifts: number
+        remaining_night_shifts: number
+        remaining_minimum_night_shifts: number
+        remaining_maximum_night_shifts: number | null
+        status: 'feasible' | 'penalty_unavoidable'
+        interpretation: string
+      }>
+    }
     fte_adjustment_preview: {
       direction: 'increase_maximum' | 'decrease_minimum'
       required_adjustment_hours: number
@@ -247,6 +264,18 @@ function startOfMonthUtc(value: Date) {
 
 function endOfMonthUtc(value: Date) {
   return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth() + 1, 0))
+}
+
+function nightPeriodLabel(periodType: string, start: string, end: string) {
+  const startDate = parseIsoDateToUtc(start)
+  const endDate = parseIsoDateToUtc(end)
+  if (periodType === 'MONTH') {
+    return startDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' })
+  }
+  if (periodType === 'WEEK') {
+    return `Week of ${startDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })}`
+  }
+  return `Full block · ${startDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })}–${endDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })}`
 }
 
 function monthLabel(value: Date) {
@@ -1461,6 +1490,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     ? context.run_state.viewed_run_can_activate
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
   const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const nightFeasibility = context?.workload_feasibility?.night_feasibility
+  const nightCapacityShortfall = Math.max(0, ...(nightFeasibility?.periods.map((period) => (
+    period.remaining_maximum_night_shifts === null
+      ? 0
+      : period.remaining_night_shifts - period.remaining_maximum_night_shifts
+  )) ?? [0]))
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -1596,6 +1631,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       </div>
 
       {context.workload_feasibility && (
+        <>
         <section
           className={`workload-feasibility-card workload-feasibility-${context.workload_feasibility.status}`}
           aria-label="Aggregate workload feasibility"
@@ -1716,6 +1752,52 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             </button>
           )}
         </section>
+        <section
+          className={`night-feasibility-card night-feasibility-${context.workload_feasibility.night_feasibility.status}`}
+          aria-label="Residual night-shift feasibility"
+        >
+          <div className="night-feasibility-heading">
+            <div>
+              <strong>Night-shift feasibility</strong>
+              <span>{context.workload_feasibility.night_feasibility.status === 'feasible' ? 'All remaining nights fit within preferred limits' : 'Coverage is possible, but a night-volume penalty cannot be avoided'}</span>
+            </div>
+            <span className={`night-feasibility-badge night-feasibility-badge-${context.workload_feasibility.night_feasibility.status}`}>
+              {context.workload_feasibility.night_feasibility.status === 'feasible' ? 'Within limits' : 'Penalty unavoidable'}
+            </span>
+          </div>
+          {nightCapacityShortfall > 0 && (
+            <div className="night-feasibility-alert">
+              <strong>{nightCapacityShortfall.toFixed(0)} night assignment(s) must exceed a preferred maximum</strong>
+              <span>Keep the contract limits unchanged. The optimizer may accept and distribute the resulting penalties.</span>
+            </div>
+          )}
+          <div className="night-feasibility-periods">
+            {context.workload_feasibility.night_feasibility.periods.map((period) => (
+              <article className={`night-period-card night-period-${period.status}`} key={`${period.period_type}-${period.period_start}-${period.period_end}`}>
+                <header>
+                  <strong>{nightPeriodLabel(period.period_type, period.period_start, period.period_end)}</strong>
+                  <span>{period.status === 'feasible' ? 'Within limits' : 'Penalty unavoidable'}</span>
+                </header>
+                <dl>
+                  <div><dt>Required</dt><dd>{period.required_night_shifts}</dd></div>
+                  <div><dt>Fixed</dt><dd>{period.fixed_manual_night_shifts}</dd></div>
+                  <div><dt>Remaining</dt><dd>{period.remaining_night_shifts}</dd></div>
+                  <div>
+                    <dt>Allowed remaining</dt>
+                    <dd>{period.remaining_minimum_night_shifts.toFixed(0)}–{period.remaining_maximum_night_shifts === null ? '∞' : period.remaining_maximum_night_shifts.toFixed(0)}</dd>
+                  </div>
+                </dl>
+                <p>{period.interpretation}</p>
+              </article>
+            ))}
+          </div>
+          <div className="night-feasibility-fixed-summary">
+            <strong>{context.workload_feasibility.night_feasibility.fixed_manual_night_shifts}</strong>
+            <span>locked manual night assignment(s) included</span>
+          </div>
+          <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
+        </section>
+        </>
       )}
 
       {optimizerRuns.length > 0 && (

@@ -95,6 +95,7 @@ type ViolationReport = {
     run_number: number
     created_at: string
     final_score: number | null
+    score_is_stale: boolean
   } | null
   total_score: number
   score_breakdown: Record<string, number>
@@ -274,7 +275,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             {report.optimizer_run && (
               <>
                 {' · '}
-                Run {report.optimizer_run.run_number} · {formatTimestamp(report.optimizer_run.created_at)} · Final {report.optimizer_run.final_score?.toFixed(1) ?? '-'}
+                Run {report.optimizer_run.run_number} · {formatTimestamp(report.optimizer_run.created_at)} · {report.optimizer_run.score_is_stale ? 'Stored final' : 'Final'} {report.optimizer_run.final_score?.toFixed(1) ?? '-'}
               </>
             )}
           </div>
@@ -283,6 +284,14 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
           Back to Build Schedule
         </a>
       </div>
+
+      {report.optimizer_run?.score_is_stale && (
+        <div className="violation-report-warning">
+          <p>
+            Contract or schedule rules changed after this run. The stored final score was {report.optimizer_run.final_score?.toFixed(1) ?? '-'}; the current-rules score is {report.total_score.toFixed(1)}. Recalculate the score or run the optimizer again before relying on this result.
+          </p>
+        </div>
+      )}
 
       {report.warnings.length > 0 && (
         <div className="violation-report-warning">

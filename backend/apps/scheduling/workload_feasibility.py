@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import timedelta
 from decimal import Decimal
 
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
@@ -13,6 +14,7 @@ from .optimizer import (
     _requests_for_shift,
     _rest_violation,
     _shift_hours,
+    _unique_night_period_rules,
 )
 from .run_state import assignments_for_viewed_run
 
@@ -302,6 +304,186 @@ def _assignment_accounting(version, instances, optimizer_run):
         ],
     }
     return accounting, run_assignments
+
+
+def _night_feasibility(version, instances, contract_assignments, optimizer_run):
+    night_instances = [instance for instance in instances if instance.shift_template.night_shift]
+    fixed_assignments = list(
+        assignments_for_viewed_run(version, optimizer_run)
+        .filter(
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+            shift_instance__shift_template__night_shift=True,
+        )
+        .select_related('shift_instance')
+    )
+    period_types = {
+        rule.get('period_type') or 'SCHEDULE_BLOCK'
+        for assignment in contract_assignments
+        for rule in _unique_night_period_rules(
+            assignment.contract.night_settings
+            if isinstance(assignment.contract.night_settings, dict) else {}
+        )
+    } or {'SCHEDULE_BLOCK'}
+    all_windows = {
+        period_type: _period_windows(night_instances or instances, period_type)
+        for period_type in period_types
+    }
+
+    def covers_window(windows, target_start, target_end):
+        ordered = sorted(windows)
+        if not ordered or ordered[0][0] != target_start or ordered[-1][1] != target_end:
+            return False
+        return all(
+            ordered[index][1] + timedelta(days=1) == ordered[index + 1][0]
+            for index in range(len(ordered) - 1)
+        )
+
+    physician_constraints = {}
+    for contract_assignment in contract_assignments:
+        rules = _unique_night_period_rules(
+            contract_assignment.contract.night_settings
+            if isinstance(contract_assignment.contract.night_settings, dict) else {}
+        )
+        constraints = []
+        for rule in rules:
+            period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+            for window_start, window_end in all_windows[period_type]:
+                fixed_count = sum(
+                    assignment.physician_id == contract_assignment.physician_id
+                    and window_start <= assignment.shift_instance.date <= window_end
+                    for assignment in fixed_assignments
+                )
+                minimum = _decimal_or_none(rule.get('min_shifts')) or Decimal('0')
+                maximum = _decimal_or_none(rule.get('max_shifts'))
+                constraints.append({
+                    'period_type': period_type,
+                    'start': window_start,
+                    'end': window_end,
+                    'minimum': max(minimum - fixed_count, Decimal('0')),
+                    'maximum': None if maximum is None else max(maximum - fixed_count, Decimal('0')),
+                    'fixed_count': fixed_count,
+                    'fixed_over_maximum': maximum is not None and fixed_count > maximum,
+                })
+        physician_constraints[contract_assignment.physician_id] = constraints
+
+    def effective_bounds(constraints, target_start, target_end):
+        minimum_candidates = []
+        maximum_candidates = []
+        exact = [
+            row for row in constraints
+            if row['start'] == target_start and row['end'] == target_end
+        ]
+        if exact:
+            minimum_candidates.append(max(row['minimum'] for row in exact))
+            exact_maxima = [row['maximum'] for row in exact if row['maximum'] is not None]
+            if exact_maxima:
+                maximum_candidates.append(min(exact_maxima))
+        for child_type in period_types:
+            children = [
+                row for row in constraints
+                if row['period_type'] == child_type
+                and target_start <= row['start']
+                and row['end'] <= target_end
+                and not (row['start'] == target_start and row['end'] == target_end)
+            ]
+            child_windows = {(row['start'], row['end']) for row in children}
+            if not covers_window(child_windows, target_start, target_end):
+                continue
+            by_window = defaultdict(list)
+            for row in children:
+                by_window[(row['start'], row['end'])].append(row)
+            minimum_candidates.append(sum(
+                max(row['minimum'] for row in window_rows)
+                for window_rows in by_window.values()
+            ))
+            if all(any(row['maximum'] is not None for row in window_rows) for window_rows in by_window.values()):
+                maximum_candidates.append(sum(
+                    min(row['maximum'] for row in window_rows if row['maximum'] is not None)
+                    for window_rows in by_window.values()
+                ))
+        minimum = max(minimum_candidates, default=Decimal('0'))
+        maximum = min(maximum_candidates) if maximum_candidates else None
+        return minimum, maximum
+
+    rows = []
+    for period_type in sorted(period_types):
+        for window_start, window_end in all_windows[period_type]:
+            window_instances = [
+                instance for instance in night_instances
+                if window_start <= instance.date <= window_end
+            ]
+            required = sum(instance.required_staffing for instance in window_instances)
+            fixed = [
+                assignment for assignment in fixed_assignments
+                if window_start <= assignment.shift_instance.date <= window_end
+            ]
+            remaining = max(required - len(fixed), 0)
+            total_minimum = Decimal('0')
+            total_maximum = Decimal('0')
+            maximum_unbounded = False
+            fixed_limit_violations = []
+            overlapping_rule_conflicts = []
+            for contract_assignment in contract_assignments:
+                constraints = physician_constraints[contract_assignment.physician_id]
+                if not constraints:
+                    maximum_unbounded = True
+                    continue
+                minimum, maximum = effective_bounds(constraints, window_start, window_end)
+                total_minimum += minimum
+                if maximum is None:
+                    maximum_unbounded = True
+                else:
+                    total_maximum += maximum
+                    if minimum > maximum:
+                        overlapping_rule_conflicts.append({
+                            'physician': _physician_display_name(contract_assignment.physician),
+                            'effective_minimum': _number(minimum),
+                            'effective_maximum': _number(maximum),
+                        })
+                for constraint in constraints:
+                    if constraint['fixed_over_maximum']:
+                        fixed_limit_violations.append({
+                            'physician': _physician_display_name(contract_assignment.physician),
+                            'fixed_nights': constraint['fixed_count'],
+                            'configured_maximum': _number(constraint['fixed_count'] + (constraint['maximum'] or 0)),
+                        })
+            bounded_maximum = None if maximum_unbounded else total_maximum
+            if overlapping_rule_conflicts:
+                status = 'penalty_unavoidable'
+                interpretation = 'Overlapping night rules make at least one volume penalty unavoidable.'
+            elif fixed_limit_violations:
+                status = 'penalty_unavoidable'
+                interpretation = 'A fixed manual night assignment already exceeds a preferred maximum.'
+            elif Decimal(remaining) < total_minimum:
+                status = 'penalty_unavoidable'
+                interpretation = 'There are not enough remaining nights to satisfy every preferred minimum.'
+            elif bounded_maximum is not None and Decimal(remaining) > bounded_maximum:
+                status = 'penalty_unavoidable'
+                interpretation = 'Some remaining nights must exceed a preferred physician maximum.'
+            else:
+                status = 'feasible'
+                interpretation = 'Remaining night shifts fit within remaining aggregate night limits.'
+            rows.append({
+                'period_type': period_type,
+                'period_start': window_start.isoformat(),
+                'period_end': window_end.isoformat(),
+                'required_night_shifts': required,
+                'fixed_manual_night_shifts': len(fixed),
+                'remaining_night_shifts': remaining,
+                'remaining_minimum_night_shifts': _number(total_minimum),
+                'remaining_maximum_night_shifts': _number(bounded_maximum),
+                'status': status,
+                'interpretation': interpretation,
+                'fixed_limit_violations': fixed_limit_violations,
+                'overlapping_rule_conflicts': overlapping_rule_conflicts,
+            })
+    return {
+        'status': 'penalty_unavoidable' if any(row['status'] != 'feasible' for row in rows) else 'feasible',
+        'fixed_manual_night_shifts': len(fixed_assignments),
+        'periods': rows,
+        'scope_note': 'Only locked manual night assignments are treated as fixed. Eligibility, rest, and exact night-block patterns are not included.',
+    }
 
 
 def _night_limit_rows(contract, instances, assigned_instances):
@@ -696,6 +878,9 @@ def build_workload_feasibility(version, optimizer_run=None):
         aggregate_min,
         total_max,
     )
+    night_feasibility = _night_feasibility(
+        version, instances, contract_assignments, optimizer_run,
+    )
     if adjustment_preview:
         groups = defaultdict(lambda: {'physician_count': 0})
         rate = Decimal(str(adjustment_preview['adjustment_hours_per_fte'] or 0))
@@ -763,5 +948,6 @@ def build_workload_feasibility(version, optimizer_run=None):
             'fte_adjustment_preview': adjustment_preview,
             'has_workload_hour_overrides': bool(version.workload_hour_overrides),
         },
+        'night_feasibility': night_feasibility,
         'reduced_contract_focus': reduced_rows,
     }

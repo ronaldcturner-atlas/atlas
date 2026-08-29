@@ -1018,6 +1018,11 @@ def _set_active_run_locked_open(instance, is_locked_open):
     active_run.save(update_fields=['locked_open_shift_instance_ids'])
 
 
+def _mark_contract_domain_scores_stale(contract):
+    ScheduleVersion.objects.filter(domain=contract.domain).update(score_is_stale=True)
+    OptimizerRun.objects.filter(schedule_version__domain=contract.domain).update(score_is_stale=True)
+
+
 def _shift_instance_queryset(version, optimizer_run=None):
     return (
         ScheduleShiftInstance.objects.filter(schedule_version=version)
@@ -1090,13 +1095,14 @@ def schedule_block_build_context(request, block_id):
     )
     workload_feasibility = None
     if selected_version:
-        feasibility_report = build_workload_feasibility(selected_version)
+        feasibility_report = build_workload_feasibility(selected_version, selected_optimizer_run)
         workload_feasibility = {
             **feasibility_report['aggregate_feasibility'],
             'total_generated_shift_instances': feasibility_report['schedule_block'][
                 'total_generated_shift_instances'
             ],
         }
+        workload_feasibility['night_feasibility'] = feasibility_report['night_feasibility']
 
     return Response(
         {
@@ -2506,6 +2512,7 @@ def contracts_list_create(request):
     serializer = ContractSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     contract = serializer.save()
+    _mark_contract_domain_scores_stale(contract)
     return Response(ContractSerializer(contract).data, status=status.HTTP_201_CREATED)
 
 
@@ -2527,6 +2534,7 @@ def contract_detail(request, contract_id):
     serializer.is_valid(raise_exception=True)
     serializer.save()
     contract.refresh_from_db()
+    _mark_contract_domain_scores_stale(contract)
     return Response(ContractSerializer(contract).data)
 
 
@@ -2581,6 +2589,7 @@ def contract_deactivate(request, contract_id):
     contract = get_object_or_404(Contract, id=contract_id)
     contract.active = False
     contract.save(update_fields=['active', 'updated_at'])
+    _mark_contract_domain_scores_stale(contract)
     return Response(ContractSerializer(contract).data)
 
 
@@ -2591,4 +2600,5 @@ def contract_reactivate(request, contract_id):
     contract = get_object_or_404(Contract, id=contract_id)
     contract.active = True
     contract.save(update_fields=['active', 'updated_at'])
+    _mark_contract_domain_scores_stale(contract)
     return Response(ContractSerializer(contract).data)

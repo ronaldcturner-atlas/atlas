@@ -27,17 +27,86 @@ from .models import (
 )
 from .optimizer import (
     _initial_fill_workload_guard,
+    _night_volume_delta_from_totals,
+    _night_volume_pressure_from_totals,
     _night_violation_report,
     _score_schedule,
     _shift_hours,
     _validated_night_report_for_current_assignments,
     _workload_schedule_score,
+    _workload_rule_delta_from_totals,
 )
 from .run_state import assignments_for_viewed_run
 from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
+    def test_incremental_night_volume_delta_prefers_remaining_capacity(self):
+        window_start = date(2026, 12, 1)
+        window_end = date(2027, 1, 31)
+        row = {
+            'window_start': window_start,
+            'window_end': window_end,
+            'min_shifts': Decimal('1'),
+            'max_shifts': Decimal('2'),
+            'min_penalty_weight': Decimal('10000'),
+            'max_penalty_weight': Decimal('10000'),
+        }
+        key = (window_start, window_end)
+
+        self.assertEqual(
+            _night_volume_delta_from_totals(
+                [row], {key: Decimal('0')}, date(2027, 1, 5),
+            ),
+            Decimal('-10000'),
+        )
+        self.assertEqual(
+            _night_volume_delta_from_totals(
+                [row], {key: Decimal('1')}, date(2027, 1, 5),
+            ),
+            Decimal('0'),
+        )
+        self.assertEqual(
+            _night_volume_delta_from_totals(
+                [row], {key: Decimal('2')}, date(2027, 1, 5),
+            ),
+            Decimal('10000'),
+        )
+
+        self.assertEqual(
+            _night_volume_pressure_from_totals(
+                [row], {key: Decimal('1')}, date(2027, 1, 5),
+            ),
+            Decimal('0.5'),
+        )
+
+    def test_incremental_initial_fill_workload_delta_matches_range_penalty(self):
+        window_start = date(2026, 12, 1)
+        window_end = date(2027, 1, 31)
+        row = {
+            'window_start': window_start,
+            'window_end': window_end,
+            'units': 'HOURS',
+            'min_value': Decimal('100'),
+            'max_value': Decimal('120'),
+            'min_penalty_weight': Decimal('10000'),
+            'max_penalty_weight': Decimal('10000'),
+        }
+        key = (window_start, window_end, 'HOURS')
+
+        self.assertEqual(
+            _workload_rule_delta_from_totals(
+                [row], {key: Decimal('90')}, date(2027, 1, 5), Decimal('8'),
+            ),
+            Decimal('-80000'),
+        )
+        self.assertEqual(
+            _workload_rule_delta_from_totals(
+                [row], {key: Decimal('118')}, date(2027, 1, 5), Decimal('8'),
+            ),
+            Decimal('60000'),
+        )
+
     def test_workload_hours_score_is_per_hour_outside_configured_range(self):
         target = {
             'rules': [{
@@ -1185,6 +1254,88 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(reset.status_code, 200)
         version.refresh_from_db()
         self.assertEqual(version.workload_hour_overrides, {})
+
+    def test_night_feasibility_subtracts_locked_manual_nights_and_limits(self):
+        physician = self._create_assignment_physician(
+            'fixed.nights@example.com', 'Fixed Nights', facilities=[self.facility],
+        )
+        assignment = ContractUserAssignment.objects.get(physician=physician)
+        assignment.contract.night_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK',
+                'min_shifts': 1,
+                'max_shifts': 1,
+            }],
+        }
+        assignment.contract.save(update_fields=['night_settings'])
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(id=generated.json()['schedule_version']['id'])
+        night_instance = ScheduleShiftInstance.objects.get(
+            schedule_version=version, shift_template=self.overnight_template,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=night_instance,
+            physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+
+        response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        )
+        night = response.json()['workload_feasibility']['night_feasibility']
+        period = night['periods'][0]
+        self.assertEqual(night['status'], 'feasible')
+        self.assertEqual(period['required_night_shifts'], 1)
+        self.assertEqual(period['fixed_manual_night_shifts'], 1)
+        self.assertEqual(period['remaining_night_shifts'], 0)
+        self.assertEqual(period['remaining_minimum_night_shifts'], 0)
+        self.assertEqual(period['remaining_maximum_night_shifts'], 0)
+
+    def test_night_feasibility_enforces_month_and_block_limits_simultaneously(self):
+        physician = self._create_assignment_physician(
+            'overlap.nights@example.com', 'Overlap Nights', facilities=[self.facility],
+        )
+        assignment = ContractUserAssignment.objects.get(physician=physician)
+        assignment.contract.night_settings = {
+            'period_rules': [
+                {'period_type': 'MONTH', 'min_shifts': 1, 'max_shifts': 4},
+                {'period_type': 'SCHEDULE_BLOCK', 'min_shifts': 2, 'max_shifts': 6},
+            ],
+        }
+        assignment.contract.save(update_fields=['night_settings'])
+        version = self._create_build_version(date(2026, 12, 1), date(2027, 1, 31))
+        dates = [
+            date(2026, 12, day) for day in (1, 8, 15, 22)
+        ] + [
+            date(2027, 1, day) for day in (1, 8, 15, 22)
+        ]
+        instances = [
+            self._create_shift_instance(version, self.overnight_template, target_date)
+            for target_date in dates
+        ]
+        for instance in instances[:4]:
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                is_locked=True,
+            )
+
+        response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        )
+        periods = response.json()['workload_feasibility']['night_feasibility']['periods']
+        months = [row for row in periods if row['period_type'] == 'MONTH']
+        block = next(row for row in periods if row['period_type'] == 'SCHEDULE_BLOCK')
+
+        self.assertTrue(all(row['status'] == 'feasible' for row in months))
+        self.assertEqual(block['remaining_night_shifts'], 4)
+        self.assertEqual(block['remaining_maximum_night_shifts'], 2)
+        self.assertEqual(block['status'], 'penalty_unavoidable')
 
     def test_manual_assignment_and_locked_open_state_persist_in_context(self):
         self.client.post(
@@ -5717,6 +5868,46 @@ class ContractApiTests(TestCase):
         patch_payload = patch_response.json()
         self.assertEqual(patch_payload['name'], 'Nocturnist 12 Shifts')
         self.assertEqual(patch_payload['assigned_users_count'], 0)
+
+    def test_edit_contract_marks_existing_schedule_scores_stale(self):
+        create_response = self.client.post('/api/contracts/', data=self._build_payload(), format='json')
+        contract_id = create_response.json()['id']
+        now = timezone.now()
+        block = ScheduleBlock.objects.create(
+            start_date=date(2026, 12, 1),
+            end_date=date(2027, 1, 31),
+            request_open_datetime=now,
+            request_close_datetime=now + timedelta(days=1),
+        )
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            name='Build 1',
+        )
+        optimizer_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('5000'),
+        )
+
+        patch_response = self.client.patch(
+            f'/api/contracts/{contract_id}/',
+            data={'night_settings': {'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK',
+                'min_shifts': '2',
+                'max_shifts': '6',
+                'min_penalty_weight': '10000',
+                'max_penalty_weight': '10000',
+            }]}},
+            format='json',
+        )
+
+        self.assertEqual(patch_response.status_code, 200)
+        version.refresh_from_db()
+        optimizer_run.refresh_from_db()
+        self.assertTrue(version.score_is_stale)
+        self.assertTrue(optimizer_run.score_is_stale)
 
     def test_deactivate_then_reactivate_contract(self):
         create_response = self.client.post('/api/contracts/', data=self._build_payload(), format='json')

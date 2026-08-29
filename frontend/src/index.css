@@ -437,8 +437,145 @@ select option:checked{
   text-align: left;
 }
 
+.night-feasibility-card {
+  display: grid;
+  gap: 1rem;
+  margin: 1.25rem 0;
+  padding: 1rem;
+  border: 1px solid #334155;
+  border-left: 4px solid #f59e0b;
+  border-radius: 0.7rem;
+  background: #111827;
+}
+
+.night-feasibility-feasible {
+  border-left-color: #22c55e;
+}
+
+.night-feasibility-heading,
+.night-feasibility-heading > div,
+.night-feasibility-fixed-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.night-feasibility-heading {
+  justify-content: space-between;
+}
+
+.night-feasibility-heading strong {
+  font-size: 1.05rem;
+}
+
+.night-feasibility-heading span,
+.night-feasibility-card small,
+.night-period-card p,
+.night-feasibility-fixed-summary span {
+  color: #cbd5e1;
+}
+
+.night-feasibility-badge,
+.night-period-card header span {
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.night-feasibility-badge-feasible,
+.night-period-feasible header span {
+  color: #bbf7d0;
+  background: #14532d;
+}
+
+.night-feasibility-badge-penalty_unavoidable,
+.night-period-penalty_unavoidable header span {
+  color: #fde68a;
+  background: #78350f;
+}
+
+.night-feasibility-alert {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid #b45309;
+  border-radius: 0.55rem;
+  color: #fef3c7;
+  background: rgba(120, 53, 15, 0.4);
+}
+
+.night-feasibility-alert strong {
+  font-size: 1.05rem;
+}
+
+.night-feasibility-periods {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.75rem;
+}
+
+.night-period-card {
+  padding: 0.85rem;
+  border: 1px solid #334155;
+  border-radius: 0.55rem;
+  background: #0f172a;
+}
+
+.night-period-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.night-period-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0;
+}
+
+.night-period-card dl div {
+  padding: 0.5rem;
+  border-radius: 0.4rem;
+  background: #111827;
+}
+
+.night-period-card dt {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.night-period-card dd {
+  margin: 0.15rem 0 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.night-period-card p {
+  margin: 0.75rem 0 0;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.night-feasibility-fixed-summary {
+  padding-top: 0.2rem;
+}
+
+.night-feasibility-fixed-summary strong {
+  font-size: 1.15rem;
+}
+
 @media (max-width: 900px) {
   .workload-feasibility-card dl {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .night-feasibility-heading,
+  .night-feasibility-heading > div {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
