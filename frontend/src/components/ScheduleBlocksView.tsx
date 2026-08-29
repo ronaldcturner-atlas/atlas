@@ -438,6 +438,31 @@ export default function ScheduleBlocksView({
     }
   }
 
+  const moveBackToBuild = async (block: ScheduleBlock) => {
+    const confirmed = window.confirm(
+      'Move this schedule block back to BUILD? Users will no longer be viewing it as preview, and scheduler edits/optimization will be enabled again.',
+    )
+    if (!confirmed) return
+
+    try {
+      setError(null)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/move-back-to-build/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({}),
+      })
+      if (!response.ok) {
+        const parsed = await parseApiResponseError(response)
+        throw new Error(parsed.message ?? 'Unable to move Schedule Block back to BUILD.')
+      }
+      await fetchBlocks()
+    } catch (moveError) {
+      console.error(moveError)
+      setError(moveError instanceof Error ? moveError.message : 'Unable to move Schedule Block back to BUILD.')
+    }
+  }
+
   const publishBlock = async (block: ScheduleBlock) => {
     try {
       setError(null)
@@ -536,7 +561,7 @@ export default function ScheduleBlocksView({
                         Build Schedule
                       </button>
                     )}
-                    {block.build_status !== 'ARCHIVE' && (
+                    {(block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
                       <>
                         <button type="button" onClick={() => openBlock(block)}>Edit Dates</button>
                         <button type="button" onClick={() => openBlock(block)}>Edit Request Window</button>
@@ -549,7 +574,10 @@ export default function ScheduleBlocksView({
                       <button type="button" onClick={() => enterPreview(block)}>Enter Preview</button>
                     )}
                     {block.build_status === 'PREVIEW' && (
-                      <button type="button" onClick={() => publishBlock(block)}>Publish</button>
+                      <>
+                        <button type="button" onClick={() => publishBlock(block)}>Publish</button>
+                        <button type="button" onClick={() => moveBackToBuild(block)}>Move Back to Build</button>
+                      </>
                     )}
                   </div>
                 </td>
