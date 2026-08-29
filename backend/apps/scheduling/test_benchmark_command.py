@@ -9,7 +9,11 @@ from django.test import TestCase
 from django.utils import timezone
 
 from apps.domains.models import Domain
-from .management.commands.benchmark_optimizer import summarize_best_chain, summarize_trials
+from .management.commands.benchmark_optimizer import (
+    Command as BenchmarkCommand,
+    summarize_best_chain,
+    summarize_trials,
+)
 from .models import OptimizerRun, ScheduleBlock, ScheduleVersion
 from .optimizer import _state_from_assignments
 from .run_state import resolve_build_workspace_run_context
@@ -55,6 +59,38 @@ class OptimizerBenchmarkCommandTests(TestCase):
         self.assertIn('persistence_mode: rollback', output)
         self.assertIn('retained_best_run_id: None', output)
         self.assertIn('schedule_changes_retained: no', output)
+
+    def test_explicit_seed_base_is_deterministic_and_reproducible(self):
+        outputs = []
+        for _attempt in range(2):
+            stdout = StringIO()
+            call_command(
+                'benchmark_optimizer', schedule_block_id=self.block.id,
+                domain='Physician', runs=2, seed_base=700, stdout=stdout,
+            )
+            outputs.append(stdout.getvalue())
+
+        for output in outputs:
+            self.assertIn('randomness_mode: deterministic', output)
+            self.assertIn('seed=700', output)
+            self.assertIn('seed=701', output)
+            self.assertIn('best_final_score: 0.0', output)
+
+    def test_omitted_seed_base_uses_distinct_stochastic_seeds(self):
+        stdout = StringIO()
+        with patch(
+            'apps.scheduling.management.commands.benchmark_optimizer.secrets.randbits',
+            side_effect=(8101, 8102, 8103),
+        ):
+            call_command(
+                'benchmark_optimizer', schedule_block_id=self.block.id,
+                domain='Physician', runs=3, stdout=stdout,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn('randomness_mode: stochastic', output)
+        for seed in (8101, 8102, 8103):
+            self.assertIn(f'seed={seed}', output)
 
     def test_retain_best_persists_only_final_best_and_preserves_workspace_state(self):
         stdout = StringIO()
@@ -125,6 +161,10 @@ class OptimizerBenchmarkCommandTests(TestCase):
             mode='best-chain',
             source_run_id=source.id,
             retain_best=True,
+            until_stalled=True,
+            batch_runs=1,
+            max_batches=2,
+            stall_batches=1,
             stdout=stdout,
         )
 
@@ -146,6 +186,166 @@ class OptimizerBenchmarkCommandTests(TestCase):
             [source.id],
         )
         self.assertIn(f'source_run_id: {source.id}', stdout.getvalue())
+
+    def test_until_stalled_continues_after_improvement_then_stops_on_stall(self):
+        source = OptimizerRun.objects.create(
+            schedule_version=self.version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=100,
+            run_kind='BENCHMARK', is_active=True,
+        )
+        retained = OptimizerRun.objects.create(
+            schedule_version=self.version, run_number=2,
+            status=OptimizerRun.Status.COMPLETED, final_score=80,
+            run_kind='BENCHMARK',
+        )
+        summaries = iter((
+            ({'run_index': 1}, {
+                'source_run_id': source.id, 'initial_score': 100,
+                'best_final_score': 80, 'retained_best_run_id': retained.id,
+            }),
+            ({'run_index': 1}, {
+                'source_run_id': retained.id, 'initial_score': 80,
+                'best_final_score': 80, 'retained_best_run_id': None,
+            }),
+        ))
+        seen_sources = []
+        seen_seeds = []
+
+        def fake_batch(_version, options):
+            seen_sources.append(options['source_run_id'])
+            seen_seeds.extend(options['_attempt_seeds'])
+            trial, summary = next(summaries)
+            return [trial], summary
+
+        stdout = StringIO()
+        with patch.object(
+            BenchmarkCommand, '_run_best_chain',
+            autospec=True,
+            side_effect=lambda _self, version, options: fake_batch(version, options),
+        ):
+            call_command(
+                'benchmark_optimizer', schedule_block_id=self.block.id,
+                domain='Physician', mode='best-chain', source_run_id=source.id,
+                retain_best=True, until_stalled=True, batch_runs=1,
+                max_batches=5, stall_batches=1, stdout=stdout,
+            )
+
+        output = stdout.getvalue()
+        self.assertEqual(seen_sources, [source.id, retained.id])
+        self.assertEqual(len(seen_seeds), len(set(seen_seeds)))
+        self.assertEqual(len(seen_seeds), 2)
+        self.assertIn('randomness_mode: stochastic', output)
+        self.assertIn(f'seeds=[{seen_seeds[0]}]', output)
+        self.assertIn(f'seeds=[{seen_seeds[1]}]', output)
+        self.assertIn('batch=1', output)
+        self.assertIn('improvement=yes', output)
+        self.assertIn('batch=2', output)
+        self.assertIn('improvement=no', output)
+        self.assertIn(f'retained_best_run_id: {retained.id}', output)
+        self.assertIn('total_batches: 2', output)
+        self.assertIn('total_optimizer_runs: 2', output)
+        self.assertIn('stopped_reason: stalled', output)
+
+    def test_until_stalled_stochastic_default_requires_three_stalled_batches(self):
+        source = OptimizerRun.objects.create(
+            schedule_version=self.version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=100,
+            run_kind='BENCHMARK', is_active=True,
+        )
+        calls = []
+
+        def fake_batch(_self, _version, options):
+            calls.append(list(options['_attempt_seeds']))
+            return [{'run_index': 1}], {
+                'source_run_id': source.id, 'initial_score': 100,
+                'best_final_score': 100, 'retained_best_run_id': None,
+            }
+
+        stdout = StringIO()
+        with patch(
+            'apps.scheduling.management.commands.benchmark_optimizer.Command._run_best_chain',
+            autospec=True, side_effect=fake_batch,
+        ):
+            call_command(
+                'benchmark_optimizer', schedule_block_id=self.block.id,
+                domain='Physician', mode='best-chain', source_run_id=source.id,
+                retain_best=True, until_stalled=True, batch_runs=1,
+                max_batches=5, stdout=stdout,
+            )
+
+        seeds = [batch[0] for batch in calls]
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(seeds), len(set(seeds)))
+        self.assertIn('total_batches: 3', stdout.getvalue())
+        self.assertIn('stopped_reason: stalled', stdout.getvalue())
+
+    def test_until_stalled_max_batches_bounds_continuing_improvements(self):
+        source = OptimizerRun.objects.create(
+            schedule_version=self.version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=100,
+            run_kind='BENCHMARK', is_active=True,
+        )
+        retained_ids = [101, 102]
+        calls = []
+
+        def fake_batch(_self, _version, options):
+            batch_index = len(calls)
+            calls.append(options['source_run_id'])
+            source_score = 100 - batch_index * 10
+            return [{'run_index': 1}], {
+                'source_run_id': options['source_run_id'],
+                'initial_score': source_score,
+                'best_final_score': source_score - 10,
+                'retained_best_run_id': retained_ids[batch_index],
+            }
+
+        stdout = StringIO()
+        with patch(
+            'apps.scheduling.management.commands.benchmark_optimizer.Command._run_best_chain',
+            autospec=True, side_effect=fake_batch,
+        ):
+            call_command(
+                'benchmark_optimizer', schedule_block_id=self.block.id,
+                domain='Physician', mode='best-chain', source_run_id=source.id,
+                retain_best=True, until_stalled=True, batch_runs=1,
+                max_batches=2, stall_batches=2, stdout=stdout,
+            )
+
+        self.assertEqual(calls, [source.id, retained_ids[0]])
+        self.assertIn('total_batches: 2', stdout.getvalue())
+        self.assertIn('stopped_reason: max_batches', stdout.getvalue())
+
+    def test_until_stalled_rollback_does_not_report_temporary_id_as_durable(self):
+        source = OptimizerRun.objects.create(
+            schedule_version=self.version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=100,
+            run_kind='BENCHMARK', is_active=True,
+        )
+        summaries = iter((
+            {'source_run_id': source.id, 'initial_score': 100,
+             'best_final_score': 80, 'retained_best_run_id': None,
+             'temporary_best_run_id': 9001},
+            {'source_run_id': 9001, 'initial_score': 80,
+             'best_final_score': 80, 'retained_best_run_id': None,
+             'temporary_best_run_id': 9001},
+        ))
+        stdout = StringIO()
+        with patch(
+            'apps.scheduling.management.commands.benchmark_optimizer.Command._run_best_chain',
+            autospec=True,
+            side_effect=lambda *_args, **_kwargs: ([{'run_index': 1}], next(summaries)),
+        ):
+            call_command(
+                'benchmark_optimizer', schedule_block_id=self.block.id,
+                domain='Physician', mode='best-chain', source_run_id=source.id,
+                until_stalled=True, batch_runs=1, max_batches=3,
+                stall_batches=1, stdout=stdout,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn('retained_best_run_id: None', output)
+        self.assertIn('schedule_changes_retained: no', output)
+        self.assertNotIn('retained_best_run_id: 9001', output)
 
     def test_preview_block_is_allowed_and_remains_preview(self):
         self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW

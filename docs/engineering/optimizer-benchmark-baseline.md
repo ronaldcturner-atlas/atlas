@@ -71,6 +71,57 @@ Console and JSON output include `persistence_mode`, `source_run_id`,
 `retained_best_run_id`, and `schedule_changes_retained`. Rollback reports never
 present a temporary winning run ID as durable.
 
+Best-chain can continue automatically in bounded batches with `--until-stalled`.
+`--batch-runs` controls optimizer attempts per batch, `--max-batches` provides a
+hard outer bound, and `--stall-batches` controls how many consecutive
+non-improving batches stop the command. Defaults are 10, 10, and 3 respectively.
+Each improving retained batch persists only its winning BENCHMARK run and uses it
+as the next read-only source. Losing runs are removed, existing runs remain, and
+workspace active state and Schedule Block lifecycle are restored. In rollback
+mode, temporary batch winners remain usable only inside one outer transaction;
+the entire multi-batch chain is rolled back and no temporary ID is reported as
+durable.
+
+```text
+python manage.py benchmark_optimizer --schedule-block-id 5 --domain Physician --mode best-chain --source-run-id 35 --retain-best --until-stalled --batch-runs 10 --max-batches 10 --stall-batches 1
+```
+
+The exact command above was verified on 2026-08-28. Batch 1 improved the selected
+run-35 chain from 435000 to 25000 and retained run 380. Batch 2 tied at 25000, so
+the command stopped as stalled after 2 batches and 20 optimizer runs. Total runtime
+was 141.25 seconds. Run 35 remained completed at 435000, the Schedule Block
+remained PREVIEW, and the previously retained score-50 run remained available;
+the command did not silently replace the explicitly selected source chain with a
+different existing run.
+
+### Benchmark randomness modes
+
+Benchmark search is stochastic by default. When `--seed-base` is omitted, every
+optimizer attempt receives a newly generated seed, including attempts from the
+same unchanged best source and attempts in later until-stalled batches. Batch and
+iteration output records the exact seeds used. The default `--stall-batches` is 3,
+so a serious stochastic search tests multiple distinct batches before declaring a
+stall.
+
+Passing `--seed-base` selects deterministic, reproducible mode. Seed `N` starts the
+sequence `N`, `N+1`, and so on across batch boundaries. This mode is intended for
+focused debugging, regression tests, and replaying a known path: the same source
+run and seed reproduce the same optimizer choices. An early stall from one
+deterministic sequence does not establish a schedule plateau.
+
+Real search should omit `--seed-base`, keep multiple attempts per batch, and use
+multiple stall batches. Best-chain still holds the current best source until a
+strictly better total score is found; stochastic attempts explore different paths
+without mutating or overwriting that source.
+
+A rollback smoke test from retained run 368 confirmed the distinction on
+2026-08-28. Two attempts from the same score-50 source used seeds
+`5006929684373504904` and `2555430668651092633`; the first returned 50 and the
+second found 0. The temporary score-0 run was rolled back, run 368 remained
+unchanged, and the Schedule Block remained PREVIEW. Different seeds are not
+guaranteed to produce different scores every time, but they now drive genuinely
+different seeded search paths.
+
 BUILD and PREVIEW Schedule Blocks are accepted. The command prints the Schedule
 Block status before and after the benchmark and never changes lifecycle status.
 Each candidate is a real optimizer run with `run_kind=BENCHMARK`, and the command
