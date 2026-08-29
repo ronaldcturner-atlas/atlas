@@ -373,17 +373,25 @@ export default function PhysiciansView() {
                 </select>
               </label>
               <label className="facility-field">
-                <span>FTE</span>
+                <span>Workload FTE</span>
                 <input
                   type="number"
                   min="0"
                   max="3"
                   step="0.01"
+                  list="workload-fte-options"
                   value={formState.fte}
                   onChange={(event) =>
                     setFormState((current) => ({ ...current, fte: event.target.value }))
                   }
                 />
+                <datalist id="workload-fte-options">
+                  <option value="1.00" />
+                  <option value="0.75" />
+                  <option value="0.50" />
+                  <option value="0.25" />
+                </datalist>
+                <small>1.00 = full time; 0.50 = half time. Used for per-FTE Schedule Block adjustments.</small>
               </label>
               <label className="facility-field physician-active-field">
                 <span>Active</span>

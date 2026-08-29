@@ -18,7 +18,7 @@ from .models import (
     ScheduleShiftInstance,
     ScheduleVersion,
 )
-from .run_state import visible_assignment_filter
+from .run_state import assignments_for_viewed_run
 
 
 COVERAGE_PENALTY = 1000
@@ -169,6 +169,35 @@ def _contract_target(contract, default_hours_target, default_shift_target):
         'contract_id': contract.id,
         'contract_name': contract.name,
     }
+
+
+def _with_workload_hour_override(target, override):
+    """Replace hour rules with one build-only Schedule Block range."""
+    if not isinstance(override, dict):
+        return target
+    minimum = _decimal_or_none(override.get('minimum_hours'))
+    maximum = _decimal_or_none(override.get('maximum_hours'))
+    if minimum is None and maximum is None:
+        return target
+    hour_rules = [rule for rule in target.get('rules') or [] if rule['units'] == 'HOURS']
+    template = hour_rules[0] if hour_rules else {}
+    rule = {
+        'period_type': 'SCHEDULE_BLOCK',
+        'units': 'HOURS',
+        'min_value': minimum,
+        'max_value': maximum,
+        'min_penalty_weight': template.get('min_penalty_weight', DEFAULT_WORKLOAD_RULE_PENALTY),
+        'max_penalty_weight': template.get('max_penalty_weight', DEFAULT_WORKLOAD_RULE_PENALTY),
+    }
+    rules = [rule for rule in target.get('rules') or [] if rule['units'] != 'HOURS'] + [rule]
+    values = [value for value in (minimum, maximum) if value is not None]
+    return {**target, 'units': 'HOURS', 'target': sum(values) / Decimal(len(values)), 'rules': rules}
+
+
+def _version_contract_target(version, physician_id, contract, default_hours_target, default_shift_target):
+    target = _contract_target(contract, default_hours_target, default_shift_target)
+    overrides = version.workload_hour_overrides if isinstance(version.workload_hour_overrides, dict) else {}
+    return _with_workload_hour_override(target, overrides.get(str(physician_id)))
 
 
 def _request_weight(contract, weight):
@@ -3006,15 +3035,6 @@ def _score_audit(scoring, night_report, request_rows):
     }
 
 
-def _assignments_for_optimizer_run(version, optimizer_run=None):
-    return ScheduleShiftAssignment.objects.filter(
-        visible_assignment_filter(optimizer_run),
-        shift_instance__schedule_version=version,
-        shift_instance__date__gte=version.schedule_block.start_date,
-        shift_instance__date__lte=version.schedule_block.end_date,
-    )
-
-
 def build_violation_report(schedule_version, optimizer_run=None):
     version = (
         ScheduleVersion.objects
@@ -3030,7 +3050,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
     if optimizer_run is None:
         optimizer_run = version.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
     assignments = list(
-        _assignments_for_optimizer_run(version, optimizer_run)
+        assignments_for_viewed_run(version, optimizer_run)
         .select_related('shift_instance__facility', 'shift_instance__shift_template', 'physician__user')
     )
     active_contract_assignments = list(
@@ -3076,8 +3096,8 @@ def build_violation_report(schedule_version, optimizer_run=None):
         else Decimal('0')
     )
     targets = {
-        physician.id: _contract_target(
-            contract_by_physician[physician.id],
+        physician.id: _version_contract_target(
+            version, physician.id, contract_by_physician[physician.id],
             default_hours_target,
             default_shift_target,
         )
@@ -3508,12 +3528,12 @@ def optimize_schedule_version(
         )
         if source_run is not None:
             raw_source_assignments = list(
-                _assignments_for_optimizer_run(version, source_run)
+                assignments_for_viewed_run(version, source_run)
                 .select_related('shift_instance', 'physician__user')
             )
         else:
             raw_source_assignments = list(
-                _assignments_for_optimizer_run(version, None)
+                assignments_for_viewed_run(version, None)
                 .select_related('shift_instance', 'physician__user')
             )
         source_assignments, source_assignment_normalization = canonical_assignment_snapshot(
@@ -3648,8 +3668,8 @@ def optimize_schedule_version(
             else Decimal('0')
         )
         targets = {
-            physician.id: _contract_target(
-                contract_by_physician[physician.id],
+            physician.id: _version_contract_target(
+                version, physician.id, contract_by_physician[physician.id],
                 default_hours_target,
                 default_shift_target,
             )
@@ -6355,7 +6375,7 @@ def optimize_schedule_version(
                 instance.save(update_fields=['status', 'updated_at'])
 
         persisted_visible_assignment_pairs = set(
-            _assignments_for_optimizer_run(version, optimizer_run).values_list(
+            assignments_for_viewed_run(version, optimizer_run).values_list(
                 'shift_instance_id', 'physician_id'
             )
         )

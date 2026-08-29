@@ -349,3 +349,96 @@ select option:checked{
   .contract-priority-grid{grid-template-columns:1fr}
 }
 
+.workload-feasibility-card {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.85rem 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid #334155;
+  border-left-width: 4px;
+  border-radius: 0.65rem;
+  background: #111827;
+}
+
+.workload-feasibility-card > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
+  align-items: baseline;
+}
+
+.workload-feasibility-card > div:first-child span,
+.workload-feasibility-card small {
+  color: #cbd5e1;
+}
+
+.workload-feasibility-card dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin: 0;
+}
+
+.workload-feasibility-card dl div {
+  padding: 0.6rem;
+  border-radius: 0.45rem;
+  background: #0f172a;
+}
+
+.workload-feasibility-card dt {
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.workload-feasibility-card dd {
+  margin: 0.15rem 0 0;
+  font-weight: 700;
+}
+
+.workload-feasibility-aggregate_feasible {
+  border-left-color: #22c55e;
+}
+
+.workload-feasibility-minimum_infeasible,
+.workload-feasibility-maximum_infeasible {
+  border-left-color: #f59e0b;
+}
+
+.workload-feasibility-preview {
+  display: grid;
+  gap: 0.65rem;
+  justify-items: start;
+}
+
+.workload-feasibility-preview p {
+  margin: 0 0 0.65rem;
+}
+
+.workload-feasibility-preview-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin-bottom: 0.5rem;
+}
+
+.workload-feasibility-preview table {
+  border-collapse: collapse;
+  min-width: 620px;
+}
+
+.workload-feasibility-preview th,
+.workload-feasibility-preview td {
+  padding: 0.45rem 0.65rem;
+  border-bottom: 1px solid #334155;
+  text-align: right;
+}
+
+.workload-feasibility-preview th:first-child,
+.workload-feasibility-preview td:first-child {
+  text-align: left;
+}
+
+@media (max-width: 900px) {
+  .workload-feasibility-card dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

@@ -22,6 +22,11 @@ These are code-level roles, not new database fields. `OptimizerRun.is_active`
 continues to persist active ownership. The shared rules live in
 `backend/apps/scheduling/run_state.py`.
 
+`assignments_for_viewed_run` is the authoritative query boundary for visible,
+in-range assignments. Build Workspace APIs, serializers, optimizer loading,
+benchmark sources, violation reports, and diagnostics must use this shared
+boundary rather than reconstructing run-kind or legacy-manual filters.
+
 ## Workspace API contract
 
 The Build Workspace context includes `run_state`, containing `viewed_run_id`,

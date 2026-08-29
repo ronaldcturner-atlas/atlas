@@ -25,6 +25,7 @@ urlpatterns = [
     path("schedule-versions/<int:version_id>/optimizer-runs/bulk-delete/", api.optimizer_runs_bulk_delete, name="optimizer_runs_bulk_delete"),
     path("schedule-versions/<int:version_id>/run-optimizer/", api.schedule_version_run_optimizer, name="schedule_version_run_optimizer"),
     path("schedule-versions/<int:version_id>/recalculate-score/", api.schedule_version_recalculate_score, name="schedule_version_recalculate_score"),
+    path("schedule-versions/<int:version_id>/workload-hour-adjustment/", api.schedule_version_workload_hour_adjustment, name="schedule_version_workload_hour_adjustment"),
     path("schedule-versions/<int:version_id>/violation-report/", api.schedule_version_violation_report, name="schedule_version_violation_report"),
     path("optimizer-runs/<int:run_id>/", api.optimizer_run_detail, name="optimizer_run_detail"),
     path("optimizer-runs/<int:run_id>/activate/", api.optimizer_run_activate, name="optimizer_run_activate"),

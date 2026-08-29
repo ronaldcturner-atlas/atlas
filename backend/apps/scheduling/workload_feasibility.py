@@ -3,8 +3,7 @@ from decimal import Decimal
 
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
 from .optimizer import (
-    _assignments_for_optimizer_run,
-    _contract_target,
+    _version_contract_target,
     _decimal_or_none,
     _effective_workload_rule,
     _minimum_rest_hours,
@@ -15,10 +14,101 @@ from .optimizer import (
     _rest_violation,
     _shift_hours,
 )
+from .run_state import assignments_for_viewed_run
 
 
 def _number(value):
     return float(value) if value is not None else None
+
+
+def _fte_adjustment_preview(status, physician_rows, available_hours, aggregate_min, total_max):
+    if status == 'maximum_infeasible':
+        candidates = [
+            row for row in physician_rows
+            if row['effective_max_hours'] is not None and Decimal(str(row['fte'])) > 0
+        ]
+        required = available_hours - total_max
+        direction = 'increase_maximum'
+        current_key = 'effective_max_hours'
+    elif status == 'minimum_infeasible':
+        candidates = [
+            row for row in physician_rows
+            if row['effective_min_hours'] is not None
+            and row['effective_min_hours'] > 0
+            and Decimal(str(row['fte'])) > 0
+        ]
+        required = aggregate_min - available_hours
+        direction = 'decrease_minimum'
+        current_key = 'effective_min_hours'
+    else:
+        return None
+
+    total_fte = sum((Decimal(str(row['fte'])) for row in candidates), Decimal('0'))
+    if not candidates or total_fte <= 0:
+        return {
+            'direction': direction,
+            'required_adjustment_hours': _number(required),
+            'total_applicable_fte': _number(total_fte),
+            'adjustment_hours_per_fte': None,
+            'proposals': [],
+            'can_preview': False,
+            'reason': 'No applicable physicians have a positive FTE and bounded hour range.',
+        }
+
+    base_rate = required / total_fte
+    adjustments = {row['physician_id']: Decimal('0') for row in candidates}
+    if direction == 'increase_maximum':
+        for row in candidates:
+            adjustments[row['physician_id']] = base_rate * Decimal(str(row['fte']))
+    else:
+        remaining = required
+        active = list(candidates)
+        while remaining > Decimal('0.000001') and active:
+            active_fte = sum((Decimal(str(row['fte'])) for row in active), Decimal('0'))
+            rate = remaining / active_fte
+            applied = Decimal('0')
+            next_active = []
+            for row in active:
+                physician_id = row['physician_id']
+                current = Decimal(str(row[current_key])) - adjustments[physician_id]
+                proposed = rate * Decimal(str(row['fte']))
+                reduction = min(current, proposed)
+                adjustments[physician_id] += reduction
+                applied += reduction
+                if current - reduction > Decimal('0.000001'):
+                    next_active.append(row)
+            if applied <= Decimal('0.000001'):
+                break
+            remaining -= applied
+            active = next_active
+
+    proposals = []
+    for row in candidates:
+        current = Decimal(str(row[current_key]))
+        adjustment = adjustments[row['physician_id']]
+        proposed = (
+            current + adjustment
+            if direction == 'increase_maximum'
+            else current - adjustment
+        )
+        proposals.append({
+            'physician_id': row['physician_id'],
+            'physician': row['physician'],
+            'fte': row['fte'],
+            'current_hours': _number(current),
+            'adjustment_hours': _number(adjustment),
+            'proposed_hours': _number(max(proposed, Decimal('0'))),
+        })
+    applied_total = sum(adjustments.values(), Decimal('0'))
+    return {
+        'direction': direction,
+        'required_adjustment_hours': _number(required),
+        'total_applicable_fte': _number(total_fte),
+        'adjustment_hours_per_fte': _number(base_rate),
+        'proposals': proposals,
+        'can_preview': abs(applied_total - required) <= Decimal('0.0001'),
+        'reason': None,
+    }
 
 
 def _assignment_hours(assignments):
@@ -42,7 +132,7 @@ def _assignment_accounting(version, instances, optimizer_run):
         ).select_related('shift_instance__shift_template', 'physician__user')
     )
     visible_assignments = list(
-        _assignments_for_optimizer_run(version, optimizer_run)
+        assignments_for_viewed_run(version, optimizer_run)
         .select_related('shift_instance__shift_template', 'physician__user')
     )
     visible_counts = defaultdict(int)
@@ -466,7 +556,7 @@ def build_workload_feasibility(version, optimizer_run=None):
     for contract_assignment in contract_assignments:
         physician = contract_assignment.physician
         contract = contract_assignment.contract
-        target = _contract_target(contract, default_hours, default_shifts)
+        target = _version_contract_target(version, physician.id, contract, default_hours, default_shifts)
         rule_rows = []
         physician_min = Decimal('0')
         physician_max = Decimal('0')
@@ -599,6 +689,26 @@ def build_workload_feasibility(version, optimizer_run=None):
         row for row in physician_rows
         if row.get('under_minimum_diagnostic') is not None
     ]
+    adjustment_preview = _fte_adjustment_preview(
+        status,
+        physician_rows,
+        available_hours,
+        aggregate_min,
+        total_max,
+    )
+    if adjustment_preview:
+        groups = defaultdict(lambda: {'physician_count': 0})
+        rate = Decimal(str(adjustment_preview['adjustment_hours_per_fte'] or 0))
+        for proposal in adjustment_preview['proposals']:
+            groups[Decimal(str(proposal['fte']))]['physician_count'] += 1
+        adjustment_preview['fte_groups'] = [
+            {
+                'fte': _number(fte),
+                'physician_count': group['physician_count'],
+                'adjustment_hours_per_physician': _number(fte * rate),
+            }
+            for fte, group in sorted(groups.items(), reverse=True)
+        ]
     return {
         'schedule_block': {
             'schedule_block_id': block.id,
@@ -650,6 +760,8 @@ def build_workload_feasibility(version, optimizer_run=None):
             'status': status,
             'interpretation': interpretation,
             'physicians_without_hour_ranges': physicians_without_hour_ranges,
+            'fte_adjustment_preview': adjustment_preview,
+            'has_workload_hour_overrides': bool(version.workload_hour_overrides),
         },
         'reduced_contract_focus': reduced_rows,
     }

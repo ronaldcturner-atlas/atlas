@@ -26,13 +26,14 @@ from .models import (
     ShiftTemplate,
 )
 from .optimizer import (
-    _assignments_for_optimizer_run,
     _initial_fill_workload_guard,
     _night_violation_report,
     _score_schedule,
+    _shift_hours,
     _validated_night_report_for_current_assignments,
     _workload_schedule_score,
 )
+from .run_state import assignments_for_viewed_run
 from .serializers import ScheduleBlockSerializer
 
 
@@ -1127,11 +1128,63 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(context_response.status_code, 200)
         self.assertEqual(context_response.json()['selected_version']['id'], version_id)
         self.assertEqual(len(context_response.json()['shift_instances']), 2)
+        feasibility = context_response.json()['workload_feasibility']
+        self.assertEqual(
+            feasibility['total_available_scheduled_hours'],
+            sum(
+                float(_shift_hours(instance)) * instance.required_staffing
+                for instance in ScheduleShiftInstance.objects.filter(schedule_version_id=version_id)
+            ),
+        )
+        self.assertEqual(feasibility['status'], 'maximum_infeasible')
+        self.assertIn('physicians_without_hour_ranges', feasibility)
         self.assertEqual(versions_response.status_code, 200)
         self.assertEqual(len(versions_response.json()), 1)
         self.assertEqual(shifts_response.status_code, 200)
         self.assertEqual(len(shifts_response.json()), 2)
         self.assertEqual(shifts_response.json()[0]['assigned_count'], 0)
+
+    def test_workload_adjustment_is_fte_weighted_and_schedule_version_only(self):
+        full_time = self._create_assignment_physician('full@example.com', 'Full Time')
+        half_time = self._create_assignment_physician('half@example.com', 'Half Time')
+        full_time.fte = Decimal('1.00')
+        full_time.save(update_fields=['fte'])
+        half_time.fte = Decimal('0.50')
+        half_time.save(update_fields=['fte'])
+        for assignment in ContractUserAssignment.objects.filter(physician__in=[full_time, half_time]):
+            assignment.contract.workload_settings = {
+                'period_rules': [{
+                    'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                    'min_value': '0', 'max_value': '10',
+                }],
+            }
+            assignment.contract.save(update_fields=['workload_settings'])
+
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(id=generated.json()['schedule_version']['id'])
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/workload-hour-adjustment/',
+            data={'hours_per_fte': 5}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        version.refresh_from_db()
+        self.assertEqual(Decimal(version.workload_hour_overrides[str(full_time.id)]['maximum_hours']), Decimal('15'))
+        self.assertEqual(Decimal(version.workload_hour_overrides[str(half_time.id)]['maximum_hours']), Decimal('12.5'))
+        self.assertEqual(
+            ContractUserAssignment.objects.get(physician=full_time).contract.workload_settings['period_rules'][0]['max_value'],
+            '10',
+        )
+        reset = self.client.post(
+            f'/api/schedule-versions/{version.id}/workload-hour-adjustment/',
+            data={'reset': True}, format='json',
+        )
+        self.assertEqual(reset.status_code, 200)
+        version.refresh_from_db()
+        self.assertEqual(version.workload_hour_overrides, {})
 
     def test_manual_assignment_and_locked_open_state_persist_in_context(self):
         self.client.post(
@@ -2007,7 +2060,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
 
         visible_ids = list(
-            _assignments_for_optimizer_run(version, benchmark_run)
+            assignments_for_viewed_run(version, benchmark_run)
             .order_by('id')
             .values_list('id', flat=True)
         )

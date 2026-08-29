@@ -122,6 +122,17 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(aggregate['sum_effective_minimum_hours'], 12.0)
         self.assertEqual(aggregate['status'], 'minimum_infeasible')
         self.assertIn('collectively infeasible', aggregate['interpretation'])
+        preview = aggregate['fte_adjustment_preview']
+        self.assertEqual(preview['direction'], 'decrease_minimum')
+        self.assertEqual(preview['required_adjustment_hours'], 2.0)
+        self.assertEqual(preview['total_applicable_fte'], 1.5)
+        proposals = {row['physician']: row for row in preview['proposals']}
+        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 2 / 3)
+        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 4 / 3)
+        self.assertAlmostEqual(
+            sum(row['proposed_hours'] for row in preview['proposals']),
+            10.0,
+        )
 
     def test_aggregate_maximum_infeasible(self):
         self._set_ranges(0, 4)
@@ -131,6 +142,17 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         aggregate = report['aggregate_feasibility']
         self.assertEqual(aggregate['sum_effective_maximum_hours'], 8.0)
         self.assertEqual(aggregate['status'], 'maximum_infeasible')
+        preview = aggregate['fte_adjustment_preview']
+        self.assertEqual(preview['direction'], 'increase_maximum')
+        self.assertEqual(preview['required_adjustment_hours'], 2.0)
+        self.assertAlmostEqual(preview['adjustment_hours_per_fte'], 4 / 3)
+        proposals = {row['physician']: row for row in preview['proposals']}
+        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 2 / 3)
+        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 4 / 3)
+        self.assertAlmostEqual(
+            sum(row['proposed_hours'] for row in preview['proposals']),
+            10.0,
+        )
 
     def test_aggregate_feasible(self):
         self._set_ranges(4, 6)
@@ -139,6 +161,7 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
 
         aggregate = report['aggregate_feasibility']
         self.assertEqual(aggregate['status'], 'aggregate_feasible')
+        self.assertIsNone(aggregate['fte_adjustment_preview'])
         self.assertEqual(aggregate['available_minus_total_minimum'], 2.0)
         self.assertEqual(aggregate['total_maximum_minus_available'], 2.0)
         self.assertEqual(report['reduced_contract_focus'][0]['physician'], 'Workload Turner')

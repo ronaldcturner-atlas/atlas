@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from . import optimizer
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
+from .run_state import assignments_for_viewed_run
 
 
 def _copy_state(state):
@@ -19,7 +20,7 @@ def _context(version, optimizer_run):
         .order_by('date', 'facility__name', 'start_datetime', 'id')
     )
     assignments = list(
-        optimizer._assignments_for_optimizer_run(version, optimizer_run)
+        assignments_for_viewed_run(version, optimizer_run)
         .select_related('shift_instance', 'physician__user')
     )
     contract_assignments = list(
@@ -46,8 +47,9 @@ def _context(version, optimizer_run):
     total_slots = sum(instance.required_staffing for instance in instances)
     divisor = Decimal(len(physicians)) if physicians else Decimal('1')
     targets = {
-        physician.id: optimizer._contract_target(
-            contracts[physician.id], total_hours / divisor, Decimal(total_slots) / divisor,
+        physician.id: optimizer._version_contract_target(
+            version, physician.id, contracts[physician.id],
+            total_hours / divisor, Decimal(total_slots) / divisor,
         )
         for physician in physicians
     }

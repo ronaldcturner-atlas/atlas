@@ -187,6 +187,39 @@ type BuildContext = {
     viewed_run_can_be_optimizer_source: boolean
   }
   shift_instances: ShiftInstance[]
+  workload_feasibility?: {
+    sum_effective_minimum_hours: number
+    sum_effective_maximum_hours: number | null
+    total_available_scheduled_hours: number
+    available_minus_total_minimum: number
+    total_maximum_minus_available: number | null
+    status: 'minimum_infeasible' | 'maximum_infeasible' | 'aggregate_feasible'
+    interpretation: string
+    physicians_without_hour_ranges: string[]
+    total_generated_shift_instances: number
+    has_workload_hour_overrides: boolean
+    fte_adjustment_preview: {
+      direction: 'increase_maximum' | 'decrease_minimum'
+      required_adjustment_hours: number
+      total_applicable_fte: number
+      adjustment_hours_per_fte: number | null
+      can_preview: boolean
+      reason: string | null
+      proposals: Array<{
+        physician_id: number
+        physician: string
+        fte: number
+        current_hours: number
+        adjustment_hours: number
+        proposed_hours: number
+      }>
+      fte_groups: Array<{
+        fte: number
+        physician_count: number
+        adjustment_hours_per_physician: number
+      }>
+    } | null
+  } | null
 }
 
 type Props = {
@@ -410,6 +443,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [showScoreDetails, setShowScoreDetails] = useState(false)
   const [showWorkloadDetails, setShowWorkloadDetails] = useState(false)
   const [showOptimizerDebug, setShowOptimizerDebug] = useState(false)
+  const [showFeasibilityPreview, setShowFeasibilityPreview] = useState(false)
+  const [workloadHoursPerFte, setWorkloadHoursPerFte] = useState('')
+  const [isApplyingWorkloadAdjustment, setIsApplyingWorkloadAdjustment] = useState(false)
   const [debugCopyStatus, setDebugCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [summaryCopyStatus, setSummaryCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [error, setError] = useState<string | null>(null)
@@ -534,6 +570,38 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       window.setTimeout(() => setSummaryCopyStatus('idle'), 1600)
     } catch {
       setSummaryCopyStatus('failed')
+    }
+  }
+
+  const changeWorkloadAdjustment = async (reset = false) => {
+    const version = context?.selected_version
+    if (!version) return
+    try {
+      setIsApplyingWorkloadAdjustment(true)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(`${API_BASE}/schedule-versions/${version.id}/workload-hour-adjustment/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reset ? { reset: true } : {
+          hours_per_fte: Number(
+            workloadHoursPerFte
+            || context?.workload_feasibility?.fte_adjustment_preview?.adjustment_hours_per_fte
+            || 0,
+          ),
+        }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to adjust Schedule Block workload limits.'))
+      setNotice(data.detail)
+      setShowFeasibilityPreview(false)
+      setWorkloadHoursPerFte('')
+      await fetchContext(version.id, { optimizerRunId: selectedOptimizerRunIdRef.current })
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Unable to adjust Schedule Block workload limits.')
+    } finally {
+      setIsApplyingWorkloadAdjustment(false)
     }
   }
 
@@ -1392,7 +1460,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const selectedRunCanActivate = context.run_state
     ? context.run_state.viewed_run_can_activate
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
-  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -1526,6 +1594,129 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         </button>
 
       </div>
+
+      {context.workload_feasibility && (
+        <section
+          className={`workload-feasibility-card workload-feasibility-${context.workload_feasibility.status}`}
+          aria-label="Aggregate workload feasibility"
+        >
+          <div>
+            <strong>Workload feasibility</strong>
+            <span>{context.workload_feasibility.interpretation}</span>
+          </div>
+          <dl>
+            <div>
+              <dt>Required hours</dt>
+              <dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd>
+            </div>
+            <div>
+              <dt>Combined minimum</dt>
+              <dd>{context.workload_feasibility.sum_effective_minimum_hours.toFixed(1)}</dd>
+            </div>
+            <div>
+              <dt>Combined maximum</dt>
+              <dd>
+                {context.workload_feasibility.sum_effective_maximum_hours === null
+                  ? 'Unbounded'
+                  : context.workload_feasibility.sum_effective_maximum_hours.toFixed(1)}
+              </dd>
+            </div>
+            <div>
+              <dt>Difference</dt>
+              <dd>
+                {context.workload_feasibility.status === 'minimum_infeasible'
+                  ? `${Math.abs(context.workload_feasibility.available_minus_total_minimum).toFixed(1)}h above available`
+                  : context.workload_feasibility.status === 'maximum_infeasible'
+                    ? `${Math.abs(context.workload_feasibility.total_maximum_minus_available ?? 0).toFixed(1)}h short`
+                    : 'Inside aggregate range'}
+              </dd>
+            </div>
+          </dl>
+          {context.workload_feasibility.physicians_without_hour_ranges.length > 0 && (
+            <small>
+              {context.workload_feasibility.physicians_without_hour_ranges.length} active physician(s) do not have an applicable hour range and are excluded from bounded totals.
+            </small>
+          )}
+          <small>Aggregate feasibility does not account for eligibility, nights, rest, requests, or locks.</small>
+          {context.workload_feasibility.fte_adjustment_preview && (
+            <div className="workload-feasibility-preview">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setShowFeasibilityPreview((current) => !current)}
+                disabled={!context.workload_feasibility.fte_adjustment_preview.can_preview}
+              >
+                {showFeasibilityPreview ? 'Hide FTE Adjustment Preview' : 'Review FTE Adjustment'}
+              </button>
+              {!context.workload_feasibility.fte_adjustment_preview.can_preview && (
+                <small>{context.workload_feasibility.fte_adjustment_preview.reason}</small>
+              )}
+              {showFeasibilityPreview && context.workload_feasibility.fte_adjustment_preview.can_preview && (
+                <div>
+                  <p>
+                    {context.workload_feasibility.fte_adjustment_preview.direction === 'increase_maximum'
+                      ? 'Increase maximum hours'
+                      : 'Decrease minimum hours'} by{' '}
+                    {context.workload_feasibility.fte_adjustment_preview.required_adjustment_hours.toFixed(1)} hours across{' '}
+                    {context.workload_feasibility.fte_adjustment_preview.total_applicable_fte.toFixed(2)} FTE
+                    {context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte === null
+                      ? ''
+                      : ` (${context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte.toFixed(2)} hours per FTE)`}.
+                  </p>
+                  <div className="workload-feasibility-preview-table-wrap">
+                    <table>
+                      <thead>
+                        <tr><th>FTE group</th><th>Physicians</th><th>Change per physician</th></tr>
+                      </thead>
+                      <tbody>
+                        {context.workload_feasibility.fte_adjustment_preview.fte_groups.map((group) => (
+                          <tr key={group.fte}>
+                            <td>{group.fte.toFixed(2)} FTE</td>
+                            <td>{group.physician_count}</td>
+                            <td>
+                              {context.workload_feasibility?.fte_adjustment_preview?.direction === 'increase_maximum' ? '+' : '−'}
+                              {(group.fte * Number(
+                                workloadHoursPerFte
+                                || context.workload_feasibility?.fte_adjustment_preview?.adjustment_hours_per_fte
+                                || 0,
+                              )).toFixed(2)}h
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <label className="workload-adjustment-input">
+                    <span>Hours per FTE</span>
+                    <input
+                      type="number"
+                      min="0.01"
+                      max="1000"
+                      step="0.01"
+                      value={workloadHoursPerFte || String(context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte ?? '')}
+                      onChange={(event) => setWorkloadHoursPerFte(event.target.value)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="primary-action"
+                    disabled={isMutatingBuild}
+                    onClick={() => void changeWorkloadAdjustment(false)}
+                  >
+                    {isApplyingWorkloadAdjustment ? 'Applying...' : 'Apply to This Schedule Block'}
+                  </button>
+                  <small>This changes only this Schedule Version. Permanent Contract hours are unchanged.</small>
+                </div>
+              )}
+            </div>
+          )}
+          {context.workload_feasibility.has_workload_hour_overrides && (
+            <button type="button" className="secondary" disabled={isMutatingBuild} onClick={() => void changeWorkloadAdjustment(true)}>
+              Reset Schedule Block Hour Adjustments
+            </button>
+          )}
+        </section>
+      )}
 
       {optimizerRuns.length > 0 && (
         <div className="optimizer-run-selector-panel">

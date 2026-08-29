@@ -305,6 +305,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'name',
             'status',
             'optimizer_summary',
+            'workload_hour_overrides',
             'score_is_stale',
             'active_optimizer_run',
             'shift_instance_count',

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone as datetime_timezone
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.db.models import Q
@@ -50,6 +51,7 @@ from .serializers import (
     ShiftSerializer,
     ShiftTemplateSerializer,
 )
+from .workload_feasibility import build_workload_feasibility
 
 
 STALE_OPTIMIZER_RUN_MINUTES = 10
@@ -991,10 +993,6 @@ def _get_optimizer_run_for_version(version, run_id):
     return get_viewed_optimizer_run(version, run_id)
 
 
-def _visible_assignment_filter(optimizer_run):
-    return visible_assignment_filter(optimizer_run)
-
-
 def _requested_editable_run(request, version):
     requested_id = request.data.get('optimizer_run_id') or request.query_params.get('optimizer_run_id')
     context = resolve_build_workspace_run_context(version, requested_id)
@@ -1090,6 +1088,15 @@ def schedule_block_build_context(request, block_id):
         if selected_version
         else []
     )
+    workload_feasibility = None
+    if selected_version:
+        feasibility_report = build_workload_feasibility(selected_version)
+        workload_feasibility = {
+            **feasibility_report['aggregate_feasibility'],
+            'total_generated_shift_instances': feasibility_report['schedule_block'][
+                'total_generated_shift_instances'
+            ],
+        }
 
     return Response(
         {
@@ -1127,6 +1134,7 @@ def schedule_block_build_context(request, block_id):
                 'viewed_run_can_copy': False, 'viewed_run_can_be_optimizer_source': False,
             },
             'shift_instances': shift_instances,
+            'workload_feasibility': workload_feasibility,
         }
     )
 
@@ -1140,6 +1148,62 @@ def schedule_block_schedule_versions(request, block_id):
 
     block = get_object_or_404(ScheduleBlock, id=block_id)
     return Response(ScheduleVersionSerializer(_schedule_version_queryset(block), many=True).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_workload_hour_adjustment(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'), id=version_id,
+    )
+    if version.status != ScheduleVersion.Status.BUILD:
+        return Response({'detail': 'Only a Build schedule version can be adjusted.'}, status=status.HTTP_409_CONFLICT)
+    if request.data.get('reset') is True:
+        version.workload_hour_overrides = {}
+        version.score_is_stale = True
+        version.save(update_fields=['workload_hour_overrides', 'score_is_stale', 'updated_at'])
+        version.optimizer_runs.update(score_is_stale=True)
+        return Response({'detail': 'Schedule Block workload adjustments were reset.'})
+
+    try:
+        hours_per_fte = Decimal(str(request.data.get('hours_per_fte')))
+    except (InvalidOperation, TypeError):
+        return Response({'hours_per_fte': 'Enter a valid number.'}, status=status.HTTP_400_BAD_REQUEST)
+    if hours_per_fte <= 0 or hours_per_fte > Decimal('1000'):
+        return Response({'hours_per_fte': 'Enter a value greater than 0 and no more than 1000.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    report = build_workload_feasibility(version)
+    preview = report['aggregate_feasibility'].get('fte_adjustment_preview')
+    if not preview or not preview.get('can_preview'):
+        return Response({'detail': 'There is no applicable workload discrepancy to adjust.'}, status=status.HTTP_409_CONFLICT)
+    direction = preview['direction']
+    overrides = dict(version.workload_hour_overrides or {})
+    rows = {row['physician_id']: row for row in report['physicians']}
+    for proposal in preview['proposals']:
+        row = rows[proposal['physician_id']]
+        adjustment = hours_per_fte * Decimal(str(row['fte']))
+        minimum = Decimal(str(row['effective_min_hours']))
+        maximum = Decimal(str(row['effective_max_hours']))
+        if direction == 'increase_maximum':
+            maximum += adjustment
+        else:
+            minimum = max(Decimal('0'), minimum - adjustment)
+        overrides[str(row['physician_id'])] = {
+            'minimum_hours': str(minimum),
+            'maximum_hours': str(maximum),
+        }
+    version.workload_hour_overrides = overrides
+    version.score_is_stale = True
+    version.save(update_fields=['workload_hour_overrides', 'score_is_stale', 'updated_at'])
+    version.optimizer_runs.update(score_is_stale=True)
+    return Response({
+        'detail': 'Schedule Block workload limits were adjusted. Permanent Contracts were not changed.',
+        'direction': direction,
+        'hours_per_fte': float(hours_per_fte),
+    })
 
 
 @api_view(['GET'])
@@ -1337,7 +1401,7 @@ def optimizer_run_save_copy(request, run_id):
             start_mode=source.start_mode,
         )
         source_assignments = ScheduleShiftAssignment.objects.filter(
-            _visible_assignment_filter(source),
+            visible_assignment_filter(source),
             shift_instance__schedule_version=version,
         )
         source_instances = list(
@@ -1632,7 +1696,7 @@ def _schedule_version_assignment_summary(version, message, cleared_count=0):
         .prefetch_related('assignments')
     )
     unfilled_shift_count = sum(
-        max(instance.required_staffing - instance.assignments.filter(_visible_assignment_filter(active_run)).count(), 0)
+        max(instance.required_staffing - instance.assignments.filter(visible_assignment_filter(active_run)).count(), 0)
         for instance in instances
     )
     return {
@@ -1777,7 +1841,7 @@ def schedule_version_clear_all_assignments(request, block_id, version_id):
 
 def _sync_shift_instance_status(instance):
     assigned_count = instance.assignments.filter(
-        _visible_assignment_filter(_active_optimizer_run(instance.schedule_version))
+        visible_assignment_filter(_active_optimizer_run(instance.schedule_version))
     ).count()
     next_status = (
         ScheduleShiftInstance.Status.ASSIGNED
@@ -1807,7 +1871,7 @@ def _physician_display_name(physician):
 def _overlapping_assignment_for_physician(physician, shift_instance, exclude_assignment_id=None):
     active_run = _active_optimizer_run(shift_instance.schedule_version)
     query = ScheduleShiftAssignment.objects.filter(
-            _visible_assignment_filter(active_run),
+            visible_assignment_filter(active_run),
             physician=physician,
             shift_instance__schedule_version=shift_instance.schedule_version,
             shift_instance__start_datetime__lt=shift_instance.end_datetime,
@@ -1902,7 +1966,7 @@ def _assignment_context_payload(shift_instance):
     )
     assigned_physician_ids = set(
         shift_instance.assignments.filter(
-            _visible_assignment_filter(active_run)
+            visible_assignment_filter(active_run)
         ).values_list('physician_id', flat=True)
     )
     eligible_physicians = []
@@ -1922,7 +1986,7 @@ def _assignment_context_payload(shift_instance):
             }
         )
     listed_ids = {item['id'] for item in eligible_physicians}
-    for assignment in shift_instance.assignments.filter(_visible_assignment_filter(active_run)):
+    for assignment in shift_instance.assignments.filter(visible_assignment_filter(active_run)):
         physician = assignment.physician
         if physician.id not in listed_ids:
             eligibility = _physician_assignment_eligibility(physician, shift_instance)
@@ -1979,7 +2043,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
         with transaction.atomic():
             locked_instance = ScheduleShiftInstance.objects.select_for_update().get(id=shift_instance.id)
             active_run = _active_optimizer_run(locked_instance.schedule_version)
-            locked_instance.assignments.filter(_visible_assignment_filter(active_run)).delete()
+            locked_instance.assignments.filter(visible_assignment_filter(active_run)).delete()
             locked_instance.is_locked_open = bool(request.data.get('is_locked_open', False))
             locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
             _set_active_run_locked_open(locked_instance, locked_instance.is_locked_open)
@@ -2019,7 +2083,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
         )
         active_run = _active_optimizer_run(locked_instance.schedule_version)
         if locked_instance.assignments.filter(
-            _visible_assignment_filter(active_run),
+            visible_assignment_filter(active_run),
             shift_instance=locked_instance,
             physician=physician,
         ).exists():
@@ -2027,7 +2091,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
                 {'physician_id': 'Physician is already assigned to this shift instance.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if locked_instance.assignments.filter(_visible_assignment_filter(active_run)).count() >= locked_instance.required_staffing:
+        if locked_instance.assignments.filter(visible_assignment_filter(active_run)).count() >= locked_instance.required_staffing:
             return Response(
                 {'detail': 'This shift instance is already fully staffed.'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -2093,7 +2157,7 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
         return run_error
 
     assignment = get_object_or_404(
-        ScheduleShiftAssignment.objects.filter(_visible_assignment_filter(viewed_run)),
+        ScheduleShiftAssignment.objects.filter(visible_assignment_filter(viewed_run)),
         id=assignment_id,
         shift_instance=shift_instance,
     )
@@ -2121,7 +2185,7 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
             locked_assignment = ScheduleShiftAssignment.objects.select_for_update().get(id=assignment.id)
             active_run = _active_optimizer_run(shift_instance.schedule_version)
             duplicate = ScheduleShiftAssignment.objects.filter(
-                _visible_assignment_filter(active_run),
+                visible_assignment_filter(active_run),
                 shift_instance=shift_instance,
                 physician=physician,
             ).exclude(id=locked_assignment.id).exists()

@@ -14,6 +14,7 @@ from apps.scheduling import optimizer
 from apps.scheduling.models import (
     OptimizerRun, ScheduleShiftAssignment, ScheduleShiftInstance, ScheduleVersion,
 )
+from apps.scheduling.run_state import assignments_for_viewed_run
 
 
 TRIAL_FIELDS = (
@@ -671,7 +672,7 @@ class Command(BaseCommand):
     def _source_snapshot(self, version, source_run):
         report = optimizer.build_violation_report(version, optimizer_run=source_run)
         rows = list(
-            optimizer._assignments_for_optimizer_run(version, source_run)
+            assignments_for_viewed_run(version, source_run)
             .order_by('id')
             .values('id', 'shift_instance_id', 'physician_id')
         )
