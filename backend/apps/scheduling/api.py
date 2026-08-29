@@ -29,6 +29,7 @@ from .models import (
 )
 from .optimizer import (
     build_violation_report,
+    canonical_assignment_snapshot,
     optimize_schedule_version,
     recalculate_schedule_version_score,
 )
@@ -1042,10 +1043,10 @@ def _facility_timezone(facility):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_build_context(request, block_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     block = get_object_or_404(ScheduleBlock, id=block_id)
+    can_manage = _can_manage_build_workspace(request.user)
+    if not can_manage and block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
+        return _build_workspace_forbidden_response()
     versions = _schedule_version_queryset(block)
     selected_version = None
 
@@ -1093,6 +1094,7 @@ def schedule_block_build_context(request, block_id):
     return Response(
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
+            'can_manage_build_workspace': can_manage,
             'domains': [
                 {'id': domain.id, 'name': domain.name}
                 for domain in Domain.objects.filter(active=True).order_by('name')
@@ -1266,6 +1268,14 @@ def schedule_version_recalculate_score(request, version_id):
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
+    if (
+        version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
+        or version.status != ScheduleVersion.Status.BUILD
+    ):
+        return Response(
+            {'detail': 'Scores can only be recalculated in a BUILD Schedule Version.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     optimizer_run, run_error = _requested_editable_run(request, version)
     if run_error:
         return run_error
@@ -1330,6 +1340,12 @@ def optimizer_run_save_copy(request, run_id):
             _visible_assignment_filter(source),
             shift_instance__schedule_version=version,
         )
+        source_instances = list(
+            ScheduleShiftInstance.objects.filter(schedule_version=version)
+        )
+        source_assignments, _normalization = canonical_assignment_snapshot(
+            list(source_assignments), source_instances, selected_run=source,
+        )
         ScheduleShiftAssignment.objects.bulk_create([
             ScheduleShiftAssignment(
                 shift_instance_id=row.shift_instance_id,
@@ -1363,9 +1379,41 @@ def optimizer_run_detail(request, run_id):
         id=run_id,
     )
     if request.method == 'DELETE':
+        if (
+            optimizer_run.schedule_version.status != ScheduleVersion.Status.BUILD
+            or optimizer_run.schedule_version.schedule_block.build_status
+            != ScheduleBlock.BuildStatus.BUILD
+        ):
+            return Response(
+                {'detail': 'Optimizer runs can only be deleted while the schedule is in BUILD.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        viewed_run_id = request.query_params.get('viewed_run_id')
+        try:
+            viewed_run_id = int(viewed_run_id) if viewed_run_id not in (None, '') else None
+        except (TypeError, ValueError):
+            return Response(
+                {'detail': 'viewed_run_id must be an integer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if optimizer_run.is_active:
             return Response(
-                {'detail': 'Cannot delete active optimizer run. Activate another run first.'},
+                {
+                    'detail': 'Cannot delete active optimizer run. Activate another run first.',
+                    'deleted_run_ids': [],
+                    'skipped_run_ids': [{'id': optimizer_run.id, 'reason': 'active_run'}],
+                    'next_viewed_run_id': viewed_run_id,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if viewed_run_id == optimizer_run.id:
+            return Response(
+                {
+                    'detail': 'Cannot delete the currently viewed optimizer run. View another run first.',
+                    'deleted_run_ids': [],
+                    'skipped_run_ids': [{'id': optimizer_run.id, 'reason': 'viewed_run'}],
+                    'next_viewed_run_id': viewed_run_id,
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if optimizer_run.status == OptimizerRun.Status.RUNNING:
@@ -1373,21 +1421,141 @@ def optimizer_run_detail(request, run_id):
             optimizer_run.refresh_from_db()
             if optimizer_run.status == OptimizerRun.Status.RUNNING:
                 return Response(
-                    {'detail': 'Cannot delete a running optimizer run until it is stale or failed.'},
+                    {
+                        'detail': 'Cannot delete a running optimizer run until it is stale or failed.',
+                        'deleted_run_ids': [],
+                        'skipped_run_ids': [{'id': optimizer_run.id, 'reason': 'running'}],
+                        'next_viewed_run_id': viewed_run_id,
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+        version = optimizer_run.schedule_version
         with transaction.atomic():
             deleted_assignment_count, _ = ScheduleShiftAssignment.objects.filter(
                 optimizer_run=optimizer_run,
             ).delete()
             optimizer_run.delete()
+        next_viewed_run = (
+            OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+                is_active=True,
+            ).first()
+            or OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+            ).order_by('-run_number').first()
+        )
         return Response(
             {
                 'message': f'Deleted optimizer run and {deleted_assignment_count} optimizer assignment(s).',
                 'assignments_deleted': deleted_assignment_count,
+                'deleted_run_ids': [run_id],
+                'skipped_run_ids': [],
+                'next_viewed_run_id': (
+                    viewed_run_id
+                    if viewed_run_id and OptimizerRun.objects.filter(
+                        id=viewed_run_id, schedule_version=version,
+                    ).exists()
+                    else getattr(next_viewed_run, 'id', None)
+                ),
             }
         )
     return Response(OptimizerRunSerializer(optimizer_run).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def optimizer_runs_bulk_delete(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block'), id=version_id,
+    )
+    if (
+        version.status != ScheduleVersion.Status.BUILD
+        or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
+    ):
+        return Response(
+            {'detail': 'Optimizer runs can only be deleted while the schedule is in BUILD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    run_ids = request.data.get('run_ids')
+    if not isinstance(run_ids, list) or not run_ids:
+        return Response(
+            {'detail': 'run_ids must be a non-empty list.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        requested_ids = list(dict.fromkeys(int(run_id) for run_id in run_ids))
+        viewed_run_id = request.data.get('viewed_run_id')
+        viewed_run_id = int(viewed_run_id) if viewed_run_id not in (None, '') else None
+    except (TypeError, ValueError):
+        return Response(
+            {'detail': 'run_ids and viewed_run_id must contain integer IDs.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    deleted_ids = []
+    skipped = []
+    assignments_deleted = 0
+    with transaction.atomic():
+        locked_version = ScheduleVersion.objects.select_for_update().get(id=version.id)
+        runs_by_id = {
+            run.id: run
+            for run in OptimizerRun.objects.select_for_update().filter(
+                schedule_version=locked_version, id__in=requested_ids,
+            )
+        }
+        for run_id in requested_ids:
+            run = runs_by_id.get(run_id)
+            reason = None
+            if run is None:
+                reason = 'not_found_in_schedule_version'
+            elif run.is_active:
+                reason = 'active_run'
+            elif run.id == viewed_run_id:
+                reason = 'viewed_run'
+            elif run.status == OptimizerRun.Status.RUNNING:
+                reason = 'running'
+            if reason:
+                skipped.append({'id': run_id, 'reason': reason})
+                continue
+            assignment_count = ScheduleShiftAssignment.objects.filter(
+                optimizer_run=run,
+            ).count()
+            ScheduleShiftAssignment.objects.filter(optimizer_run=run).delete()
+            run.delete()
+            assignments_deleted += assignment_count
+            deleted_ids.append(run_id)
+
+    next_viewed_run_id = viewed_run_id
+    if not (
+        next_viewed_run_id
+        and OptimizerRun.objects.filter(
+            id=next_viewed_run_id, schedule_version=version,
+        ).exists()
+    ):
+        next_run = (
+            OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+                is_active=True,
+            ).first()
+            or OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+            ).order_by('-run_number').first()
+        )
+        next_viewed_run_id = getattr(next_run, 'id', None)
+    return Response({
+        'message': f'Deleted {len(deleted_ids)} optimizer run(s).',
+        'deleted_run_ids': deleted_ids,
+        'skipped_run_ids': skipped,
+        'assignments_deleted': assignments_deleted,
+        'next_viewed_run_id': next_viewed_run_id,
+    })
 
 
 @api_view(['POST'])
@@ -1794,10 +1962,6 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
     if request.method == 'GET':
         return Response(_assignment_context_payload(shift_instance))
 
-    viewed_run, run_error = _requested_editable_run(request, shift_instance.schedule_version)
-    if run_error:
-        return run_error
-
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or shift_instance.schedule_version.status != ScheduleVersion.Status.BUILD
@@ -1806,6 +1970,10 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
             {'detail': 'Physicians can only be assigned in a BUILD Schedule Version.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    viewed_run, run_error = _requested_editable_run(request, shift_instance.schedule_version)
+    if run_error:
+        return run_error
 
     if request.method == 'PATCH' and request.data.get('physician_id') is None:
         with transaction.atomic():
@@ -2115,6 +2283,9 @@ def schedule_blocks_list_create(request):
         serializer = ScheduleBlockSerializer(blocks, many=True)
         return Response(serializer.data)
 
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
     serializer = ScheduleBlockSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
@@ -2149,6 +2320,9 @@ def schedule_block_detail(request, block_id):
         serializer = ScheduleBlockSerializer(block)
         return Response(serializer.data)
 
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
     if request.method == 'PATCH':
         partial = True
         serializer = ScheduleBlockSerializer(block, data=request.data, partial=partial)
@@ -2170,6 +2344,9 @@ def schedule_block_detail(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_enter_preview(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
     block = get_object_or_404(ScheduleBlock, id=block_id)
 
     if block.build_status == ScheduleBlock.BuildStatus.ARCHIVE:
@@ -2190,7 +2367,29 @@ def schedule_block_enter_preview(request, block_id):
 @api_view(['POST'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
+def schedule_block_move_back_to_build(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    if block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
+        return Response(
+            {'detail': 'Only PREVIEW Schedule Blocks can move back to BUILD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    block.build_status = ScheduleBlock.BuildStatus.BUILD
+    block.save(update_fields=['build_status', 'updated_at'])
+    return Response(ScheduleBlockSerializer(block).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
 def schedule_block_publish(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
     block = get_object_or_404(ScheduleBlock, id=block_id)
 
     if block.build_status != ScheduleBlock.BuildStatus.PREVIEW:

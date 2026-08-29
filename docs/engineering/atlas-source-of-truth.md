@@ -94,6 +94,7 @@ Status is workflow-controlled and cannot be edited as an ordinary field.
 - Generating the first Schedule Build Workspace moves a `PRE_BUILD` block to `BUILD`.
 - Only `PRE_BUILD` blocks can be deleted.
 - `PRE_BUILD` and `BUILD` blocks can enter `PREVIEW`.
+- `PREVIEW` is view-only. Schedulers can either publish it or move it back to `BUILD`; moving back preserves all schedule versions, optimizer runs, and assignments.
 - Only `PREVIEW` blocks can be published.
 - Publishing stamps `published_at` and moves the block to `ARCHIVE`.
 - Archived blocks are read-only and cannot return to preview.

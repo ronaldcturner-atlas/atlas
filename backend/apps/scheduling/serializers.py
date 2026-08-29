@@ -271,7 +271,10 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
                 'request_close_datetime': 'Request close must be later than request open.'
             })
 
-        if instance and instance.build_status == ScheduleBlock.BuildStatus.ARCHIVE:
+        if instance and instance.build_status in {
+            ScheduleBlock.BuildStatus.PREVIEW,
+            ScheduleBlock.BuildStatus.ARCHIVE,
+        }:
             editable_fields = {
                 'start_date',
                 'end_date',
@@ -280,7 +283,8 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
             }
             attempted_edits = editable_fields.intersection(set(attrs.keys()))
             if attempted_edits:
-                raise serializers.ValidationError('Archived Schedule Blocks are read only.')
+                phase = instance.get_build_status_display()
+                raise serializers.ValidationError(f'{phase} Schedule Blocks are read only.')
 
         return attrs
 

@@ -22,6 +22,7 @@ urlpatterns = [
     path("schedule-blocks/<int:block_id>/build/versions/<int:version_id>/clear-optimizer-assignments/", api.schedule_version_clear_optimizer_assignments, name="schedule_version_clear_optimizer_assignments"),
     path("schedule-blocks/<int:block_id>/build/versions/<int:version_id>/clear-all-assignments/", api.schedule_version_clear_all_assignments, name="schedule_version_clear_all_assignments"),
     path("schedule-versions/<int:version_id>/optimizer-runs/", api.schedule_version_optimizer_runs, name="schedule_version_optimizer_runs"),
+    path("schedule-versions/<int:version_id>/optimizer-runs/bulk-delete/", api.optimizer_runs_bulk_delete, name="optimizer_runs_bulk_delete"),
     path("schedule-versions/<int:version_id>/run-optimizer/", api.schedule_version_run_optimizer, name="schedule_version_run_optimizer"),
     path("schedule-versions/<int:version_id>/recalculate-score/", api.schedule_version_recalculate_score, name="schedule_version_recalculate_score"),
     path("schedule-versions/<int:version_id>/violation-report/", api.schedule_version_violation_report, name="schedule_version_violation_report"),
@@ -38,5 +39,6 @@ urlpatterns = [
     path("schedule-blocks/<int:block_id>/requests/clear/", api.schedule_block_clear_requests, name="schedule_block_clear_requests"),
     path("schedule-blocks/<int:block_id>/requests/bulk/", api.schedule_block_bulk_requests, name="schedule_block_bulk_requests"),
     path("schedule-blocks/<int:block_id>/enter-preview/", api.schedule_block_enter_preview, name="schedule_block_enter_preview"),
+    path("schedule-blocks/<int:block_id>/move-back-to-build/", api.schedule_block_move_back_to_build, name="schedule_block_move_back_to_build"),
     path("schedule-blocks/<int:block_id>/publish/", api.schedule_block_publish, name="schedule_block_publish"),
 ]

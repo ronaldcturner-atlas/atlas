@@ -155,7 +155,7 @@ type OptimizerRun = {
   score_is_stale: boolean
   copied_from_run: number | null
   copied_from_run_number: number | null
-  run_kind: 'OPTIMIZER' | 'COPY'
+  run_kind: 'OPTIMIZER' | 'COPY' | 'BENCHMARK'
   locked_open_shift_instance_ids: number[]
   start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
   optimizer_summary?: OptimizerSummary
@@ -171,12 +171,21 @@ type PopoverPosition = {
 
 type BuildContext = {
   schedule_block: ScheduleBlock
+  can_manage_build_workspace: boolean
   domains: DomainOption[]
   versions: ScheduleVersion[]
   selected_version: ScheduleVersion | null
   optimizer_summary?: OptimizerSummary | null
   optimizer_runs?: OptimizerRun[]
   selected_optimizer_run?: OptimizerRun | null
+  run_state?: {
+    viewed_run_id: number | null
+    active_run_id: number | null
+    viewed_run_is_editable: boolean
+    viewed_run_can_activate: boolean
+    viewed_run_can_copy: boolean
+    viewed_run_can_be_optimizer_source: boolean
+  }
   shift_instances: ShiftInstance[]
 }
 
@@ -390,8 +399,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
+  const [isMovingBackToBuild, setIsMovingBackToBuild] = useState(false)
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
+  const [isBulkDeletingRuns, setIsBulkDeletingRuns] = useState(false)
+  const [selectedRunIdsForDelete, setSelectedRunIdsForDelete] = useState<number[]>([])
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
   const [selectedOptimizerRunId, setSelectedOptimizerRunIdState] = useState<number | null>(null)
   const [showRunHistory, setShowRunHistory] = useState(false)
@@ -589,12 +601,51 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const moveBackToBuild = async () => {
+    const confirmed = window.confirm(
+      'Move this schedule block back to BUILD? Users will no longer be viewing it as preview, and scheduler edits/optimization will be enabled again.',
+    )
+    if (!confirmed) return
+
+    try {
+      setError(null)
+      setNotice(null)
+      setIsMovingBackToBuild(true)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/move-back-to-build/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({}),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to move Schedule Block back to BUILD.'))
+      await fetchContext(context?.selected_version?.id, { quiet: true, preserveError: true })
+      setNotice('Schedule Block moved back to BUILD. Scheduler edits and optimization are enabled again.')
+    } catch (moveError) {
+      setError(moveError instanceof Error ? moveError.message : 'Unable to move Schedule Block back to BUILD.')
+    } finally {
+      setIsMovingBackToBuild(false)
+    }
+  }
+
   const selectedOptimizerRun = context?.selected_optimizer_run ?? null
   const optimizerRuns = context?.optimizer_runs ?? []
   const completedOptimizerRuns = optimizerRuns.filter(isCompletedOptimizerRun)
   const selectedRunForActions = completedOptimizerRuns.find((run) => run.id === selectedOptimizerRunId)
     ?? selectedOptimizerRun
   const activeOptimizerRun = optimizerRuns.find((run) => run.is_active) ?? null
+  const viewedOptimizerRunId = context?.run_state?.viewed_run_id ?? selectedOptimizerRunId
+
+  const runDeleteProtectionReason = (run: OptimizerRun) => {
+    if (run.is_active) return 'Activate another run before deleting the active run.'
+    if (run.id === viewedOptimizerRunId) return 'View another run before deleting this run.'
+    if (run.status === 'RUNNING') return 'Running optimizer runs cannot be deleted.'
+    return null
+  }
+  const eligibleSelectedRunIds = selectedRunIdsForDelete.filter((runId) => {
+    const run = optimizerRuns.find((item) => item.id === runId)
+    return Boolean(run && !runDeleteProtectionReason(run))
+  })
 
   const selectOptimizerRun = async (run: OptimizerRun) => {
     if (!isCompletedOptimizerRun(run)) {
@@ -641,10 +692,17 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const deleteOptimizerRun = async (run: OptimizerRun) => {
     const versionId = context?.selected_version?.id
-    if (!versionId || run.is_active) {
+    if (!versionId) {
       return
     }
-    const confirmed = window.confirm('Delete this optimizer run? This cannot be undone.')
+    const protectionReason = runDeleteProtectionReason(run)
+    if (protectionReason) {
+      setError(protectionReason)
+      return
+    }
+    const confirmed = window.confirm(
+      `Delete optimizer run ${run.run_number}? This removes only that optimizer run and its optimizer-owned assignments. Schedule versions and other runs are preserved.`,
+    )
     if (!confirmed) {
       return
     }
@@ -653,7 +711,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setDeletingRunId(run.id)
       setError(null)
       setNotice(null)
-      const response = await fetch(`${API_BASE}/optimizer-runs/${run.id}/`, {
+      const viewedQuery = viewedOptimizerRunId ? `?viewed_run_id=${viewedOptimizerRunId}` : ''
+      const response = await fetch(`${API_BASE}/optimizer-runs/${run.id}/${viewedQuery}`, {
         method: 'DELETE',
         credentials: 'include',
       })
@@ -661,16 +720,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       if (!response.ok) {
         throw new Error(apiError(data, 'Unable to delete optimizer run.'))
       }
-      const deletedSelectedRun = selectedOptimizerRunId === run.id
-      const currentRun = completedOptimizerRuns.find((item) => item.id === selectedOptimizerRunId && item.id !== run.id)
-      const fallbackRun = completedOptimizerRuns.find((item) => item.is_active && item.id !== run.id)
-        ?? completedOptimizerRuns.find((item) => item.id !== run.id)
-        ?? null
-      const nextRun = deletedSelectedRun ? fallbackRun : currentRun
-      setSelectedOptimizerRunId(nextRun?.id ?? null)
-      updateOptimizerRunUrl(nextRun?.id ?? null)
+      const nextRunId = data?.next_viewed_run_id ?? viewedOptimizerRunId ?? null
+      setSelectedRunIdsForDelete((current) => current.filter((id) => id !== run.id))
+      setSelectedOptimizerRunId(nextRunId)
+      updateOptimizerRunUrl(nextRunId)
       await fetchContext(versionId, {
-        optimizerRunId: nextRun?.id,
+        optimizerRunId: nextRunId,
         quiet: true,
       })
       setNotice(data?.message ?? `Run ${run.run_number} deleted.`)
@@ -680,6 +735,67 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setDeletingRunId(null)
     }
   }
+
+  const bulkDeleteOptimizerRuns = async () => {
+    const versionId = context?.selected_version?.id
+    if (!versionId || eligibleSelectedRunIds.length === 0) {
+      setError('Select at least one eligible inactive optimizer run to delete.')
+      return
+    }
+    const confirmed = window.confirm(
+      `Delete ${eligibleSelectedRunIds.length} selected optimizer run${eligibleSelectedRunIds.length === 1 ? '' : 's'}? This removes only those optimizer runs and their optimizer-owned assignments.`,
+    )
+    if (!confirmed) return
+    try {
+      closeAssignments()
+      setIsBulkDeletingRuns(true)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(
+        `${API_BASE}/schedule-versions/${versionId}/optimizer-runs/bulk-delete/`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            run_ids: eligibleSelectedRunIds,
+            viewed_run_id: viewedOptimizerRunId,
+          }),
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to delete selected optimizer runs.'))
+      const nextRunId = data?.next_viewed_run_id ?? viewedOptimizerRunId ?? null
+      setSelectedRunIdsForDelete([])
+      setSelectedOptimizerRunId(nextRunId)
+      updateOptimizerRunUrl(nextRunId)
+      await fetchContext(versionId, { optimizerRunId: nextRunId, quiet: true })
+      const deletedCount = Array.isArray(data?.deleted_run_ids) ? data.deleted_run_ids.length : 0
+      const skippedRows = Array.isArray(data?.skipped_run_ids) ? data.skipped_run_ids : []
+      const skippedDetails = skippedRows.map((row: { id: number, reason: string }) => (
+        `Run ${row.id}: ${row.reason.replaceAll('_', ' ')}`
+      )).join('; ')
+      setNotice(
+        skippedRows.length
+          ? `Deleted ${deletedCount} optimizer run${deletedCount === 1 ? '' : 's'}. Skipped: ${skippedDetails}.`
+          : `Deleted ${deletedCount} optimizer run${deletedCount === 1 ? '' : 's'}.`,
+      )
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete selected optimizer runs.')
+    } finally {
+      setIsBulkDeletingRuns(false)
+    }
+  }
+
+  useEffect(() => {
+    setSelectedRunIdsForDelete((current) => {
+      const filtered = current.filter((runId) => {
+        const run = optimizerRuns.find((item) => item.id === runId)
+        return Boolean(run && !run.is_active && run.id !== viewedOptimizerRunId && run.status !== 'RUNNING')
+      })
+      return filtered.length === current.length ? current : filtered
+    })
+  }, [optimizerRuns, viewedOptimizerRunId])
 
   useEffect(() => {
     closeAssignments()
@@ -821,9 +937,40 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   }
 
   const runOptimizer = async () => {
-    const versionId = context.selected_version?.id
+    const versionId = context?.selected_version?.id
     if (!versionId) {
       setError('Select a BUILD Schedule Version before running the optimizer.')
+      return
+    }
+    const viewedRun = context.selected_optimizer_run ?? null
+    if (optimizerStartMode === 'CURRENT_SCHEDULE') {
+      if (!viewedRun) {
+        setError('Select a completed optimizer run before optimizing from the current schedule.')
+        return
+      }
+      if (context.run_state && !context.run_state.viewed_run_can_be_optimizer_source) {
+        setError('Activate this run before optimizing from it.')
+        return
+      }
+      if (
+        context.run_state?.viewed_run_id !== undefined
+        && context.run_state.viewed_run_id !== viewedRun.id
+      ) {
+        setError('The viewed optimizer run changed. Refresh the workspace and try again.')
+        return
+      }
+      const viewedScore = Number(viewedRun.final_score ?? optimizerSummary?.final_score)
+      if (Number.isFinite(viewedScore) && viewedScore === 0) {
+        setError(null)
+        setNotice('This schedule already has score 0. No optimizer run was started.')
+        return
+      }
+    }
+    if (
+      context.schedule_block.build_status !== 'BUILD'
+      || context.selected_version?.status !== 'BUILD'
+    ) {
+      setError('Run Optimizer is available only while the Schedule Block and Schedule Version are in BUILD.')
       return
     }
 
@@ -846,7 +993,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           credentials: 'include',
           body: JSON.stringify({
             schedule_version_id: versionId,
-            currently_viewed_run_id: selectedOptimizerRunId,
+            currently_viewed_run_id: viewedRun?.id ?? null,
             start_mode: optimizerStartMode,
           }),
         },
@@ -1209,9 +1356,34 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const canEditAssignments = context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
     && (!context.selected_optimizer_run || context.selected_optimizer_run.is_active)
-  const canOptimize = canEditAssignments && context.shift_instances.length > 0
+  const canOptimizeBuild = context.schedule_block.build_status === 'BUILD'
+    && context.selected_version?.status === 'BUILD'
+    && context.shift_instances.length > 0
+  const viewedRunCanBeOptimizerSource = context.run_state
+    ? context.run_state.viewed_run_can_be_optimizer_source
+    : Boolean(context.selected_optimizer_run && isCompletedOptimizerRun(context.selected_optimizer_run))
+  const viewedScore = Number(
+    context.selected_optimizer_run?.final_score ?? optimizerSummary?.final_score,
+  )
+  const currentScheduleIsZero = optimizerStartMode === 'CURRENT_SCHEDULE'
+    && Number.isFinite(viewedScore) && viewedScore === 0
+  const optimizerUnavailableReason = currentScheduleIsZero
+    ? 'This schedule already has score 0. No optimizer run will be started.'
+    : !canOptimizeBuild
+      ? 'Run Optimizer is available only while the Schedule Block and Schedule Version are in BUILD with generated shifts.'
+      : optimizerStartMode === 'CURRENT_SCHEDULE' && !context.selected_optimizer_run
+      ? 'Select a completed optimizer run before optimizing from the current schedule.'
+      : optimizerStartMode === 'CURRENT_SCHEDULE' && !viewedRunCanBeOptimizerSource
+        ? 'Activate this run before optimizing from it.'
+        : null
+  // Keep preflight-rejected actions clickable so selecting Run Optimizer always
+  // results in either a request/loading state or a visible explanation.
+  const canOptimize = Boolean(context.selected_version) && context.shift_instances.length > 0
   const canClearAssignments = canEditAssignments && context.shift_instances.length > 0
-  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || clearingAction !== null || deletingRunId !== null
+  const canManageRunDeletion = context.can_manage_build_workspace
+    && context.schedule_block.build_status === 'BUILD'
+    && context.selected_version?.status === 'BUILD'
+  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
     (physician) => physician.can_assign && !physician.already_assigned,
   ) ?? []
@@ -1232,7 +1404,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             Status: {context.schedule_block.build_status}
           </div>
         </div>
-        <button type="button" className="secondary" onClick={onBack}>Back to Schedule Blocks</button>
+        <div className="facility-actions">
+          {context.schedule_block.build_status === 'PREVIEW' && context.can_manage_build_workspace && (
+            <button type="button" className="secondary" onClick={() => void moveBackToBuild()} disabled={isMutatingBuild}>
+              {isMovingBackToBuild ? 'Moving...' : 'Move Back to Build'}
+            </button>
+          )}
+          <button type="button" className="secondary" onClick={onBack}>Back to Schedule Blocks</button>
+        </div>
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
@@ -1297,19 +1476,24 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </small>
         </div>
 
-        <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || isMutatingBuild}>
+        <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
           {isOptimizing
             ? 'Running...'
             : optimizerStartMode === 'CURRENT_SCHEDULE'
               ? 'Run Optimizer from Current Schedule'
               : 'Run Optimizer from Fresh Fill'}
         </button>
+        {optimizerUnavailableReason && (
+          <small className="optimizer-action-message" role="status">
+            {optimizerUnavailableReason}
+          </small>
+        )}
 
         <button
           type="button"
           className="secondary"
           onClick={() => void recalculateScore()}
-          disabled={!selectedRunForActions || isMutatingBuild}
+          disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild}
         >
           {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
         </button>
@@ -1366,7 +1550,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 )}
               </div>
               <div className="optimizer-run-actions">
-                <button type="button" className="secondary" onClick={() => void saveRunCopy()} disabled={isMutatingBuild}>
+                <button type="button" className="secondary" onClick={() => void saveRunCopy()} disabled={!canEditAssignments || isMutatingBuild}>
                   {isSavingCopy ? 'Saving...' : 'Save Copy'}
                 </button>
                 <button
@@ -1381,7 +1565,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   type="button"
                   className="secondary"
                   onClick={() => void activateOptimizerRun(selectedRunForActions.id)}
-                  disabled={isMutatingBuild || selectedRunForActions.is_active}
+                  disabled={!canEditAssignments || isMutatingBuild || selectedRunForActions.is_active}
                 >
                   Activate
                 </button>
@@ -1391,17 +1575,21 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 >
                   Violations
                 </a>
-                {!selectedRunForActions.is_active && (
-                  <button
-                    type="button"
-                    className="secondary danger-action"
-                    onClick={() => void deleteOptimizerRun(selectedRunForActions)}
-                    disabled={isMutatingBuild}
-                  >
-                    {deletingRunId === selectedRunForActions.id ? 'Deleting...' : 'Delete'}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className="secondary danger-action"
+                  onClick={() => void deleteOptimizerRun(selectedRunForActions)}
+                  disabled={!canManageRunDeletion || isMutatingBuild || Boolean(runDeleteProtectionReason(selectedRunForActions))}
+                  title={runDeleteProtectionReason(selectedRunForActions) ?? undefined}
+                >
+                  {deletingRunId === selectedRunForActions.id ? 'Deleting...' : 'Delete'}
+                </button>
               </div>
+              {runDeleteProtectionReason(selectedRunForActions) && (
+                <span className="optimizer-run-delete-reason" role="status">
+                  {runDeleteProtectionReason(selectedRunForActions)}
+                </span>
+              )}
             </div>
           )}
           <button
@@ -1413,12 +1601,46 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             {showRunHistory ? 'Hide run history' : `Show run history (${optimizerRuns.length})`}
           </button>
           {showRunHistory && (
-            <div className="optimizer-runs-list">
+            <>
+              {selectedRunIdsForDelete.length > 0 && (
+              <div className="optimizer-run-bulk-actions">
+                <span role="status">
+                  {eligibleSelectedRunIds.length} eligible run{eligibleSelectedRunIds.length === 1 ? '' : 's'} selected
+                </span>
+                <button
+                  type="button"
+                  className="secondary danger-action"
+                  onClick={() => void bulkDeleteOptimizerRuns()}
+                  disabled={!canManageRunDeletion || isMutatingBuild || eligibleSelectedRunIds.length === 0}
+                >
+                  {isBulkDeletingRuns ? 'Deleting Selected...' : `Delete Selected Runs (${eligibleSelectedRunIds.length})`}
+                </button>
+              </div>
+              )}
+              <div className="optimizer-runs-list">
               {optimizerRuns.map((run) => (
                 <div
                   className={`optimizer-run-row${selectedOptimizerRunId === run.id ? ' optimizer-run-row-selected' : ''}`}
                   key={run.id}
                 >
+                  <label
+                    className="optimizer-run-delete-select"
+                    title={runDeleteProtectionReason(run) ?? `Select Run ${run.run_number} for deletion`}
+                  >
+                    <input
+                      type="checkbox"
+                      aria-label={`Select optimizer run ${run.run_number} for deletion`}
+                      checked={selectedRunIdsForDelete.includes(run.id)}
+                      disabled={!canManageRunDeletion || isMutatingBuild || Boolean(runDeleteProtectionReason(run))}
+                      onChange={(event) => {
+                        setSelectedRunIdsForDelete((current) => (
+                          event.target.checked
+                            ? [...current, run.id]
+                            : current.filter((id) => id !== run.id)
+                        ))
+                      }}
+                    />
+                  </label>
                   <div>
                     <strong>Run {run.run_number}</strong>
                     <span>{optimizerRunStatusLabel(run)}</span>
@@ -1441,7 +1663,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       type="button"
                       className="secondary"
                       onClick={() => void activateOptimizerRun(run.id)}
-                      disabled={isMutatingBuild || !isCompletedOptimizerRun(run) || run.is_active}
+                      disabled={!canEditAssignments || isMutatingBuild || !isCompletedOptimizerRun(run) || run.is_active}
                     >
                       Activate
                     </button>
@@ -1457,20 +1679,20 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                         Violations
                       </button>
                     )}
-                  {!run.is_active && (
                     <button
                       type="button"
                       className="secondary danger-action"
                       onClick={() => void deleteOptimizerRun(run)}
-                      disabled={isMutatingBuild || run.status === 'RUNNING'}
+                      disabled={!canManageRunDeletion || isMutatingBuild || Boolean(runDeleteProtectionReason(run))}
+                      title={runDeleteProtectionReason(run) ?? undefined}
                     >
                       {deletingRunId === run.id ? 'Deleting...' : 'Delete'}
                     </button>
-                  )}
                   </div>
                 </div>
               ))}
-            </div>
+              </div>
+            </>
           )}
         </div>
       )}

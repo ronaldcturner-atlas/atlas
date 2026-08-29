@@ -692,6 +692,68 @@ def _state_from_assignments(assignments):
     return state, manual_pairs
 
 
+def canonical_assignment_snapshot(assignments, instances, selected_run=None):
+    """Deduplicate and cap an assignment snapshot without mutating source rows."""
+    required_by_instance = {
+        instance.id: instance.required_staffing for instance in instances
+    }
+    selected_run_id = getattr(selected_run, 'id', None)
+
+    def priority(assignment):
+        locked_manual = (
+            assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+            and assignment.is_locked
+        )
+        return (
+            0 if locked_manual else 1,
+            0 if assignment.optimizer_run_id == selected_run_id else 1,
+            0 if assignment.optimizer_run_id is not None else 1,
+            assignment.id or 0,
+        )
+
+    kept = []
+    seen_pairs = set()
+    counts_by_instance = defaultdict(int)
+    duplicate_rows = []
+    excess_rows = []
+    for assignment in sorted(assignments, key=priority):
+        pair = (assignment.shift_instance_id, assignment.physician_id)
+        if pair in seen_pairs:
+            duplicate_rows.append(assignment)
+            continue
+        required = required_by_instance.get(assignment.shift_instance_id)
+        if required is None or counts_by_instance[assignment.shift_instance_id] >= required:
+            excess_rows.append(assignment)
+            continue
+        seen_pairs.add(pair)
+        counts_by_instance[assignment.shift_instance_id] += 1
+        kept.append(assignment)
+    return kept, {
+        'duplicate_rows_discarded': len(duplicate_rows),
+        'excess_rows_discarded': len(excess_rows),
+        'discarded_assignment_ids': [
+            assignment.id for assignment in [*duplicate_rows, *excess_rows]
+            if assignment.id is not None
+        ],
+    }
+
+
+def _invalid_state_assignment_capacity(instances, state):
+    issues = []
+    for instance in instances:
+        physician_ids = state[instance.id]
+        duplicate_count = len(physician_ids) - len(set(physician_ids))
+        excess_count = max(len(physician_ids) - instance.required_staffing, 0)
+        if duplicate_count or excess_count:
+            issues.append({
+                'shift_instance_id': instance.id,
+                'duplicate_count': duplicate_count,
+                'excess_count': excess_count,
+                'required_staffing': instance.required_staffing,
+            })
+    return issues
+
+
 def _intervals_for_physician(state, instances_by_id, physician_id, exclude_instance_id=None):
     intervals = []
     for instance_id, physician_ids in state.items():
@@ -3440,15 +3502,21 @@ def optimize_schedule_version(
             .order_by('date', 'facility__name', 'start_datetime', 'id')
         )
         if source_run is not None:
-            source_assignments = list(
+            raw_source_assignments = list(
                 _assignments_for_optimizer_run(version, source_run)
                 .select_related('shift_instance', 'physician__user')
             )
         else:
-            source_assignments = list(
+            raw_source_assignments = list(
                 _assignments_for_optimizer_run(version, None)
                 .select_related('shift_instance', 'physician__user')
             )
+        source_assignments, source_assignment_normalization = canonical_assignment_snapshot(
+            raw_source_assignments,
+            instances,
+            selected_run=source_run,
+        )
+        source_assignment_count_raw = len(raw_source_assignments)
 
         if source_assignments:
             source_assignment_count = len(source_assignments)
@@ -4254,6 +4322,7 @@ def optimize_schedule_version(
             'night_minimum_repair',
             'post_night_recovery_repair',
             'workload_range_repair',
+            'workload_minimum_repair',
             'same_shift_repair',
             'consecutive_day_repair',
             'general_hill_climb_swaps',
@@ -4273,6 +4342,17 @@ def optimize_schedule_version(
         workload_candidate_swaps_considered = 0
         workload_moves_accepted = 0
         workload_swaps_accepted = 0
+        workload_minimum_repair_physicians_considered = 0
+        workload_minimum_repair_candidates_considered = 0
+        workload_minimum_repair_accepts = 0
+        workload_minimum_repair_best_delta = None
+        workload_minimum_repair_rejected_reasons = defaultdict(int)
+        workload_minimum_repair_turner_summary = {
+            'physicians': [],
+            'candidates_considered': 0,
+            'accepts': [],
+            'rejected_reasons': defaultdict(int),
+        }
         general_swap_attempts = 0
         general_swap_improvements = 0
         workload_transfer_attempts = 0
@@ -5559,6 +5639,241 @@ def optimize_schedule_version(
         plateau_improved = False
         violating_workload_ids = set()
         targeted_pairs = []
+
+        # The ordinary workload repair starts with physicians above maximum.  A
+        # reduced-contract schedule can instead have a large below-minimum
+        # penalty while every current owner is inside range.  Mirror the
+        # lightweight feasibility diagnostic's individual-shift neighborhood:
+        # inspect legal unlocked transfers for the worst under-minimum physician
+        # first, but use the complete official score as the acceptance rule.
+        minimum_repair_attempt_limit = min(
+            2000, max(500, plateau_candidate_limit * 10),
+        )
+
+        def workload_row_by_physician(scoring):
+            return {
+                row['physician_id']: row
+                for row in scoring.get('workload_score_rows', [])
+            }
+
+        def workload_contribution(row):
+            if row is None:
+                return Decimal('0')
+            return Decimal(str(
+                row.get('score_contribution_exact', row.get('score_contribution', 0))
+            ))
+
+        def night_maximum_penalty(scoring, physician_id):
+            return sum(
+                Decimal(str(row.get('penalty', 0)))
+                for row in scoring.get('night_violations', [])
+                if row.get('physician_id') == physician_id
+                and row.get('violation_type') == 'NIGHT_OVER_MAXIMUM'
+            )
+
+        def record_minimum_rejection(reason, physician_name):
+            workload_minimum_repair_rejected_reasons[reason] += 1
+            if 'turner' in (physician_name or '').lower():
+                workload_minimum_repair_turner_summary['rejected_reasons'][reason] += 1
+
+        minimum_repair_exhausted = False
+        while (
+            not runtime_exceeded()
+            and workload_minimum_repair_candidates_considered < minimum_repair_attempt_limit
+        ):
+            current_rows = workload_row_by_physician(plateau_scoring)
+            under_rows = sorted(
+                [
+                    row for row in current_rows.values()
+                    if row.get('deviation_direction') == 'below_minimum'
+                ],
+                key=lambda row: (
+                    -workload_contribution(row),
+                    -Decimal(str(row.get('deviation', 0))),
+                    row['physician_id'],
+                ),
+            )
+            if not under_rows or final_score <= 0:
+                break
+            accepted_in_round = False
+            for under_row in under_rows:
+                if runtime_exceeded():
+                    break
+                to_physician_id = under_row['physician_id']
+                physician = next(
+                    item for item in physicians if item.id == to_physician_id
+                )
+                physician_name = _physician_display_name(physician)
+                workload_minimum_repair_physicians_considered += 1
+                if 'turner' in physician_name.lower():
+                    workload_minimum_repair_turner_summary['physicians'].append({
+                        'physician_id': to_physician_id,
+                        'physician': physician_name,
+                        'assigned_hours': under_row.get('assigned_hours'),
+                        'allowed_min': under_row.get('allowed_min'),
+                        'allowed_max': under_row.get('allowed_max'),
+                        'workload_score_contribution': float(workload_contribution(under_row)),
+                    })
+                deficit = Decimal(str(under_row.get('deviation', 0)))
+                ordered_instances = sorted(
+                    instances,
+                    key=lambda item: (
+                        abs(_shift_hours(item) - deficit),
+                        item.date,
+                        item.start_datetime,
+                        item.id,
+                    ),
+                )
+                for instance in ordered_instances:
+                    if (
+                        runtime_exceeded()
+                        or workload_minimum_repair_candidates_considered
+                        >= minimum_repair_attempt_limit
+                    ):
+                        break
+                    if to_physician_id in state[instance.id]:
+                        record_minimum_rejection('already_assigned', physician_name)
+                        continue
+                    if instance.id in source_locked_open_ids:
+                        record_minimum_rejection('locked_assignment', physician_name)
+                        continue
+                    if instance.facility_id not in eligible_facilities_by_physician.get(
+                        to_physician_id, set(),
+                    ):
+                        record_minimum_rejection('facility_ineligible', physician_name)
+                        continue
+                    matching_requests = _requests_for_shift(
+                        requests_by_physician_date, to_physician_id, instance,
+                    )
+                    if any(
+                        request.request_type in {
+                            ScheduleRequest.RequestType.DAY_OFF,
+                            ScheduleRequest.RequestType.SHIFT_OFF,
+                        }
+                        for request in matching_requests
+                    ):
+                        record_minimum_rejection('request_conflict', physician_name)
+                        continue
+
+                    movable_owners = [
+                        owner_id for owner_id in state[instance.id]
+                        if (instance.id, owner_id) not in manual_pairs
+                    ]
+                    if not movable_owners:
+                        record_minimum_rejection('locked_assignment', physician_name)
+                        continue
+                    # Prefer an owner whose current workload penalty can absorb
+                    # the transfer, while still allowing full-score evaluation
+                    # to make the final decision.
+                    movable_owners.sort(key=lambda owner_id: (
+                        0 if current_rows.get(owner_id, {}).get('deviation_direction') == 'above_maximum' else 1,
+                        -workload_contribution(current_rows.get(owner_id)),
+                        owner_id,
+                    ))
+                    for from_physician_id in movable_owners:
+                        if (
+                            runtime_exceeded()
+                            or workload_minimum_repair_candidates_considered
+                            >= minimum_repair_attempt_limit
+                        ):
+                            break
+                        workload_minimum_repair_candidates_considered += 1
+                        workload_candidate_moves_considered += 1
+                        phase_attempts['workload_minimum_repair'] += 1
+                        if 'turner' in physician_name.lower():
+                            workload_minimum_repair_turner_summary['candidates_considered'] += 1
+                        result = try_final_plateau_reassign(
+                            instance.id, from_physician_id, to_physician_id,
+                        )
+                        if result is None:
+                            # Facility was checked above, so the remaining shared
+                            # assignment guard is overlap/rest (or an invalid
+                            # source state). Keep the diagnostic reason explicit.
+                            trial_intervals = [
+                                (instances_by_id[assigned_id].start_datetime,
+                                 instances_by_id[assigned_id].end_datetime)
+                                for assigned_id, assigned_physician_ids in state.items()
+                                for assigned_physician_id in assigned_physician_ids
+                                if assigned_physician_id == to_physician_id
+                                and assigned_id != instance.id
+                            ]
+                            reason = (
+                                'overlap' if _overlaps(instance, trial_intervals)
+                                else 'rest' if _rest_violation(
+                                    instance, trial_intervals,
+                                    minimum_rest_by_physician[to_physician_id],
+                                ) else 'illegal_or_locked_move'
+                            )
+                            record_minimum_rejection(reason, physician_name)
+                            continue
+                        trial_scoring, trial_state = result
+                        trial_rows = workload_row_by_physician(trial_scoring)
+                        trial_receiver = trial_rows.get(to_physician_id)
+                        if trial_receiver and trial_receiver.get('deviation_direction') == 'above_maximum':
+                            record_minimum_rejection('would_exceed_max_workload', physician_name)
+                            continue
+                        if (
+                            instance.shift_template.night_shift
+                            and night_maximum_penalty(trial_scoring, to_physician_id)
+                            > night_maximum_penalty(plateau_scoring, to_physician_id)
+                        ):
+                            record_minimum_rejection('night_maximum', physician_name)
+                            continue
+
+                        recipient_gain = (
+                            workload_contribution(current_rows.get(to_physician_id))
+                            - workload_contribution(trial_rows.get(to_physician_id))
+                        )
+                        donor_loss = (
+                            workload_contribution(trial_rows.get(from_physician_id))
+                            - workload_contribution(current_rows.get(from_physician_id))
+                        )
+                        donor_remains_in_range = (
+                            trial_rows.get(from_physician_id, {}).get('deviation_direction')
+                            == 'inside_range'
+                        )
+                        if not donor_remains_in_range and donor_loss >= recipient_gain:
+                            record_minimum_rejection('donor_workload_tradeoff', physician_name)
+                            continue
+                        delta = trial_scoring['score'] - final_score
+                        if (
+                            workload_minimum_repair_best_delta is None
+                            or delta < workload_minimum_repair_best_delta
+                        ):
+                            workload_minimum_repair_best_delta = delta
+                        if delta >= 0:
+                            record_minimum_rejection('would_not_lower_total_score', physician_name)
+                            continue
+
+                        score_before_move = final_score
+                        state = trial_state
+                        plateau_scoring = trial_scoring
+                        final_score = trial_scoring['score']
+                        improvement_count += 1
+                        workload_minimum_repair_accepts += 1
+                        workload_moves_accepted += 1
+                        phase_improvements['workload_minimum_repair'] += 1
+                        plateau_improved = True
+                        accepted_in_round = True
+                        if 'turner' in physician_name.lower():
+                            workload_minimum_repair_turner_summary['accepts'].append({
+                                'shift_instance_id': instance.id,
+                                'from_physician_id': from_physician_id,
+                                'to_physician_id': to_physician_id,
+                                'hours': float(_shift_hours(instance)),
+                                'score_before': float(score_before_move),
+                                'score_after': float(final_score),
+                                'score_delta': float(delta),
+                            })
+                        break
+                    if accepted_in_round:
+                        break
+                if accepted_in_round:
+                    break
+            if not accepted_in_round:
+                minimum_repair_exhausted = True
+                break
+
         if not runtime_exceeded():
             final_plateau_repair_reason = 'no_improving_candidate'
             workload_rows = plateau_scoring.get('workload_score_rows', [])
@@ -5999,6 +6314,13 @@ def optimize_schedule_version(
         if unlocked_manual_ids:
             ScheduleShiftAssignment.objects.filter(id__in=unlocked_manual_ids).delete()
 
+        invalid_assignment_capacity = _invalid_state_assignment_capacity(instances, state)
+        if invalid_assignment_capacity:
+            raise ValueError(
+                'Optimizer produced duplicate or over-capacity assignments; no run assignments were persisted. '
+                f'Details: {invalid_assignment_capacity}'
+            )
+
         for instance in instances:
             optimizer_physician_ids = [
                 physician_id
@@ -6111,6 +6433,8 @@ def optimize_schedule_version(
             'start_mode': start_mode,
             'source_optimizer_run_id': source_run.id if source_run is not None else None,
             'source_assignment_count': source_assignment_count,
+            'source_assignment_count_raw': source_assignment_count_raw,
+            'source_assignment_normalization': source_assignment_normalization,
             'seeded_assignment_count': len(assignments),
             'source_unique_assignment_count': len(source_visible_assignment_pairs),
             'copied_start_assignment_count': len(loaded_start_assignment_pairs),
@@ -6188,6 +6512,27 @@ def optimize_schedule_version(
             'workload_candidate_swaps_considered': workload_candidate_swaps_considered,
             'workload_moves_accepted': workload_moves_accepted,
             'workload_swaps_accepted': workload_swaps_accepted,
+            'workload_minimum_repair_physicians_considered': workload_minimum_repair_physicians_considered,
+            'workload_minimum_repair_candidates_considered': workload_minimum_repair_candidates_considered,
+            'workload_minimum_repair_accepts': workload_minimum_repair_accepts,
+            'workload_minimum_repair_best_delta': (
+                float(workload_minimum_repair_best_delta)
+                if workload_minimum_repair_best_delta is not None else None
+            ),
+            'workload_minimum_repair_rejected_reasons': dict(
+                workload_minimum_repair_rejected_reasons
+            ),
+            'workload_minimum_repair_turner_summary': {
+                **workload_minimum_repair_turner_summary,
+                'rejected_reasons': dict(
+                    workload_minimum_repair_turner_summary['rejected_reasons']
+                ),
+                'attempt_guard_reached': (
+                    workload_minimum_repair_candidates_considered
+                    >= minimum_repair_attempt_limit
+                ),
+                'search_exhausted_without_accept': minimum_repair_exhausted,
+            },
             'workload_score_initial': float(initial_scoring['breakdown']['workload_score']),
             'workload_score_final': float(final_scoring['breakdown']['workload_score']),
             'final_plateau_repair_attempts': final_plateau_repair_attempts,

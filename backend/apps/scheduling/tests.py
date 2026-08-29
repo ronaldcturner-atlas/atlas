@@ -189,6 +189,8 @@ class ScheduleBlockApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.user = get_user_model().objects.create_user(username='scheduler', password='password123')
+        scheduler_group, _ = Group.objects.get_or_create(name='Scheduler')
+        self.user.groups.add(scheduler_group)
         self.client.force_authenticate(user=self.user)
 
     def _create_block(self, **overrides):
@@ -219,6 +221,19 @@ class ScheduleBlockApiTests(TestCase):
         block.refresh_from_db()
         self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.ARCHIVE)
         self.assertIsNotNone(block.published_at)
+
+    def test_preview_block_fields_are_read_only(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+
+        response = self.client.patch(
+            f'/api/schedule-blocks/{block.id}/',
+            data={'end_date': '2026-08-31'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        block.refresh_from_db()
+        self.assertEqual(block.end_date, date(2026, 7, 31))
 
 
 class ScheduleRequestApiTests(TestCase):
@@ -1159,6 +1174,86 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(ScheduleVersion.objects.filter(schedule_block=self.block).exists())
+
+    def test_preview_moves_back_to_build_without_losing_data_and_restores_manual_edits(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        shift_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        first = self._create_assignment_physician(
+            'preview.first@example.com', 'Preview First', facilities=[self.facility]
+        )
+        second = self._create_assignment_physician(
+            'preview.second@example.com', 'Preview Second', facilities=[self.facility]
+        )
+        assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{shift_instance.id}/assignments/'
+        )
+        assigned = self.client.post(
+            assignment_url, data={'physician_id': first.id}, format='json'
+        )
+        self.assertEqual(assigned.status_code, 201)
+        existing_assignment_id = assigned.json()['shift_instance']['assignments'][0]['id']
+        existing_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=0,
+            is_active=True,
+        )
+        self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
+        self.block.save(update_fields=['build_status', 'updated_at'])
+
+        blocked_assignment = self.client.post(
+            assignment_url, data={'physician_id': second.id}, format='json'
+        )
+        blocked_optimizer = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/versions/{version.id}/optimize/',
+            data={}, format='json',
+        )
+        self.assertEqual(blocked_assignment.status_code, 400)
+        self.assertEqual(blocked_optimizer.status_code, 400)
+
+        moved = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/move-back-to-build/',
+            data={}, format='json',
+        )
+
+        self.assertEqual(moved.status_code, 200)
+        self.assertEqual(moved.json()['build_status'], ScheduleBlock.BuildStatus.BUILD)
+        self.assertTrue(ScheduleVersion.objects.filter(id=version.id).exists())
+        self.assertTrue(ScheduleShiftInstance.objects.filter(id=shift_instance.id).exists())
+        self.assertTrue(OptimizerRun.objects.filter(id=existing_run.id).exists())
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(id=existing_assignment_id).exists())
+        restored_assignment = self.client.post(
+            assignment_url, data={'physician_id': second.id}, format='json'
+        )
+        self.assertEqual(restored_assignment.status_code, 201)
+        restored_optimizer = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/versions/{version.id}/optimize/',
+            data={}, format='json',
+        )
+        self.assertEqual(restored_optimizer.status_code, 200)
+
+    def test_authenticated_user_can_view_preview_but_cannot_move_it_to_build(self):
+        self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
+        self.block.save(update_fields=['build_status', 'updated_at'])
+        viewer = get_user_model().objects.create_user(username='preview-viewer')
+        self.client.force_authenticate(user=viewer)
+
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/')
+        move_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/move-back-to-build/', data={}, format='json'
+        )
+
+        self.assertEqual(context_response.status_code, 200)
+        self.assertFalse(context_response.json()['can_manage_build_workspace'])
+        self.assertEqual(move_response.status_code, 403)
 
     def test_assign_remove_and_refresh_multiple_physicians(self):
         self.client.post(
@@ -2703,6 +2798,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertFalse(ScheduleShiftAssignment.objects.filter(optimizer_run=run_one).exists())
         self.assertEqual(ScheduleShiftAssignment.objects.filter(optimizer_run=run_two).count(), run_two_assignment_count)
         self.assertEqual(delete_response.json()['assignments_deleted'], run_one_assignment_count)
+        self.assertEqual(delete_response.json()['deleted_run_ids'], [run_one.id])
+        self.assertEqual(delete_response.json()['skipped_run_ids'], [])
         run_two.refresh_from_db()
         self.assertTrue(run_two.is_active)
 
@@ -2730,6 +2827,110 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             'Cannot delete active optimizer run. Activate another run first.',
         )
         self.assertTrue(OptimizerRun.objects.filter(id=active_run.id).exists())
+
+    def test_delete_currently_viewed_inactive_run_is_blocked_with_reason(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        viewed_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=100,
+        )
+        active_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=2,
+            status=OptimizerRun.Status.COMPLETED, final_score=50, is_active=True,
+        )
+
+        response = self.client.delete(
+            f'/api/optimizer-runs/{viewed_run.id}/?viewed_run_id={viewed_run.id}',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['skipped_run_ids'], [
+            {'id': viewed_run.id, 'reason': 'viewed_run'},
+        ])
+        self.assertEqual(response.json()['next_viewed_run_id'], viewed_run.id)
+        self.assertTrue(OptimizerRun.objects.filter(id=viewed_run.id).exists())
+        self.assertTrue(OptimizerRun.objects.filter(id=active_run.id).exists())
+
+    def test_bulk_delete_removes_eligible_runs_and_skips_protected_runs(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        shift_instance = ScheduleShiftInstance.objects.filter(
+            schedule_version=version,
+        ).first()
+        physician = self._create_assignment_physician(
+            'bulk-delete@example.com', 'Bulk Delete', facilities=[self.facility],
+        )
+        active_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, final_score=10, is_active=True,
+        )
+        viewed_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=2,
+            status=OptimizerRun.Status.COMPLETED, final_score=20,
+        )
+        completed_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=3,
+            status=OptimizerRun.Status.COMPLETED, final_score=30,
+        )
+        failed_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=4,
+            status=OptimizerRun.Status.FAILED,
+        )
+        running_run = OptimizerRun.objects.create(
+            schedule_version=version, run_number=5,
+            status=OptimizerRun.Status.RUNNING,
+        )
+        for run in (active_run, viewed_run, completed_run, failed_run, running_run):
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=shift_instance, physician=physician,
+                optimizer_run=run,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            )
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/optimizer-runs/bulk-delete/',
+            data={
+                'run_ids': [
+                    active_run.id, viewed_run.id, completed_run.id,
+                    failed_run.id, running_run.id,
+                ],
+                'viewed_run_id': viewed_run.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            set(payload['deleted_run_ids']), {completed_run.id, failed_run.id},
+        )
+        self.assertEqual(payload['next_viewed_run_id'], viewed_run.id)
+        self.assertEqual(
+            {row['id']: row['reason'] for row in payload['skipped_run_ids']},
+            {
+                active_run.id: 'active_run',
+                viewed_run.id: 'viewed_run',
+                running_run.id: 'running',
+            },
+        )
+        self.assertFalse(OptimizerRun.objects.filter(
+            id__in=[completed_run.id, failed_run.id],
+        ).exists())
+        self.assertFalse(ScheduleShiftAssignment.objects.filter(
+            optimizer_run_id__in=[completed_run.id, failed_run.id],
+        ).exists())
+        self.assertEqual(OptimizerRun.objects.filter(
+            id__in=[active_run.id, viewed_run.id, running_run.id],
+        ).count(), 3)
+        self.assertEqual(ScheduleVersion.objects.filter(id=version.id).count(), 1)
+        self.assertTrue(ScheduleShiftInstance.objects.filter(id=shift_instance.id).exists())
 
     def test_delete_failed_optimizer_run_succeeds_without_touching_active_run(self):
         self.client.post(
@@ -3039,6 +3240,13 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertIn('workload_candidate_swaps_considered', payload['debug'])
         self.assertIn('workload_moves_accepted', payload['debug'])
         self.assertIn('workload_swaps_accepted', payload['debug'])
+        self.assertIn('workload_minimum_repair', payload['debug']['phase_order'])
+        self.assertIn('workload_minimum_repair_physicians_considered', payload['debug'])
+        self.assertIn('workload_minimum_repair_candidates_considered', payload['debug'])
+        self.assertIn('workload_minimum_repair_accepts', payload['debug'])
+        self.assertIn('workload_minimum_repair_best_delta', payload['debug'])
+        self.assertIn('workload_minimum_repair_rejected_reasons', payload['debug'])
+        self.assertIn('workload_minimum_repair_turner_summary', payload['debug'])
         self.assertIn('workload_score_initial', payload['debug'])
         self.assertIn('workload_score_final', payload['debug'])
         self.assertIn('final_plateau_repair', payload['debug']['phase_order'])
@@ -3090,6 +3298,161 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(assigned_counts[first.id], 1)
         self.assertEqual(assigned_counts[second.id], 1)
+
+    def test_workload_minimum_repair_transfers_from_in_range_owner(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 6))
+        ten_hour = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(17, 0),
+            active_days_of_week=['Wednesday'],
+            weekend_days=[],
+            default_staffing_count=1,
+            active=True,
+        )
+        turner = self._create_assignment_physician(
+            'minimum.turner@example.com', 'Turner', facilities=[self.facility],
+        )
+        donor = self._create_assignment_physician(
+            'minimum.donor@example.com', 'Minimum Donor', facilities=[self.facility],
+        )
+        contract = Contract.objects.get(user_assignments__physician=turner)
+        contract.workload_settings = {'period_rules': [{
+            'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+            'min_value': '20', 'max_value': '30',
+            'min_penalty_weight': '10000', 'max_penalty_weight': '10000',
+        }]}
+        contract.save(update_fields=['workload_settings', 'updated_at'])
+        contract = Contract.objects.get(user_assignments__physician=donor)
+        contract.workload_settings = {'period_rules': [{
+            'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+            'min_value': '40', 'max_value': '50',
+            'min_penalty_weight': '10000', 'max_penalty_weight': '10000',
+        }]}
+        contract.save(update_fields=['workload_settings', 'updated_at'])
+        instances = [
+            self._create_shift_instance(version, ten_hour, date(2026, 7, day))
+            for day in range(1, 7)
+        ]
+        source = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('100000'), is_active=True,
+        )
+        for index, instance in enumerate(instances):
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=turner if index == 0 else donor,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+                optimizer_run=source,
+            )
+
+        with patch('apps.scheduling.optimizer.SAFE_BASELINE_PHASE_PASSES', 0):
+            response = self.client.post(
+                f'/api/schedule-versions/{version.id}/run-optimizer/',
+                data={
+                    'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                    'currently_viewed_run_id': source.id,
+                    'seed': 709,
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        debug = payload['debug']
+        self.assertGreater(debug['workload_minimum_repair_accepts'], 0)
+        self.assertLess(debug['workload_minimum_repair_best_delta'], 0)
+        self.assertTrue(debug['workload_minimum_repair_turner_summary']['accepts'])
+        candidate_run = OptimizerRun.objects.get(id=payload['optimizer_run_id'])
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=candidate_run, physician=turner,
+            ).count(),
+            2,
+        )
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=source, physician=turner,
+            ).count(),
+            1,
+        )
+
+    def test_workload_minimum_repair_rejects_equal_tradeoff_and_preserves_lock(self):
+        version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 3))
+        ten_hour = ShiftTemplate.objects.create(
+            facility=self.facility, start_time=time(7, 0), end_time=time(17, 0),
+            active_days_of_week=['Wednesday'], weekend_days=[],
+            default_staffing_count=1, active=True,
+        )
+        turner = self._create_assignment_physician(
+            'locked.turner@example.com', 'Turner Locked', facilities=[self.facility],
+        )
+        donor = self._create_assignment_physician(
+            'locked.donor@example.com', 'Locked Donor', facilities=[self.facility],
+        )
+        for physician in (turner, donor):
+            contract = Contract.objects.get(user_assignments__physician=physician)
+            contract.workload_settings = {'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '20', 'max_value': '30',
+                'min_penalty_weight': '10000', 'max_penalty_weight': '10000',
+            }]}
+            contract.save(update_fields=['workload_settings', 'updated_at'])
+        instances = [
+            self._create_shift_instance(version, ten_hour, date(2026, 7, day))
+            for day in range(1, 4)
+        ]
+        source = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('100000'), is_active=True,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instances[0], physician=turner,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=source,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instances[1], physician=donor,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=source, is_locked=True,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instances[2], physician=donor,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=source,
+        )
+
+        with patch('apps.scheduling.optimizer.SAFE_BASELINE_PHASE_PASSES', 0):
+            response = self.client.post(
+                f'/api/schedule-versions/{version.id}/run-optimizer/',
+                data={
+                    'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                    'currently_viewed_run_id': source.id,
+                    'seed': 711,
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        debug = payload['debug']
+        self.assertEqual(debug['workload_minimum_repair_accepts'], 0)
+        self.assertGreater(
+            debug['workload_minimum_repair_rejected_reasons'].get(
+                'donor_workload_tradeoff', 0,
+            ),
+            0,
+        )
+        candidate_run = OptimizerRun.objects.get(id=payload['optimizer_run_id'])
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(
+            optimizer_run=candidate_run, shift_instance=instances[1],
+            physician=donor, is_locked=True,
+        ).exists())
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(
+            optimizer_run=source, shift_instance=instances[2], physician=donor,
+        ).exists())
 
     def test_final_plateau_workload_micro_repair_reduces_one_hour_overage(self):
         version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 12))
