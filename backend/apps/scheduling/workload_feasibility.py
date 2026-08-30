@@ -23,6 +23,42 @@ def _number(value):
     return float(value) if value is not None else None
 
 
+def _aggregate_hour_rule_bounds(rule_rows):
+    """Sum disjoint windows, then intersect simultaneous period-rule totals.
+
+    Monthly and block rules constrain the same hours, not extra capacity.
+    Duplicate rules for a window also intersect rather than add.
+    """
+    periods = defaultdict(lambda: defaultdict(list))
+    for row in rule_rows:
+        periods[row['period']][(row['period_start'], row['period_end'])].append(row)
+    minimum_totals = []
+    maximum_totals = []
+    for windows in periods.values():
+        minimum_total = Decimal('0')
+        maximum_total = Decimal('0')
+        bounded = True
+        for rows in windows.values():
+            minimum_total += max(
+                Decimal(str(row['effective_min_hours'] or 0)) for row in rows
+            )
+            maxima = [
+                Decimal(str(row['effective_max_hours'])) for row in rows
+                if row['effective_max_hours'] is not None
+            ]
+            if maxima:
+                maximum_total += min(maxima)
+            else:
+                bounded = False
+        minimum_totals.append(minimum_total)
+        if bounded:
+            maximum_totals.append(maximum_total)
+    return (
+        max(minimum_totals, default=Decimal('0')),
+        min(maximum_totals) if maximum_totals else None,
+    )
+
+
 def _fte_adjustment_preview(status, physician_rows, available_hours, aggregate_min, total_max):
     if status == 'maximum_infeasible':
         candidates = [
@@ -772,11 +808,6 @@ def build_workload_feasibility(version, optimizer_run=None):
                     deficit * effective['min_penalty_weight']
                     + surplus * effective['max_penalty_weight']
                 )
-                physician_min += minimum or Decimal('0')
-                if maximum is None:
-                    physician_max_unbounded = True
-                else:
-                    physician_max += maximum
                 rule_rows.append({
                     'period': effective['period_type'],
                     'period_start': window_start.isoformat(),
@@ -789,6 +820,8 @@ def build_workload_feasibility(version, optimizer_run=None):
                     'workload_score_contribution': _number(contribution) if optimizer_run else None,
                 })
 
+        physician_min, physician_max = _aggregate_hour_rule_bounds(rule_rows)
+        physician_max_unbounded = physician_max is None
         name = _physician_display_name(physician)
         if not rule_rows:
             physicians_without_hour_ranges.append(name)

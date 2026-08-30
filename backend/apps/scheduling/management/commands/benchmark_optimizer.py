@@ -2,6 +2,7 @@ import csv
 import json
 import secrets
 from contextlib import nullcontext
+from math import log10
 from pathlib import Path
 from statistics import mean, median
 from time import monotonic
@@ -12,7 +13,8 @@ from django.db import transaction
 
 from apps.scheduling import optimizer
 from apps.scheduling.models import (
-    OptimizerRun, ScheduleShiftAssignment, ScheduleShiftInstance, ScheduleVersion,
+    ContractUserAssignment, OptimizerRun, ScheduleShiftAssignment,
+    ScheduleShiftInstance, ScheduleVersion,
 )
 from apps.scheduling.run_state import assignments_for_viewed_run
 
@@ -30,6 +32,8 @@ TRIAL_FIELDS = (
     'visible_assignments_added_after_final_scoring',
     'status', 'run_kind', 'initial_score', 'final_total_score',
     'assignments_made', 'unfilled_shifts', 'timed_out', 'error',
+    'search_candidates', 'search_candidates_per_second', 'pairwise_candidates',
+    'full_score_evaluations', 'full_scores_per_second',
 )
 
 
@@ -190,7 +194,7 @@ class Command(BaseCommand):
         version.schedule_block.refresh_from_db(fields=['build_status'])
         status_after = version.schedule_block.build_status
         report = {
-            'benchmark_version': 4,
+            'benchmark_version': 5,
             'mode': options['mode'],
             'persistence_mode': persistence_mode,
             'schedule_block_id': version.schedule_block_id,
@@ -221,6 +225,7 @@ class Command(BaseCommand):
                 if options['retain_best'] else
                 'All BENCHMARK runs rolled back; Build Workspace state unchanged.'
             ),
+            'scale': self._scale_metrics(version),
             'summary': summary,
             'batches': batches,
             'trials': trials,
@@ -414,7 +419,11 @@ class Command(BaseCommand):
                 f'run={run_index} kind={trial["run_kind"]} '
                 f'candidate_run_id={trial["candidate_run_id"]} seed={seed} status={trial["status"]} '
                 f'initial={trial["initial_score"]} final={trial["final_total_score"]} '
-                f'seconds={trial["runtime_seconds"]:.3f}'
+                f'seconds={trial["runtime_seconds"]:.3f} '
+                f'search_candidates={trial["search_candidates"]} '
+                f'candidates_per_second={trial["search_candidates_per_second"]} '
+                f'full_scores={trial["full_score_evaluations"]} '
+                f'full_scores_per_second={trial["full_scores_per_second"]}'
             )
         return trials, summarize_trials(trials)
 
@@ -470,6 +479,7 @@ class Command(BaseCommand):
 
             initial_source_run_id = best_run.id
             initial_snapshot = self._source_snapshot(version, best_run)
+            self._assert_complete_source(best_run, initial_snapshot)
             initial_score = initial_snapshot['score']
             best_score = initial_score
             attempt_seeds = options.get('_attempt_seeds') or self._attempt_seeds(
@@ -520,6 +530,9 @@ class Command(BaseCommand):
                     if accepted:
                         best_run = candidate_run
                         best_score = candidate_score
+                    runtime_seconds = float(
+                        payload.get('runtime_seconds') or (monotonic() - started_at)
+                    )
                     trial = {
                         'run_index': run_index,
                         'source_run_id': source_run.id,
@@ -530,7 +543,7 @@ class Command(BaseCommand):
                         'score_delta': candidate_score - source_score,
                         'accepted_as_new_best': accepted,
                         'best_score_so_far': best_score,
-                        'runtime_seconds': float(payload.get('runtime_seconds') or (monotonic() - started_at)),
+                        'runtime_seconds': runtime_seconds,
                         'seed': seed,
                         'stopped_reason': payload.get('stopped_reason'),
                         'optimizer_initial_score': optimizer_initial_score,
@@ -562,6 +575,7 @@ class Command(BaseCommand):
                         'unfilled_shifts': payload.get('unfilled_shift_count'),
                         'timed_out': bool(payload.get('timed_out')),
                         'error': None,
+                        **self._search_metrics(payload, runtime_seconds),
                     }
                 except CommandError:
                     raise
@@ -593,6 +607,10 @@ class Command(BaseCommand):
                     f'accepted_as_new_best={"yes" if trial["accepted_as_new_best"] else "no"} '
                     f'best_score_so_far={trial["best_score_so_far"]} '
                     f'runtime_seconds={trial["runtime_seconds"]:.3f} seed={seed} '
+                    f'search_candidates={trial["search_candidates"]} '
+                    f'candidates_per_second={trial["search_candidates_per_second"]} '
+                    f'full_scores={trial["full_score_evaluations"]} '
+                    f'full_scores_per_second={trial["full_scores_per_second"]} '
                     f'stopped_reason={trial["stopped_reason"]} error={trial["error"]}'
                 )
 
@@ -678,12 +696,26 @@ class Command(BaseCommand):
         )
         return {
             'score': float(report['total_score']),
+            'coverage_score': float(
+                report.get('score_breakdown', {}).get('coverage_score', 0)
+            ),
             'assignment_count': len({
                 (row['shift_instance_id'], row['physician_id']) for row in rows
             }),
             'assignment_ids': [row['id'] for row in rows],
             'shift_instance_ids': sorted({row['shift_instance_id'] for row in rows}),
         }
+
+    def _assert_complete_source(self, source_run, source_snapshot):
+        if source_snapshot.get('coverage_score', 0) == 0:
+            return
+        raise CommandError(
+            'Benchmark source is obsolete or incomplete for the current shift instances; '
+            'generate and complete a current optimizer run before benchmarking. '
+            f'source_run_id={source_run.id} '
+            f'coverage_score={source_snapshot["coverage_score"]} '
+            f'assignment_count={source_snapshot["assignment_count"]}.'
+        )
 
     def _assert_source_start_matches(
         self, source_run, stored_source_score, source_snapshot,
@@ -715,6 +747,8 @@ class Command(BaseCommand):
     def _independent_trial(self, run_index, seed, payload, created_run, started_at):
         final_score = float(payload['final_score'])
         initial_score = float(payload['initial_score'])
+        runtime_seconds = float(payload.get('runtime_seconds') or (monotonic() - started_at))
+        search_metrics = self._search_metrics(payload, runtime_seconds)
         return {
             'run_index': run_index,
             'source_run_id': None,
@@ -725,7 +759,7 @@ class Command(BaseCommand):
             'score_delta': final_score - initial_score,
             'accepted_as_new_best': None,
             'best_score_so_far': final_score,
-            'runtime_seconds': float(payload.get('runtime_seconds') or (monotonic() - started_at)),
+            'runtime_seconds': runtime_seconds,
             'seed': seed,
             'stopped_reason': payload.get('stopped_reason'),
             'optimizer_initial_score': initial_score,
@@ -752,6 +786,7 @@ class Command(BaseCommand):
             'unfilled_shifts': payload.get('unfilled_shift_count'),
             'timed_out': bool(payload.get('timed_out')),
             'error': None,
+            **search_metrics,
         }
 
     def _error_trial(
@@ -789,6 +824,54 @@ class Command(BaseCommand):
             'unfilled_shifts': None,
             'timed_out': False,
             'error': f'{type(exc).__name__}: {exc}',
+            'search_candidates': None,
+            'search_candidates_per_second': None,
+            'pairwise_candidates': None,
+            'full_score_evaluations': None,
+            'full_scores_per_second': None,
+        }
+
+    @staticmethod
+    def _search_metrics(payload, runtime_seconds):
+        debug = payload.get('debug') or {}
+        search_candidates = int(debug.get('candidates_considered_before_timeout') or 0)
+        pairwise_candidates = int(debug.get('pairwise_candidates_considered') or 0)
+        full_score_evaluations = int(debug.get('full_score_evaluations') or 0)
+        return {
+            'search_candidates': search_candidates,
+            'search_candidates_per_second': (
+                search_candidates / runtime_seconds if runtime_seconds > 0 else None
+            ),
+            'pairwise_candidates': pairwise_candidates,
+            'full_score_evaluations': full_score_evaluations,
+            'full_scores_per_second': (
+                full_score_evaluations / runtime_seconds if runtime_seconds > 0 else None
+            ),
+        }
+
+    @staticmethod
+    def _scale_metrics(version):
+        block = version.schedule_block
+        shift_instances = ScheduleShiftInstance.objects.filter(schedule_version=version)
+        required_slots = sum(
+            shift_instances.values_list('required_staffing', flat=True)
+        )
+        physician_count = ContractUserAssignment.objects.filter(
+            domain=version.domain,
+            contract__active=True,
+            physician__active=True,
+        ).values('physician_id').distinct().count()
+        block_days = (block.end_date - block.start_date).days + 1
+        return {
+            'block_days': block_days,
+            'approximate_months': round(block_days / 30.4375, 2),
+            'physicians': physician_count,
+            'shift_instances': shift_instances.count(),
+            'required_assignment_slots': required_slots,
+            'raw_assignment_choice_log10': (
+                required_slots * log10(physician_count)
+                if physician_count > 0 else 0
+            ),
         }
 
     @staticmethod

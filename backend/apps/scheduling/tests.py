@@ -29,8 +29,10 @@ from .optimizer import (
     _initial_fill_workload_guard,
     _night_volume_delta_from_totals,
     _night_volume_pressure_from_totals,
+    _should_preserve_timeout_result,
     _night_violation_report,
     _score_schedule,
+    _selected_physician_score_delta,
     _shift_hours,
     _validated_night_report_for_current_assignments,
     _workload_schedule_score,
@@ -41,6 +43,37 @@ from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
+    def test_anytime_timeout_result_requires_complete_valid_improvement(self):
+        valid_scoring = {'validation': {
+            'final_rest_violations': 0,
+            'final_overlap_violations': 0,
+            'final_duplicate_violations': 0,
+            'final_overstaffed_violations': 0,
+            'final_facility_ineligible_violations': 0,
+            'final_inactive_physician_violations': 0,
+        }}
+        self.assertTrue(_should_preserve_timeout_result(
+            timed_out=True,
+            initial_score=Decimal('100'),
+            final_score=Decimal('80'),
+            final_scoring=valid_scoring,
+            unfilled_shift_count=0,
+        ))
+        self.assertFalse(_should_preserve_timeout_result(
+            timed_out=True,
+            initial_score=Decimal('100'),
+            final_score=Decimal('100'),
+            final_scoring=valid_scoring,
+            unfilled_shift_count=0,
+        ))
+        self.assertFalse(_should_preserve_timeout_result(
+            timed_out=True,
+            initial_score=Decimal('100'),
+            final_score=Decimal('80'),
+            final_scoring=valid_scoring,
+            unfilled_shift_count=1,
+        ))
+
     def test_incremental_night_volume_delta_prefers_remaining_capacity(self):
         window_start = date(2026, 12, 1)
         window_end = date(2027, 1, 31)
@@ -4145,6 +4178,39 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(workload_rows[physicians[2].id]['score_contribution'], 80000.0)
         self.assertEqual(float(scoring['breakdown']['workload_score']), 80000.0)
 
+        trial_state = defaultdict(list, {
+            instance_id: list(physician_ids)
+            for instance_id, physician_ids in state.items()
+        })
+        moved_instance = instances[11]
+        trial_state[moved_instance.id] = [physicians[0].id]
+        trial_scoring = _score_schedule(
+            instances,
+            physicians,
+            trial_state,
+            targets,
+            contract_by_physician,
+            defaultdict(list),
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+        )
+        selected_delta = _selected_physician_score_delta(
+            instances,
+            physicians,
+            state,
+            trial_state,
+            {physicians[0].id, physicians[2].id},
+            targets,
+            contract_by_physician,
+            defaultdict(list),
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+        )
+        self.assertEqual(
+            selected_delta,
+            trial_scoring['score'] - scoring['score'],
+        )
+
     def test_lower_workload_contract_limits_initial_allocation(self):
         version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 6))
         day_template = ShiftTemplate.objects.create(
@@ -5391,6 +5457,38 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
                 for key, value in breakdown.items()
                 if key != 'total_score'
             ),
+        )
+
+        redistributed_state = defaultdict(list, {
+            instance_id: list(physician_ids)
+            for instance_id, physician_ids in state.items()
+        })
+        redistributed_state[instances[-1].id] = [alternate.id]
+        redistributed_scoring = _score_schedule(
+            instances,
+            physicians,
+            redistributed_state,
+            targets,
+            contract_by_physician,
+            defaultdict(list),
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+        )
+        redistributed_delta = _selected_physician_score_delta(
+            instances,
+            physicians,
+            state,
+            redistributed_state,
+            {clustered.id, alternate.id},
+            targets,
+            contract_by_physician,
+            defaultdict(list),
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+        )
+        self.assertEqual(
+            redistributed_delta,
+            redistributed_scoring['score'] - scoring['score'],
         )
 
     def test_schedule_version_violation_report_lists_all_users(self):

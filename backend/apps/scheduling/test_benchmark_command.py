@@ -60,6 +60,36 @@ class OptimizerBenchmarkCommandTests(TestCase):
         self.assertIn('retained_best_run_id: None', output)
         self.assertIn('schedule_changes_retained: no', output)
 
+    def test_scale_and_search_metrics_quantify_optimizer_work(self):
+        scale = BenchmarkCommand._scale_metrics(self.version)
+        self.assertEqual(scale['block_days'], 1)
+        self.assertEqual(scale['physicians'], 0)
+        self.assertEqual(scale['shift_instances'], 0)
+        self.assertEqual(scale['required_assignment_slots'], 0)
+        self.assertEqual(scale['raw_assignment_choice_log10'], 0)
+
+        metrics = BenchmarkCommand._search_metrics(
+            {'debug': {
+                'candidates_considered_before_timeout': 2500,
+                'pairwise_candidates_considered': 400,
+                'full_score_evaluations': 25,
+            }},
+            5.0,
+        )
+        self.assertEqual(metrics['search_candidates'], 2500)
+        self.assertEqual(metrics['search_candidates_per_second'], 500)
+        self.assertEqual(metrics['pairwise_candidates'], 400)
+        self.assertEqual(metrics['full_score_evaluations'], 25)
+        self.assertEqual(metrics['full_scores_per_second'], 5)
+
+        with self.assertRaisesMessage(
+            CommandError, 'Benchmark source is obsolete or incomplete',
+        ):
+            BenchmarkCommand()._assert_complete_source(
+                SimpleNamespace(id=77),
+                {'coverage_score': 1000.0, 'assignment_count': 12},
+            )
+
     def test_explicit_seed_base_is_deterministic_and_reproducible(self):
         outputs = []
         for _attempt in range(2):

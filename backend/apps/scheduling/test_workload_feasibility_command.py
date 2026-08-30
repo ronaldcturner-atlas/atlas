@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from datetime import date, datetime, time
 from io import StringIO
 
@@ -22,9 +23,47 @@ from .models import (
     ShiftTemplate,
 )
 from .optimizer import optimize_schedule_version
+from .workload_feasibility import _aggregate_hour_rule_bounds
 
 
 class ExplainWorkloadFeasibilityCommandTests(TestCase):
+    def test_overlapping_period_capacity_matches_42_full_and_two_fractional_users(self):
+        def row(period, start, end, minimum, maximum):
+            return {'period': period, 'period_start': start, 'period_end': end,
+                    'effective_min_hours': minimum, 'effective_max_hours': maximum}
+        full = [
+            row('MONTH', '2026-12-01', '2026-12-31', 100, 140),
+            row('MONTH', '2027-01-01', '2027-01-31', 100, 140),
+            row('SCHEDULE_BLOCK', '2026-12-01', '2027-01-31', 200, 280),
+        ]
+        fractional = [
+            row('MONTH', '2026-12-01', '2026-12-31', 60, 70),
+            row('MONTH', '2027-01-01', '2027-01-31', 60, 70),
+        ]
+        full_min, full_max = _aggregate_hour_rule_bounds(full)
+        part_min, part_max = _aggregate_hour_rule_bounds(fractional)
+        self.assertEqual(full_min * 42 + part_min * 2, Decimal('8640'))
+        self.assertEqual(full_max * 42 + part_max * 2, Decimal('12040'))
+        self.assertEqual(_aggregate_hour_rule_bounds(full + full), (full_min, full_max))
+        full[-1]['effective_min_hours'] = 220
+        full[-1]['effective_max_hours'] = 260
+        self.assertEqual(_aggregate_hour_rule_bounds(full), (Decimal('220'), Decimal('260')))
+        full[-1]['effective_max_hours'] = None
+        self.assertEqual(_aggregate_hour_rule_bounds(full), (Decimal('220'), Decimal('280')))
+
+    def test_overlapping_rules_drive_correct_maximum_adjustment_preview(self):
+        for contract in self.contracts:
+            contract.workload_settings = {'period_rules': [
+                {'period_type': period, 'units': 'HOURS', 'min_value': '0', 'max_value': '4'}
+                for period in ('SCHEDULE_BLOCK', 'WEEK')
+            ]}
+            contract.save(update_fields=['workload_settings'])
+        report = self._run()['aggregate_feasibility']
+        self.assertEqual(report['sum_effective_maximum_hours'], 8)
+        self.assertEqual(report['status'], 'maximum_infeasible')
+        self.assertEqual(report['fte_adjustment_preview']['direction'], 'increase_maximum')
+        self.assertEqual(report['fte_adjustment_preview']['required_adjustment_hours'], 2)
+
     def setUp(self):
         self.domain = Domain.objects.create(name='Physician', active=True)
         self.facility = Facility.objects.create(name='Hours Hospital', short_name='Hours')
