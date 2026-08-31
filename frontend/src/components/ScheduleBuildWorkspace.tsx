@@ -1516,6 +1516,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
   const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
+  const bothFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
+    && nightFeasibility?.status === 'feasible'
   const nightCapacityShortfall = Math.max(0, ...(nightFeasibility?.periods.map((period) => (
     period.remaining_maximum_night_shifts === null
       ? 0
@@ -1660,6 +1662,57 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       </div>
 
       {context.workload_feasibility && (
+        <>
+        {bothFeasibilityChecksPass ? (
+          <section className="feasibility-compact-summary" aria-label="Feasibility checks passed">
+            <div className="feasibility-compact-item">
+              <strong tabIndex={0}>Workload feasibility</strong>
+              <div className="feasibility-hover-panel workload-feasibility-hover-panel" role="tooltip">
+                <h3>Workload feasibility</h3>
+                <dl>
+                  <div><dt>Required hours</dt><dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd></div>
+                  <div><dt>Combined minimum</dt><dd>{context.workload_feasibility.sum_effective_minimum_hours.toFixed(1)}</dd></div>
+                  <div>
+                    <dt>Combined maximum</dt>
+                    <dd>{context.workload_feasibility.sum_effective_maximum_hours === null
+                      ? 'Unbounded'
+                      : context.workload_feasibility.sum_effective_maximum_hours.toFixed(1)}</dd>
+                  </div>
+                  <div><dt>Difference</dt><dd>Inside aggregate range</dd></div>
+                </dl>
+                <p>{context.workload_feasibility.interpretation}</p>
+                {context.workload_feasibility.physicians_without_hour_ranges.length > 0 && (
+                  <p>{context.workload_feasibility.physicians_without_hour_ranges.length} active physician(s) are excluded from bounded totals because they do not have an applicable hour range.</p>
+                )}
+                <small>Aggregate feasibility does not account for eligibility, nights, rest, requests, or locks.</small>
+              </div>
+            </div>
+            <div className="feasibility-compact-item">
+              <strong tabIndex={0}>Night-shift feasibility</strong>
+              <div className="feasibility-hover-panel night-feasibility-hover-panel" role="tooltip">
+                <h3>Night-shift feasibility</h3>
+                <div className="feasibility-hover-periods">
+                  {context.workload_feasibility.night_feasibility.periods.map((period) => (
+                    <article key={`${period.period_type}-${period.period_start}-${period.period_end}`}>
+                      <h4>{nightPeriodLabel(period.period_type, period.period_start, period.period_end)}</h4>
+                      <dl>
+                        <div><dt>Required</dt><dd>{period.required_night_shifts}</dd></div>
+                        <div><dt>Fixed</dt><dd>{period.fixed_manual_night_shifts}</dd></div>
+                        <div><dt>Remaining</dt><dd>{period.remaining_night_shifts}</dd></div>
+                        <div>
+                          <dt>Allowed remaining</dt>
+                          <dd>{period.remaining_minimum_night_shifts.toFixed(0)}–{period.remaining_maximum_night_shifts === null ? '∞' : period.remaining_maximum_night_shifts.toFixed(0)}</dd>
+                        </div>
+                      </dl>
+                    </article>
+                  ))}
+                </div>
+                <p>{context.workload_feasibility.night_feasibility.fixed_manual_night_shifts} locked manual night assignment(s) included.</p>
+                <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
+              </div>
+            </div>
+          </section>
+        ) : (
         <>
         <section
           className={`workload-feasibility-card workload-feasibility-${context.workload_feasibility.status}`}
@@ -1826,6 +1879,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </div>
           <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
         </section>
+        </>
+        )}
         </>
       )}
 
