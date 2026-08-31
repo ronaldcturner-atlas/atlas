@@ -241,6 +241,9 @@ select option:checked{
 .danger-action{border-color:rgba(248,113,113,0.45)!important;color:#fecaca!important;background:rgba(127,29,29,0.16)!important}
 .build-workspace-link-button{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;min-height:38px}
 .violation-report-page{display:flex;flex-direction:column;gap:18px}
+.violation-report-page .optimizer-summary-panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+.violation-report-page .optimizer-summary-panel>div{display:flex;flex-direction:column;gap:5px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)}
+.violation-report-page .optimizer-summary-panel span{color:var(--muted);font-size:13px}
 .violation-report-warning{border:1px solid rgba(251,191,36,0.45);background:rgba(251,191,36,0.12);color:var(--sidebar-fg);border-radius:8px;padding:12px}
 .violation-report-warning p{margin:0 0 6px}
 .violation-report-warning p:last-child{margin-bottom:0}

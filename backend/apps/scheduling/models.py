@@ -413,6 +413,15 @@ class ScheduleRequest(models.Model):
         ]
 
 
+class OptimizerControl(models.Model):
+    """Cooperative cancellation, committed separately from the search transaction."""
+    token = models.UUIDField(primary_key=True)
+    schedule_version = models.OneToOneField(ScheduleVersion, on_delete=models.CASCADE)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
+    stop_requested = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class Contract(models.Model):
     """A domain-specific scheduling rule set."""
 

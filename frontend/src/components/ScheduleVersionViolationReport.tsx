@@ -28,6 +28,8 @@ type AssignmentDetail = {
 }
 
 type ViolationRow = {
+  period_start?: string | null
+  period_end?: string | null
   violation_type: string
   dates_involved: string[]
   night_block_dates?: string[]
@@ -52,6 +54,16 @@ type ViolationRow = {
 }
 
 type WorkloadScoreRow = {
+  rule_rows?: Array<{
+    period_type: string
+    period_start: string
+    period_end: string
+    units: string
+    assigned_value: number
+    effective_min_value: number | null
+    effective_max_value: number | null
+    score_contribution: number
+  }>
   physician_id: number
   physician: string
   assigned_shifts: number
@@ -334,6 +346,11 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
           <span>Same shift score</span>
           <strong>{(report.score_breakdown.same_shift_score ?? 0).toFixed(1)}</strong>
         </div>
+        <div><span>Weekend score</span><strong>{(report.score_breakdown.weekend_score ?? 0).toFixed(1)}</strong></div>
+        <div><span>Consecutive days score</span><strong>{(report.score_breakdown.consecutive_days_score ?? 0).toFixed(1)}</strong></div>
+        <div><span>Facility distribution score</span><strong>{(report.score_breakdown.facility_distribution_score ?? 0).toFixed(1)}</strong></div>
+        <div><span>Underutilization score</span><strong>{(report.score_breakdown.underutilization_score ?? 0).toFixed(1)}</strong></div>
+        <div><span>Invalid assignment score</span><strong>{(report.score_breakdown.invalid_assignment_score ?? 0).toFixed(1)}</strong></div>
       </div>
 
       <div className="violation-user-list">
@@ -350,7 +367,9 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             </div>
 
             {user.violations.length === 0 ? (
-              <p className="violation-empty">No violations</p>
+              <p className="violation-empty">{(user.workload_score?.score_contribution ?? 0) > 0
+                ? 'Workload violations are shown below. No other listed violations.'
+                : 'No listed violations'}</p>
             ) : (
               <div className="violation-table-wrap">
                 <table className="scheduler-table violation-table">
@@ -372,7 +391,9 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                       <tr key={`${violation.violation_type}-${index}`}>
                         <td>{prettyType(violation.violation_type)}</td>
                         <td>{violation.contract_name ?? '-'}</td>
-                        <td>{violation.dates_involved.map(formatDate).join(', ') || '-'}</td>
+                        <td>{violation.period_start && violation.period_end
+                          ? `${formatDate(violation.period_start)} – ${formatDate(violation.period_end)}`
+                          : violation.dates_involved.map(formatDate).join(', ') || '-'}</td>
                         <td>{shiftFacilityLabel(violation)}</td>
                         <td>{formatValue(violation.configured_limit)}</td>
                         <td>{formatValue(violation.actual_value)}</td>
@@ -389,6 +410,22 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             {user.workload_score && (
               <div className="violation-workload-score">
                 <h4>Workload balancing score</h4>
+                {user.workload_score.rule_rows?.length ? (
+                  <div className="violation-table-wrap">
+                    <table className="scheduler-table violation-table">
+                      <thead><tr><th>Period</th><th>Dates</th><th>Assigned in period</th><th>Allowed range</th><th>Penalty</th></tr></thead>
+                      <tbody>{user.workload_score.rule_rows.map((rule, index) => (
+                        <tr key={`${rule.period_type}-${rule.period_start}-${index}`}>
+                          <td>{prettyType(rule.period_type)}</td>
+                          <td>{formatDate(rule.period_start)} – {formatDate(rule.period_end)}</td>
+                          <td>{rule.assigned_value.toFixed(1)} {rule.units.toLowerCase()}</td>
+                          <td>{rule.effective_min_value ?? 'No minimum'} – {rule.effective_max_value ?? 'No maximum'} {rule.units.toLowerCase()}</td>
+                          <td>{rule.score_contribution.toFixed(1)}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                ) : (
                 <div className="violation-user-metrics">
                   <span>Contract: {user.workload_score.contract_name ?? 'No contract'}</span>
                   <span>Period: {user.workload_score.period_type ?? 'Not configured'}</span>
@@ -399,6 +436,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                   <span>Penalty weight: {user.workload_score.penalty_weight.toFixed(1)}</span>
                   <span>Score contribution: {user.workload_score.score_contribution.toFixed(1)}</span>
                 </div>
+                )}
               </div>
             )}
           </section>

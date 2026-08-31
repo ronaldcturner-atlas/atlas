@@ -458,6 +458,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isOptimizing, setIsOptimizing] = useState(false)
+  const [isStoppingOptimizer, setIsStoppingOptimizer] = useState(false)
+  const optimizerControlRef = useRef<{ token: string; versionId: number } | null>(null)
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
@@ -1076,6 +1078,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     try {
       closeAssignments()
       setIsOptimizing(true)
+      setIsStoppingOptimizer(false)
+      optimizerControlRef.current = { token: crypto.randomUUID(), versionId }
       setError(null)
       setNotice(null)
       setOptimizerSummary(null)
@@ -1092,6 +1096,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             schedule_version_id: versionId,
             currently_viewed_run_id: viewedRun?.id ?? null,
             start_mode: optimizerStartMode,
+            search_token: optimizerControlRef.current.token,
           }),
         },
       )
@@ -1123,6 +1128,26 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         }
       }
       setIsOptimizing(false)
+      setIsStoppingOptimizer(false)
+      optimizerControlRef.current = null
+    }
+  }
+
+  const stopOptimizer = async () => {
+    const control = optimizerControlRef.current
+    if (!control) return
+    setIsStoppingOptimizer(true)
+    try {
+      const response = await fetch(`${API_BASE}/schedule-versions/${control.versionId}/stop-optimizer/`, {
+        method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ search_token: control.token }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to request Stop.'))
+      setNotice(data.detail)
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Unable to request Stop.')
+      setIsStoppingOptimizer(false)
     }
   }
 
@@ -1588,6 +1613,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </small>
         </div>
 
+        {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
+          {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
+        </button>}
+        <span className="muted">Stops after 60 seconds without improvement; maximum 10 minutes. Keep this page open.</span>
         <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
           {isOptimizing
             ? 'Running...'

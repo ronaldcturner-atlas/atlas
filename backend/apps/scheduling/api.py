@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from uuid import UUID
+from time import monotonic
 
 from django.db.models import Q
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
@@ -20,6 +22,7 @@ from .models import (
     Contract,
     ContractUserAssignment,
     OptimizerRun,
+    OptimizerControl,
     ScheduleBlock,
     ScheduleRequest,
     ScheduleShiftAssignment,
@@ -960,6 +963,9 @@ def _mark_schedule_score_stale(version, viewed_run=None):
 
 
 def _cleanup_stale_optimizer_runs(version):
+    if OptimizerControl.objects.filter(schedule_version=version,
+                                       created_at__gte=timezone.now() - timedelta(minutes=15)).exists():
+        return 0
     stale_before = timezone.now() - timedelta(minutes=STALE_OPTIMIZER_RUN_MINUTES)
     stale_runs = OptimizerRun.objects.filter(
         schedule_version=version,
@@ -1275,14 +1281,60 @@ def _run_optimizer_response(request, version):
             'detail': 'An optimizer run is already running for this schedule version.',
             'optimizer_run_id': running_run.id,
         }, status=status.HTTP_409_CONFLICT)
+    control = None
+    token = request.data.get('search_token')
+    if token:
+        try:
+            token = UUID(str(token))
+        except ValueError:
+            return Response({'detail': 'Invalid search token.'}, status=400)
+        OptimizerControl.objects.filter(schedule_version=version,
+                                        created_at__lt=timezone.now() - timedelta(minutes=15)).delete()
+        try:
+            with transaction.atomic():
+                control = OptimizerControl.objects.create(token=token, schedule_version=version, created_by=request.user)
+        except IntegrityError:
+            return Response({'detail': 'An optimizer search is already running.'}, status=409)
+    elif OptimizerControl.objects.filter(schedule_version=version).exists():
+        return Response({'detail': 'An optimizer search is already running.'}, status=409)
+    last_poll, requested = [0.0], [False]
+
+    def stop_requested():
+        now = monotonic()
+        if control is not None and now - last_poll[0] >= 0.5:
+            requested[0] = OptimizerControl.objects.filter(token=control.token, stop_requested=True).exists()
+            last_poll[0] = now
+        return requested[0]
+
     try:
         summary = optimize_schedule_version(
             version, created_by=request.user, seed=seed,
             start_mode=start_mode, source_run=source_run,
+            adaptive_runtime=control is not None, stop_requested=stop_requested,
         )
     except ValueError as optimizer_error:
         return Response({'detail': str(optimizer_error)}, status=status.HTTP_400_BAD_REQUEST)
+    finally:
+        if control is not None:
+            OptimizerControl.objects.filter(token=control.token).delete()
     return Response(summary)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_stop_optimizer(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    try:
+        token = UUID(str(request.data.get('search_token', '')))
+    except ValueError:
+        return Response({'detail': 'Invalid search token.'}, status=400)
+    updated = OptimizerControl.objects.filter(token=token, schedule_version_id=version_id,
+                                             created_by=request.user).update(stop_requested=True)
+    if not updated:
+        return Response({'detail': 'This search has finished or is not yet ready to stop.'}, status=409)
+    return Response({'detail': 'Stop requested. Finishing the current check and preserving the best valid schedule.'})
 
 
 @api_view(['POST'])

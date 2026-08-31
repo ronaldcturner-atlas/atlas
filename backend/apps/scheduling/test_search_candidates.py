@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from .optimizer import _bounded_pairwise_candidates, _project_workload_change, _repair_workload_transfers, _repair_night_spacing_swaps
-from .optimizer import _run_productive_repair_rounds
+from .optimizer import _run_productive_repair_rounds, _round_robin_candidates, _repair_recovery_day_swaps
 
 
 class BoundedPairwiseCandidateTests(SimpleTestCase):
@@ -88,27 +88,48 @@ class WorkloadRankingTests(SimpleTestCase):
 
 
 class NightSpacingRepairTests(SimpleTestCase):
+    maximum_only = False
+    recovery_only = False
+
     def run_repair(self, *, workload=10, night=80, total=90, invalid=False,
-                   locked=False, stop=False, different_month=False, different_hours=False):
-        instances = [SimpleNamespace(id=1, date=date(2027, 1, 1), is_locked_open=False),
-                     SimpleNamespace(id=2, date=date(2027, 2 if different_month else 1, 15), is_locked_open=False)]
+                   locked=False, stop=False, different_month=False, different_hours=False,
+                   excess_reduced=True, receiver_night=False, locked_open=False, same_date=False):
+        instances = [SimpleNamespace(id=1, date=date(2027, 1, 1), is_locked_open=False,
+                                    shift_template=SimpleNamespace(night_shift=True)),
+                     SimpleNamespace(id=2, date=date(2027, 2 if different_month else 1, 15), is_locked_open=locked_open,
+                                     shift_template=SimpleNamespace(night_shift=receiver_night))]
         original = {1: [1], 2: [2]}
+        if same_date:
+            instances[1].date = instances[0].date
         baseline = {'score': 110, 'breakdown': {'night_score': 100, 'workload_score': 10}}
         candidate = {'score': total, 'breakdown': {'night_score': night, 'workload_score': workload}}
         report = {'night_violations': [{'violation_type': 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK',
                                        'shift_instance_ids': [1], 'physician_id': 1, 'penalty': 20}]}
+        if self.maximum_only:
+            report['night_violations'][0].update(violation_type='NIGHT_OVER_MAXIMUM', actual_value=8, configured_limit=7)
+        if self.recovery_only:
+            instances[0].shift_template.night_shift = False
+            report['night_violations'][0].update(
+                violation_type='INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
+                next_assignment={'shift_instance_id': 1})
+        def night_report(instances, physicians, state, contracts):
+            if self.maximum_only and state != original and excess_reduced:
+                return {'night_violations': []}
+            return report
         with patch('apps.scheduling.optimizer._score_schedule', return_value=baseline), \
-             patch('apps.scheduling.optimizer._night_violation_report', return_value=report), \
+             patch('apps.scheduling.optimizer._night_violation_report', side_effect=night_report), \
              patch('apps.scheduling.optimizer._shift_hours', side_effect=lambda x: 9 if different_hours and x.id == 2 else 8), \
              patch('apps.scheduling.optimizer._has_hard_invalids', return_value=invalid), \
              patch('apps.scheduling.optimizer.evaluate_plateau_pairwise_swap', return_value={
                  'legal': True, 'scoring': candidate, 'state': {1: [2], 2: [1]},
              }) as evaluate:
-            state, score, debug = _repair_night_spacing_swaps(
+            repair = _repair_recovery_day_swaps if self.recovery_only else _repair_night_spacing_swaps
+            state, score, debug = repair(
                 instances=instances, physicians=[], state=original, manual_pairs={(2, 2)} if locked else set(),
                 targets={}, contract_by_physician={}, requests_by_physician_date={},
                 eligible_facilities_by_physician={}, minimum_rest_by_physician={},
                 should_stop=lambda: stop, candidate_limit=1,
+                **({} if self.recovery_only else {'maximum_only': self.maximum_only}),
             )
         self.assertEqual(original, {1: [1], 2: [2]})
         return state, debug, evaluate.call_count
@@ -133,6 +154,55 @@ class NightSpacingRepairTests(SimpleTestCase):
                 state, debug, calls = self.run_repair(**options)
                 self.assertEqual(calls, 0)
                 self.assertEqual(debug['accepts'], [])
+
+
+class NightMaximumRepairTests(NightSpacingRepairTests):
+    maximum_only = True
+
+    def test_rejects_merely_moving_excess_to_another_physician(self):
+        state, debug, calls = self.run_repair(excess_reduced=False)
+        self.assertEqual(state, {1: [1], 2: [2]})
+        self.assertEqual(debug['accepts'], [])
+
+    def test_only_non_night_unlocked_counterparts(self):
+        for options in ({'receiver_night': True}, {'locked_open': True}):
+            state, debug, calls = self.run_repair(**options)
+            self.assertEqual(calls, 0)
+
+
+class RecoveryDayRepairTests(NightSpacingRepairTests):
+    recovery_only = True
+
+    def test_non_night_counterparts_and_locked_open(self):
+        for options in ({'receiver_night': True}, {'locked_open': True}, {'same_date': True}):
+            state, debug, calls = self.run_repair(**options)
+            self.assertEqual(calls, 0)
+
+    def test_round_robin_is_lazy_and_interleaves_unequal_streams(self):
+        self.assertEqual(list(_round_robin_candidates([[1, 2, 3], [], [4, 5]])), [1, 4, 2, 5, 3])
+        def endless():
+            while True:
+                yield 1
+        stream = _round_robin_candidates([endless(), [2]])
+        self.assertEqual([next(stream), next(stream)], [1, 2])
+
+    def test_candidate_budget_reaches_each_physician_before_revisiting(self):
+        instances = [SimpleNamespace(id=sid, date=date(2027, 1, day), is_locked_open=False,
+                                     shift_template=SimpleNamespace(night_shift=False))
+                     for sid, day in [(1, 1), (2, 10), (3, 20), (4, 2), (5, 11), (6, 21)]]
+        state = {1: [1], 2: [2], 3: [3], 4: [99], 5: [99], 6: [99]}
+        report = {'night_violations': [dict(
+            violation_type='INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
+            physician_id=pid, next_assignment={'shift_instance_id': pid}) for pid in (1, 2, 3)]}
+        with patch('apps.scheduling.optimizer._score_schedule', return_value={'score': 100}), \
+             patch('apps.scheduling.optimizer._night_violation_report', return_value=report), \
+             patch('apps.scheduling.optimizer._shift_hours', return_value=8), \
+             patch('apps.scheduling.optimizer.evaluate_plateau_pairwise_swap', return_value={'legal': False}) as evaluate:
+            _repair_recovery_day_swaps(
+                instances=instances, physicians=[], state=state, manual_pairs=set(), targets={},
+                contract_by_physician={}, requests_by_physician_date={}, eligible_facilities_by_physician={},
+                minimum_rest_by_physician={}, should_stop=lambda: False, candidate_limit=3)
+        self.assertEqual([call.kwargs['left_physician_id'] for call in evaluate.call_args_list], [1, 2, 3])
 
 
 class ProductiveRepairRoundTests(SimpleTestCase):
