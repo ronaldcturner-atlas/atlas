@@ -78,7 +78,8 @@ class GeneralizationBenchmarkTests(TestCase):
         models = [User, ScheduleBlock, OptimizerRun, ScheduleShiftAssignment]
         before = [model.objects.count() for model in models]
         results = [run_case(('1m-5p', 'partial', 'mixed'), seed=1, variant=variant, seconds=.1)
-                   for variant in ('current', 'without_targeted_repairs', 'without_general_repair')]
+                   for variant in ('current', 'without_targeted_repairs', 'without_general_repair',
+                                   'without_general_swaps')]
         self.assertEqual(before, [model.objects.count() for model in models])
         self.assertEqual(results[0]['initial_score'], results[1]['initial_score'])
         self.assertEqual(results[0]['starting_slots'], results[1]['starting_slots'])

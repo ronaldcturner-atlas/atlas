@@ -3578,6 +3578,139 @@ def _repair_general_constraint_reassignments(
     return current, current_scoring, debug
 
 
+def _repair_general_constraint_swaps(
+    *, instances, physicians, state, manual_pairs, targets,
+    contract_by_physician, requests_by_physician_date,
+    eligible_facilities_by_physician, minimum_rest_by_physician,
+    should_stop=lambda: False, candidate_limit=600, on_improvement=None,
+):
+    """Exchange two movable assignments to escape single-move local minima.
+
+    Constraint reports identify promising source assignments; legality and the
+    complete objective decide whether an exchange is accepted.
+    """
+    current = _copy_state(state)
+    instances_by_id = {instance.id: instance for instance in instances}
+    current_scoring = _score_schedule(
+        instances, physicians, current, targets, contract_by_physician,
+        requests_by_physician_date, eligible_facilities_by_physician,
+        minimum_rest_by_physician,
+    )
+    source_groups = (
+        ('request', _request_repair_candidates(
+            instances, physicians, current, manual_pairs, contract_by_physician,
+            requests_by_physician_date)),
+        ('same_shift', _same_shift_break_candidates(
+            instances, physicians, current, manual_pairs, contract_by_physician)),
+        ('consecutive_days', _consecutive_day_break_candidates(
+            current, instances_by_id, manual_pairs, contract_by_physician)),
+    )
+    sources, seen = [], set()
+    for source_kind, candidates in source_groups:
+        for physician_id, instance_id in candidates:
+            key = (physician_id, instance_id)
+            if key not in seen:
+                seen.add(key)
+                sources.append((source_kind, physician_id, instance_id))
+
+    assignments_by_physician = defaultdict(list)
+    for instance_id, physician_ids in current.items():
+        instance = instances_by_id.get(instance_id)
+        if instance is None:
+            continue
+        for physician_id in physician_ids:
+            if (instance_id, physician_id) not in manual_pairs:
+                assignments_by_physician[physician_id].append(instance)
+
+    debug = {'attempts': 0, 'accepts': [], 'stopped_reason': 'candidates_exhausted',
+             'source_counts': {name: len(rows) for name, rows in source_groups}}
+    physician_ids = sorted(physician.id for physician in physicians)
+    for source_kind, left_physician_id, left_instance_id in sources:
+        if should_stop() or debug['attempts'] >= candidate_limit:
+            debug['stopped_reason'] = 'runtime_or_candidate_limit'
+            break
+        left_instance = instances_by_id.get(left_instance_id)
+        if left_instance is None or left_physician_id not in current[left_instance_id]:
+            continue
+        if (left_instance_id, left_physician_id) in manual_pairs:
+            continue
+        for right_physician_id in physician_ids:
+            if should_stop() or debug['attempts'] >= candidate_limit:
+                debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                break
+            if right_physician_id == left_physician_id or right_physician_id in current[left_instance_id]:
+                continue
+            right_instances = sorted(
+                assignments_by_physician.get(right_physician_id, ()),
+                key=lambda item: (
+                    abs(_shift_hours(item) - _shift_hours(left_instance)),
+                    abs((item.date - left_instance.date).days),
+                    item.id,
+                ),
+            )
+            for right_instance in right_instances:
+                if should_stop() or debug['attempts'] >= candidate_limit:
+                    debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                    break
+                if right_instance.id == left_instance_id:
+                    continue
+                if left_physician_id in current[right_instance.id]:
+                    continue
+                if right_physician_id not in current[right_instance.id]:
+                    continue
+                if (right_instance.id, right_physician_id) in manual_pairs:
+                    continue
+                debug['attempts'] += 1
+                trial = _copy_state(current)
+                _replace_in_state(trial, left_instance_id, left_physician_id, right_physician_id)
+                _replace_in_state(trial, right_instance.id, right_physician_id, left_physician_id)
+                if not _can_assign_in_state(
+                    trial, instances_by_id, left_instance, right_physician_id,
+                    eligible_facilities_by_physician, minimum_rest_by_physician,
+                    exclude_instance_id=left_instance_id,
+                ):
+                    continue
+                if not _can_assign_in_state(
+                    trial, instances_by_id, right_instance, left_physician_id,
+                    eligible_facilities_by_physician, minimum_rest_by_physician,
+                    exclude_instance_id=right_instance.id,
+                ):
+                    continue
+                trial_scoring = _score_schedule(
+                    instances, physicians, trial, targets, contract_by_physician,
+                    requests_by_physician_date, eligible_facilities_by_physician,
+                    minimum_rest_by_physician,
+                )
+                if trial_scoring['score'] >= current_scoring['score']:
+                    continue
+                debug['accepts'].append({
+                    'source': source_kind,
+                    'left_shift_instance_id': left_instance_id,
+                    'left_physician_id': left_physician_id,
+                    'right_shift_instance_id': right_instance.id,
+                    'right_physician_id': right_physician_id,
+                    'score_before': float(current_scoring['score']),
+                    'score_after': float(trial_scoring['score']),
+                })
+                current, current_scoring = trial, trial_scoring
+                assignments_by_physician[left_physician_id] = [
+                    item for item in assignments_by_physician[left_physician_id]
+                    if item.id != left_instance_id
+                ] + [right_instance]
+                assignments_by_physician[right_physician_id] = [
+                    item for item in assignments_by_physician[right_physician_id]
+                    if item.id != right_instance.id
+                ] + [left_instance]
+                if on_improvement:
+                    on_improvement(current, current_scoring)
+                break
+            else:
+                continue
+            if debug['accepts'] and debug['accepts'][-1]['left_shift_instance_id'] == left_instance_id:
+                break
+    return current, current_scoring, debug
+
+
 def _night_fix_sources(instances_by_id, physicians, state, manual_pairs, contract_by_physician):
     instances = list(instances_by_id.values())
     report = _night_violation_report(
@@ -7739,6 +7872,7 @@ def optimize_schedule_version(
             if search_budget.best_score is not None:
                 state, final_scoring = adaptive_best_state, adaptive_best_scoring
                 repairs = [(_repair_general_constraint_reassignments, {}),
+                           (_repair_general_constraint_swaps, {}),
                            (_repair_workload_transfers, {}),
                            (_repair_night_spacing_swaps, {'maximum_only': True}),
                            (_repair_recovery_day_swaps, {}),

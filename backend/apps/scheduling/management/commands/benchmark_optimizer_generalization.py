@@ -24,7 +24,7 @@ CASES = (
     ('12m-100p', 'fresh', 'mixed'),
     ('12m-150p', 'partial', 'conflicting'),
 )
-VARIANTS = ('current', 'without_targeted_repairs', 'without_general_repair')
+VARIANTS = ('current', 'without_targeted_repairs', 'without_general_repair', 'without_general_swaps')
 
 
 class ScreeningRunner(ScaleCommand):
@@ -129,8 +129,11 @@ def run_case(case, *, seed, variant, seconds):
             for name in ('_repair_workload_transfers', '_repair_night_spacing_swaps', '_repair_recovery_day_swaps'):
                 stack.enter_context(patch.object(optimizer, name, side_effect=disabled_repair))
         elif variant == 'without_general_repair':
+            for name in ('_repair_general_constraint_reassignments', '_repair_general_constraint_swaps'):
+                stack.enter_context(patch.object(optimizer, name, side_effect=disabled_repair))
+        elif variant == 'without_general_swaps':
             stack.enter_context(patch.object(
-                optimizer, '_repair_general_constraint_reassignments', side_effect=disabled_repair,
+                optimizer, '_repair_general_constraint_swaps', side_effect=disabled_repair,
             ))
         # Half the short screening budget for the original pass, then continuation.
         result = runner._run_profile(profile, seed=seed, time_limit=seconds / 2,
