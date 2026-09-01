@@ -178,6 +178,14 @@ class SearchControlTests(TestCase):
                 start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE, seed=52, adaptive_runtime=True)
         self.assertLessEqual(summary['final_score'], before)
         self.assertGreater(summary['debug']['adaptive_runtime']['cycles'], 0)
+        repair_stats = summary['debug']['adaptive_runtime']['repair_stats']
+        self.assertTrue(repair_stats)
+        for stats in repair_stats.values():
+            self.assertGreaterEqual(stats['calls'], 1)
+            self.assertGreaterEqual(stats['attempts'], stats['accepts'])
+            self.assertGreaterEqual(stats['attempts'], stats['legal_candidates'])
+            self.assertGreaterEqual(stats['legal_candidates'], stats['scored_candidates'])
+            self.assertGreaterEqual(stats['runtime_seconds'], 0)
         self.assertEqual(summary['unfilled_shift_count'], 0)
         self.assertEqual(OptimizerRun.objects.get(pk=summary['optimizer_run_id']).status, OptimizerRun.Status.COMPLETED)
 

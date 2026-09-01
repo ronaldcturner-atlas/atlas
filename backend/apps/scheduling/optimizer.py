@@ -3040,6 +3040,125 @@ def _run_productive_repair_rounds(repair, *, state, elapsed, deadline,
     return state, scoring, debug
 
 
+def _repair_night_minimum_distribution(
+    *, instances, physicians, state, manual_pairs, targets, contract_by_physician,
+    requests_by_physician_date, eligible_facilities_by_physician,
+    minimum_rest_by_physician, should_stop, candidate_limit=500, on_improvement=None,
+):
+    """Move nights toward contract minimum deficits using verified legal improvements."""
+    by_id = {instance.id: instance for instance in instances}
+    locked_open = {instance.id for instance in instances if instance.is_locked_open}
+    args = (targets, contract_by_physician, requests_by_physician_date,
+            eligible_facilities_by_physician, minimum_rest_by_physician)
+    scoring = _score_schedule(instances, physicians, state, *args)
+    attempts, accepts = 0, []
+
+    def covers(row, instance):
+        day = instance.date.isoformat()
+        return row['period_start'] <= day <= row['period_end']
+
+    while attempts < candidate_limit and not should_stop():
+        status = _night_minimum_status(
+            instances, physicians, state, contract_by_physician,
+        )
+        under_rows = status['physicians_under_night_minimum']
+        over_rows = status['physicians_over_night_minimum']
+        if not under_rows or not over_rows:
+            break
+
+        night_pairs = [
+            (instance_id, physician_id)
+            for instance_id, physician_id in _optimizer_pairs(state, manual_pairs)
+            if instance_id not in locked_open
+            and by_id[instance_id].shift_template.night_shift
+        ]
+        non_night_pairs = [
+            (instance_id, physician_id)
+            for instance_id, physician_id in _optimizer_pairs(state, manual_pairs)
+            if instance_id not in locked_open
+            and not by_id[instance_id].shift_template.night_shift
+        ]
+        candidates = []
+        for night_instance_id, donor in night_pairs:
+            night_instance = by_id[night_instance_id]
+            donor_surplus = max(
+                (row['actual'] - row['minimum'] for row in over_rows
+                 if row['physician_id'] == donor and covers(row, night_instance)),
+                default=0,
+            )
+            if donor_surplus <= 0:
+                continue
+            for under_row in under_rows:
+                receiver = under_row['physician_id']
+                if receiver == donor or receiver in state[night_instance_id]:
+                    continue
+                if not covers(under_row, night_instance):
+                    continue
+                deficit = under_row['minimum'] - under_row['actual']
+                priority = (-deficit * under_row['penalty_weight'], -donor_surplus,
+                            night_instance_id, donor, receiver)
+                candidates.append((priority, night_instance_id, donor, receiver, None))
+                for non_night_instance_id, owner in non_night_pairs:
+                    if owner == receiver:
+                        candidates.append((priority, night_instance_id, donor, receiver,
+                                           non_night_instance_id))
+        candidates.sort(key=lambda item: item[0])
+
+        accepted = False
+        for _, night_instance_id, donor, receiver, non_night_instance_id in candidates:
+            if attempts >= candidate_limit or should_stop():
+                break
+            attempts += 1
+            night_instance = by_id[night_instance_id]
+            trial = _copy_state(state)
+            _replace_in_state(trial, night_instance_id, donor, receiver)
+            if not _can_assign_in_state(
+                trial, by_id, night_instance, receiver,
+                eligible_facilities_by_physician, minimum_rest_by_physician,
+                exclude_instance_id=night_instance_id,
+            ):
+                continue
+            move_kind = 'reassignment'
+            if non_night_instance_id is not None:
+                non_night_instance = by_id[non_night_instance_id]
+                _replace_in_state(trial, non_night_instance_id, receiver, donor)
+                if not _can_assign_in_state(
+                    trial, by_id, non_night_instance, donor,
+                    eligible_facilities_by_physician, minimum_rest_by_physician,
+                    exclude_instance_id=non_night_instance_id,
+                ):
+                    continue
+                move_kind = 'exchange'
+            verified = _score_schedule(instances, physicians, trial, *args)
+            if _has_hard_invalids(verified) or verified['score'] >= scoring['score']:
+                continue
+            accepts.append({
+                'kind': move_kind,
+                'night_shift_instance_id': night_instance_id,
+                'non_night_shift_instance_id': non_night_instance_id,
+                'from_physician_id': donor,
+                'to_physician_id': receiver,
+                'score_before': float(scoring['score']),
+                'score_after': float(verified['score']),
+            })
+            state, scoring = trial, verified
+            if on_improvement is not None:
+                on_improvement(state, scoring)
+            accepted = True
+            break
+        if not accepted:
+            break
+
+    reason = 'no_improving_move'
+    if should_stop():
+        reason = 'time_budget'
+    elif attempts >= candidate_limit:
+        reason = 'candidate_budget'
+    return state, scoring, {
+        'attempts': attempts, 'accepts': accepts, 'stopped_reason': reason,
+    }
+
+
 def _repair_night_spacing_swaps(
     *, instances, physicians, state, manual_pairs, targets, contract_by_physician,
     requests_by_physician_date, eligible_facilities_by_physician,
@@ -3530,7 +3649,8 @@ def _repair_general_constraint_reassignments(
                 seen.add(key)
                 sources.append((source_kind, physician_id, instance_id))
 
-    debug = {'attempts': 0, 'accepts': [], 'stopped_reason': 'candidates_exhausted',
+    debug = {'attempts': 0, 'legal_candidates': 0, 'scored_candidates': 0,
+             'accepts': [], 'stopped_reason': 'candidates_exhausted',
              'source_counts': {name: len(rows) for name, rows in source_groups}}
     physician_ids = sorted(physician.id for physician in physicians)
     for source_kind, from_physician_id, instance_id in sources:
@@ -3557,11 +3677,13 @@ def _repair_general_constraint_reassignments(
                 exclude_instance_id=instance_id,
             ):
                 continue
+            debug['legal_candidates'] += 1
             trial_scoring = _score_schedule(
                 instances, physicians, trial, targets, contract_by_physician,
                 requests_by_physician_date, eligible_facilities_by_physician,
                 minimum_rest_by_physician,
             )
+            debug['scored_candidates'] += 1
             if trial_scoring['score'] >= current_scoring['score']:
                 continue
             debug['accepts'].append({
@@ -3709,6 +3831,74 @@ def _repair_general_constraint_swaps(
             if debug['accepts'] and debug['accepts'][-1]['left_shift_instance_id'] == left_instance_id:
                 break
     return current, current_scoring, debug
+
+
+def _run_adaptive_search_rounds(
+    *, instances, physicians, initial_state, initial_scoring, manual_pairs, targets,
+    contract_by_physician, requests_by_physician_date,
+    eligible_facilities_by_physician, minimum_rest_by_physician,
+    search_budget, rng, debug,
+):
+    """Repeat the current continuation neighborhoods while retaining the best valid state."""
+    best_state = _copy_state(initial_state)
+    best_scoring = initial_scoring
+    repairs = [
+        ('general_reassignments', _repair_general_constraint_reassignments, {}),
+        ('general_swaps', _repair_general_constraint_swaps, {}),
+        ('workload_transfers', _repair_workload_transfers, {}),
+        ('night_minimum', _repair_night_minimum_distribution, {}),
+        ('night_maximum', _repair_night_spacing_swaps, {'maximum_only': True}),
+        ('night_recovery', _repair_recovery_day_swaps, {}),
+        ('night_spacing', _repair_night_spacing_swaps, {}),
+    ]
+    repair_stats = debug.setdefault('repair_stats', {})
+
+    def keep_progress(candidate_state, candidate_scoring):
+        nonlocal best_state, best_scoring
+        valid = (
+            _result_priority(
+                candidate_scoring, _unfilled_slot_count(instances, candidate_state),
+            )[0] == 0
+            and all(pid in candidate_state[sid] for sid, pid in manual_pairs)
+        )
+        if search_budget.observe(candidate_scoring['score'], valid=valid):
+            best_state = _copy_state(candidate_state)
+            best_scoring = candidate_scoring
+            debug['improvements'] += 1
+
+    while search_budget.reason() is None:
+        debug['cycles'] += 1
+        cycle_instances = list(instances)
+        rng.shuffle(cycle_instances)
+        for repair_name, repair, options in repairs:
+            if search_budget.reason() is not None:
+                break
+            repair_started = monotonic()
+            slice_end = repair_started + 4
+            _, _, repair_debug = repair(
+                instances=cycle_instances, physicians=physicians,
+                state=best_state, manual_pairs=manual_pairs, targets=targets,
+                contract_by_physician=contract_by_physician,
+                requests_by_physician_date=requests_by_physician_date,
+                eligible_facilities_by_physician=eligible_facilities_by_physician,
+                minimum_rest_by_physician=minimum_rest_by_physician,
+                should_stop=lambda: (
+                    search_budget.reason() is not None or monotonic() >= slice_end
+                ),
+                candidate_limit=600, on_improvement=keep_progress, **options,
+            )
+            debug['attempts'] += repair_debug['attempts']
+            stats = repair_stats.setdefault(repair_name, {
+                'calls': 0, 'attempts': 0, 'legal_candidates': 0,
+                'scored_candidates': 0, 'accepts': 0, 'runtime_seconds': 0,
+            })
+            stats['calls'] += 1
+            stats['attempts'] += repair_debug['attempts']
+            stats['legal_candidates'] += repair_debug.get('legal_candidates', 0)
+            stats['scored_candidates'] += repair_debug.get('scored_candidates', 0)
+            stats['accepts'] += len(repair_debug['accepts'])
+            stats['runtime_seconds'] += monotonic() - repair_started
+    return best_state, best_scoring, debug
 
 
 def _night_fix_sources(instances_by_id, physicians, state, manual_pairs, contract_by_physician):
@@ -7870,38 +8060,18 @@ def optimize_schedule_version(
         if adaptive_runtime:
             observe_best(state, final_scoring)
             if search_budget.best_score is not None:
-                state, final_scoring = adaptive_best_state, adaptive_best_scoring
-                repairs = [(_repair_general_constraint_reassignments, {}),
-                           (_repair_general_constraint_swaps, {}),
-                           (_repair_workload_transfers, {}),
-                           (_repair_night_spacing_swaps, {'maximum_only': True}),
-                           (_repair_recovery_day_swaps, {}),
-                           (_repair_night_spacing_swaps, {})]
-
-                def keep_progress(candidate_state, candidate_scoring):
-                    if observe_best(candidate_state, candidate_scoring):
-                        adaptive_debug['improvements'] += 1
-
-                while search_budget.reason() is None:
-                    adaptive_debug['cycles'] += 1
-                    cycle_instances = list(instances)
-                    rng.shuffle(cycle_instances)
-                    for repair, options in repairs:
-                        if search_budget.reason() is not None:
-                            break
-                        slice_end = monotonic() + 4
-                        _, _, repair_debug = repair(
-                            instances=cycle_instances, physicians=physicians,
-                            state=adaptive_best_state, manual_pairs=manual_pairs, targets=targets,
-                            contract_by_physician=contract_by_physician,
-                            requests_by_physician_date=requests_by_physician_date,
-                            eligible_facilities_by_physician=eligible_facilities_by_physician,
-                            minimum_rest_by_physician=minimum_rest_by_physician,
-                            should_stop=lambda: search_budget.reason() is not None or monotonic() >= slice_end,
-                            candidate_limit=600, on_improvement=keep_progress, **options,
-                        )
-                        adaptive_debug['attempts'] += repair_debug['attempts']
-                    state, final_scoring = adaptive_best_state, adaptive_best_scoring
+                state, final_scoring, adaptive_debug = _run_adaptive_search_rounds(
+                    instances=instances, physicians=physicians,
+                    initial_state=adaptive_best_state,
+                    initial_scoring=adaptive_best_scoring,
+                    manual_pairs=manual_pairs, targets=targets,
+                    contract_by_physician=contract_by_physician,
+                    requests_by_physician_date=requests_by_physician_date,
+                    eligible_facilities_by_physician=eligible_facilities_by_physician,
+                    minimum_rest_by_physician=minimum_rest_by_physician,
+                    search_budget=search_budget, rng=rng, debug=adaptive_debug,
+                )
+                adaptive_best_state, adaptive_best_scoring = state, final_scoring
                 final_score = final_scoring['score']
                 improvement_count += adaptive_debug['improvements']
                 candidates_considered_before_timeout += adaptive_debug['attempts']
