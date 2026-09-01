@@ -1201,17 +1201,54 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             data={'domain_id': self.domain.id},
             format='json',
         )
-        second_response = self.client.post(
-            generate_url,
-            data={'domain_id': self.domain.id},
-            format='json',
-        )
+        with patch.object(
+            ScheduleShiftInstance.objects,
+            'get_or_create',
+            side_effect=AssertionError('unchanged templates should skip the date scan'),
+        ):
+            second_response = self.client.post(
+                generate_url,
+                data={'domain_id': self.domain.id},
+                format='json',
+            )
 
         self.assertEqual(first_response.status_code, 200)
         self.assertEqual(second_response.status_code, 200)
         self.assertEqual(second_response.json()['created_count'], 0)
+        self.assertEqual(second_response.json()['updated_count'], 0)
         self.assertEqual(ScheduleVersion.objects.filter(schedule_block=self.block).count(), 1)
         self.assertEqual(ScheduleShiftInstance.objects.filter(schedule_block=self.block).count(), 2)
+
+    def test_generate_synchronizes_changed_shift_template(self):
+        generate_url = f'/api/schedule-blocks/{self.block.id}/build/generate/'
+        generated = self.client.post(
+            generate_url, data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(id=generated.json()['schedule_version']['id'])
+        version.score_is_stale = False
+        version.save(update_fields=['score_is_stale'])
+
+        self.day_template.start_time = time(9, 0)
+        self.day_template.end_time = time(18, 0)
+        self.day_template.default_staffing_count = 3
+        self.day_template.save(
+            update_fields=['start_time', 'end_time', 'default_staffing_count'],
+        )
+        response = self.client.post(
+            generate_url, data={'domain_id': self.domain.id}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['created_count'], 0)
+        self.assertEqual(response.json()['updated_count'], 1)
+        day_instance = ScheduleShiftInstance.objects.get(
+            schedule_version=version, shift_template=self.day_template,
+        )
+        version.refresh_from_db()
+        self.assertEqual(day_instance.start_datetime.time(), time(9, 0))
+        self.assertEqual(day_instance.end_datetime.time(), time(18, 0))
+        self.assertEqual(day_instance.required_staffing, 3)
+        self.assertTrue(version.score_is_stale)
 
     def test_context_and_list_endpoints_return_selected_version_and_instances(self):
         generate_response = self.client.post(
@@ -1245,6 +1282,63 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(shifts_response.status_code, 200)
         self.assertEqual(len(shifts_response.json()), 2)
         self.assertEqual(shifts_response.json()[0]['assigned_count'], 0)
+
+    def test_request_off_feasibility_lists_dates_with_unavoidable_shortages(self):
+        physicians = [
+            self._create_assignment_physician(
+                f'off-{index}@example.com', f'Off Physician {index}', facilities=[self.facility],
+            )
+            for index in range(2)
+        ]
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version_id = generated.json()['schedule_version']['id']
+        for physician in physicians:
+            ScheduleRequest.objects.create(
+                schedule_block=self.block,
+                physician=physician,
+                date=self.block.start_date,
+                request_scope=ScheduleRequest.RequestScope.USER,
+                request_type=ScheduleRequest.RequestType.DAY_OFF,
+                weight=ScheduleRequest.Weight.HIGH,
+            )
+
+        response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version_id}',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        feasibility = response.json()['workload_feasibility']['request_off_feasibility']
+        self.assertEqual(feasibility['status'], 'infeasible')
+        self.assertEqual(len(feasibility['affected_dates']), 1)
+        affected = feasibility['affected_dates'][0]
+        self.assertEqual(affected['date'], self.block.start_date.isoformat())
+        self.assertEqual(affected['required_staffing'], 2)
+        self.assertEqual(affected['maximum_staffable'], 0)
+        self.assertEqual(affected['shortage'], 2)
+        self.assertEqual(affected['physicians_requested_off'], 2)
+
+    def test_request_off_feasibility_does_not_add_nonoverlapping_staffing(self):
+        for index in range(2):
+            self._create_assignment_physician(
+                f'available-{index}@example.com', f'Available Physician {index}',
+                facilities=[self.facility],
+            )
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+
+        response = self.client.get(
+            f"/api/schedule-blocks/{self.block.id}/build/?version_id={generated.json()['schedule_version']['id']}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        feasibility = response.json()['workload_feasibility']['request_off_feasibility']
+        self.assertEqual(feasibility['status'], 'feasible')
+        self.assertEqual(feasibility['affected_dates'], [])
 
     def test_workload_adjustment_is_fte_weighted_and_schedule_version_only(self):
         full_time = self._create_assignment_physician('full@example.com', 'Full Time')

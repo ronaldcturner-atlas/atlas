@@ -327,6 +327,27 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
         return OptimizerRunSerializer(run).data if run else None
 
 
+class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
+    """Lightweight version metadata for the Build Workspace header and selector."""
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    shift_instance_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ScheduleVersion
+        fields = [
+            'id', 'schedule_block', 'domain', 'domain_name', 'version_number',
+            'name', 'status', 'score_is_stale', 'shift_instance_count',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_shift_instance_count(self, obj):
+        return obj.shift_instances.filter(
+            date__gte=obj.schedule_block.start_date,
+            date__lte=obj.schedule_block.end_date,
+        ).count()
+
+
 class OptimizerRunSerializer(serializers.ModelSerializer):
     schedule_version_name = serializers.CharField(source='schedule_version.name', read_only=True)
     copied_from_run_number = serializers.IntegerField(source='copied_from_run.run_number', read_only=True)
@@ -355,6 +376,23 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'run_kind',
             'locked_open_shift_instance_ids',
             'start_mode',
+        ]
+        read_only_fields = fields
+
+
+class OptimizerRunHistorySerializer(serializers.ModelSerializer):
+    """Compact run metadata for workspace selection controls."""
+    copied_from_run_number = serializers.IntegerField(
+        source='copied_from_run.run_number', read_only=True,
+    )
+
+    class Meta:
+        model = OptimizerRun
+        fields = [
+            'id', 'schedule_version', 'run_number', 'created_at', 'status', 'seed',
+            'initial_score', 'final_score', 'is_active', 'score_is_stale',
+            'copied_from_run', 'copied_from_run_number', 'run_kind',
+            'locked_open_shift_instance_ids', 'start_mode',
         ]
         read_only_fields = fields
 
@@ -429,7 +467,7 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
         return obj.shift_template.generated_name()
 
     def get_assigned_count(self, obj):
-        return self._visible_assignments(obj).count()
+        return len(self._visible_assignments(obj))
 
     def get_open_count(self, obj):
         return max(obj.required_staffing - self.get_assigned_count(obj), 0)
@@ -452,6 +490,9 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
         return obj.is_locked_open
 
     def _visible_assignments(self, obj):
+        cached = getattr(obj, 'visible_assignments_cached', None)
+        if cached is not None:
+            return cached
         from .run_state import visible_assignment_filter
         optimizer_run_id = self.context.get('optimizer_run_id')
         query = obj.assignments.select_related('physician__user')
@@ -460,8 +501,8 @@ class ScheduleShiftInstanceSerializer(serializers.ModelSerializer):
             if viewed_run is None:
                 viewed_run = OptimizerRun.objects.filter(id=optimizer_run_id).first()
                 self.context['viewed_run'] = viewed_run
-            return query.filter(visible_assignment_filter(viewed_run))
-        return query.filter(visible_assignment_filter(None))
+            return list(query.filter(visible_assignment_filter(viewed_run)))
+        return list(query.filter(visible_assignment_filter(None)))
 
 
 class ScheduleRequestSerializer(serializers.ModelSerializer):

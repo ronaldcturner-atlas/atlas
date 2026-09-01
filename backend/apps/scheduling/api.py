@@ -1,10 +1,12 @@
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import UUID
 from time import monotonic
 
-from django.db.models import Q
+from django.db.models import Prefetch, Q
 from django.db import transaction, IntegrityError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -46,11 +48,13 @@ from .run_state import (
 )
 from .serializers import (
     ContractSerializer,
+    OptimizerRunHistorySerializer,
     OptimizerRunSerializer,
     ScheduleBlockSerializer,
     ScheduleRequestSerializer,
     ScheduleShiftInstanceSerializer,
     ScheduleVersionSerializer,
+    ScheduleVersionWorkspaceSerializer,
     ShiftSerializer,
     ShiftTemplateSerializer,
 )
@@ -58,6 +62,27 @@ from .workload_feasibility import build_workload_feasibility
 
 
 STALE_OPTIMIZER_RUN_MINUTES = 10
+
+
+def _shift_template_fingerprint(block, templates):
+    payload = {
+        'block_start': block.start_date.isoformat(),
+        'block_end': block.end_date.isoformat(),
+        'templates': [
+            {
+                'id': template.id,
+                'facility_id': template.facility_id,
+                'facility_timezone': template.facility.timezone,
+                'start_time': template.start_time.isoformat(),
+                'end_time': template.end_time.isoformat(),
+                'active_days_of_week': sorted(template.active_days_of_week or []),
+                'default_staffing_count': template.default_staffing_count,
+            }
+            for template in templates
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class CsrfExemptSessionAuthentication(SessionAuthentication):
@@ -948,7 +973,6 @@ def _schedule_version_queryset(block):
     return (
         ScheduleVersion.objects.filter(schedule_block=block)
         .select_related('domain')
-        .prefetch_related('shift_instances', 'optimizer_runs')
     )
 
 
@@ -1030,14 +1054,23 @@ def _mark_contract_domain_scores_stale(contract):
 
 
 def _shift_instance_queryset(version, optimizer_run=None):
+    visible_assignments = (
+        ScheduleShiftAssignment.objects
+        .filter(visible_assignment_filter(optimizer_run))
+        .select_related('physician__user')
+        .order_by('physician__user__last_name', 'physician__user__first_name', 'id')
+    )
     return (
         ScheduleShiftInstance.objects.filter(schedule_version=version)
         .filter(
             date__gte=version.schedule_block.start_date,
             date__lte=version.schedule_block.end_date,
         )
-        .select_related('facility', 'shift_template')
-        .prefetch_related('assignments__physician__user')
+        .select_related('facility', 'shift_template__facility')
+        .prefetch_related(Prefetch(
+            'assignments', queryset=visible_assignments,
+            to_attr='visible_assignments_cached',
+        ))
     )
 
 
@@ -1101,7 +1134,10 @@ def schedule_block_build_context(request, block_id):
     )
     workload_feasibility = None
     if selected_version:
-        feasibility_report = build_workload_feasibility(selected_version, selected_optimizer_run)
+        feasibility_report = build_workload_feasibility(
+            selected_version, selected_optimizer_run,
+            include_individual_diagnostics=False,
+        )
         workload_feasibility = {
             **feasibility_report['aggregate_feasibility'],
             'total_generated_shift_instances': feasibility_report['schedule_block'][
@@ -1109,6 +1145,7 @@ def schedule_block_build_context(request, block_id):
             ],
         }
         workload_feasibility['night_feasibility'] = feasibility_report['night_feasibility']
+        workload_feasibility['request_off_feasibility'] = feasibility_report['request_off_feasibility']
 
     return Response(
         {
@@ -1118,9 +1155,9 @@ def schedule_block_build_context(request, block_id):
                 {'id': domain.id, 'name': domain.name}
                 for domain in Domain.objects.filter(active=True).order_by('name')
             ],
-            'versions': ScheduleVersionSerializer(versions, many=True).data,
+            'versions': ScheduleVersionWorkspaceSerializer(versions, many=True).data,
             'selected_version': (
-                ScheduleVersionSerializer(selected_version).data
+                ScheduleVersionWorkspaceSerializer(selected_version).data
                 if selected_version
                 else None
             ),
@@ -1128,15 +1165,18 @@ def schedule_block_build_context(request, block_id):
                 optimizer_summary
             ),
             'optimizer_runs': (
-                OptimizerRunSerializer(
-                    selected_version.optimizer_runs.order_by('-run_number'),
+                OptimizerRunHistorySerializer(
+                    selected_version.optimizer_runs
+                    .select_related('copied_from_run')
+                    .defer('optimizer_summary', 'optimizer_debug', 'score_breakdown')
+                    .order_by('-run_number'),
                     many=True,
                 ).data
                 if selected_version
                 else []
             ),
             'selected_optimizer_run': (
-                OptimizerRunSerializer(selected_optimizer_run).data
+                OptimizerRunHistorySerializer(selected_optimizer_run).data
                 if selected_optimizer_run
                 else None
             ),
@@ -2338,7 +2378,19 @@ def schedule_block_generate_shift_instances(request, block_id):
             .select_related('facility')
             .order_by('facility__name', 'start_time', 'id')
         )
+        template_fingerprint = _shift_template_fingerprint(block, templates)
+        if version.shift_template_fingerprint == template_fingerprint:
+            total_count = ScheduleShiftInstance.objects.filter(schedule_version=version).count()
+            return Response({
+                'message': 'Schedule shifts are already up to date.',
+                'created_count': 0,
+                'updated_count': 0,
+                'total_count': total_count,
+                'schedule_block': ScheduleBlockSerializer(block).data,
+                'schedule_version': ScheduleVersionSerializer(version).data,
+            })
         created_count = 0
+        updated_count = 0
         current_date = block.start_date
         while current_date <= block.end_date:
             day_name = current_date.strftime('%A')
@@ -2351,7 +2403,7 @@ def schedule_block_generate_shift_instances(request, block_id):
                 if template.end_time <= template.start_time:
                     end_date = current_date + timedelta(days=1)
 
-                _, created = ScheduleShiftInstance.objects.get_or_create(
+                shift_instance, created = ScheduleShiftInstance.objects.get_or_create(
                     schedule_version=version,
                     date=current_date,
                     shift_template=template,
@@ -2374,7 +2426,34 @@ def schedule_block_generate_shift_instances(request, block_id):
                 )
                 if created:
                     created_count += 1
+                else:
+                    expected_values = {
+                        'facility': template.facility,
+                        'start_datetime': datetime.combine(
+                            current_date, template.start_time, tzinfo=timezone_info,
+                        ),
+                        'end_datetime': datetime.combine(
+                            end_date, template.end_time, tzinfo=timezone_info,
+                        ),
+                        'required_staffing': template.default_staffing_count,
+                    }
+                    updated_fields = []
+                    for field, expected_value in expected_values.items():
+                        if getattr(shift_instance, field) != expected_value:
+                            setattr(shift_instance, field, expected_value)
+                            updated_fields.append(field)
+                    if updated_fields:
+                        shift_instance.save(update_fields=[*updated_fields, 'updated_at'])
+                        updated_count += 1
             current_date += timedelta(days=1)
+
+        version.shift_template_fingerprint = template_fingerprint
+        version_update_fields = ['shift_template_fingerprint', 'updated_at']
+        if created_count or updated_count:
+            version.score_is_stale = True
+            version_update_fields.append('score_is_stale')
+            version.optimizer_runs.update(score_is_stale=True)
+        version.save(update_fields=version_update_fields)
 
         if block.build_status == ScheduleBlock.BuildStatus.PRE_BUILD:
             block.build_status = ScheduleBlock.BuildStatus.BUILD
@@ -2384,11 +2463,12 @@ def schedule_block_generate_shift_instances(request, block_id):
     return Response(
         {
             'message': (
-                f'Created {created_count} shift instances.'
-                if created_count
-                else 'Shift instances already exist for this BUILD version.'
+                f'Added {created_count} and updated {updated_count} schedule shifts.'
+                if created_count or updated_count
+                else 'Schedule shifts are already up to date.'
             ),
             'created_count': created_count,
+            'updated_count': updated_count,
             'total_count': total_count,
             'schedule_block': ScheduleBlockSerializer(block).data,
             'schedule_version': ScheduleVersionSerializer(version).data,

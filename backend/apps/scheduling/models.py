@@ -163,6 +163,7 @@ class ScheduleVersion(models.Model):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.BUILD)
     optimizer_summary = models.JSONField(default=dict, blank=True)
     workload_hour_overrides = models.JSONField(default=dict, blank=True)
+    shift_template_fingerprint = models.CharField(max_length=64, blank=True, default='')
     score_is_stale = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

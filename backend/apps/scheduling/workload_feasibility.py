@@ -23,6 +23,134 @@ def _number(value):
     return float(value) if value is not None else None
 
 
+def _request_off_feasibility(instances, contract_assignments, schedule_requests):
+    """Find dates that cannot cover concurrent slots if requests off are honored."""
+    instances_by_date = defaultdict(list)
+    for instance in instances:
+        instances_by_date[instance.date].append(instance)
+
+    physicians = {}
+    eligible_facilities = {}
+    for assignment in contract_assignments:
+        physician = assignment.physician
+        physicians[physician.id] = physician
+        eligible_facilities[physician.id] = {
+            facility.id for facility in assignment.contract.facilities.all()
+        }
+
+    requests_by_physician_date = defaultdict(list)
+    for schedule_request in schedule_requests:
+        requests_by_physician_date[
+            (schedule_request.physician_id, schedule_request.date)
+        ].append(schedule_request)
+
+    def physician_can_cover(physician_id, instance):
+        if instance.facility_id not in eligible_facilities.get(physician_id, set()):
+            return False
+        return not any(
+            request.request_type in {
+                ScheduleRequest.RequestType.DAY_OFF,
+                ScheduleRequest.RequestType.SHIFT_OFF,
+            }
+            for request in _requests_for_shift(
+                requests_by_physician_date, physician_id, instance,
+            )
+        )
+
+    def maximum_slot_matching(active_instances):
+        slots = []
+        for instance in active_instances:
+            slots.extend([instance] * instance.required_staffing)
+        candidates_by_slot = [
+            [
+                physician_id for physician_id in physicians
+                if physician_can_cover(physician_id, instance)
+            ]
+            for instance in slots
+        ]
+        slot_order = sorted(range(len(slots)), key=lambda index: len(candidates_by_slot[index]))
+        physician_to_slot = {}
+
+        def assign_slot(slot_index, visited_physicians):
+            for physician_id in candidates_by_slot[slot_index]:
+                if physician_id in visited_physicians:
+                    continue
+                visited_physicians.add(physician_id)
+                prior_slot = physician_to_slot.get(physician_id)
+                if prior_slot is None or assign_slot(prior_slot, visited_physicians):
+                    physician_to_slot[physician_id] = slot_index
+                    return True
+            return False
+
+        matched = 0
+        for slot_index in slot_order:
+            if assign_slot(slot_index, set()):
+                matched += 1
+        return len(slots), matched
+
+    affected_dates = []
+    for target_date, date_instances in sorted(instances_by_date.items()):
+        boundaries = sorted({
+            boundary
+            for instance in date_instances
+            for boundary in (instance.start_datetime, instance.end_datetime)
+        })
+        worst_window = None
+        for window_start, window_end in zip(boundaries, boundaries[1:]):
+            active_instances = [
+                instance for instance in date_instances
+                if instance.start_datetime < window_end and instance.end_datetime > window_start
+            ]
+            if not active_instances:
+                continue
+            required, maximum_staffable = maximum_slot_matching(active_instances)
+            shortage = required - maximum_staffable
+            if shortage <= 0:
+                continue
+            if worst_window is None or shortage > worst_window['shortage']:
+                requested_off_ids = {
+                    physician_id for physician_id in physicians
+                    if any(
+                        request.request_type in {
+                            ScheduleRequest.RequestType.DAY_OFF,
+                            ScheduleRequest.RequestType.SHIFT_OFF,
+                        }
+                        for instance in active_instances
+                        for request in _requests_for_shift(
+                            requests_by_physician_date, physician_id, instance,
+                        )
+                    )
+                }
+                worst_window = {
+                    'date': target_date.isoformat(),
+                    'window_start': window_start.isoformat(),
+                    'window_end': window_end.isoformat(),
+                    'required_staffing': required,
+                    'maximum_staffable': maximum_staffable,
+                    'shortage': shortage,
+                    'physicians_requested_off': len(requested_off_ids),
+                }
+        if worst_window:
+            affected_dates.append(worst_window)
+
+    feasible = not affected_dates
+    return {
+        'status': 'feasible' if feasible else 'infeasible',
+        'dates_checked': len(instances_by_date),
+        'affected_dates': affected_dates,
+        'interpretation': (
+            'Every date has enough request-free, facility-eligible physicians for its concurrent staffing needs.'
+            if feasible else
+            f'{len(affected_dates)} date(s) cannot be fully staffed if all requests off are honored.'
+        ),
+        'scope_note': (
+            'Honors all day-off and shift-off requests regardless of request weight and accounts for facility '
+            'eligibility and overlapping shifts. It does not include rest rules, workload limits, or other '
+            'cross-date constraints.'
+        ),
+    }
+
+
 def _aggregate_hour_rule_bounds(rule_rows):
     """Sum disjoint windows, then intersect simultaneous period-rule totals.
 
@@ -716,14 +844,18 @@ def _under_minimum_candidate_diagnostic(
     }
 
 
-def build_workload_feasibility(version, optimizer_run=None):
+def build_workload_feasibility(
+    version, optimizer_run=None, *, include_individual_diagnostics=True,
+):
     """Build a read-only, linear-time workload-hours capacity diagnostic."""
     block = version.schedule_block
     instances = list(
         version.shift_instances.filter(
             date__gte=block.start_date,
             date__lte=block.end_date,
-        ).select_related('schedule_block', 'shift_template', 'facility').order_by('date', 'id')
+        ).select_related(
+            'schedule_block', 'shift_template__facility', 'facility',
+        ).order_by('date', 'id')
     )
     available_hours = sum(
         (_shift_hours(instance) * instance.required_staffing for instance in instances),
@@ -745,15 +877,16 @@ def build_workload_feasibility(version, optimizer_run=None):
     default_hours = available_hours / physician_count if physician_count else Decimal('0')
     default_shifts = Decimal(required_slots) / physician_count if physician_count else Decimal('0')
 
+    detailed_run = optimizer_run if include_individual_diagnostics else None
     assignment_accounting, assignments = _assignment_accounting(
-        version, instances, optimizer_run,
+        version, instances, detailed_run,
     )
     assigned_instances = defaultdict(list)
-    if optimizer_run is not None:
+    if detailed_run is not None:
         for assignment in assignments:
             assigned_instances[assignment.physician_id].append(assignment.shift_instance)
     requests_by_physician_date = defaultdict(list)
-    if optimizer_run is not None:
+    if detailed_run is not None:
         requests = ScheduleRequest.objects.filter(
             schedule_block=block,
             date__gte=block.start_date,
@@ -814,10 +947,10 @@ def build_workload_feasibility(version, optimizer_run=None):
                     'period_end': window_end.isoformat(),
                     'effective_min_hours': _number(minimum),
                     'effective_max_hours': _number(maximum),
-                    'assigned_hours': _number(assigned_window) if optimizer_run else None,
-                    'deficit_hours': _number(deficit) if optimizer_run else None,
-                    'surplus_hours': _number(surplus) if optimizer_run else None,
-                    'workload_score_contribution': _number(contribution) if optimizer_run else None,
+                    'assigned_hours': _number(assigned_window) if detailed_run else None,
+                    'deficit_hours': _number(deficit) if detailed_run else None,
+                    'surplus_hours': _number(surplus) if detailed_run else None,
+                    'workload_score_contribution': _number(contribution) if detailed_run else None,
                 })
 
         physician_min, physician_max = _aggregate_hour_rule_bounds(rule_rows)
@@ -833,7 +966,7 @@ def build_workload_feasibility(version, optimizer_run=None):
         score_contribution = sum(
             (Decimal(str(row['workload_score_contribution'])) for row in rule_rows),
             Decimal('0'),
-        ) if optimizer_run else None
+        ) if detailed_run else None
         physician_row = {
             'physician_id': physician.id,
             'physician': name,
@@ -844,19 +977,19 @@ def build_workload_feasibility(version, optimizer_run=None):
             'effective_max_hours': (
                 None if physician_max_unbounded or not rule_rows else _number(physician_max)
             ),
-            'assigned_hours': _number(assigned_total) if optimizer_run else None,
+            'assigned_hours': _number(assigned_total) if detailed_run else None,
             'deficit_hours': (
                 sum((row['deficit_hours'] for row in rule_rows), 0.0)
-                if optimizer_run and rule_rows else None
+                if detailed_run and rule_rows else None
             ),
             'surplus_hours': (
                 sum((row['surplus_hours'] for row in rule_rows), 0.0)
-                if optimizer_run and rule_rows else None
+                if detailed_run and rule_rows else None
             ),
             'workload_score_contribution': _number(score_contribution),
         }
         deficit_total = Decimal(str(physician_row['deficit_hours'] or 0))
-        if optimizer_run is not None and deficit_total > 0:
+        if detailed_run is not None and deficit_total > 0:
             physician_row['under_minimum_diagnostic'] = _under_minimum_candidate_diagnostic(
                 physician=physician,
                 contract=contract,
@@ -913,6 +1046,20 @@ def build_workload_feasibility(version, optimizer_run=None):
     )
     night_feasibility = _night_feasibility(
         version, instances, contract_assignments, optimizer_run,
+    )
+    request_off_rows = list(
+        ScheduleRequest.objects.filter(
+            schedule_block=block,
+            date__gte=block.start_date,
+            date__lte=block.end_date,
+            request_type__in=[
+                ScheduleRequest.RequestType.DAY_OFF,
+                ScheduleRequest.RequestType.SHIFT_OFF,
+            ],
+        ).prefetch_related('shift_templates')
+    )
+    request_off_feasibility = _request_off_feasibility(
+        instances, contract_assignments, request_off_rows,
     )
     if adjustment_preview:
         groups = defaultdict(lambda: {'physician_count': 0})
@@ -982,5 +1129,6 @@ def build_workload_feasibility(version, optimizer_run=None):
             'has_workload_hour_overrides': bool(version.workload_hour_overrides),
         },
         'night_feasibility': night_feasibility,
+        'request_off_feasibility': request_off_feasibility,
         'reduced_contract_focus': reduced_rows,
     }

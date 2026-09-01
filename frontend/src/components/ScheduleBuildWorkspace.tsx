@@ -215,6 +215,21 @@ type BuildContext = {
         interpretation: string
       }>
     }
+    request_off_feasibility: {
+      status: 'feasible' | 'infeasible'
+      dates_checked: number
+      interpretation: string
+      scope_note: string
+      affected_dates: Array<{
+        date: string
+        window_start: string
+        window_end: string
+        required_staffing: number
+        maximum_staffable: number
+        shortage: number
+        physicians_requested_off: number
+      }>
+    }
     fte_adjustment_preview: {
       direction: 'increase_maximum' | 'decrease_minimum'
       required_adjustment_hours: number
@@ -457,6 +472,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [visibleMonth, setVisibleMonth] = useState<Date | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
+  const automaticGenerationKeyRef = useRef<string | null>(null)
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [isStoppingOptimizer, setIsStoppingOptimizer] = useState(false)
   const optimizerControlRef = useRef<{ token: string; versionId: number } | null>(null)
@@ -1001,7 +1017,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     ? monthGrid(visibleMonth, blockStart, blockEnd)
     : []
 
-  const generateInstances = async () => {
+  const generateInstances = async (options: { quiet?: boolean } = {}) => {
     if (!selectedDomainId) {
       setError('Select a Domain before generating shift instances.')
       return
@@ -1024,7 +1040,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         throw new Error(apiError(data, 'Unable to generate shift instances.'))
       }
 
-      setNotice(data.message)
+      if (!options.quiet && (data.created_count || data.updated_count)) {
+        setNotice('Schedule shifts are ready.')
+      }
       setSelectedOptimizerRunId(null)
       updateOptimizerRunUrl(null)
       await fetchContext(data.schedule_version.id, { optimizerRunId: null })
@@ -1034,6 +1052,24 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setIsGenerating(false)
     }
   }
+
+  useEffect(() => {
+    if (
+      !context
+      || !selectedDomainId
+      || isGenerating
+      || !context.can_manage_build_workspace
+      || !['PRE_BUILD', 'BUILD'].includes(context.schedule_block.build_status)
+    ) {
+      return
+    }
+    const generationKey = `${context.schedule_block.id}:${selectedDomainId}`
+    if (automaticGenerationKeyRef.current === generationKey) {
+      return
+    }
+    automaticGenerationKeyRef.current = generationKey
+    void generateInstances({ quiet: true })
+  }, [context, selectedDomainId, isGenerating])
 
   const runOptimizer = async () => {
     const versionId = context?.selected_version?.id
@@ -1473,8 +1509,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     )
   }
 
-  const canGenerate = context.schedule_block.build_status === 'PRE_BUILD'
-    || context.schedule_block.build_status === 'BUILD'
   const canEditAssignments = context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
     && (!context.selected_optimizer_run || context.selected_optimizer_run.is_active)
@@ -1516,8 +1550,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
   const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
-  const bothFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
+  const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
+  const allFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
     && nightFeasibility?.status === 'feasible'
+    && requestOffFeasibility?.status === 'feasible'
   const nightCapacityShortfall = Math.max(0, ...(nightFeasibility?.periods.map((period) => (
     period.remaining_maximum_night_shifts === null
       ? 0
@@ -1557,113 +1593,109 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       {notice && <div className="contract-saved-banner">{notice}</div>}
 
       <div className="build-workspace-controls">
-        <label className="facility-field">
-          <span>Domain</span>
-          <select
-            value={selectedDomainId ?? ''}
-            onChange={(event) => setSelectedDomainId(Number(event.target.value))}
-            disabled={Boolean(context.selected_version)}
-          >
-            {!context.domains.length && <option value="">No active domains</option>}
-            {context.domains.map((domain) => (
-              <option key={domain.id} value={domain.id}>{domain.name}</option>
-            ))}
-          </select>
-        </label>
-
-        <label className="facility-field">
-          <span>Schedule Version</span>
-          <select
-            value={context.selected_version?.id ?? ''}
-            onChange={(event) => {
-              setSelectedOptimizerRunId(null)
-              updateOptimizerRunUrl(null)
-              void fetchContext(Number(event.target.value), { optimizerRunId: null })
-            }}
-            disabled={!context.versions.length}
-          >
-            {!context.versions.length && <option value="">No version generated</option>}
-            {context.versions.map((version) => (
-              <option key={version.id} value={version.id}>
-                {version.name} · {version.domain_name} · {version.status}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <button
-          type="button"
-          className="primary-action"
-          onClick={generateInstances}
-          disabled={!canGenerate || !selectedDomainId || isMutatingBuild}
-        >
-          {isGenerating ? 'Generating...' : 'Generate Shift Instances'}
-        </button>
-
-        <div className="optimizer-start-control">
+        <div className="build-workspace-control-fields">
           <label className="facility-field">
-            <span>Optimizer Start</span>
-            <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as 'CURRENT_SCHEDULE' | 'FRESH_FILL')} disabled={isMutatingBuild}>
-              <option value="CURRENT_SCHEDULE">Current Viewed Schedule</option>
-              <option value="FRESH_FILL">Fresh Fill</option>
+            <span>Domain</span>
+            <select
+              value={selectedDomainId ?? ''}
+              onChange={(event) => setSelectedDomainId(Number(event.target.value))}
+              disabled={Boolean(context.selected_version)}
+            >
+              {!context.domains.length && <option value="">No active domains</option>}
+              {context.domains.map((domain) => (
+                <option key={domain.id} value={domain.id}>{domain.name}</option>
+              ))}
             </select>
           </label>
-          <small>
-            {optimizerStartMode === 'CURRENT_SCHEDULE'
-              ? 'Uses the currently displayed assignments as the optimizer starting point. Locked edits are preserved; unlocked edits may change.'
-              : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
-          </small>
+
+          <label className="facility-field">
+            <span>Schedule Version</span>
+            <select
+              value={context.selected_version?.id ?? ''}
+              onChange={(event) => {
+                setSelectedOptimizerRunId(null)
+                updateOptimizerRunUrl(null)
+                void fetchContext(Number(event.target.value), { optimizerRunId: null })
+              }}
+              disabled={!context.versions.length}
+            >
+              {!context.versions.length && <option value="">No version generated</option>}
+              {context.versions.map((version) => (
+                <option key={version.id} value={version.id}>
+                  {version.name} · {version.domain_name} · {version.status}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <div className="optimizer-start-control">
+            <label className="facility-field">
+              <span>Optimizer Start</span>
+              <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as 'CURRENT_SCHEDULE' | 'FRESH_FILL')} disabled={isMutatingBuild}>
+                <option value="CURRENT_SCHEDULE">Current Viewed Schedule</option>
+                <option value="FRESH_FILL">Fresh Fill</option>
+              </select>
+            </label>
+            <small>
+              {optimizerStartMode === 'CURRENT_SCHEDULE'
+                ? 'Uses the currently displayed assignments as the optimizer starting point. Locked edits are preserved; unlocked edits may change.'
+                : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
+            </small>
+          </div>
         </div>
 
-        {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
-          {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
-        </button>}
-        <span className="muted">Stops after 60 seconds without improvement; maximum 10 minutes. Keep this page open.</span>
-        <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
-          {isOptimizing
-            ? 'Running...'
-            : optimizerStartMode === 'CURRENT_SCHEDULE'
-              ? 'Run Optimizer from Current Schedule'
-              : 'Run Optimizer from Fresh Fill'}
-        </button>
-        {optimizerUnavailableReason && (
-          <small className="optimizer-action-message" role="status">
-            {optimizerUnavailableReason}
-          </small>
-        )}
+        <div className="build-workspace-optimizer-actions">
+          <span className="muted build-workspace-runtime-note">Stops after 60 seconds without improvement; maximum 10 minutes. Keep this page open.</span>
+          {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
+            {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
+          </button>}
+          <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
+            {isOptimizing
+              ? 'Running...'
+              : optimizerStartMode === 'CURRENT_SCHEDULE'
+                ? 'Run Optimizer from Current Schedule'
+                : 'Run Optimizer from Fresh Fill'}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void recalculateScore()}
+            disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild}
+          >
+            {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
+          </button>
+        </div>
 
-        <button
-          type="button"
-          className="secondary"
-          onClick={() => void recalculateScore()}
-          disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild}
-        >
-          {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
-        </button>
+        <div className="build-workspace-maintenance-actions">
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void clearScheduleAssignments('optimizer')}
+            disabled={!canClearAssignments || isMutatingBuild}
+          >
+            {clearingAction === 'optimizer' ? 'Clearing...' : 'Clear Optimizer Assignments'}
+          </button>
 
-        <button
-          type="button"
-          className="secondary"
-          onClick={() => void clearScheduleAssignments('optimizer')}
-          disabled={!canClearAssignments || isMutatingBuild}
-        >
-          {clearingAction === 'optimizer' ? 'Clearing...' : 'Clear Optimizer Assignments'}
-        </button>
-
-        <button
-          type="button"
-          className="secondary danger-action"
-          onClick={() => void clearScheduleAssignments('all')}
-          disabled={!canClearAssignments || isMutatingBuild}
-        >
-          {clearingAction === 'all' ? 'Clearing...' : 'Clear All Assignments'}
-        </button>
+          <button
+            type="button"
+            className="secondary danger-action"
+            onClick={() => void clearScheduleAssignments('all')}
+            disabled={!canClearAssignments || isMutatingBuild}
+          >
+            {clearingAction === 'all' ? 'Clearing...' : 'Clear All Assignments'}
+          </button>
+          {optimizerUnavailableReason && (
+            <small className="optimizer-action-message" role="status">
+              {optimizerUnavailableReason}
+            </small>
+          )}
+        </div>
 
       </div>
 
       {context.workload_feasibility && (
         <>
-        {bothFeasibilityChecksPass ? (
+        {allFeasibilityChecksPass ? (
           <section className="feasibility-compact-summary" aria-label="Feasibility checks passed">
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Workload feasibility</strong>
@@ -1709,6 +1741,18 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 </div>
                 <p>{context.workload_feasibility.night_feasibility.fixed_manual_night_shifts} locked manual night assignment(s) included.</p>
                 <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
+              </div>
+            </div>
+            <div className="feasibility-compact-item">
+              <strong tabIndex={0}>Request-off feasibility</strong>
+              <div className="feasibility-hover-panel request-off-feasibility-hover-panel" role="tooltip">
+                <h3>Request-off feasibility</h3>
+                <dl>
+                  <div><dt>Dates checked</dt><dd>{requestOffFeasibility?.dates_checked ?? 0}</dd></div>
+                  <div><dt>Understaffable dates</dt><dd>0</dd></div>
+                </dl>
+                <p>{requestOffFeasibility?.interpretation}</p>
+                <small>{requestOffFeasibility?.scope_note}</small>
               </div>
             </div>
           </section>
@@ -1878,6 +1922,36 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             <span>locked manual night assignment(s) included</span>
           </div>
           <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
+        </section>
+        <section
+          className={`request-off-feasibility-card request-off-feasibility-${requestOffFeasibility?.status ?? 'feasible'}`}
+          aria-label="Request-off staffing feasibility"
+        >
+          <div className="night-feasibility-heading">
+            <div>
+              <strong>Request-off feasibility</strong>
+              <span>{requestOffFeasibility?.interpretation}</span>
+            </div>
+            <span className={`request-off-feasibility-badge request-off-feasibility-badge-${requestOffFeasibility?.status ?? 'feasible'}`}>
+              {requestOffFeasibility?.status === 'infeasible' ? 'Shortage found' : 'Within capacity'}
+            </span>
+          </div>
+          {requestOffFeasibility?.affected_dates.length ? (
+            <div className="request-off-feasibility-dates">
+              {requestOffFeasibility.affected_dates.map((row) => (
+                <article key={row.date}>
+                  <strong>{formatDate(row.date)}</strong>
+                  <span>{row.shortage} uncovered position{row.shortage === 1 ? '' : 's'}</span>
+                  <dl>
+                    <div><dt>Required at once</dt><dd>{row.required_staffing}</dd></div>
+                    <div><dt>Maximum staffable</dt><dd>{row.maximum_staffable}</dd></div>
+                    <div><dt>Requested off</dt><dd>{row.physicians_requested_off}</dd></div>
+                  </dl>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          <small>{requestOffFeasibility?.scope_note}</small>
         </section>
         </>
         )}
@@ -2264,15 +2338,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       {!context.shift_instances.length ? (
         <div className="build-workspace-empty">
-          <strong>No shift instances generated yet.</strong>
-          <button
-            type="button"
-            className="primary-action"
-            onClick={generateInstances}
-            disabled={!canGenerate || !selectedDomainId || isMutatingBuild}
-          >
-            Generate Shift Instances
-          </button>
+          <strong>{isGenerating ? 'Preparing schedule shifts…' : 'Schedule shifts are not available.'}</strong>
         </div>
       ) : (
         <>

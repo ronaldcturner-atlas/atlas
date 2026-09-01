@@ -199,8 +199,13 @@ select option:checked{
 .build-workspace-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .build-workspace-header h2{margin:0 0 4px;font-size:20px}
 .build-workspace-subtitle{color:var(--muted);font-size:13px}
-.build-workspace-controls{position:sticky;top:0;z-index:12;display:grid;grid-template-columns:minmax(180px,0.8fr) minmax(240px,1.2fr) repeat(4,auto);gap:8px;align-items:end;padding:8px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;background:rgba(15,23,42,0.96);box-shadow:0 8px 24px rgba(0,0,0,0.18)}
+.build-workspace-controls{position:sticky;top:0;z-index:12;display:grid;gap:10px;padding:12px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;background:rgba(15,23,42,0.96);box-shadow:0 8px 24px rgba(0,0,0,0.18)}
 .build-workspace-controls .primary-action,.build-workspace-controls .secondary{height:34px;padding:7px 10px;white-space:nowrap}
+.build-workspace-control-fields{display:grid;grid-template-columns:minmax(180px,0.7fr) minmax(280px,1fr) minmax(340px,1.25fr);gap:12px;align-items:start}
+.build-workspace-control-fields>*{min-width:0}
+.build-workspace-optimizer-actions,.build-workspace-maintenance-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.build-workspace-runtime-note{flex:1 1 360px;line-height:1.35}
+.build-workspace-maintenance-actions .optimizer-action-message{flex:1 1 280px;max-width:none}
 .build-workspace-empty{display:grid;justify-items:center;gap:14px;padding:54px 20px;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;color:var(--muted)}
 .optimizer-run-selector-panel,.optimizer-summary-card{display:grid;gap:8px;padding:10px;border:1px solid rgba(147,197,253,0.2);border-radius:8px;background:rgba(15,23,42,0.34)}
 .optimizer-run-selector-main{display:grid;grid-template-columns:minmax(260px,1fr) auto auto;gap:8px;align-items:end}
@@ -220,7 +225,7 @@ select option:checked{
 .optimizer-run-row span{color:var(--muted);font-size:12px}
 .optimizer-run-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
 .optimizer-summary-grid,.optimizer-extra-grid{display:grid;grid-template-columns:repeat(6,minmax(104px,1fr));gap:6px}
-.optimizer-start-control{display:grid;gap:4px;max-width:360px}.optimizer-start-control small{color:var(--muted);font-size:11px;line-height:1.3}
+.optimizer-start-control{display:grid;gap:4px;min-width:0}.optimizer-start-control small{color:var(--muted);font-size:11px;line-height:1.3}
 .optimizer-action-message{max-width:360px;color:#fde68a;font-size:12px;line-height:1.35}
 .optimizer-score-stale{justify-self:start;padding:4px 8px;border:1px solid rgba(251,191,36,0.42);border-radius:999px;background:rgba(251,191,36,0.1);color:#fde68a;font-size:11px}
 .optimizer-summary-grid>div,.optimizer-extra-grid>div{display:grid;gap:2px;min-width:0;padding:6px 8px;border:1px solid rgba(255,255,255,0.07);border-radius:6px;background:rgba(255,255,255,0.025)}
@@ -297,7 +302,10 @@ select option:checked{
 .assignment-popover-picker .assignment-lock-option{display:flex;align-items:center;gap:7px;color:var(--sidebar-fg)}.assignment-lock-option input{width:auto}
 
 @media (max-width: 900px){
-  .build-workspace-controls{grid-template-columns:1fr}
+  .build-workspace-control-fields{grid-template-columns:1fr}
+  .build-workspace-optimizer-actions,.build-workspace-maintenance-actions{align-items:stretch}
+  .build-workspace-runtime-note{flex-basis:100%}
+  .build-workspace-controls .primary-action,.build-workspace-controls .secondary{height:auto;min-height:34px}
   .optimizer-run-selector-main{grid-template-columns:1fr}
   .optimizer-run-status{min-height:0}
   .optimizer-summary-grid,.optimizer-extra-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}
@@ -575,6 +583,76 @@ select option:checked{
   border-left: 4px solid #f59e0b;
   border-radius: 0.7rem;
   background: #111827;
+}
+
+.request-off-feasibility-card {
+  display: grid;
+  gap: 1rem;
+  margin: 1.25rem 0;
+  padding: 1rem;
+  border: 1px solid #334155;
+  border-left: 4px solid #f59e0b;
+  border-radius: 0.7rem;
+  background: #111827;
+}
+
+.request-off-feasibility-feasible {
+  border-left-color: #22c55e;
+}
+
+.request-off-feasibility-card small {
+  color: #cbd5e1;
+}
+
+.request-off-feasibility-badge {
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  background: #78350f;
+  color: #fde68a;
+  font-size: 0.75rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.request-off-feasibility-badge-feasible {
+  background: #14532d;
+  color: #bbf7d0;
+}
+
+.request-off-feasibility-dates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 0.65rem;
+}
+
+.request-off-feasibility-dates article {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border: 1px solid #92400e;
+  border-radius: 0.5rem;
+  background: #0f172a;
+}
+
+.request-off-feasibility-dates article > span {
+  color: #fde68a;
+}
+
+.request-off-feasibility-dates dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.request-off-feasibility-dates dt {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.request-off-feasibility-dates dd {
+  margin: 0.15rem 0 0;
+  font-weight: 700;
 }
 
 .night-feasibility-feasible {
