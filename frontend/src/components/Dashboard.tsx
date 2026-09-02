@@ -10,12 +10,14 @@ import ScheduleVersionViolationReport from './ScheduleVersionViolationReport'
 import ContractsView from './ContractsView'
 import FacilitiesView from './FacilitiesView'
 import PhysiciansView from './PhysiciansView'
+import StatsView from './StatsView'
 import { useAuth } from '../contexts/AuthContext'
 
-type AppView = 'my-schedule' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
+type AppView = 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
 
 const VIEW_PATHS: Record<AppView, string> = {
   'my-schedule': '/',
+  stats: '/stats',
   'shift-builder': '/shift-builder',
   'schedule-blocks': '/schedule-blocks',
   contracts: '/contracts',
@@ -29,6 +31,9 @@ function viewFromPath(pathname: string): AppView | null {
   }
   if (pathname === '/shift-builder') {
     return 'shift-builder'
+  }
+  if (pathname === '/stats') {
+    return 'stats'
   }
   if (
     pathname === '/schedule-blocks'
@@ -78,6 +83,8 @@ export default function Dashboard() {
       ? 'Request Builder'
       : activeView === 'my-schedule'
       ? 'Schedule'
+      : activeView === 'stats'
+      ? 'Stats'
         : activeView === 'shift-builder'
           ? 'Shift Builder'
         : activeView === 'schedule-blocks'
@@ -113,6 +120,7 @@ export default function Dashboard() {
         <main className="content">
           <h1 className="page-title">{pageTitle}</h1>
           {activeView === 'my-schedule' && <Calendar shiftsRefreshToken={shiftsRefreshToken} />}
+          {activeView === 'stats' && <StatsView />}
           {activeView === 'shift-builder' && <ShiftsView />}
           {activeView === 'schedule-blocks' && violationVersionId !== null && (
             <ScheduleVersionViolationReport versionId={violationVersionId} />

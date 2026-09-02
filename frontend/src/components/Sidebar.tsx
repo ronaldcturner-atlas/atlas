@@ -2,8 +2,8 @@ import React from 'react'
 import { useAuth } from '../contexts/AuthContext'
 
 type SidebarProps = {
-  activeView: 'my-schedule' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
-  onSelectView: (view: 'my-schedule' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians') => void
+  activeView: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
+  onSelectView: (view: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians') => void
 }
 
 export default function Sidebar({ activeView, onSelectView }: SidebarProps){
@@ -23,6 +23,13 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           onClick={() => onSelectView('my-schedule')}
         >
           Schedule
+        </button>
+        <button
+          type="button"
+          className={activeView === 'stats' ? 'active' : ''}
+          onClick={() => onSelectView('stats')}
+        >
+          Stats
         </button>
         <button
           type="button"

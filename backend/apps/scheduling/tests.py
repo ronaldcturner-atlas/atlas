@@ -309,8 +309,19 @@ class ScheduleBlockApiTests(TestCase):
         defaults.update(overrides)
         return ScheduleBlock.objects.create(**defaults)
 
-    def test_delete_only_allowed_for_pre_build(self):
+    def test_delete_allowed_for_unpublished_build_block(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.BUILD)
+
+        response = self.client.delete(f'/api/schedule-blocks/{block.id}/')
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(ScheduleBlock.objects.filter(id=block.id).exists())
+
+    def test_delete_requires_published_block_to_be_unpublished_first(self):
+        block = self._create_block(
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
 
         response = self.client.delete(f'/api/schedule-blocks/{block.id}/')
 

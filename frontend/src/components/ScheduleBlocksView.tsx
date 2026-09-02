@@ -400,11 +400,14 @@ export default function ScheduleBlocksView({
   }
 
   const deleteBlock = async (block: ScheduleBlock) => {
-    if (block.build_status !== 'PRE_BUILD') {
+    if (block.published_at) {
+      setError('Unpublish this Schedule Block before deleting it.')
       return
     }
 
-    const confirmed = window.confirm(`Delete Schedule Block ${block.name}?`)
+    const confirmed = window.confirm(
+      `Permanently delete Schedule Block ${block.name}? This will remove its schedule versions, optimizer runs, assignments, requests, and trade records. This cannot be undone.`,
+    )
     if (!confirmed) {
       return
     }
@@ -677,7 +680,7 @@ export default function ScheduleBlocksView({
                         <button type="button" onClick={() => openBlock(block)}>Edit Request Window</button>
                       </>
                     )}
-                    {block.build_status === 'PRE_BUILD' && (
+                    {!block.published_at && (
                       <button type="button" onClick={() => deleteBlock(block)}>Delete</button>
                     )}
                     {(block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (

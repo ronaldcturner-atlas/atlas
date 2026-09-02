@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { useLocation } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 
 type ScheduleVersion = {
   id: number
@@ -292,9 +292,9 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             )}
           </div>
         </div>
-        <a className="secondary build-workspace-link-button" href={`/schedule-blocks/${report.schedule_block.id}/build${report.optimizer_run ? `?optimizer_run_id=${report.optimizer_run.id}` : ''}`}>
+        <Link className="secondary build-workspace-link-button" to={`/schedule-blocks/${report.schedule_block.id}/build${report.optimizer_run ? `?optimizer_run_id=${report.optimizer_run.id}` : ''}`}>
           Back to Build Schedule
-        </a>
+        </Link>
       </div>
 
       {report.optimizer_run?.score_is_stale && (

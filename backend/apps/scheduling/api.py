@@ -32,6 +32,10 @@ from .models import (
     ScheduleShiftInstance,
     ScheduleVersion,
     Shift,
+    ShiftPosting,
+    ShiftStatsGroup,
+    ShiftTrade,
+    ShiftTradePolicy,
     ShiftTemplate,
 )
 from .optimizer import (
@@ -63,6 +67,27 @@ from .workload_feasibility import build_workload_feasibility
 
 
 STALE_OPTIMIZER_RUN_MINUTES = 10
+
+
+def _timezone_from_name(timezone_name):
+    aliases = {
+        'EST': 'America/New_York',
+        'EDT': 'America/New_York',
+        'Eastern': 'America/New_York',
+        'CST': 'America/Chicago',
+        'CDT': 'America/Chicago',
+        'Central': 'America/Chicago',
+        'MST': 'America/Denver',
+        'MDT': 'America/Denver',
+        'Mountain': 'America/Denver',
+        'PST': 'America/Los_Angeles',
+        'PDT': 'America/Los_Angeles',
+        'Pacific': 'America/Los_Angeles',
+    }
+    try:
+        return ZoneInfo(aliases.get(timezone_name, timezone_name or 'UTC'))
+    except ZoneInfoNotFoundError:
+        return datetime_timezone.utc
 
 
 def _shift_template_fingerprint(block, templates):
@@ -187,14 +212,28 @@ def published_schedule(request):
             'physician__display_name', 'physician__user__first_name',
             'physician__user__last_name', 'physician__user__username',
             'shift_instance__schedule_block_id', 'shift_instance__schedule_version_id',
+            'shift_instance__id', 'shift_instance__split_parent_id',
+            'shift_instance__split_parent__segment_start_time',
+            'shift_instance__split_parent__shift_template__start_time',
             'shift_instance__date', 'shift_instance__facility_id',
             'shift_instance__facility__name', 'shift_instance__facility__short_name',
-            'shift_instance__facility__sort_order', 'shift_instance__shift_template__name',
+            'shift_instance__facility__sort_order', 'shift_instance__facility__timezone',
+            'shift_instance__shift_template__name', 'shift_instance__start_datetime',
+            'shift_instance__end_datetime', 'shift_instance__segment_start_time',
+            'shift_instance__segment_end_time', 'posting__mode', 'posting__active',
             'shift_instance__shift_template__start_time',
             'shift_instance__shift_template__end_time',
+            'shift_instance__shift_template__night_shift',
+            'shift_instance__shift_template_id',
         )
     )
+    split_root_ids = {
+        assignment['shift_instance__split_parent_id']
+        for assignment in published_assignments
+        if assignment['shift_instance__split_parent_id'] is not None
+    }
     rows = []
+    displayed_instance_ids = set()
     for assignment in published_assignments:
         assignment_date = assignment['shift_instance__date']
         block_id = assignment['shift_instance__schedule_block_id']
@@ -220,8 +259,21 @@ def published_schedule(request):
                 assignment['physician__user__last_name'],
             ) if part
         ) or assignment['physician__user__username']
+        start_time = assignment['shift_instance__segment_start_time'] or assignment['shift_instance__shift_template__start_time']
+        end_time = assignment['shift_instance__segment_end_time'] or assignment['shift_instance__shift_template__end_time']
+        instance_id = assignment['shift_instance__id']
+        split_parent_id = assignment['shift_instance__split_parent_id']
+        split_group_id = split_parent_id or (instance_id if instance_id in split_root_ids else None)
+        split_group_start_time = None
+        if split_group_id is not None:
+            split_group_start_time = (
+                assignment['shift_instance__split_parent__segment_start_time']
+                or assignment['shift_instance__split_parent__shift_template__start_time']
+                if split_parent_id else start_time
+            )
         rows.append({
             'id': assignment['id'],
+            'shift_instance_id': instance_id,
             'facility': assignment['shift_instance__facility_id'],
             'facility_name': assignment['shift_instance__facility__name'],
             'facility_short_name': assignment['shift_instance__facility__short_name'],
@@ -231,18 +283,570 @@ def published_schedule(request):
             'role': assignment['shift_instance__shift_template__name'],
             'role_display': assignment['shift_instance__shift_template__name'],
             'date': assignment_date.isoformat(),
-            'start_time': assignment['shift_instance__shift_template__start_time'].isoformat(),
-            'end_time': assignment['shift_instance__shift_template__end_time'].isoformat(),
+            'start_time': start_time.isoformat(),
+            'end_time': end_time.isoformat(),
+            'is_night': assignment['shift_instance__shift_template__night_shift'],
+            'shift_template_id': assignment['shift_instance__shift_template_id'],
+            'split_group_id': split_group_id,
+            'split_group_start_time': split_group_start_time.isoformat() if split_group_start_time else None,
+            'is_split': split_group_id is not None,
+            'posting_mode': assignment['posting__mode'] if assignment['posting__active'] else None,
             'status': 'scheduled',
             'status_display': 'Scheduled',
             'schedule_block': block_id,
             'schedule_version': version_id,
+        })
+        displayed_instance_ids.add(instance_id)
+    open_instances = ScheduleShiftInstance.objects.filter(
+        schedule_block__in=published_blocks,
+        schedule_version_id__in=active_runs.keys(),
+        is_locked_open=True,
+    ).select_related('facility', 'shift_template', 'schedule_block')
+    for instance in open_instances:
+        if instance.id in displayed_instance_ids:
+            continue
+        if authoritative_block_by_date.get(instance.date) != instance.schedule_block_id:
+            continue
+        start_time = instance.segment_start_time or instance.shift_template.start_time
+        end_time = instance.segment_end_time or instance.shift_template.end_time
+        rows.append({
+            'id': None,
+            'shift_instance_id': instance.id,
+            'facility': instance.facility_id,
+            'facility_name': instance.facility.name,
+            'facility_short_name': instance.facility.short_name,
+            'facility_sort_order': instance.facility.sort_order,
+            'physician': None,
+            'physician_name': 'Open',
+            'role': instance.shift_template.name,
+            'role_display': instance.shift_template.name,
+            'date': instance.date.isoformat(),
+            'start_time': start_time.isoformat(),
+            'end_time': end_time.isoformat(),
+            'is_night': instance.shift_template.night_shift,
+            'shift_template_id': instance.shift_template_id,
+            'split_group_id': None,
+            'split_group_start_time': None,
+            'is_split': False,
+            'posting_mode': None,
+            'status': 'open',
+            'status_display': 'Open',
+            'schedule_block': instance.schedule_block_id,
+            'schedule_version': instance.schedule_version_id,
         })
     rows.sort(key=lambda row: (
         row['date'], row['facility_sort_order'], row['facility_name'],
         row['start_time'], row['physician_name'], row['id'],
     ))
     return Response(rows)
+
+
+def _published_assignment_or_404(assignment_id):
+    return get_object_or_404(
+        ScheduleShiftAssignment.objects.select_related(
+            'physician__user', 'shift_instance__facility', 'shift_instance__shift_template',
+            'shift_instance__schedule_block', 'shift_instance__schedule_version__domain',
+        ), id=assignment_id, shift_instance__schedule_block__published_at__isnull=False,
+    )
+
+
+@api_view(['GET', 'PATCH'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_trade_policy(request):
+    policy = ShiftTradePolicy.load()
+    if request.method == 'PATCH':
+        if not _can_manage_build_workspace(request.user):
+            return Response({'detail': 'Only a scheduler or administrator can change trade approval policy.'}, status=status.HTTP_403_FORBIDDEN)
+        value = request.data.get('require_scheduler_approval')
+        if type(value) is not bool:
+            return Response({'detail': 'Provide require_scheduler_approval as true or false.'}, status=status.HTTP_400_BAD_REQUEST)
+        policy.require_scheduler_approval = value
+        policy.updated_by = request.user
+        policy.save()
+    return Response({'require_scheduler_approval': policy.require_scheduler_approval, 'can_manage': _can_manage_build_workspace(request.user)})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_posting(request, assignment_id):
+    assignment = _published_assignment_or_404(assignment_id)
+    if assignment.physician.user_id != request.user.id and not _can_manage_build_workspace(request.user):
+        return Response({'detail': 'You may only post your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    mode = request.data.get('mode')
+    if mode == 'CLOSE':
+        ShiftPosting.objects.filter(assignment=assignment).update(active=False)
+    elif mode in (ShiftPosting.Mode.PICKUP, ShiftPosting.Mode.TRADE_ONLY):
+        ShiftPosting.objects.update_or_create(assignment=assignment, defaults={'mode': mode, 'active': True, 'posted_by': request.user})
+    else:
+        return Response({'detail': 'Choose pickup, trade only, or close.'}, status=status.HTTP_400_BAD_REQUEST)
+    posting = ShiftPosting.objects.filter(assignment=assignment, active=True).first()
+    return Response({'assignment_id': assignment.id, 'posting_mode': posting.mode if posting else None})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_split(request, assignment_id):
+    assignment = _published_assignment_or_404(assignment_id)
+    if assignment.physician.user_id != request.user.id and not _can_manage_build_workspace(request.user):
+        return Response({'detail': 'You may only split your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    try:
+        split_clock = datetime.strptime(str(request.data.get('split_time', '')), '%H:%M').time()
+    except ValueError:
+        return Response({'detail': 'Enter a valid split time.'}, status=status.HTTP_400_BAD_REQUEST)
+    instance = assignment.shift_instance
+    facility_zone = _timezone_from_name(instance.facility.timezone)
+    start_clock = instance.segment_start_time or instance.shift_template.start_time
+    end_clock = instance.segment_end_time or instance.shift_template.end_time
+    start_at = datetime.combine(instance.date, start_clock, tzinfo=facility_zone)
+    end_date = instance.date + timedelta(days=1) if end_clock <= start_clock else instance.date
+    end_at = datetime.combine(end_date, end_clock, tzinfo=facility_zone)
+    split_date = instance.date + timedelta(days=1) if split_clock <= start_clock and end_date != instance.date else instance.date
+    split_at = datetime.combine(split_date, split_clock, tzinfo=facility_zone)
+    if not start_at < split_at < end_at:
+        return Response({'detail': 'Split time must fall inside the shift.'}, status=status.HTTP_400_BAD_REQUEST)
+    with transaction.atomic():
+        locked = ScheduleShiftAssignment.objects.select_for_update().select_related('shift_instance').get(id=assignment.id)
+        original = locked.shift_instance
+        prior_end = end_at
+        original.end_datetime = split_at
+        original.start_datetime = start_at
+        original.segment_start_time = start_clock
+        original.segment_end_time = split_clock
+        original.save(update_fields=['start_datetime', 'end_datetime', 'segment_start_time', 'segment_end_time', 'updated_at'])
+        second = ScheduleShiftInstance.objects.create(
+            schedule_version=original.schedule_version, schedule_block=original.schedule_block,
+            date=original.date, shift_template=original.shift_template, facility=original.facility,
+            start_datetime=split_at, end_datetime=prior_end, required_staffing=original.required_staffing,
+            status=original.status, is_locked_open=original.is_locked_open,
+            split_parent=original.split_parent or original,
+            segment_start_time=split_clock, segment_end_time=end_clock,
+        )
+        cohort = ScheduleShiftAssignment.objects.filter(
+            shift_instance=original,
+            optimizer_run=locked.optimizer_run,
+        ).select_related('physician')
+        ScheduleShiftAssignment.objects.bulk_create([
+            ScheduleShiftAssignment(
+                shift_instance=second, physician=row.physician, created_by=request.user,
+                assignment_source=row.assignment_source, optimizer_run=row.optimizer_run,
+                is_locked=row.is_locked,
+            )
+            for row in cohort
+        ])
+        ShiftPosting.objects.filter(assignment__shift_instance=original).update(active=False)
+    return Response({'detail': 'Shift split successfully.'})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_unsplit(request, assignment_id):
+    assignment = _published_assignment_or_404(assignment_id)
+    if assignment.physician.user_id != request.user.id and not _can_manage_build_workspace(request.user):
+        return Response({'detail': 'You may only unsplit your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    instance = assignment.shift_instance
+    root = instance.split_parent or instance
+    segments = list(
+        ScheduleShiftInstance.objects.filter(Q(id=root.id) | Q(split_parent=root))
+        .select_related('shift_template', 'facility')
+        .order_by('start_datetime', 'id')
+    )
+    if len(segments) < 2:
+        return Response({'detail': 'This shift is not split.'}, status=status.HTTP_400_BAD_REQUEST)
+    segment_ids = [segment.id for segment in segments]
+    cohort_filter = {'optimizer_run': assignment.optimizer_run}
+    physician_sets = [
+        set(ScheduleShiftAssignment.objects.filter(shift_instance=segment, **cohort_filter).values_list('physician_id', flat=True))
+        for segment in segments
+    ]
+    if not physician_sets[0] or any(physicians != physician_sets[0] for physicians in physician_sets[1:]):
+        return Response(
+            {'detail': 'The split segments have different scheduled users and cannot be recombined until their assignments match.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    group_assignment_ids = ScheduleShiftAssignment.objects.filter(
+        shift_instance_id__in=segment_ids, **cohort_filter,
+    ).values_list('id', flat=True)
+    if ShiftTrade.objects.filter(
+        Q(offered_assignment_id__in=group_assignment_ids) | Q(requested_assignment_id__in=group_assignment_ids)
+    ).exists():
+        return Response(
+            {'detail': 'This split shift has trade history and cannot be recombined.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    template = root.shift_template
+    facility_zone = _timezone_from_name(root.facility.timezone)
+    start_at = datetime.combine(root.date, template.start_time, tzinfo=facility_zone)
+    end_date = root.date + timedelta(days=1) if template.end_time <= template.start_time else root.date
+    end_at = datetime.combine(end_date, template.end_time, tzinfo=facility_zone)
+    with transaction.atomic():
+        locked_root = ScheduleShiftInstance.objects.select_for_update().get(id=root.id)
+        derived_ids = [segment.id for segment in segments if segment.id != root.id]
+        ShiftPosting.objects.filter(assignment__shift_instance_id__in=segment_ids).delete()
+        ScheduleShiftInstance.objects.filter(id__in=derived_ids).delete()
+        locked_root.start_datetime = start_at
+        locked_root.end_datetime = end_at
+        locked_root.segment_start_time = None
+        locked_root.segment_end_time = None
+        locked_root.save(update_fields=['start_datetime', 'end_datetime', 'segment_start_time', 'segment_end_time', 'updated_at'])
+    return Response({'detail': 'Shift recombined successfully.'})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_reassign(request, assignment_id):
+    if not _can_manage_build_workspace(request.user):
+        return Response({'detail': 'Only a scheduler or administrator can change the scheduled user.'}, status=status.HTTP_403_FORBIDDEN)
+    assignment = _published_assignment_or_404(assignment_id)
+    physician = get_object_or_404(Physician, id=request.data.get('physician_id'), active=True)
+    valid, reason = _trade_assignment_is_valid(physician, assignment, [assignment.id])
+    if not valid:
+        return Response({'detail': reason}, status=status.HTTP_400_BAD_REQUEST)
+    assignment.physician = physician
+    assignment.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
+    assignment.created_by = request.user
+    assignment.is_locked = True
+    assignment.save()
+    ShiftPosting.objects.filter(assignment=assignment).update(active=False)
+    return Response({'detail': 'Scheduled user changed.'})
+
+
+@api_view(['PATCH'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_instance_times(request, instance_id):
+    """Change one published shift instance without altering its recurring template."""
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can change actual shift times.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    instance = get_object_or_404(
+        ScheduleShiftInstance.objects.select_related('facility', 'schedule_block'),
+        id=instance_id, schedule_block__published_at__isnull=False,
+    )
+    try:
+        start_clock = datetime.strptime(str(request.data.get('start_time', '')), '%H:%M').time()
+        end_clock = datetime.strptime(str(request.data.get('end_time', '')), '%H:%M').time()
+    except ValueError:
+        return Response({'detail': 'Enter valid start and end times.'}, status=status.HTTP_400_BAD_REQUEST)
+    if start_clock == end_clock:
+        return Response({'detail': 'Start and end times must be different.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    facility_zone = _timezone_from_name(instance.facility.timezone)
+    start_at = datetime.combine(instance.date, start_clock, tzinfo=facility_zone)
+    end_date = instance.date + timedelta(days=1) if end_clock <= start_clock else instance.date
+    end_at = datetime.combine(end_date, end_clock, tzinfo=facility_zone)
+    instance.start_datetime = start_at
+    instance.end_datetime = end_at
+    instance.segment_start_time = start_clock
+    instance.segment_end_time = end_clock
+    try:
+        instance.save(update_fields=[
+            'start_datetime', 'end_datetime', 'segment_start_time', 'segment_end_time', 'updated_at',
+        ])
+    except IntegrityError:
+        return Response(
+            {'detail': 'Another instance of this shift already starts at that time.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response({
+        'detail': 'Actual shift times updated.', 'shift_instance_id': instance.id,
+        'start_time': start_clock.isoformat(), 'end_time': end_clock.isoformat(),
+    })
+
+
+def _trade_assignment_payload(assignment):
+    if assignment is None:
+        return None
+    instance = assignment.shift_instance
+    physician = assignment.physician
+    return {
+        'id': assignment.id,
+        'physician_id': physician.id,
+        'physician_name': physician.display_name or physician.user.get_full_name() or physician.user.username,
+        'date': instance.date.isoformat(),
+        'facility': instance.facility.short_name,
+        'shift': instance.shift_template.name,
+        'start_time': instance.start_datetime.isoformat(),
+        'end_time': instance.end_datetime.isoformat(),
+    }
+
+
+def _trade_payload(trade, user):
+    return {
+        'id': trade.id,
+        'status': trade.status,
+        'status_display': trade.get_status_display(),
+        'note': trade.note,
+        'trade_type': trade.trade_type,
+        'requester_id': trade.requester_id,
+        'recipient_id': trade.recipient_id,
+        'offered_assignment': _trade_assignment_payload(trade.offered_assignment),
+        'requested_assignment': _trade_assignment_payload(trade.requested_assignment),
+        'created_at': trade.created_at.isoformat(),
+        'can_accept': trade.status == ShiftTrade.Status.PENDING_RECIPIENT and trade.recipient and trade.recipient.user_id == user.id,
+        'can_cancel': trade.status in (ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER) and trade.requester.user_id == user.id,
+        'can_review': trade.status == ShiftTrade.Status.PENDING_SCHEDULER and _can_manage_build_workspace(user),
+    }
+
+
+def _trade_queryset():
+    return ShiftTrade.objects.select_related(
+        'requester__user', 'recipient__user',
+        'offered_assignment__physician__user',
+        'offered_assignment__shift_instance__facility',
+        'offered_assignment__shift_instance__shift_template',
+        'offered_assignment__shift_instance__schedule_block',
+        'requested_assignment__physician__user',
+        'requested_assignment__shift_instance__facility',
+        'requested_assignment__shift_instance__shift_template',
+        'requested_assignment__shift_instance__schedule_block',
+    )
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_trades(request):
+    physician = getattr(request.user, 'physician', None)
+    can_manage = _can_manage_build_workspace(request.user)
+    if request.method == 'GET':
+        trades = _trade_queryset()
+        if not can_manage:
+            if physician is None:
+                return Response([])
+            trades = trades.filter(Q(requester=physician) | Q(recipient=physician))
+        return Response([_trade_payload(trade, request.user) for trade in trades[:200]])
+
+    if physician is None and not can_manage:
+        return Response({'detail': 'Your user account is not linked to a physician.'}, status=status.HTTP_403_FORBIDDEN)
+    if physician is None:
+        return Response({'detail': 'Your user account is not linked to a physician.'}, status=status.HTTP_403_FORBIDDEN)
+    target = _published_assignment_or_404(request.data.get('target_assignment_id'))
+    posting = ShiftPosting.objects.filter(assignment=target, active=True).first()
+    offered_id = request.data.get('offered_assignment_id')
+    if target.physician_id == physician.id:
+        return Response({'detail': 'This shift is not available to you.'}, status=status.HTTP_400_BAD_REQUEST)
+    offered = None
+    trade_type = ShiftTrade.TradeType.PICKUP
+    if offered_id:
+        offered = _published_assignment_or_404(offered_id)
+        trade_type = ShiftTrade.TradeType.TRADE
+        if offered.physician_id != physician.id:
+            return Response({'detail': 'You may only offer one of your own shifts.'}, status=status.HTTP_403_FORBIDDEN)
+        if offered.shift_instance.schedule_block_id != target.shift_instance.schedule_block_id:
+            return Response({'detail': 'Both shifts must belong to the same schedule block.'}, status=status.HTTP_400_BAD_REQUEST)
+        valid_option_ids = {
+            option['id'] for option in _trade_options_for_assignment(offered)
+        }
+        if target.id not in valid_option_ids:
+            return Response({'detail': 'That shift is not a valid trade option for your current schedule.'}, status=status.HTTP_400_BAD_REQUEST)
+    elif not posting or posting.mode != ShiftPosting.Mode.PICKUP:
+        return Response({'detail': 'This shift is not posted for pickup.'}, status=status.HTTP_400_BAD_REQUEST)
+    if ShiftTrade.objects.filter(
+        Q(offered_assignment=target) | Q(requested_assignment=target),
+        status__in=[ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER],
+    ).exists():
+        return Response({'detail': 'This shift already has a pending request.'}, status=status.HTTP_400_BAD_REQUEST)
+    trade = ShiftTrade.objects.create(
+        offered_assignment=target, requested_assignment=offered,
+        requester=physician, recipient=target.physician, trade_type=trade_type,
+        note=str(request.data.get('note', '')).strip(),
+    )
+    return Response(_trade_payload(_trade_queryset().get(id=trade.id), request.user), status=status.HTTP_201_CREATED)
+
+
+def _physician_is_eligible_for_facility(physician, assignment):
+    instance = assignment.shift_instance
+    return physician.active and ContractUserAssignment.objects.filter(
+        physician=physician, domain=instance.schedule_version.domain,
+        contract__active=True, contract__facilities=instance.facility,
+    ).exists()
+
+
+def _trade_options_for_assignment(offered):
+    proposer = offered.physician
+    run = offered.optimizer_run
+    block = offered.shift_instance.schedule_block
+    cohort = ScheduleShiftAssignment.objects.filter(
+        shift_instance__schedule_block=block,
+        optimizer_run=run,
+    )
+    cohort_rows = list(cohort.order_by(
+        'physician__display_name', 'shift_instance__date',
+        'shift_instance__facility__sort_order', 'shift_instance__start_datetime', 'id',
+    ).values(
+        'id', 'physician_id', 'physician__display_name',
+        'physician__user__first_name', 'physician__user__last_name', 'physician__user__username',
+        'shift_instance__date', 'shift_instance__facility_id', 'shift_instance__facility__short_name',
+        'shift_instance__segment_start_time', 'shift_instance__segment_end_time',
+        'shift_instance__shift_template__start_time', 'shift_instance__shift_template__end_time',
+    ))
+    proposer_work_dates = {
+        row['shift_instance__date'] for row in cohort_rows if row['physician_id'] == proposer.id
+    }
+    physician_dates = {}
+    for row in cohort_rows:
+        physician_dates.setdefault(row['physician_id'], set()).add(row['shift_instance__date'])
+    physician_ids = set(physician_dates)
+    eligible_facilities = {}
+    for physician_id, facility_id in ContractUserAssignment.objects.filter(
+        physician_id__in=physician_ids,
+        domain=offered.shift_instance.schedule_version.domain,
+        physician__active=True,
+        contract__active=True,
+    ).values_list('physician_id', 'contract__facilities'):
+        if facility_id is not None:
+            eligible_facilities.setdefault(physician_id, set()).add(facility_id)
+    proposer_facilities = eligible_facilities.get(proposer.id, set())
+    offered_facility_id = offered.shift_instance.facility_id
+    options = []
+    for target in cohort_rows:
+        if target['physician_id'] == proposer.id:
+            continue
+        target_date = target['shift_instance__date']
+        if target_date in proposer_work_dates:
+            continue
+        if offered.shift_instance.date in physician_dates.get(target['physician_id'], set()):
+            continue
+        if target['shift_instance__facility_id'] not in proposer_facilities:
+            continue
+        if offered_facility_id not in eligible_facilities.get(target['physician_id'], set()):
+            continue
+        start_time = target['shift_instance__segment_start_time'] or target['shift_instance__shift_template__start_time']
+        end_time = target['shift_instance__segment_end_time'] or target['shift_instance__shift_template__end_time']
+        physician_name = target['physician__display_name'] or ' '.join(
+            part for part in (
+                target['physician__user__first_name'], target['physician__user__last_name'],
+            ) if part
+        ) or target['physician__user__username']
+        options.append({
+            'id': target['id'],
+            'physician_id': target['physician_id'],
+            'physician_name': physician_name,
+            'date': target_date.isoformat(),
+            'facility': target['shift_instance__facility__short_name'],
+            'start_time': start_time.isoformat(),
+            'end_time': end_time.isoformat(),
+        })
+    return options
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_trade_options(request, assignment_id):
+    offered = _published_assignment_or_404(assignment_id)
+    if offered.physician.user_id != request.user.id:
+        return Response({'detail': 'You may only propose a trade from your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    return Response(_trade_options_for_assignment(offered))
+
+
+def _trade_assignment_is_valid(physician, assignment, excluded_ids):
+    instance = assignment.shift_instance
+    contract_assignment = ContractUserAssignment.objects.filter(
+        physician=physician, domain=instance.schedule_version.domain, contract__active=True,
+        contract__facilities=instance.facility,
+    ).exists()
+    if not physician.active or not contract_assignment:
+        return False, f'{physician} is not eligible for {instance.facility.name}.'
+    overlap = ScheduleShiftAssignment.objects.filter(
+        physician=physician,
+        shift_instance__start_datetime__lt=instance.end_datetime,
+        shift_instance__end_datetime__gt=instance.start_datetime,
+    ).exclude(id__in=excluded_ids).exists()
+    if overlap:
+        return False, f'{physician} has an overlapping assignment.'
+    return True, ''
+
+
+def _apply_shift_trade(trade, reviewed_by=None):
+    now = timezone.now()
+    with transaction.atomic():
+        target = ScheduleShiftAssignment.objects.select_for_update().select_related('physician', 'shift_instance__schedule_version__domain', 'shift_instance__facility').get(id=trade.offered_assignment_id)
+        offered = None
+        if trade.requested_assignment_id:
+            offered = ScheduleShiftAssignment.objects.select_for_update().select_related('physician', 'shift_instance__schedule_version__domain', 'shift_instance__facility').get(id=trade.requested_assignment_id)
+        if target.physician_id != trade.recipient_id or (offered and offered.physician_id != trade.requester_id):
+            return False, 'An assignment changed after this request was created.'
+        excluded = [target.id] + ([offered.id] if offered else [])
+        valid, reason = _trade_assignment_is_valid(trade.requester, target, excluded)
+        if not valid:
+            return False, reason
+        if offered:
+            valid, reason = _trade_assignment_is_valid(trade.recipient, offered, excluded)
+            if not valid:
+                return False, reason
+        target.physician = trade.requester
+        target.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
+        target.created_by, target.is_locked = reviewed_by, True
+        target.save()
+        if offered:
+            offered.physician = trade.recipient
+            offered.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
+            offered.created_by, offered.is_locked = reviewed_by, True
+            offered.save()
+        ShiftPosting.objects.filter(assignment=target).update(active=False)
+        trade.status = ShiftTrade.Status.APPROVED
+        trade.reviewed_at, trade.reviewed_by = now, reviewed_by
+        trade.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'updated_at'])
+        _cancel_competing_trades(trade)
+    return True, ''
+
+
+def _cancel_competing_trades(trade):
+    assignment_ids = [trade.offered_assignment_id]
+    if trade.requested_assignment_id:
+        assignment_ids.append(trade.requested_assignment_id)
+    ShiftTrade.objects.filter(
+        Q(offered_assignment_id__in=assignment_ids) | Q(requested_assignment_id__in=assignment_ids),
+        status__in=[ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER],
+    ).exclude(id=trade.id).update(status=ShiftTrade.Status.CANCELLED, updated_at=timezone.now())
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_trade_action(request, trade_id, action):
+    trade = get_object_or_404(_trade_queryset(), id=trade_id)
+    now = timezone.now()
+    if action in ('accept', 'decline'):
+        if trade.recipient.user_id != request.user.id or trade.status != ShiftTrade.Status.PENDING_RECIPIENT:
+            return Response({'detail': 'This trade is not awaiting your response.'}, status=status.HTTP_403_FORBIDDEN)
+        requires_review = ShiftTradePolicy.load().require_scheduler_approval
+        trade.status = ShiftTrade.Status.PENDING_SCHEDULER if action == 'accept' else ShiftTrade.Status.DECLINED
+        trade.responded_at = now
+        trade.save(update_fields=['status', 'responded_at', 'updated_at'])
+        if action == 'accept':
+            _cancel_competing_trades(trade)
+        if action == 'accept' and not requires_review:
+            applied, reason = _apply_shift_trade(trade, reviewed_by=request.user)
+            if not applied:
+                return Response({'detail': reason}, status=status.HTTP_400_BAD_REQUEST)
+    elif action == 'cancel':
+        if trade.requester.user_id != request.user.id or trade.status not in (ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER):
+            return Response({'detail': 'This trade cannot be cancelled.'}, status=status.HTTP_403_FORBIDDEN)
+        trade.status = ShiftTrade.Status.CANCELLED
+        trade.save(update_fields=['status', 'updated_at'])
+    elif action in ('approve', 'reject'):
+        if not _can_manage_build_workspace(request.user) or trade.status != ShiftTrade.Status.PENDING_SCHEDULER:
+            return Response({'detail': 'This trade is not awaiting scheduler review.'}, status=status.HTTP_403_FORBIDDEN)
+        if action == 'approve':
+            applied, reason = _apply_shift_trade(trade, reviewed_by=request.user)
+            if not applied:
+                return Response({'detail': reason}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            trade.status = ShiftTrade.Status.DECLINED
+            trade.reviewed_at, trade.reviewed_by = now, request.user
+            trade.save(update_fields=['status', 'reviewed_at', 'reviewed_by', 'updated_at'])
+    else:
+        return Response({'detail': 'Unknown trade action.'}, status=status.HTTP_404_NOT_FOUND)
+    return Response(_trade_payload(_trade_queryset().get(id=trade.id), request.user))
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
@@ -319,6 +923,78 @@ def shift_template_detail(request, template_id):
     serializer.is_valid(raise_exception=True)
     serializer.save()
     return Response(serializer.data)
+
+
+def _stats_group_payload(group):
+    return {
+        'id': group.id,
+        'name': group.name,
+        'shift_template_ids': list(group.shift_templates.order_by('facility__sort_order', 'start_time', 'id').values_list('id', flat=True)),
+    }
+
+
+def _validate_stats_group_data(data, instance=None):
+    name = str(data.get('name', instance.name if instance else '')).strip()
+    raw_ids = data.get('shift_template_ids')
+    if raw_ids is None and instance is not None:
+        template_ids = list(instance.shift_templates.values_list('id', flat=True))
+    elif not isinstance(raw_ids, list):
+        return None, None, 'Select one or more shifts.'
+    else:
+        try:
+            template_ids = list(dict.fromkeys(int(template_id) for template_id in raw_ids))
+        except (TypeError, ValueError):
+            return None, None, 'Shift selections are invalid.'
+    if not name:
+        return None, None, 'Enter a group name.'
+    if not template_ids:
+        return None, None, 'Select at least one shift.'
+    duplicate = ShiftStatsGroup.objects.filter(name__iexact=name)
+    if instance is not None:
+        duplicate = duplicate.exclude(id=instance.id)
+    if duplicate.exists():
+        return None, None, 'A Stats group with this name already exists.'
+    if ShiftTemplate.objects.filter(id__in=template_ids).count() != len(template_ids):
+        return None, None, 'One or more selected shifts no longer exist.'
+    return name, template_ids, None
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def stats_groups_list_create(request):
+    if request.method == 'GET':
+        groups = ShiftStatsGroup.objects.prefetch_related('shift_templates')
+        return Response([_stats_group_payload(group) for group in groups])
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    name, template_ids, error = _validate_stats_group_data(request.data)
+    if error:
+        return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+    with transaction.atomic():
+        group = ShiftStatsGroup.objects.create(name=name, created_by=request.user)
+        group.shift_templates.set(template_ids)
+    return Response(_stats_group_payload(group), status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH', 'DELETE'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def stats_group_detail(request, group_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    group = get_object_or_404(ShiftStatsGroup, id=group_id)
+    if request.method == 'DELETE':
+        group.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    name, template_ids, error = _validate_stats_group_data(request.data, group)
+    if error:
+        return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+    with transaction.atomic():
+        group.name = name
+        group.save(update_fields=['name', 'updated_at'])
+        group.shift_templates.set(template_ids)
+    return Response(_stats_group_payload(group))
 
 
 def _has_published_overlap(start_date, end_date, exclude_id=None):
@@ -2769,13 +3445,21 @@ def schedule_block_detail(request, block_id):
         serializer.save()
         return Response(serializer.data)
 
-    if block.build_status != ScheduleBlock.BuildStatus.PRE_BUILD:
+    if block.published_at is not None:
         return Response(
-            {'detail': 'Only PRE_BUILD Schedule Blocks can be deleted.'},
+            {'detail': 'Unpublish this Schedule Block before deleting it.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    block.delete()
+    with transaction.atomic():
+        ShiftTrade.objects.filter(
+            Q(offered_assignment__shift_instance__schedule_block=block)
+            | Q(requested_assignment__shift_instance__schedule_block=block)
+        ).delete()
+        ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_block=block,
+        ).delete()
+        block.delete()
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 

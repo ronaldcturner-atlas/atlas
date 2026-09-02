@@ -102,6 +102,20 @@ class ShiftTemplate(models.Model):
         ordering = ['facility__name', 'name', 'start_time']
 
 
+class ShiftStatsGroup(models.Model):
+    name = models.CharField(max_length=80, unique=True)
+    shift_templates = models.ManyToManyField(ShiftTemplate, related_name='stats_groups')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='shift_stats_groups_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name', 'id']
+
+    def __str__(self):
+        return self.name
+
+
 class ScheduleBlock(models.Model):
     """Defines the lifecycle and metadata for a schedule planning block."""
 
@@ -277,6 +291,11 @@ class ScheduleShiftInstance(models.Model):
     required_staffing = models.PositiveIntegerField(default=1)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
     is_locked_open = models.BooleanField(default=False)
+    split_parent = models.ForeignKey(
+        'self', on_delete=models.PROTECT, related_name='split_segments', null=True, blank=True,
+    )
+    segment_start_time = models.TimeField(null=True, blank=True)
+    segment_end_time = models.TimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -287,8 +306,8 @@ class ScheduleShiftInstance(models.Model):
         ordering = ['date', 'start_datetime', 'facility__name', 'id']
         constraints = [
             models.UniqueConstraint(
-                fields=['schedule_version', 'date', 'shift_template'],
-                name='unique_shift_template_date_per_schedule_version',
+                fields=['schedule_version', 'date', 'shift_template', 'start_datetime'],
+                name='unique_shift_segment_per_schedule_version',
             ),
         ]
 
@@ -355,6 +374,74 @@ class ScheduleShiftAssignment(models.Model):
                 name='unique_optimizer_run_physician_per_shift_instance',
             ),
         ]
+
+
+class ShiftTrade(models.Model):
+    class TradeType(models.TextChoices):
+        PICKUP = 'PICKUP', 'Pickup'
+        TRADE = 'TRADE', 'Trade'
+
+    class Status(models.TextChoices):
+        PENDING_RECIPIENT = 'PENDING_RECIPIENT', 'Pending recipient'
+        PENDING_SCHEDULER = 'PENDING_SCHEDULER', 'Pending scheduler'
+        DECLINED = 'DECLINED', 'Declined'
+        APPROVED = 'APPROVED', 'Approved'
+        CANCELLED = 'CANCELLED', 'Cancelled'
+
+    offered_assignment = models.ForeignKey(
+        ScheduleShiftAssignment, on_delete=models.PROTECT, related_name='trades_offered',
+    )
+    requested_assignment = models.ForeignKey(
+        ScheduleShiftAssignment, on_delete=models.PROTECT, related_name='trades_requested',
+        null=True, blank=True,
+    )
+    requester = models.ForeignKey(
+        Physician, on_delete=models.PROTECT, related_name='shift_trades_requested',
+    )
+    recipient = models.ForeignKey(
+        Physician, on_delete=models.PROTECT, related_name='shift_trades_received', null=True, blank=True,
+    )
+    trade_type = models.CharField(max_length=12, choices=TradeType.choices, default=TradeType.TRADE)
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING_RECIPIENT)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='shift_trades_reviewed',
+    )
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+
+class ShiftPosting(models.Model):
+    class Mode(models.TextChoices):
+        PICKUP = 'PICKUP', 'Available for pickup'
+        TRADE_ONLY = 'TRADE_ONLY', 'Trade only'
+
+    assignment = models.OneToOneField(
+        ScheduleShiftAssignment, on_delete=models.CASCADE, related_name='posting',
+    )
+    posted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='shift_postings')
+    mode = models.CharField(max_length=16, choices=Mode.choices)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ShiftTradePolicy(models.Model):
+    require_scheduler_approval = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='shift_trade_policy_updates',
+    )
+
+    @classmethod
+    def load(cls):
+        policy, _created = cls.objects.get_or_create(pk=1)
+        return policy
 
 
 class ScheduleRequest(models.Model):

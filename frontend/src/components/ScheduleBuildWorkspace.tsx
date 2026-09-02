@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 
@@ -2054,12 +2055,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 >
                   Activate
                 </button>
-                <a
+                <Link
                   className="secondary build-workspace-link-button"
-                  href={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
+                  to={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
                 >
                   Violations
-                </a>
+                </Link>
                 <button
                   type="button"
                   className="secondary danger-action"
@@ -2153,12 +2154,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       Activate
                     </button>
                     {isCompletedOptimizerRun(run) ? (
-                      <a
+                      <Link
                         className="secondary build-workspace-link-button"
-                        href={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
+                        to={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
                       >
                         Violations
-                      </a>
+                      </Link>
                     ) : (
                       <button type="button" className="secondary" disabled>
                         Violations
