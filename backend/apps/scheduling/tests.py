@@ -6,6 +6,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.db.models import Count
+from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -17,6 +18,7 @@ from apps.facilities.models import Facility
 from .models import (
     Contract,
     ContractUserAssignment,
+    OptimizerControl,
     OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
@@ -1995,6 +1997,70 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             day_assignments,
         )
         self.assertEqual(day_instance.assignments.count(), day_instance.required_staffing)
+
+    def test_background_optimizer_can_be_left_and_reconnected(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 9876}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 202)
+        run = OptimizerRun.objects.get(id=response.json()['id'])
+        self.assertEqual(run.status, OptimizerRun.Status.RUNNING)
+        control = OptimizerControl.objects.get(optimizer_run=run)
+        self.assertIsNone(control.started_at)
+        context = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/').json()
+        self.assertTrue(any(row['id'] == run.id and row['status'] == 'RUNNING' for row in context['optimizer_runs']))
+        compact_status = self.client.get(f'/api/optimizer-runs/{run.id}/?compact=1')
+        self.assertEqual(compact_status.status_code, 200)
+        self.assertEqual(compact_status.json()['status'], 'RUNNING')
+        self.assertNotIn('optimizer_summary', compact_status.json())
+
+        stopped = self.client.post(
+            f'/api/schedule-versions/{version.id}/stop-optimizer/',
+            data={'optimizer_run_id': run.id}, format='json',
+        )
+        self.assertEqual(stopped.status_code, 200)
+        control.refresh_from_db()
+        self.assertTrue(control.stop_requested)
+
+    def test_background_worker_completes_queued_optimizer_job(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 4321}, format='json',
+        )
+        run = OptimizerRun.objects.get(id=response.json()['id'])
+
+        def complete_job(_version, **kwargs):
+            queued_run = kwargs['optimizer_run']
+            queued_run.status = OptimizerRun.Status.COMPLETED
+            queued_run.final_score = 0
+            queued_run.is_active = True
+            queued_run.save(update_fields=['status', 'final_score', 'is_active'])
+            return {'optimizer_run_id': queued_run.id, 'final_score': 0}
+
+        with patch(
+            'apps.scheduling.management.commands.run_optimizer_worker.optimize_schedule_version',
+            side_effect=complete_job,
+        ) as optimize:
+            call_command('run_optimizer_worker', '--once')
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, OptimizerRun.Status.COMPLETED)
+        self.assertTrue(run.is_active)
+        self.assertFalse(OptimizerControl.objects.filter(optimizer_run=run).exists())
+        optimize.assert_called_once()
 
     def test_manual_edits_mark_score_stale_and_rescore_preserves_schedule_state(self):
         self.client.post(

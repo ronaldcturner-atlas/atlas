@@ -36,5 +36,25 @@ services:
     depends_on:
       - postgres
 
+  optimizer-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: sh -c "python manage.py migrate && python manage.py run_optimizer_worker"
+    env_file:
+      - .env
+    environment:
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: ${DB_PORT}
+      DEBUG: ${DEBUG}
+      SECRET_KEY: ${SECRET_KEY}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+
 volumes:
   postgres_data:

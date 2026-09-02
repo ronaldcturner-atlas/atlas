@@ -419,7 +419,15 @@ class OptimizerControl(models.Model):
     token = models.UUIDField(primary_key=True)
     schedule_version = models.OneToOneField(ScheduleVersion, on_delete=models.CASCADE)
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
+    optimizer_run = models.OneToOneField(
+        OptimizerRun, on_delete=models.CASCADE, related_name='control', null=True, blank=True,
+    )
+    source_run = models.ForeignKey(
+        OptimizerRun, on_delete=models.SET_NULL, related_name='queued_from_controls',
+        null=True, blank=True,
+    )
     stop_requested = models.BooleanField(default=False)
+    started_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 

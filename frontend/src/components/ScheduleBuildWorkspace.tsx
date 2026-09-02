@@ -475,7 +475,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const automaticGenerationKeyRef = useRef<string | null>(null)
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [isStoppingOptimizer, setIsStoppingOptimizer] = useState(false)
-  const optimizerControlRef = useRef<{ token: string; versionId: number } | null>(null)
+  const optimizerControlRef = useRef<{ versionId: number; runId: number } | null>(null)
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
@@ -689,6 +689,17 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       const nextContext = data as BuildContext
       setContext(nextContext)
       setOptimizerSummary(nextContext.optimizer_summary ?? null)
+      const runningRun = nextContext.optimizer_runs?.find((run) => run.status === 'RUNNING') ?? null
+      setIsOptimizing(Boolean(runningRun))
+      if (runningRun && nextContext.selected_version) {
+        optimizerControlRef.current = {
+          versionId: nextContext.selected_version.id,
+          runId: runningRun.id,
+        }
+      } else {
+        optimizerControlRef.current = null
+        setIsStoppingOptimizer(false)
+      }
       const returnedRunId = nextContext.selected_optimizer_run?.id ?? null
       if (requestedOptimizerRunId !== undefined || selectedOptimizerRunIdRef.current === null) {
         setSelectedOptimizerRunId(returnedRunId)
@@ -715,6 +726,43 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       }
     }
   }
+
+  useEffect(() => {
+    const versionId = context?.selected_version?.id
+    const runningRunId = optimizerControlRef.current?.runId
+    if (!isOptimizing || !versionId || !runningRunId) return
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const response = await fetch(`${API_BASE}/optimizer-runs/${runningRunId}/?compact=1`, {
+            credentials: 'include', cache: 'no-store',
+          })
+          const run = await response.json().catch(() => null) as OptimizerRun | null
+          if (!response.ok) throw new Error(apiError(run, 'Unable to refresh optimizer status.'))
+          if (run?.status !== 'RUNNING') {
+            setIsOptimizing(false)
+            setIsStoppingOptimizer(false)
+            optimizerControlRef.current = null
+            await fetchContext(versionId, {
+              preserveError: true,
+              quiet: true,
+              optimizerRunId: run?.status === 'COMPLETED' ? run.id : selectedOptimizerRunIdRef.current,
+            })
+            if (run?.status === 'COMPLETED') {
+              setSelectedOptimizerRunId(run.id)
+              updateOptimizerRunUrl(run.id)
+              setNotice(`Optimizer Run ${run.run_number} completed.`)
+            } else if (run?.status === 'FAILED') {
+              setError(`Optimizer Run ${run.run_number} did not complete.`)
+            }
+          }
+        } catch (pollError) {
+          setError(pollError instanceof Error ? pollError.message : 'Unable to refresh optimizer status.')
+        }
+      })()
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [isOptimizing, context?.selected_version?.id])
 
   const moveBackToBuild = async () => {
     const confirmed = window.confirm(
@@ -1110,12 +1158,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
 
     let optimizeErrorMessage: string | null = null
-    let completedOptimizerRunId: number | undefined
+    let queuedOptimizerRunId: number | undefined
     try {
       closeAssignments()
       setIsOptimizing(true)
       setIsStoppingOptimizer(false)
-      optimizerControlRef.current = { token: crypto.randomUUID(), versionId }
       setError(null)
       setNotice(null)
       setOptimizerSummary(null)
@@ -1132,7 +1179,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             schedule_version_id: versionId,
             currently_viewed_run_id: viewedRun?.id ?? null,
             start_mode: optimizerStartMode,
-            search_token: optimizerControlRef.current.token,
+            search_token: crypto.randomUUID(),
+            background: true,
           }),
         },
       )
@@ -1141,31 +1189,31 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         throw new Error(apiError(data, 'Unable to run optimizer.'))
       }
 
-      const summary = data as OptimizerSummary
-      completedOptimizerRunId = summary.optimizer_run_id
-      setSelectedOptimizerRunId(completedOptimizerRunId ?? null)
-      updateOptimizerRunUrl(completedOptimizerRunId ?? null)
-      setOptimizerSummary(summary)
-      setNotice((data as OptimizerSummary).message ?? 'Optimizer v0 completed.')
+      const queuedRun = data as OptimizerRun & { message?: string }
+      queuedOptimizerRunId = queuedRun.id
+      optimizerControlRef.current = { versionId, runId: queuedRun.id }
+      setNotice(queuedRun.message ?? 'Optimizer started. You may leave this page.')
     } catch (optimizeError) {
       optimizeErrorMessage = optimizeError instanceof Error ? optimizeError.message : 'Unable to run optimizer.'
       setError(optimizeErrorMessage)
+      setIsOptimizing(false)
+      optimizerControlRef.current = null
     } finally {
       try {
         await fetchContext(versionId, {
           preserveError: Boolean(optimizeErrorMessage),
           quiet: true,
           rethrow: true,
-          optimizerRunId: completedOptimizerRunId,
+          optimizerRunId: selectedOptimizerRunIdRef.current,
         })
       } catch {
         if (!optimizeErrorMessage) {
-          setError('Optimizer completed, but the Schedule Build Workspace could not refresh.')
+          setError('Optimizer started, but its current status could not be refreshed.')
         }
       }
-      setIsOptimizing(false)
-      setIsStoppingOptimizer(false)
-      optimizerControlRef.current = null
+      if (!queuedOptimizerRunId) {
+        setIsStoppingOptimizer(false)
+      }
     }
   }
 
@@ -1176,7 +1224,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     try {
       const response = await fetch(`${API_BASE}/schedule-versions/${control.versionId}/stop-optimizer/`, {
         method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ search_token: control.token }),
+        body: JSON.stringify({ optimizer_run_id: control.runId }),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(apiError(data, 'Unable to request Stop.'))
@@ -1645,7 +1693,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         </div>
 
         <div className="build-workspace-optimizer-actions">
-          <span className="muted build-workspace-runtime-note">Stops after 60 seconds without improvement; maximum 10 minutes. Keep this page open.</span>
+          <span className="muted build-workspace-runtime-note">Stops after 60 seconds without improvement; maximum 10 minutes. You may leave this page while it runs.</span>
           {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
             {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
           </button>}

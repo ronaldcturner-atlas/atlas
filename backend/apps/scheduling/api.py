@@ -1,5 +1,6 @@
 import hashlib
 import json
+import secrets
 from datetime import datetime, timedelta, timezone as datetime_timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1366,12 +1367,19 @@ def _run_optimizer_response(request, version):
 def schedule_version_stop_optimizer(request, version_id):
     if not _can_manage_build_workspace(request.user):
         return _build_workspace_forbidden_response()
-    try:
-        token = UUID(str(request.data.get('search_token', '')))
-    except ValueError:
-        return Response({'detail': 'Invalid search token.'}, status=400)
-    updated = OptimizerControl.objects.filter(token=token, schedule_version_id=version_id,
-                                             created_by=request.user).update(stop_requested=True)
+    run_id = request.data.get('optimizer_run_id')
+    controls = OptimizerControl.objects.filter(schedule_version_id=version_id)
+    if run_id not in (None, ''):
+        try:
+            controls = controls.filter(optimizer_run_id=int(run_id))
+        except (TypeError, ValueError):
+            return Response({'detail': 'Invalid optimizer run.'}, status=400)
+    else:
+        try:
+            controls = controls.filter(token=UUID(str(request.data.get('search_token', ''))))
+        except ValueError:
+            return Response({'detail': 'Invalid optimizer run.'}, status=400)
+    updated = controls.update(stop_requested=True)
     if not updated:
         return Response({'detail': 'This search has finished or is not yet ready to stop.'}, status=409)
     return Response({'detail': 'Stop requested. Finishing the current check and preserving the best valid schedule.'})
@@ -1417,7 +1425,74 @@ def schedule_version_run_optimizer(request, version_id):
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
-    return _run_optimizer_response(request, version)
+    if not request.data.get('background'):
+        return _run_optimizer_response(request, version)
+    seed, seed_error = _parse_optimizer_seed(request)
+    if seed_error:
+        return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    start_mode, source_run, start_error = _optimizer_start_options(request, version)
+    if start_error:
+        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    if (
+        version.status != ScheduleVersion.Status.BUILD
+        or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
+    ):
+        return Response(
+            {'detail': 'Optimizer can only run on a BUILD Schedule Version.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    token = request.data.get('search_token')
+    try:
+        token = UUID(str(token)) if token else UUID(int=secrets.randbits(128))
+    except ValueError:
+        return Response({'detail': 'Invalid search token.'}, status=400)
+    OptimizerControl.objects.filter(
+        schedule_version=version,
+        created_at__lt=timezone.now() - timedelta(minutes=15),
+    ).delete()
+    try:
+        with transaction.atomic():
+            locked_version = ScheduleVersion.objects.select_for_update().get(id=version.id)
+            running_run = _blocking_optimizer_run(locked_version)
+            if running_run is not None:
+                return Response({
+                    'detail': 'An optimizer run is already running for this schedule version.',
+                    'optimizer_run_id': running_run.id,
+                }, status=status.HTTP_409_CONFLICT)
+            latest_number = (
+                OptimizerRun.objects.filter(schedule_version=locked_version)
+                .order_by('-run_number').values_list('run_number', flat=True).first() or 0
+            )
+            locked_open_ids = (
+                list(source_run.locked_open_shift_instance_ids or [])
+                if source_run is not None else list(
+                    ScheduleShiftInstance.objects.filter(
+                        schedule_version=locked_version, is_locked_open=True,
+                    ).values_list('id', flat=True)
+                )
+            )
+            optimizer_run = OptimizerRun.objects.create(
+                schedule_version=locked_version,
+                run_number=latest_number + 1,
+                created_by=request.user,
+                status=OptimizerRun.Status.RUNNING,
+                seed=seed if seed is not None else secrets.randbits(63),
+                start_mode=start_mode,
+                run_kind='OPTIMIZER',
+                locked_open_shift_instance_ids=locked_open_ids,
+            )
+            OptimizerControl.objects.create(
+                token=token,
+                schedule_version=locked_version,
+                created_by=request.user,
+                optimizer_run=optimizer_run,
+                source_run=source_run,
+            )
+    except IntegrityError:
+        return Response({'detail': 'An optimizer search is already running.'}, status=409)
+    payload = OptimizerRunSerializer(optimizer_run).data
+    payload['message'] = 'Optimizer queued. You may leave this page; the search will continue.'
+    return Response(payload, status=status.HTTP_202_ACCEPTED)
 
 
 @api_view(['POST'])
@@ -1623,6 +1698,8 @@ def optimizer_run_detail(request, run_id):
                 ),
             }
         )
+    if request.query_params.get('compact') in {'1', 'true', 'TRUE'}:
+        return Response(OptimizerRunHistorySerializer(optimizer_run).data)
     return Response(OptimizerRunSerializer(optimizer_run).data)
 
 
