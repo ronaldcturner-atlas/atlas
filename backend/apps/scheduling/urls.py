@@ -9,6 +9,7 @@ urlpatterns = [
     path("contracts/<int:contract_id>/deactivate/", api.contract_deactivate, name="contract_deactivate"),
     path("contracts/<int:contract_id>/reactivate/", api.contract_reactivate, name="contract_reactivate"),
     path("shifts/", api.shifts_list_create, name="shifts_list_create"),
+    path("published-schedule/", api.published_schedule, name="published_schedule"),
     path("shifts/<int:shift_id>/", api.shift_detail, name="shift_detail"),
     path("shift-templates/", api.shift_templates_list_create, name="shift_templates_list_create"),
     path("shift-templates/<int:template_id>/", api.shift_template_detail, name="shift_template_detail"),
@@ -43,4 +44,5 @@ urlpatterns = [
     path("schedule-blocks/<int:block_id>/enter-preview/", api.schedule_block_enter_preview, name="schedule_block_enter_preview"),
     path("schedule-blocks/<int:block_id>/move-back-to-build/", api.schedule_block_move_back_to_build, name="schedule_block_move_back_to_build"),
     path("schedule-blocks/<int:block_id>/publish/", api.schedule_block_publish, name="schedule_block_publish"),
+    path("schedule-blocks/<int:block_id>/unpublish/", api.schedule_block_unpublish, name="schedule_block_unpublish"),
 ]

@@ -142,6 +142,109 @@ def shifts_list_create(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def published_schedule(request):
+    """Return the assignments from the current published schedule of record."""
+    published_blocks = list(
+        ScheduleBlock.objects.filter(published_at__isnull=False)
+        .order_by('-published_at', '-id')
+    )
+    authoritative_block_by_date = {}
+    for block in published_blocks:
+        pointer = block.start_date
+        while pointer <= block.end_date:
+            authoritative_block_by_date.setdefault(pointer, block.id)
+            pointer += timedelta(days=1)
+
+    active_runs = {}
+    for active_run in (
+        OptimizerRun.objects.filter(
+            schedule_version__schedule_block__in=published_blocks,
+            is_active=True,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+        .select_related('schedule_version')
+        .order_by('schedule_version_id', '-run_number')
+    ):
+        active_runs.setdefault(active_run.schedule_version_id, active_run)
+    active_run_ids = [active_run.id for active_run in active_runs.values()]
+    published_assignments = (
+        ScheduleShiftAssignment.objects.filter(
+            shift_instance__schedule_block__in=published_blocks,
+        )
+        .filter(
+        Q(
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run__isnull=True,
+        )
+        | Q(optimizer_run_id__in=active_run_ids)
+        )
+        .order_by()
+        .values(
+            'id', 'assignment_source', 'optimizer_run_id', 'physician_id',
+            'physician__display_name', 'physician__user__first_name',
+            'physician__user__last_name', 'physician__user__username',
+            'shift_instance__schedule_block_id', 'shift_instance__schedule_version_id',
+            'shift_instance__date', 'shift_instance__facility_id',
+            'shift_instance__facility__name', 'shift_instance__facility__short_name',
+            'shift_instance__facility__sort_order', 'shift_instance__shift_template__name',
+            'shift_instance__shift_template__start_time',
+            'shift_instance__shift_template__end_time',
+        )
+    )
+    rows = []
+    for assignment in published_assignments:
+        assignment_date = assignment['shift_instance__date']
+        block_id = assignment['shift_instance__schedule_block_id']
+        version_id = assignment['shift_instance__schedule_version_id']
+        if authoritative_block_by_date.get(assignment_date) != block_id:
+            continue
+        active_run = active_runs.get(version_id)
+        if active_run is not None and active_run.run_kind in ('COPY', 'BENCHMARK'):
+            if assignment['optimizer_run_id'] != active_run.id:
+                continue
+        else:
+            is_legacy_manual = (
+                assignment['assignment_source'] == ScheduleShiftAssignment.AssignmentSource.MANUAL
+                and assignment['optimizer_run_id'] is None
+            )
+            if not is_legacy_manual and (
+                active_run is None or assignment['optimizer_run_id'] != active_run.id
+            ):
+                continue
+        physician_name = assignment['physician__display_name'] or ' '.join(
+            part for part in (
+                assignment['physician__user__first_name'],
+                assignment['physician__user__last_name'],
+            ) if part
+        ) or assignment['physician__user__username']
+        rows.append({
+            'id': assignment['id'],
+            'facility': assignment['shift_instance__facility_id'],
+            'facility_name': assignment['shift_instance__facility__name'],
+            'facility_short_name': assignment['shift_instance__facility__short_name'],
+            'facility_sort_order': assignment['shift_instance__facility__sort_order'],
+            'physician': assignment['physician_id'],
+            'physician_name': physician_name,
+            'role': assignment['shift_instance__shift_template__name'],
+            'role_display': assignment['shift_instance__shift_template__name'],
+            'date': assignment_date.isoformat(),
+            'start_time': assignment['shift_instance__shift_template__start_time'].isoformat(),
+            'end_time': assignment['shift_instance__shift_template__end_time'].isoformat(),
+            'status': 'scheduled',
+            'status_display': 'Scheduled',
+            'schedule_block': block_id,
+            'schedule_version': version_id,
+        })
+    rows.sort(key=lambda row: (
+        row['date'], row['facility_sort_order'], row['facility_name'],
+        row['start_time'], row['physician_name'], row['id'],
+    ))
+    return Response(rows)
+
+
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -235,6 +338,30 @@ def _can_manage_requests(user):
     return user.has_perm('scheduling.add_schedulerequest') or user.has_perm(
         'scheduling.change_schedulerequest'
     )
+
+
+def _request_blocks_for_regular_user():
+    """Return only the latest published block and the nearest active/upcoming block."""
+    latest_published = (
+        ScheduleBlock.objects.filter(published_at__isnull=False)
+        .order_by('-published_at')
+        .first()
+    )
+    upcoming = (
+        ScheduleBlock.objects.filter(
+            published_at__isnull=True,
+            end_date__gte=timezone.localdate(),
+        )
+        .order_by('start_date', 'created_at')
+        .first()
+    )
+    block_ids = [block.id for block in (latest_published, upcoming) if block is not None]
+    return ScheduleBlock.objects.filter(id__in=block_ids)
+
+
+def _request_window_is_open(block):
+    now = timezone.now()
+    return block.request_open_datetime <= now <= block.request_close_datetime
 
 
 def _can_manage_build_workspace(user):
@@ -619,6 +746,11 @@ def schedule_block_request_upsert(request, block_id):
 
     can_manage = _can_manage_requests(request.user)
     self_physician = _resolve_self_physician(request.user)
+    if not can_manage and not _request_window_is_open(block):
+        return Response(
+            {'detail': 'The request window for this Schedule Block is not open.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     physician_id = request.data.get('physician_id')
     try:
@@ -758,6 +890,12 @@ def schedule_block_request_detail(request, block_id, request_id):
 
     if request.method == 'GET':
         return Response(ScheduleRequestSerializer(schedule_request).data)
+
+    if not can_manage and not _request_window_is_open(block):
+        return Response(
+            {'detail': 'The request window for this Schedule Block is not open.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if not _editable_request_status(block):
         return Response(
@@ -2558,9 +2696,31 @@ def schedule_block_generate_shift_instances(request, block_id):
 @permission_classes([IsAuthenticated])
 def schedule_blocks_list_create(request):
     if request.method == 'GET':
-        blocks = ScheduleBlock.objects.all()
-        serializer = ScheduleBlockSerializer(blocks, many=True)
-        return Response(serializer.data)
+        can_manage = _can_manage_build_workspace(request.user) or _can_manage_requests(request.user)
+        blocks = ScheduleBlock.objects.all() if can_manage else _request_blocks_for_regular_user()
+        payload = ScheduleBlockSerializer(blocks, many=True).data
+        if not can_manage:
+            physician = _resolve_self_physician(request.user)
+            requests_by_block = {}
+            if physician is not None:
+                own_requests = (
+                    ScheduleRequest.objects.filter(
+                        schedule_block__in=blocks,
+                        physician=physician,
+                        request_scope=ScheduleRequest.RequestScope.USER,
+                    )
+                    .select_related('physician__user')
+                    .prefetch_related('shift_templates__facility')
+                    .order_by('date')
+                )
+                for schedule_request in own_requests:
+                    requests_by_block.setdefault(schedule_request.schedule_block_id, []).append(schedule_request)
+            for block_payload in payload:
+                block_payload['my_requests'] = ScheduleRequestSerializer(
+                    requests_by_block.get(block_payload['id'], []),
+                    many=True,
+                ).data
+        return Response(payload)
 
     if not _can_manage_build_workspace(request.user):
         return _build_workspace_forbidden_response()
@@ -2691,6 +2851,26 @@ def schedule_block_publish(request, block_id):
 
     block.published_at = timezone.now()
     block.build_status = ScheduleBlock.BuildStatus.ARCHIVE
+    block.save(update_fields=['published_at', 'build_status', 'updated_at'])
+    return Response(ScheduleBlockSerializer(block).data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_unpublish(request, block_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    if block.build_status != ScheduleBlock.BuildStatus.ARCHIVE or block.published_at is None:
+        return Response(
+            {'detail': 'Only a published Schedule Block can be returned to BUILD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    block.published_at = None
+    block.build_status = ScheduleBlock.BuildStatus.BUILD
     block.save(update_fields=['published_at', 'build_status', 'updated_at'])
     return Response(ScheduleBlockSerializer(block).data)
 

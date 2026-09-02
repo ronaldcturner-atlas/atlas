@@ -3,7 +3,6 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import Sidebar from './Sidebar'
 import Topbar from './Topbar'
 import Calendar from './Calendar'
-import SchedulerView from './SchedulerView'
 import ShiftsView from './ShiftsView'
 import ScheduleBuildWorkspace from './ScheduleBuildWorkspace'
 import ScheduleBlocksView from './ScheduleBlocksView'
@@ -11,12 +10,12 @@ import ScheduleVersionViolationReport from './ScheduleVersionViolationReport'
 import ContractsView from './ContractsView'
 import FacilitiesView from './FacilitiesView'
 import PhysiciansView from './PhysiciansView'
+import { useAuth } from '../contexts/AuthContext'
 
-type AppView = 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
+type AppView = 'my-schedule' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
 
 const VIEW_PATHS: Record<AppView, string> = {
   'my-schedule': '/',
-  'scheduler-view': '/scheduler',
   'shift-builder': '/shift-builder',
   'schedule-blocks': '/schedule-blocks',
   contracts: '/contracts',
@@ -27,9 +26,6 @@ const VIEW_PATHS: Record<AppView, string> = {
 function viewFromPath(pathname: string): AppView | null {
   if (pathname === '/') {
     return 'my-schedule'
-  }
-  if (pathname === '/scheduler') {
-    return 'scheduler-view'
   }
   if (pathname === '/shift-builder') {
     return 'shift-builder'
@@ -55,6 +51,7 @@ function viewFromPath(pathname: string): AppView | null {
 }
 
 export default function Dashboard() {
+  const { user } = useAuth()
   const location = useLocation()
   const navigate = useNavigate()
   const activeView = viewFromPath(location.pathname) ?? 'my-schedule'
@@ -66,6 +63,11 @@ export default function Dashboard() {
   const violationVersionId = violationReportMatch ? Number(violationReportMatch[1]) : null
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
   const [shiftsRefreshToken, setShiftsRefreshToken] = React.useState(0)
+  const canManageSchedules = Boolean(
+    user?.is_staff
+    || user?.is_superuser
+    || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())),
+  )
 
   const pageTitle =
     buildBlockId !== null
@@ -75,13 +77,11 @@ export default function Dashboard() {
       : requestBlockId !== null
       ? 'Request Builder'
       : activeView === 'my-schedule'
-      ? 'My Schedule'
-      : activeView === 'scheduler-view'
-        ? 'Scheduler View'
+      ? 'Schedule'
         : activeView === 'shift-builder'
           ? 'Shift Builder'
         : activeView === 'schedule-blocks'
-          ? 'Schedule Blocks'
+          ? canManageSchedules ? 'Schedule Blocks' : 'My Requests'
         : activeView === 'contracts'
           ? 'Contracts'
         : activeView === 'facilities'
@@ -91,8 +91,12 @@ export default function Dashboard() {
   React.useEffect(() => {
     if (viewFromPath(location.pathname) === null) {
       navigate('/', { replace: true })
+      return
     }
-  }, [location.pathname, navigate])
+    if (!canManageSchedules && (buildBlockId !== null || violationVersionId !== null)) {
+      navigate('/schedule-blocks', { replace: true })
+    }
+  }, [buildBlockId, canManageSchedules, location.pathname, navigate, violationVersionId])
 
   const handleFacilitiesChanged = React.useCallback(() => {
     setFacilitiesRefreshToken((current) => current + 1)
@@ -109,12 +113,6 @@ export default function Dashboard() {
         <main className="content">
           <h1 className="page-title">{pageTitle}</h1>
           {activeView === 'my-schedule' && <Calendar shiftsRefreshToken={shiftsRefreshToken} />}
-          {activeView === 'scheduler-view' && (
-            <SchedulerView
-              facilitiesRefreshToken={facilitiesRefreshToken}
-              shiftsRefreshToken={shiftsRefreshToken}
-            />
-          )}
           {activeView === 'shift-builder' && <ShiftsView />}
           {activeView === 'schedule-blocks' && violationVersionId !== null && (
             <ScheduleVersionViolationReport versionId={violationVersionId} />
@@ -127,6 +125,7 @@ export default function Dashboard() {
           )}
           {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId === null && (
             <ScheduleBlocksView
+              requestUserView={!canManageSchedules}
               requestBlockId={requestBlockId}
               onOpenRequests={(blockId) => navigate(`/schedule-blocks/${blockId}/requests`)}
               onCloseRequests={() => navigate('/schedule-blocks')}

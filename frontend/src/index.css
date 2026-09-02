@@ -47,6 +47,29 @@ select option:checked{
 .calendar-card{background:var(--surface);padding:16px;border-radius:8px;min-height:520px}
 .calendar-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .month-label{font-weight:600}
+.schedule-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.my-schedule-filter{height:34px;display:inline-flex;align-items:center;gap:7px;padding:0 10px;border:1px solid rgba(255,255,255,0.14);border-radius:7px;background:rgba(255,255,255,0.03);font-size:13px;cursor:pointer}
+.my-schedule-filter:hover,.my-schedule-filter.selected{background:rgba(79,70,229,0.2);border-color:rgba(129,140,248,0.65)}
+.my-schedule-filter.disabled{opacity:0.5;cursor:not-allowed}
+.my-schedule-filter input,.physician-filter-list input{accent-color:var(--accent)}
+.physician-filter-menu{position:relative}
+.physician-filter-menu summary{height:34px;min-width:140px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 10px;border:1px solid rgba(255,255,255,0.14);border-radius:7px;background:rgba(255,255,255,0.03);font-size:13px;cursor:pointer;list-style:none}
+.physician-filter-menu summary::-webkit-details-marker{display:none}
+.physician-filter-menu summary::after{content:'▾';color:var(--muted)}
+.physician-filter-menu[open] summary{border-color:rgba(129,140,248,0.65);background:rgba(79,70,229,0.16)}
+.physician-filter-popover{position:absolute;right:0;top:40px;z-index:30;width:310px;max-height:430px;display:flex;flex-direction:column;padding:10px;background:#111c2e;border:1px solid rgba(255,255,255,0.16);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.45)}
+.physician-filter-heading{display:flex;align-items:center;justify-content:space-between;padding:2px 4px 9px;border-bottom:1px solid rgba(255,255,255,0.08);font-size:13px}
+.physician-filter-heading button,.schedule-filter-status button{border:0;background:transparent;color:#a5b4fc;cursor:pointer;font:inherit}
+.physician-filter-heading button:disabled{color:var(--muted);cursor:default;opacity:0.55}
+.physician-filter-list{overflow-y:auto;padding-top:6px}
+.physician-filter-list label{display:flex;align-items:center;gap:9px;padding:7px 5px;border-radius:6px;font-size:13px;cursor:pointer}
+.physician-filter-list label:hover{background:rgba(255,255,255,0.05)}
+.physician-filter-list label.inactive{color:var(--muted)}
+.physician-filter-list label small{margin-left:auto;color:var(--muted)}
+.schedule-filter-status{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:-2px 0 12px;padding:7px 10px;border-radius:7px;background:rgba(79,70,229,0.12);color:#c7d2fe;font-size:12px}
+.schedule-filter-error{margin-bottom:12px;padding:8px 10px;border-radius:7px;background:rgba(239,68,68,0.16);color:#fecaca;font-size:13px}
+.my-request-summary{display:flex;flex-direction:column;gap:4px;min-width:220px}
+.my-request-summary span{font-size:12px;color:var(--sidebar-fg)}
 .controls button{margin-left:8px;padding:6px 10px;border-radius:6px;border:0;background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .controls button.primary{background:var(--accent);color:white}
 .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
@@ -57,6 +80,8 @@ select option:checked{
 .shift-item{background:var(--shift-bg, rgba(79,70,229,0.1));border-left:3px solid var(--shift-border, var(--accent));padding:6px 8px;border-radius:6px;font-size:11px;line-height:1.2;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.03)}
 .shift-item.clickable{cursor:pointer}
 .shift-item.clickable:hover{background:var(--shift-hover, rgba(79,70,229,0.18))}
+.shift-item-compact{padding:4px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;font-weight:500}
+.shift-item-compact span{display:block;overflow:hidden;text-overflow:ellipsis}
 .shift-time-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
 .shift-time{font-weight:700;color:var(--shift-accent, var(--accent));font-size:11px}
 .shift-role-badge{padding:2px 6px;border-radius:999px;background:var(--shift-badge-bg, rgba(255,255,255,0.08));color:var(--shift-badge-fg, var(--sidebar-fg));font-size:9px;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;white-space:nowrap}
@@ -80,6 +105,12 @@ select option:checked{
 .shift-modal-actions button.secondary{background:rgba(255,255,255,0.06)}
 .shift-modal-actions button.secondary:hover{background:rgba(255,255,255,0.12)}
 
+@media (max-width: 980px){
+  .calendar-header{align-items:flex-start;gap:12px;flex-direction:column}
+  .schedule-toolbar{justify-content:flex-start}
+  .physician-filter-popover{left:0;right:auto}
+}
+
 .scheduler-view-card{background:var(--surface);border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:18px}
 .scheduler-day-group h2{margin:0 0 10px 0;font-size:16px;color:var(--sidebar-fg)}
 .scheduler-table-wrap{overflow-x:auto;border:1px solid rgba(255,255,255,0.08);border-radius:8px}
@@ -95,9 +126,15 @@ select option:checked{
 .facilities-header h2{margin:0;font-size:16px}
 .primary-action{padding:8px 12px;border-radius:8px;border:0;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
 .facilities-error{padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.16);color:#fecaca;font-size:13px}
+.facility-order-help{margin-top:-6px;color:var(--muted);font-size:12px}
+.facility-drag-handle{width:36px;color:var(--muted);font-size:18px;letter-spacing:-4px;cursor:grab;user-select:none}
+.facility-drag-handle:active{cursor:grabbing}
+.facility-row-dragging{opacity:0.45;background:rgba(79,70,229,0.12)}
 .facility-actions{display:flex;gap:8px}
 .facility-actions button{padding:6px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.16);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .facility-actions button:hover{background:rgba(255,255,255,0.06)}
+.facility-actions button.danger{border-color:rgba(248,113,113,0.55);color:#fca5a5}
+.facility-actions button.danger:hover{background:rgba(239,68,68,0.12)}
 .facility-color-cell{display:inline-flex;align-items:center;gap:8px}
 .facility-color-swatch{width:12px;height:12px;border-radius:50%;border:1px solid rgba(255,255,255,0.35);display:inline-block}
 .facility-field{display:grid;gap:6px}

@@ -59,3 +59,38 @@ class FacilitiesTests(TestCase):
         names = {item['name'] for item in payload}
         self.assertIn('Alpha', names)
         self.assertNotIn('Beta', names)
+
+    def test_facilities_can_be_reordered(self):
+        alpha = Facility.objects.create(name='Alpha', short_name='Alpha', sort_order=1)
+        beta = Facility.objects.create(name='Beta', short_name='Beta', sort_order=2)
+        gamma = Facility.objects.create(name='Gamma', short_name='Gamma', sort_order=3)
+
+        response = self.client.post(
+            '/api/facilities/reorder/',
+            {'facility_ids': [gamma.id, alpha.id, beta.id]},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['id'] for item in response.json()], [gamma.id, alpha.id, beta.id])
+        self.assertEqual(list(Facility.objects.values_list('id', flat=True)), [gamma.id, alpha.id, beta.id])
+
+    def test_reorder_requires_every_facility_exactly_once(self):
+        alpha = Facility.objects.create(name='Alpha', short_name='Alpha', sort_order=1)
+        Facility.objects.create(name='Beta', short_name='Beta', sort_order=2)
+
+        response = self.client.post(
+            '/api/facilities/reorder/',
+            {'facility_ids': [alpha.id]},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_unused_facility_can_be_deleted(self):
+        facility = Facility.objects.create(name='Temporary', short_name='Temp')
+
+        response = self.client.delete(f'/api/facilities/{facility.id}/')
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Facility.objects.filter(id=facility.id).exists())

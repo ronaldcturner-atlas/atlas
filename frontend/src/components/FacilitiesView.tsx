@@ -7,6 +7,7 @@ type Facility = {
   timezone: string
   color: string
   active: boolean
+  sort_order: number
 }
 
 type FacilityFormState = {
@@ -74,6 +75,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
   const [facilities, setFacilities] = useState<Facility[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
+  const [draggedFacilityId, setDraggedFacilityId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const [isModalOpen, setIsModalOpen] = useState(false)
@@ -210,6 +212,69 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
     }
   }
 
+  const deleteFacility = async (facility: Facility) => {
+    const confirmed = window.confirm(
+      `Delete "${facility.name}"? This is permanent. Facilities already used by a schedule cannot be deleted.`,
+    )
+    if (!confirmed) return
+
+    try {
+      setError(null)
+      const response = await fetch(`${API_BASE}/facilities/${facility.id}/`, {
+        method: 'DELETE',
+        credentials: 'include',
+      })
+      if (!response.ok) {
+        const errorMessage = await getApiErrorMessage(response)
+        throw new Error(errorMessage ?? 'Unable to delete facility')
+      }
+      await fetchFacilities()
+      onFacilitiesChanged()
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete facility.')
+    }
+  }
+
+  const reorderFacilities = async (targetFacilityId: number) => {
+    if (draggedFacilityId === null || draggedFacilityId === targetFacilityId) {
+      setDraggedFacilityId(null)
+      return
+    }
+
+    const previousFacilities = facilities
+    const draggedIndex = facilities.findIndex((facility) => facility.id === draggedFacilityId)
+    const targetIndex = facilities.findIndex((facility) => facility.id === targetFacilityId)
+    if (draggedIndex < 0 || targetIndex < 0) {
+      setDraggedFacilityId(null)
+      return
+    }
+
+    const reordered = [...facilities]
+    const [dragged] = reordered.splice(draggedIndex, 1)
+    reordered.splice(targetIndex, 0, dragged)
+    setFacilities(reordered)
+    setDraggedFacilityId(null)
+
+    try {
+      setError(null)
+      const response = await fetch(`${API_BASE}/facilities/reorder/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ facility_ids: reordered.map((facility) => facility.id) }),
+      })
+      if (!response.ok) {
+        const errorMessage = await getApiErrorMessage(response)
+        throw new Error(errorMessage ?? 'Unable to save facility order')
+      }
+      setFacilities(await response.json())
+      onFacilitiesChanged()
+    } catch (reorderError) {
+      setFacilities(previousFacilities)
+      setError(reorderError instanceof Error ? reorderError.message : 'Unable to save facility order.')
+    }
+  }
+
   if (isLoading) {
     return <div className="scheduler-loading">Loading facilities...</div>
   }
@@ -225,10 +290,13 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
 
       {error && <div className="facilities-error">{error}</div>}
 
+      <div className="facility-order-help">Drag a facility to set the order used on every daily schedule.</div>
+
       <div className="scheduler-table-wrap">
         <table className="scheduler-table">
           <thead>
             <tr>
+              <th aria-label="Display order" />
               <th>Name</th>
               <th>Short Name</th>
               <th>Timezone</th>
@@ -239,7 +307,25 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
           </thead>
           <tbody>
             {facilities.map((facility) => (
-              <tr key={facility.id}>
+              <tr
+                key={facility.id}
+                className={draggedFacilityId === facility.id ? 'facility-row-dragging' : ''}
+                draggable
+                onDragStart={(event) => {
+                  setDraggedFacilityId(facility.id)
+                  event.dataTransfer.effectAllowed = 'move'
+                }}
+                onDragEnd={() => setDraggedFacilityId(null)}
+                onDragOver={(event) => {
+                  event.preventDefault()
+                  event.dataTransfer.dropEffect = 'move'
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  reorderFacilities(facility.id)
+                }}
+              >
+                <td className="facility-drag-handle" title="Drag to reorder" aria-label={`Reorder ${facility.name}`}>⋮⋮</td>
                 <td>{facility.name}</td>
                 <td>{facility.short_name}</td>
                 <td>{facility.timezone}</td>
@@ -268,6 +354,9 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                         Enable
                       </button>
                     )}
+                    <button type="button" className="danger" onClick={() => deleteFacility(facility)}>
+                      Delete
+                    </button>
                   </div>
                 </td>
               </tr>

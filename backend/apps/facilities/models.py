@@ -8,6 +8,7 @@ class Facility(models.Model):
     timezone = models.CharField(max_length=64, default='UTC')
     color = models.CharField(max_length=7, default='#2563eb')
     active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0, db_index=True)
 
     @property
     def display_name(self):
@@ -17,4 +18,4 @@ class Facility(models.Model):
         return self.name
     
     class Meta:
-        ordering = ['name']
+        ordering = ['sort_order', 'name', 'id']

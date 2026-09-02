@@ -14,6 +14,12 @@ type ScheduleBlock = {
   created_at: string
   updated_at: string
   published_at: string | null
+  my_requests?: Array<{
+    id: number
+    date: string
+    request_type: 'DAY_OFF' | 'SHIFT_OFF' | 'DAY_ON' | 'SHIFT_ON'
+    weight: 'LOW' | 'MEDIUM' | 'HIGH' | 'FIXED'
+  }>
 }
 
 type ScheduleBlockFormState = {
@@ -24,6 +30,7 @@ type ScheduleBlockFormState = {
 }
 
 type ScheduleBlocksViewProps = {
+  requestUserView?: boolean
   requestBlockId?: number | null
   onOpenRequests?: (blockId: number) => void
   onCloseRequests?: () => void
@@ -181,6 +188,7 @@ async function parseApiResponseError(response: Response) {
 }
 
 export default function ScheduleBlocksView({
+  requestUserView = false,
   requestBlockId = null,
   onOpenRequests,
   onCloseRequests,
@@ -270,6 +278,12 @@ export default function ScheduleBlocksView({
     () => [...blocks].sort((a, b) => b.created_at.localeCompare(a.created_at)),
     [blocks],
   )
+
+  const requestTypeLabel = (requestType: string) => requestType
+    .toLowerCase()
+    .split('_')
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(' ')
 
   const openCreateModal = () => {
     setEditingBlockId(null)
@@ -513,6 +527,102 @@ export default function ScheduleBlocksView({
     return <div className="scheduler-loading">Loading Schedule Blocks...</div>
   }
 
+  const unpublishBlock = async (block: ScheduleBlock) => {
+    const confirmed = window.confirm(
+      'Unpublish this schedule and return it to BUILD? It will be removed from the live Schedule page, but all draft assignments and optimizer runs will be preserved.',
+    )
+    if (!confirmed) return
+
+    try {
+      setError(null)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/unpublish/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({}),
+      })
+      if (!response.ok) {
+        const parsed = await parseApiResponseError(response)
+        throw new Error(parsed.message ?? 'Unable to unpublish this Schedule Block.')
+      }
+      await fetchBlocks()
+    } catch (unpublishError) {
+      console.error(unpublishError)
+      setError(unpublishError instanceof Error ? unpublishError.message : 'Unable to unpublish this Schedule Block.')
+    }
+  }
+
+  if (requestUserView) {
+    return (
+      <div className="facilities-view-card">
+        <div className="facilities-header">
+          <h2>My Requests</h2>
+        </div>
+        {error && <div className="facilities-error">{error}</div>}
+        <div className="scheduler-table-wrap">
+          <table className="scheduler-table schedule-blocks-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Schedule Dates</th>
+                <th>Request Opens</th>
+                <th>Request Closes</th>
+                <th>Status</th>
+                <th>My Entered Requests</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedBlocks.map((block) => {
+                const requestStatus = getRequestStatus(block.request_open_datetime, block.request_close_datetime)
+                return (
+                  <tr key={block.id}>
+                    <td>{block.name}</td>
+                    <td>{`${formatDate(block.start_date)} - ${formatDate(block.end_date)}`}</td>
+                    <td>{formatDateTime(block.request_open_datetime)}</td>
+                    <td>{formatDateTime(block.request_close_datetime)}</td>
+                    <td>{requestStatus}</td>
+                    <td>
+                      {block.my_requests?.length ? (
+                        <div className="my-request-summary">
+                          {block.my_requests.map((item) => (
+                            <span key={item.id}>
+                              {formatDate(item.date)}: {requestTypeLabel(item.request_type)} ({item.weight.toLowerCase()})
+                            </span>
+                          ))}
+                        </div>
+                      ) : 'None'}
+                    </td>
+                    <td>
+                      {requestStatus === 'Open' && (block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') ? (
+                        <button type="button" onClick={() => openRequests(block)}>Enter Requests</button>
+                      ) : '—'}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+        {!sortedBlocks.length && <div className="empty-state">No request periods are available.</div>}
+
+        {isModalOpen && activeModalTab === 'requests' && openedBlock && (
+          <div className="shift-modal-overlay" onClick={closeModal}>
+            <div className="shift-modal shift-modal-wide schedule-block-modal request-builder-modal" onClick={(event) => event.stopPropagation()}>
+              <div className="shift-modal-header"><h2>Enter Requests</h2></div>
+              <div className="shift-modal-body">
+                <RequestBuilderView block={openedBlock} />
+              </div>
+              <div className="shift-modal-actions">
+                <button className="secondary" type="button" onClick={closeModal}>Back to My Requests</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="facilities-view-card">
       <div className="facilities-header">
@@ -578,6 +688,9 @@ export default function ScheduleBlocksView({
                         <button type="button" onClick={() => publishBlock(block)}>Publish</button>
                         <button type="button" onClick={() => moveBackToBuild(block)}>Move Back to Build</button>
                       </>
+                    )}
+                    {block.build_status === 'ARCHIVE' && block.published_at && (
+                      <button type="button" onClick={() => unpublishBlock(block)}>Unpublish / Return to Build</button>
                     )}
                   </div>
                 </td>

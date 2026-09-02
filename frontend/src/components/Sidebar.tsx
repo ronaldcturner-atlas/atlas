@@ -1,11 +1,18 @@
 import React from 'react'
+import { useAuth } from '../contexts/AuthContext'
 
 type SidebarProps = {
-  activeView: 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
-  onSelectView: (view: 'my-schedule' | 'scheduler-view' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians') => void
+  activeView: 'my-schedule' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
+  onSelectView: (view: 'my-schedule' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians') => void
 }
 
 export default function Sidebar({ activeView, onSelectView }: SidebarProps){
+  const { user } = useAuth()
+  const canManageSchedules = Boolean(
+    user?.is_staff
+    || user?.is_superuser
+    || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())),
+  )
   return (
     <aside className="sidebar">
       <div className="logo">Atlas <span style={{opacity:0.85,fontWeight:500}}>Physician Scheduling</span></div>
@@ -15,14 +22,7 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           className={activeView === 'my-schedule' ? 'active' : ''}
           onClick={() => onSelectView('my-schedule')}
         >
-          My Schedule
-        </button>
-        <button
-          type="button"
-          className={activeView === 'scheduler-view' ? 'active' : ''}
-          onClick={() => onSelectView('scheduler-view')}
-        >
-          Scheduler View
+          Schedule
         </button>
         <button
           type="button"
@@ -36,7 +36,7 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           className={activeView === 'schedule-blocks' ? 'active' : ''}
           onClick={() => onSelectView('schedule-blocks')}
         >
-          Schedule Blocks
+          {canManageSchedules ? 'Schedule Blocks' : 'My Requests'}
         </button>
         <button
           type="button"

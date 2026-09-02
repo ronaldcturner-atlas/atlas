@@ -1,4 +1,7 @@
 from django.shortcuts import get_object_or_404
+from django.db import transaction
+from django.db.models import Max
+from django.db.models.deletion import ProtectedError
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
@@ -30,15 +33,50 @@ def facilities_list_create(request):
 
 	serializer = FacilitySerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
-	serializer.save()
+	next_sort_order = (Facility.objects.aggregate(max_order=Max('sort_order'))['max_order'] or 0) + 1
+	serializer.save(sort_order=next_sort_order)
 	return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['GET', 'PUT', 'PATCH'])
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def facilities_reorder(request):
+	facility_ids = request.data.get('facility_ids')
+	if not isinstance(facility_ids, list) or any(type(value) is not int for value in facility_ids):
+		return Response(
+			{'facility_ids': ['Provide the facility IDs in the desired order.']},
+			status=status.HTTP_400_BAD_REQUEST,
+		)
+
+	existing_ids = list(Facility.objects.values_list('id', flat=True))
+	if len(facility_ids) != len(set(facility_ids)) or set(facility_ids) != set(existing_ids):
+		return Response(
+			{'facility_ids': ['Include every facility exactly once.']},
+			status=status.HTTP_400_BAD_REQUEST,
+		)
+
+	with transaction.atomic():
+		for sort_order, facility_id in enumerate(facility_ids, start=1):
+			Facility.objects.filter(id=facility_id).update(sort_order=sort_order)
+
+	return Response(FacilitySerializer(Facility.objects.all(), many=True).data)
+
+
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facility_detail(request, facility_id):
 	facility = get_object_or_404(Facility, id=facility_id)
+	if request.method == 'DELETE':
+		try:
+			facility.delete()
+		except ProtectedError:
+			return Response(
+				{'error': 'This facility is already used by a schedule and cannot be deleted. Disable it instead.'},
+				status=status.HTTP_409_CONFLICT,
+			)
+		return Response(status=status.HTTP_204_NO_CONTENT)
 
 	if request.method == 'GET':
 		serializer = FacilitySerializer(facility)

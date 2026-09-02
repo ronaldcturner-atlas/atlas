@@ -327,6 +327,83 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.ARCHIVE)
         self.assertIsNotNone(block.published_at)
 
+    def test_unpublish_returns_archived_block_to_build(self):
+        block = self._create_block(
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+
+        response = self.client.post(f'/api/schedule-blocks/{block.id}/unpublish/', data={}, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        block.refresh_from_db()
+        self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.BUILD)
+        self.assertIsNone(block.published_at)
+
+    def test_published_schedule_uses_active_optimizer_run_assignments(self):
+        block = self._create_block(
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        domain = Domain.objects.create(name='Published Schedule Domain', active=True)
+        facility = Facility.objects.create(name='Published Hospital', short_name='PUB', sort_order=7)
+        physician_user = get_user_model().objects.create_user(
+            username='published@example.com',
+            first_name='Published',
+            last_name='Physician',
+        )
+        physician = Physician.objects.create(user=physician_user, display_name='Published Physician')
+        template = ShiftTemplate.objects.create(
+            facility=facility,
+            start_time=time(7, 0),
+            end_time=time(16, 0),
+            active_days_of_week=['Wednesday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=domain,
+            version_number=1,
+            name='Published Version',
+        )
+        instance = ScheduleShiftInstance.objects.create(
+            schedule_version=version,
+            schedule_block=block,
+            date=date(2026, 7, 1),
+            shift_template=template,
+            facility=facility,
+            start_datetime=timezone.make_aware(datetime(2026, 7, 1, 7, 0)),
+            end_datetime=timezone.make_aware(datetime(2026, 7, 1, 16, 0)),
+            required_staffing=1,
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        active_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=physician,
+            created_by=self.user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=active_run,
+        )
+
+        response = self.client.get('/api/published-schedule/')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]['physician_name'], 'Published Physician')
+        self.assertEqual(payload[0]['facility_name'], 'Published Hospital')
+        self.assertEqual(payload[0]['facility_short_name'], 'PUB')
+        self.assertEqual(payload[0]['facility_sort_order'], 7)
+
     def test_preview_block_fields_are_read_only(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
 
@@ -377,8 +454,8 @@ class ScheduleRequestApiTests(TestCase):
         self.block = ScheduleBlock.objects.create(
             start_date=date(2026, 7, 1),
             end_date=date(2026, 7, 31),
-            request_open_datetime=timezone.make_aware(datetime(2026, 5, 1, 12, 0, 0)),
-            request_close_datetime=timezone.make_aware(datetime(2026, 5, 15, 12, 0, 0)),
+            request_open_datetime=timezone.now() - timedelta(days=1),
+            request_close_datetime=timezone.now() + timedelta(days=1),
             build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
         )
 
@@ -514,6 +591,80 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(payload['is_scheduler_or_admin'], False)
         self.assertEqual(payload['selected_physician_id'], None)
         self.assertEqual(payload['physicians'], [])
+
+    def test_regular_user_only_sees_latest_published_and_upcoming_request_blocks(self):
+        older_published = ScheduleBlock.objects.create(
+            start_date=date(2026, 4, 1),
+            end_date=date(2026, 4, 30),
+            request_open_datetime=timezone.now() - timedelta(days=120),
+            request_close_datetime=timezone.now() - timedelta(days=110),
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now() - timedelta(days=90),
+        )
+        latest_published = ScheduleBlock.objects.create(
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            request_open_datetime=timezone.now() - timedelta(days=60),
+            request_close_datetime=timezone.now() - timedelta(days=50),
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now() - timedelta(days=2),
+        )
+        upcoming = ScheduleBlock.objects.create(
+            start_date=timezone.localdate() + timedelta(days=30),
+            end_date=timezone.localdate() + timedelta(days=60),
+            request_open_datetime=timezone.now() + timedelta(days=1),
+            request_close_datetime=timezone.now() + timedelta(days=10),
+            build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        )
+        ScheduleRequest.objects.create(
+            schedule_block=latest_published,
+            physician=self.physician,
+            date=date(2026, 8, 10),
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.HIGH,
+            created_by=self.physician_user,
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.get('/api/schedule-blocks/')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        returned_ids = {item['id'] for item in payload}
+        self.assertEqual(returned_ids, {latest_published.id, upcoming.id})
+        self.assertNotIn(older_published.id, returned_ids)
+        published_payload = next(item for item in payload if item['id'] == latest_published.id)
+        self.assertEqual(len(published_payload['my_requests']), 1)
+        self.assertEqual(published_payload['my_requests'][0]['request_type'], 'DAY_OFF')
+
+    def test_regular_user_cannot_write_outside_request_window_but_scheduler_can(self):
+        self.block.request_open_datetime = timezone.now() - timedelta(days=3)
+        self.block.request_close_datetime = timezone.now() - timedelta(days=2)
+        self.block.save(update_fields=['request_open_datetime', 'request_close_datetime'])
+        payload = {
+            'physician_id': self.physician.id,
+            'date': '2026-07-01',
+            'request_scope': 'USER',
+            'request_type': 'DAY_OFF',
+            'weight': 'HIGH',
+            'shift_template_ids': [],
+        }
+        self.client.force_authenticate(user=self.physician_user)
+        physician_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data=payload,
+            format='json',
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        scheduler_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data=payload,
+            format='json',
+        )
+
+        self.assertEqual(physician_response.status_code, 403)
+        self.assertEqual(scheduler_response.status_code, 200)
 
     def test_normal_user_request_options_and_templates_follow_contract(self):
         other_facility = Facility.objects.create(name='Other Hospital', short_name='Other')
