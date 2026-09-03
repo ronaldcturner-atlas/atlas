@@ -1,10 +1,14 @@
 from time import monotonic
 
+DEFAULT_STALL_SECONDS = 120
+DEFAULT_TOTAL_SECONDS = 900
+
 
 class SearchBudget:
     """Separate a renewable progress deadline from a non-renewable safety cap."""
 
-    def __init__(self, *, started_at=None, stall_seconds=60, total_seconds=600,
+    def __init__(self, *, started_at=None, stall_seconds=DEFAULT_STALL_SECONDS,
+                 total_seconds=DEFAULT_TOTAL_SECONDS,
                  clock=monotonic, stop_requested=lambda: False):
         self.clock = clock
         self.started_at = clock() if started_at is None else started_at

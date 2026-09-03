@@ -7,7 +7,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import UUID
 from time import monotonic
 
-from django.db.models import Prefetch, Q
+from django.db.models import FloatField, Prefetch, Q
+from django.db.models.functions import Cast
 from django.db import transaction, IntegrityError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -1983,6 +1984,7 @@ def schedule_block_build_context(request, block_id):
                 OptimizerRunHistorySerializer(
                     selected_version.optimizer_runs
                     .select_related('copied_from_run')
+                    .annotate(runtime_seconds_value=Cast('optimizer_summary__runtime_seconds', FloatField()))
                     .defer('optimizer_summary', 'optimizer_debug', 'score_breakdown')
                     .order_by('-run_number'),
                     many=True,
@@ -2182,7 +2184,10 @@ def schedule_version_stop_optimizer(request, version_id):
     if not _can_manage_build_workspace(request.user):
         return _build_workspace_forbidden_response()
     run_id = request.data.get('optimizer_run_id')
-    controls = OptimizerControl.objects.filter(schedule_version_id=version_id)
+    controls = OptimizerControl.objects.filter(
+        schedule_version_id=version_id,
+        created_by=request.user,
+    )
     if run_id not in (None, ''):
         try:
             controls = controls.filter(optimizer_run_id=int(run_id))

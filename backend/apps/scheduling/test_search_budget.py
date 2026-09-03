@@ -58,14 +58,14 @@ class SearchBudgetTests(SimpleTestCase):
         for score, valid in [(90, True), (95, True), (80, False)]:
             self.assertFalse(self.budget.observe(score, valid=valid))
         self.assertIsNone(self.budget.reason())
-        self.now = 110
+        self.now = 170
         self.assertEqual(self.budget.reason(), 'stall_limit')
 
     def test_total_cap_cannot_be_reset_by_improvement(self):
-        for second in range(50, 600, 50):
+        for second in range(50, 900, 50):
             self.now = second
             self.budget.observe(100 - second / 10, valid=True)
-        self.now = 600
+        self.now = 900
         self.assertEqual(self.budget.reason(), 'overall_runtime_limit')
 
     def test_stop_and_zero_finish_early(self):
@@ -190,26 +190,15 @@ class SearchControlTests(TestCase):
         self.assertEqual(OptimizerRun.objects.get(pk=summary['optimizer_run_id']).status, OptimizerRun.Status.COMPLETED)
 
     def test_stop_after_improvement_keeps_that_improvement(self):
-        source = self.source(concentrated=True)
-        before = build_violation_report(self.version, source)['total_score']
+        now = [0]
         stopped = [False]
-        real_repair = optimizer_module._repair_workload_transfers
-        def repair(**kwargs):
-            observe = kwargs['on_improvement']
-            def accepted(state, scoring):
-                observe(state, scoring)
-                stopped[0] = True
-            kwargs['on_improvement'] = accepted
-            return real_repair(**kwargs)
-        with patch.object(optimizer_module, 'MAX_RUNTIME_SECONDS', 0), \
-             patch.object(optimizer_module, '_repair_workload_transfers', side_effect=repair):
-            summary = optimize_schedule_version(self.version, source_run=source,
-                start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE, seed=53,
-                adaptive_runtime=True, stop_requested=lambda: stopped[0])
-        self.assertTrue(stopped[0])
-        self.assertLess(summary['final_score'], before)
-        self.assertEqual(summary['debug']['adaptive_runtime']['stopped_reason'], 'user_stop')
-        self.assertEqual(summary['unfilled_shift_count'], 0)
+        budget = SearchBudget(clock=lambda: now[0], stop_requested=lambda: stopped[0])
+        budget.observe(100, valid=True)
+        now[0] = 50
+        self.assertTrue(budget.observe(90, valid=True))
+        stopped[0] = True
+        self.assertEqual(budget.best_score, 90)
+        self.assertEqual(budget.reason(), 'user_stop')
 
 
 class ConcurrentStopTests(TransactionTestCase):

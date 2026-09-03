@@ -159,6 +159,7 @@ type OptimizerRun = {
   run_kind: 'OPTIMIZER' | 'COPY' | 'BENCHMARK'
   locked_open_shift_instance_ids: number[]
   start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
+  runtime_seconds?: number | null
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
 }
@@ -355,10 +356,19 @@ function optimizerRunScoreLabel(run: OptimizerRun) {
 function optimizerRunLabel(run: OptimizerRun) {
   const copyLabel = run.copied_from_run_number ? ` - Copy of Run ${run.copied_from_run_number}` : ''
   const startLabel = run.start_mode === 'CURRENT_SCHEDULE' ? 'Current schedule' : 'Fresh fill'
+  const runtimeLabel = run.runtime_seconds == null
+    ? ''
+    : ` - total time ${formatRuntimeMinutes(run.runtime_seconds)}`
   if (!isCompletedOptimizerRun(run)) {
-    return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+    return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
   }
-  return `Run ${run.run_number}${copyLabel} - ${startLabel} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${copyLabel} - ${startLabel} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
+}
+
+function formatRuntimeMinutes(runtimeSeconds: number) {
+  const minutes = runtimeSeconds / 60
+  const displayed = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1)
+  return `${displayed} ${minutes === 1 ? 'minute' : 'minutes'}`
 }
 
 function workloadRangeLabel(range: OptimizerSummary['workload_summary'][number]['effective_workload_range']) {
@@ -477,6 +487,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [isStoppingOptimizer, setIsStoppingOptimizer] = useState(false)
   const optimizerControlRef = useRef<{ versionId: number; runId: number } | null>(null)
+  const [optimizerPollingRunId, setOptimizerPollingRunId] = useState<number | null>(null)
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
@@ -697,8 +708,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           versionId: nextContext.selected_version.id,
           runId: runningRun.id,
         }
+        setOptimizerPollingRunId(runningRun.id)
       } else {
         optimizerControlRef.current = null
+        setOptimizerPollingRunId(null)
         setIsStoppingOptimizer(false)
       }
       const returnedRunId = nextContext.selected_optimizer_run?.id ?? null
@@ -730,7 +743,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   useEffect(() => {
     const versionId = context?.selected_version?.id
-    const runningRunId = optimizerControlRef.current?.runId
+    const runningRunId = optimizerPollingRunId
     if (!isOptimizing || !versionId || !runningRunId) return
     const timer = window.setInterval(() => {
       void (async () => {
@@ -744,6 +757,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             setIsOptimizing(false)
             setIsStoppingOptimizer(false)
             optimizerControlRef.current = null
+            setOptimizerPollingRunId(null)
             await fetchContext(versionId, {
               preserveError: true,
               quiet: true,
@@ -763,7 +777,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       })()
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [isOptimizing, context?.selected_version?.id])
+  }, [isOptimizing, context?.selected_version?.id, optimizerPollingRunId])
 
   const moveBackToBuild = async () => {
     const confirmed = window.confirm(
@@ -1193,12 +1207,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       const queuedRun = data as OptimizerRun & { message?: string }
       queuedOptimizerRunId = queuedRun.id
       optimizerControlRef.current = { versionId, runId: queuedRun.id }
+      setOptimizerPollingRunId(queuedRun.id)
       setNotice(queuedRun.message ?? 'Optimizer started. You may leave this page.')
     } catch (optimizeError) {
       optimizeErrorMessage = optimizeError instanceof Error ? optimizeError.message : 'Unable to run optimizer.'
       setError(optimizeErrorMessage)
       setIsOptimizing(false)
       optimizerControlRef.current = null
+      setOptimizerPollingRunId(null)
     } finally {
       try {
         await fetchContext(versionId, {
@@ -1694,7 +1710,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         </div>
 
         <div className="build-workspace-optimizer-actions">
-          <span className="muted build-workspace-runtime-note">Stops after 60 seconds without improvement; maximum 10 minutes. You may leave this page while it runs.</span>
+          <span className="muted build-workspace-runtime-note">Stops after 120 seconds without improvement; maximum 15 minutes. You may leave this page while it runs.</span>
           {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
             {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
           </button>}
@@ -2133,6 +2149,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     <span>{run.start_mode === 'CURRENT_SCHEDULE' ? 'Current schedule' : 'Fresh fill'}</span>
                     <span>{optimizerRunScoreLabel(run)}</span>
                     <span>{formatTimestamp(run.created_at)}</span>
+                    {run.runtime_seconds != null && <span>Total time {formatRuntimeMinutes(run.runtime_seconds)}</span>}
                     <span>Seed {run.seed ?? '-'}</span>
                     <span>{run.is_active ? 'Active' : 'Inactive'}</span>
                   </div>

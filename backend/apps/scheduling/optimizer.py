@@ -63,7 +63,7 @@ MAX_GENERAL_SWAPS = 25000
 SAFE_BASELINE_PHASE_PASSES = 1
 SAFE_BASELINE_CANDIDATES_PER_REPAIR = 40
 SAFE_BASELINE_GENERAL_SWAPS = 50
-MAX_RUNTIME_SECONDS = 60
+MAX_RUNTIME_SECONDS = 900
 NIGHT_BLOCK_BUILDER_ENABLED = False
 NIGHT_BLOCK_BUILDER_DISABLED_REASON = 'Disabled after runtime regression'
 
@@ -5076,6 +5076,7 @@ def optimize_schedule_version(
                     ))
                 if search_budget.reason() is not None:
                     return True
+                return False
             return runtime_seconds_elapsed() >= MAX_RUNTIME_SECONDS
 
         def mark_timeout(phase):
@@ -8239,8 +8240,10 @@ def optimize_schedule_version(
         for key, value in final_scoring['breakdown'].items()
     }
     if adaptive_runtime and completed_result:
-        stop_label = {'stall_limit': '60 seconds without a new best schedule',
-                      'overall_runtime_limit': 'the 10-minute limit',
+        total_minutes = search_budget.total_seconds / 60
+        total_minutes_label = int(total_minutes) if total_minutes.is_integer() else total_minutes
+        stop_label = {'stall_limit': f'{search_budget.stall_seconds:g} seconds without a new best schedule',
+                      'overall_runtime_limit': f'the {total_minutes_label}-minute limit',
                       'user_stop': 'your Stop request', 'score_zero': 'score zero'}.get(stopped_reason, stopped_reason)
         message = f'Optimizer finished after {stop_label}. Best complete valid schedule retained.'
     final_validation = final_scoring['validation']

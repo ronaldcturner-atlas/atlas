@@ -385,6 +385,14 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
     copied_from_run_number = serializers.IntegerField(
         source='copied_from_run.run_number', read_only=True,
     )
+    runtime_seconds = serializers.SerializerMethodField()
+
+    def get_runtime_seconds(self, obj):
+        annotated_runtime = getattr(obj, 'runtime_seconds_value', None)
+        if annotated_runtime is not None:
+            return float(annotated_runtime)
+        value = (obj.optimizer_summary or {}).get('runtime_seconds')
+        return float(value) if value is not None else None
 
     class Meta:
         model = OptimizerRun
@@ -393,6 +401,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
             'initial_score', 'final_score', 'is_active', 'score_is_stale',
             'copied_from_run', 'copied_from_run_number', 'run_kind',
             'locked_open_shift_instance_ids', 'start_mode',
+            'runtime_seconds',
         ]
         read_only_fields = fields
 
