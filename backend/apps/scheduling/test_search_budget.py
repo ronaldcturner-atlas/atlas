@@ -68,6 +68,18 @@ class SearchBudgetTests(SimpleTestCase):
         self.now = 900
         self.assertEqual(self.budget.reason(), 'overall_runtime_limit')
 
+    def test_stall_restart_opens_new_window_without_extending_total_cap(self):
+        self.now = 120
+        self.assertEqual(self.budget.reason(), 'stall_limit')
+        self.assertTrue(self.budget.restart_after_stall())
+        self.assertIsNone(self.budget.reason())
+        self.now = 240
+        self.assertEqual(self.budget.reason(), 'stall_limit')
+        self.assertTrue(self.budget.restart_after_stall())
+        self.now = 900
+        self.assertEqual(self.budget.reason(), 'overall_runtime_limit')
+        self.assertFalse(self.budget.restart_after_stall())
+
     def test_stop_and_zero_finish_early(self):
         self.stop = True
         self.assertEqual(self.budget.reason(), 'user_stop')

@@ -1710,7 +1710,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         </div>
 
         <div className="build-workspace-optimizer-actions">
-          <span className="muted build-workspace-runtime-note">Stops after 120 seconds without improvement; maximum 15 minutes. You may leave this page while it runs.</span>
+          <span className="muted build-workspace-runtime-note">Diversifies after 120 seconds without improvement; stops after a maximum of 15 minutes. You may leave this page while it runs.</span>
           {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
             {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
           </button>}

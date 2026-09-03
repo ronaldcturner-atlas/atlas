@@ -3852,6 +3852,11 @@ def _run_adaptive_search_rounds(
         ('night_spacing', _repair_night_spacing_swaps, {}),
     ]
     repair_stats = debug.setdefault('repair_stats', {})
+    debug.setdefault('restarts', 0)
+    debug.setdefault('restart_details', [])
+    exploration_state = _copy_state(best_state)
+    instances_by_id = {instance.id: instance for instance in instances}
+    locked_open_instance_ids = {instance.id for instance in instances if instance.is_locked_open}
 
     def keep_progress(candidate_state, candidate_scoring):
         nonlocal best_state, best_scoring
@@ -3866,18 +3871,73 @@ def _run_adaptive_search_rounds(
             best_scoring = candidate_scoring
             debug['improvements'] += 1
 
-    while search_budget.reason() is None:
+    def diversify_from_best():
+        """Move to a nearby hard-valid state while retaining the global best."""
+        pairs = _optimizer_pairs(best_state, manual_pairs)
+        if len(pairs) < 2:
+            return _copy_state(best_state), {'perturbed': False, 'attempts': 0}
+        best_kick = None
+        attempts = min(300, len(pairs) * 4)
+        for _ in range(attempts):
+            left, right = rng.sample(pairs, 2)
+            result = evaluate_plateau_pairwise_swap(
+                instances=instances, physicians=physicians, state=best_state,
+                instances_by_id=instances_by_id, manual_pairs=manual_pairs,
+                locked_open_instance_ids=locked_open_instance_ids,
+                targets=targets, contract_by_physician=contract_by_physician,
+                requests_by_physician_date=requests_by_physician_date,
+                eligible_facilities_by_physician=eligible_facilities_by_physician,
+                minimum_rest_by_physician=minimum_rest_by_physician,
+                current_score=best_scoring['score'],
+                left_instance_id=left[0], left_physician_id=left[1],
+                right_instance_id=right[0], right_physician_id=right[1],
+            )
+            if not result.get('legal'):
+                continue
+            if result.get('improving') and result.get('scoring') is not None:
+                keep_progress(result['state'], result['scoring'])
+                return _copy_state(best_state), {
+                    'perturbed': False, 'direct_improvement': True, 'attempts': attempts,
+                }
+            delta = result.get('score_delta')
+            if best_kick is None or (delta is not None and delta < best_kick[0]):
+                best_kick = (delta, result['state'])
+        if best_kick is None:
+            return _copy_state(best_state), {'perturbed': False, 'attempts': attempts}
+        return best_kick[1], {
+            'perturbed': True, 'attempts': attempts,
+            'estimated_penalty_delta': float(best_kick[0]),
+        }
+
+    active_repairs = list(repairs)
+    while True:
+        stop_reason = search_budget.reason()
+        if stop_reason == 'stall_limit':
+            if not search_budget.restart_after_stall():
+                break
+            restart_seed = rng.getrandbits(63)
+            rng = random.Random(restart_seed)
+            active_repairs = list(repairs)
+            rng.shuffle(active_repairs)
+            exploration_state, restart_detail = diversify_from_best()
+            debug['restarts'] += 1
+            debug['restart_details'].append({
+                'restart': debug['restarts'], 'seed': restart_seed, **restart_detail,
+            })
+            continue
+        if stop_reason is not None:
+            break
         debug['cycles'] += 1
         cycle_instances = list(instances)
         rng.shuffle(cycle_instances)
-        for repair_name, repair, options in repairs:
+        for repair_name, repair, options in active_repairs:
             if search_budget.reason() is not None:
                 break
             repair_started = monotonic()
             slice_end = repair_started + 4
-            _, _, repair_debug = repair(
+            exploration_state, _, repair_debug = repair(
                 instances=cycle_instances, physicians=physicians,
-                state=best_state, manual_pairs=manual_pairs, targets=targets,
+                state=exploration_state, manual_pairs=manual_pairs, targets=targets,
                 contract_by_physician=contract_by_physician,
                 requests_by_physician_date=requests_by_physician_date,
                 eligible_facilities_by_physician=eligible_facilities_by_physician,

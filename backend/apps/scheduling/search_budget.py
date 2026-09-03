@@ -43,6 +43,13 @@ class SearchBudget:
         self.best_score = score
         return True
 
+    def restart_after_stall(self):
+        """Open a new search window without extending the absolute deadline."""
+        if self.reason() != 'stall_limit':
+            return False
+        self.last_improvement = self.clock()
+        return True
+
     def reason(self):
         if self.stop_requested():
             return 'user_stop'
