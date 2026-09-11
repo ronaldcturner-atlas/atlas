@@ -2,6 +2,7 @@ from time import monotonic
 
 DEFAULT_STALL_SECONDS = 120
 DEFAULT_TOTAL_SECONDS = 900
+DEFAULT_MAX_UNPRODUCTIVE_RESTARTS = 3
 
 
 class SearchBudget:
@@ -9,6 +10,7 @@ class SearchBudget:
 
     def __init__(self, *, started_at=None, stall_seconds=DEFAULT_STALL_SECONDS,
                  total_seconds=DEFAULT_TOTAL_SECONDS,
+                 max_unproductive_restarts=DEFAULT_MAX_UNPRODUCTIVE_RESTARTS,
                  clock=monotonic, stop_requested=lambda: False):
         self.clock = clock
         self.started_at = clock() if started_at is None else started_at
@@ -18,6 +20,11 @@ class SearchBudget:
         self.stop_requested = stop_requested
         self.best_score = None
         self.best_coverage = None
+        self.max_unproductive_restarts = max_unproductive_restarts
+        self.restart_count = 0
+        self.consecutive_unproductive_restarts = 0
+        self.improved_since_restart = False
+        self.restart_exhausted = False
 
     def observe_coverage(self, filled_slots):
         """Renew construction time only for newly filled legal slots.
@@ -31,6 +38,8 @@ class SearchBudget:
             return False
         if self.best_coverage is not None:
             self.last_improvement = self.clock()
+            if self.restart_count:
+                self.improved_since_restart = True
         self.best_coverage = filled_slots
         return True
 
@@ -40,6 +49,8 @@ class SearchBudget:
         # Establishing the initial score is not itself progress.
         if self.best_score is not None or self.best_coverage is not None:
             self.last_improvement = self.clock()
+            if self.restart_count:
+                self.improved_since_restart = True
         self.best_score = score
         return True
 
@@ -47,6 +58,18 @@ class SearchBudget:
         """Open a new search window without extending the absolute deadline."""
         if self.reason() != 'stall_limit':
             return False
+        # The first stall opens the first diversified search window. Thereafter,
+        # stop once several complete diversified windows fail to improve the best.
+        if self.restart_count:
+            if self.improved_since_restart:
+                self.consecutive_unproductive_restarts = 0
+            else:
+                self.consecutive_unproductive_restarts += 1
+            if self.consecutive_unproductive_restarts >= self.max_unproductive_restarts:
+                self.restart_exhausted = True
+                return False
+        self.restart_count += 1
+        self.improved_since_restart = False
         self.last_improvement = self.clock()
         return True
 

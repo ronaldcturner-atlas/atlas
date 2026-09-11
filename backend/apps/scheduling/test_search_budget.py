@@ -80,6 +80,27 @@ class SearchBudgetTests(SimpleTestCase):
         self.assertEqual(self.budget.reason(), 'overall_runtime_limit')
         self.assertFalse(self.budget.restart_after_stall())
 
+    def test_stops_after_three_unproductive_diversified_windows(self):
+        for second in (120, 240, 360):
+            self.now = second
+            self.assertEqual(self.budget.reason(), 'stall_limit')
+            self.assertTrue(self.budget.restart_after_stall())
+        self.now = 480
+        self.assertEqual(self.budget.reason(), 'stall_limit')
+        self.assertFalse(self.budget.restart_after_stall())
+        self.assertTrue(self.budget.restart_exhausted)
+
+    def test_improvement_resets_unproductive_restart_count(self):
+        self.now = 120
+        self.assertTrue(self.budget.restart_after_stall())
+        self.now = 240
+        self.assertTrue(self.budget.restart_after_stall())
+        self.now = 250
+        self.assertTrue(self.budget.observe(90, valid=True))
+        self.now = 370
+        self.assertTrue(self.budget.restart_after_stall())
+        self.assertEqual(self.budget.consecutive_unproductive_restarts, 0)
+
     def test_stop_and_zero_finish_early(self):
         self.stop = True
         self.assertEqual(self.budget.reason(), 'user_stop')

@@ -26,6 +26,7 @@ class FakeBudget:
     def __init__(self):
         self.best_score = Decimal('10')
         self.stopped = False
+        self.restart_exhausted = False
 
     def reason(self):
         return 'stall_limit' if self.stopped else None
@@ -35,6 +36,9 @@ class FakeBudget:
             return False
         self.best_score = score
         return True
+
+    def restart_after_stall(self):
+        return False
 
 
 class AdaptiveSearchRoundTests(SimpleTestCase):
@@ -76,7 +80,7 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
              patch.object(optimizer, '_repair_recovery_day_swaps',
                           side_effect=repair('night_recovery')):
             state, scoring, debug = optimizer._run_adaptive_search_rounds(
-                instances=[SimpleNamespace(id=1, required_staffing=1)],
+                instances=[SimpleNamespace(id=1, required_staffing=1, is_locked_open=False)],
                 physicians=[SimpleNamespace(id=1), SimpleNamespace(id=2)],
                 initial_state={1: [1]}, initial_scoring=valid_scoring(10),
                 manual_pairs=set(), targets={}, contract_by_physician={},

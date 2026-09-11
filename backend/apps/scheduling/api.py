@@ -2559,15 +2559,30 @@ def optimizer_runs_bulk_delete(request, version_id):
     skipped = []
     assignments_deleted = 0
     with transaction.atomic():
-        locked_version = ScheduleVersion.objects.select_for_update().get(id=version.id)
-        runs_by_id = {
+        # Do not lock the schedule version or a currently running row. The
+        # optimizer owns those records for the duration of its search, while
+        # completed inactive history rows are independent deletion targets.
+        candidate_runs_by_id = {
+            run.id: run
+            for run in OptimizerRun.objects.filter(
+                schedule_version=version, id__in=requested_ids,
+            )
+        }
+        eligible_ids = [
+            run_id
+            for run_id, run in candidate_runs_by_id.items()
+            if not run.is_active
+            and run.id != viewed_run_id
+            and run.status != OptimizerRun.Status.RUNNING
+        ]
+        locked_eligible_runs = {
             run.id: run
             for run in OptimizerRun.objects.select_for_update().filter(
-                schedule_version=locked_version, id__in=requested_ids,
+                schedule_version=version, id__in=eligible_ids,
             )
         }
         for run_id in requested_ids:
-            run = runs_by_id.get(run_id)
+            run = candidate_runs_by_id.get(run_id)
             reason = None
             if run is None:
                 reason = 'not_found_in_schedule_version'
@@ -2579,6 +2594,16 @@ def optimizer_runs_bulk_delete(request, version_id):
                 reason = 'running'
             if reason:
                 skipped.append({'id': run_id, 'reason': reason})
+                continue
+            run = locked_eligible_runs.get(run_id)
+            if run is None:
+                skipped.append({'id': run_id, 'reason': 'changed_during_delete'})
+                continue
+            if run.is_active or run.status == OptimizerRun.Status.RUNNING:
+                skipped.append({
+                    'id': run_id,
+                    'reason': 'active_run' if run.is_active else 'running',
+                })
                 continue
             assignment_count = ScheduleShiftAssignment.objects.filter(
                 optimizer_run=run,

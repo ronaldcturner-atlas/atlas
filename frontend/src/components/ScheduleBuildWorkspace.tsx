@@ -164,6 +164,23 @@ type OptimizerRun = {
   optimizer_debug?: OptimizerSummary['debug']
 }
 
+type CalendarViolation = {
+  violation_type: string
+  dates_involved: string[]
+  configured_limit: number | string | null
+  actual_value: number | string | null
+  penalty_amount: number
+  explanation: string
+}
+
+type ViolationReport = {
+  users: Array<{
+    user_id: number
+    display_name: string
+    violations: CalendarViolation[]
+  }>
+}
+
 type PopoverPosition = {
   left: number
   top?: number
@@ -496,6 +513,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
   const [isBulkDeletingRuns, setIsBulkDeletingRuns] = useState(false)
   const [selectedRunIdsForDelete, setSelectedRunIdsForDelete] = useState<number[]>([])
+  const lastRunDeleteSelectionRef = useRef<number | null>(null)
   const [optimizerSummary, setOptimizerSummary] = useState<OptimizerSummary | null>(null)
   const [selectedOptimizerRunId, setSelectedOptimizerRunIdState] = useState<number | null>(null)
   const [showRunHistory, setShowRunHistory] = useState(false)
@@ -517,6 +535,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [physicianSearch, setPhysicianSearch] = useState('')
   const [editingAssignmentId, setEditingAssignmentId] = useState<number | null>(null)
   const [selectedPhysicianId, setSelectedPhysicianId] = useState<number | null>(null)
+  const [calendarPhysicianId, setCalendarPhysicianId] = useState<number | null>(null)
+  const [calendarViolationReport, setCalendarViolationReport] = useState<ViolationReport | null>(null)
+  const [calendarViolationError, setCalendarViolationError] = useState<string | null>(null)
+  const [isCalendarViolationLoading, setIsCalendarViolationLoading] = useState(false)
   const [lockAssignment, setLockAssignment] = useState(false)
   const [lockOpen, setLockOpen] = useState(false)
   const [popoverPosition, setPopoverPosition] = useState<PopoverPosition | null>(null)
@@ -825,6 +847,27 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     return Boolean(run && !runDeleteProtectionReason(run))
   })
 
+  const updateRunDeleteSelection = (runId: number, checked: boolean, shiftKey: boolean) => {
+    const anchorRunId = lastRunDeleteSelectionRef.current
+    const currentIndex = optimizerRuns.findIndex((run) => run.id === runId)
+    const anchorIndex = anchorRunId == null
+      ? -1
+      : optimizerRuns.findIndex((run) => run.id === anchorRunId)
+    const rangeIds = shiftKey && currentIndex >= 0 && anchorIndex >= 0
+      ? optimizerRuns
+        .slice(Math.min(currentIndex, anchorIndex), Math.max(currentIndex, anchorIndex) + 1)
+        .filter((run) => !runDeleteProtectionReason(run))
+        .map((run) => run.id)
+      : [runId]
+
+    setSelectedRunIdsForDelete((current) => {
+      const next = new Set(current)
+      rangeIds.forEach((id) => checked ? next.add(id) : next.delete(id))
+      return [...next]
+    })
+    lastRunDeleteSelectionRef.current = runId
+  }
+
   const selectOptimizerRun = async (run: OptimizerRun) => {
     if (!isCompletedOptimizerRun(run)) {
       return
@@ -1073,6 +1116,80 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
     return map
   }, [context?.shift_instances])
+
+  const calendarPhysicians = useMemo(() => {
+    const names = new Map<number, string>()
+    for (const row of optimizerSummary?.workload_summary ?? []) {
+      names.set(row.physician_id, row.physician_name)
+    }
+    for (const instance of context?.shift_instances ?? []) {
+      for (const assignment of instance.assignments) {
+        names.set(assignment.physician, assignment.physician_name)
+      }
+    }
+    return [...names.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((left, right) => left.name.localeCompare(right.name))
+  }, [context?.shift_instances, optimizerSummary?.workload_summary])
+
+  const selectedCalendarViolationUser = useMemo(() => (
+    calendarViolationReport?.users.find((user) => user.user_id === calendarPhysicianId) ?? null
+  ), [calendarPhysicianId, calendarViolationReport])
+
+  const calendarViolationsByDate = useMemo(() => {
+    const values = new Map<string, CalendarViolation[]>()
+    for (const violation of selectedCalendarViolationUser?.violations ?? []) {
+      for (const date of violation.dates_involved ?? []) {
+        const rows = values.get(date) ?? []
+        rows.push(violation)
+        values.set(date, rows)
+      }
+    }
+    return values
+  }, [selectedCalendarViolationUser])
+
+  useEffect(() => {
+    if (!calendarPhysicianId || !context?.selected_version) {
+      setCalendarViolationReport(null)
+      setCalendarViolationError(null)
+      setIsCalendarViolationLoading(false)
+      return
+    }
+    let cancelled = false
+    const loadViolations = async () => {
+      setIsCalendarViolationLoading(true)
+      setCalendarViolationError(null)
+      try {
+        const query = selectedOptimizerRunId ? `?optimizer_run_id=${selectedOptimizerRunId}` : ''
+        const response = await fetch(
+          `${API_BASE}/schedule-versions/${context.selected_version!.id}/violation-report/${query}`,
+          { credentials: 'include' },
+        )
+        const data = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(apiError(data, 'Unable to load physician violations.'))
+        }
+        if (!cancelled) {
+          setCalendarViolationReport(data as ViolationReport)
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setCalendarViolationReport(null)
+          setCalendarViolationError(
+            loadError instanceof Error ? loadError.message : 'Unable to load physician violations.',
+          )
+        }
+      } finally {
+        if (!cancelled) {
+          setIsCalendarViolationLoading(false)
+        }
+      }
+    }
+    void loadViolations()
+    return () => {
+      cancelled = true
+    }
+  }, [calendarPhysicianId, context?.selected_version?.id, selectedOptimizerRunId, optimizerSummary])
 
   const blockStart = context ? parseIsoDateToUtc(context.schedule_block.start_date) : null
   const blockEnd = context ? parseIsoDateToUtc(context.schedule_block.end_date) : null
@@ -1614,6 +1731,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     ? context.run_state.viewed_run_can_activate
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
   const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
   const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
   const allFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
@@ -1710,7 +1828,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         </div>
 
         <div className="build-workspace-optimizer-actions">
-          <span className="muted build-workspace-runtime-note">Diversifies after 120 seconds without improvement; stops after a maximum of 15 minutes. You may leave this page while it runs.</span>
+          <span className="muted build-workspace-runtime-note">Diversifies after 120 seconds without improvement; stops after 3 unsuccessful diversified searches or a maximum of 15 minutes. You may leave this page while it runs.</span>
           {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
             {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
           </button>}
@@ -2113,7 +2231,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   type="button"
                   className="secondary danger-action"
                   onClick={() => void bulkDeleteOptimizerRuns()}
-                  disabled={!canManageRunDeletion || isMutatingBuild || eligibleSelectedRunIds.length === 0}
+                  disabled={!canManageRunDeletion || isRunDeletionBusy || eligibleSelectedRunIds.length === 0}
                 >
                   {isBulkDeletingRuns ? 'Deleting Selected...' : `Delete Selected Runs (${eligibleSelectedRunIds.length})`}
                 </button>
@@ -2127,19 +2245,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 >
                   <label
                     className="optimizer-run-delete-select"
-                    title={runDeleteProtectionReason(run) ?? `Select Run ${run.run_number} for deletion`}
+                    title={runDeleteProtectionReason(run) ?? `Select Run ${run.run_number} for deletion. Shift-click to select a range.`}
                   >
                     <input
                       type="checkbox"
                       aria-label={`Select optimizer run ${run.run_number} for deletion`}
                       checked={selectedRunIdsForDelete.includes(run.id)}
-                      disabled={!canManageRunDeletion || isMutatingBuild || Boolean(runDeleteProtectionReason(run))}
+                      disabled={!canManageRunDeletion || isRunDeletionBusy || Boolean(runDeleteProtectionReason(run))}
                       onChange={(event) => {
-                        setSelectedRunIdsForDelete((current) => (
-                          event.target.checked
-                            ? [...current, run.id]
-                            : current.filter((id) => id !== run.id)
-                        ))
+                        updateRunDeleteSelection(
+                          run.id,
+                          event.target.checked,
+                          (event.nativeEvent as MouseEvent).shiftKey,
+                        )
                       }}
                     />
                   </label>
@@ -2186,7 +2304,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       type="button"
                       className="secondary danger-action"
                       onClick={() => void deleteOptimizerRun(run)}
-                      disabled={!canManageRunDeletion || isMutatingBuild || Boolean(runDeleteProtectionReason(run))}
+                      disabled={!canManageRunDeletion || isRunDeletionBusy || Boolean(runDeleteProtectionReason(run))}
                       title={runDeleteProtectionReason(run) ?? undefined}
                     >
                       {deletingRunId === run.id ? 'Deleting...' : 'Delete'}
@@ -2424,7 +2542,31 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             >
               Next
             </button>
+            <label className="build-calendar-physician-filter">
+              <span>Physician</span>
+              <select
+                value={calendarPhysicianId ?? ''}
+                onChange={(event) => setCalendarPhysicianId(Number(event.target.value) || null)}
+              >
+                <option value="">All physicians</option>
+                {calendarPhysicians.map((physician) => (
+                  <option key={physician.id} value={physician.id}>{physician.name}</option>
+                ))}
+              </select>
+            </label>
           </div>
+
+          {calendarPhysicianId && (
+            <div className="build-calendar-filter-summary">
+              <span>
+                {isCalendarViolationLoading
+                  ? 'Loading violations…'
+                  : `${selectedCalendarViolationUser?.display_name ?? 'Selected physician'} · ${selectedCalendarViolationUser?.violations.length ?? 0} violation(s)`}
+              </span>
+              {calendarViolationError && <span className="build-calendar-filter-error">{calendarViolationError}</span>}
+              <button type="button" onClick={() => setCalendarPhysicianId(null)}>Show all physicians</button>
+            </div>
+          )}
 
           <div className="build-calendar">
             <div className="build-calendar-weekdays">
@@ -2442,10 +2584,38 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 }
 
                 const dateKey = toIsoDateUtc(cell.date)
-                const instances = instancesByDate.get(dateKey) ?? []
+                const instances = (instancesByDate.get(dateKey) ?? []).filter((instance) => (
+                  !calendarPhysicianId
+                  || instance.assignments.some((assignment) => assignment.physician === calendarPhysicianId)
+                ))
+                const dateViolations = calendarViolationsByDate.get(dateKey) ?? []
                 return (
                   <div key={cell.key} className="build-day">
-                    <div className="build-day-number">{cell.date.getUTCDate()}</div>
+                    <div className="build-day-heading">
+                      <div className="build-day-number">{cell.date.getUTCDate()}</div>
+                      {dateViolations.length > 0 && (
+                        <div className="build-violation-hover">
+                          <span
+                            className="build-violation-icon"
+                            role="img"
+                            aria-label={`${dateViolations.length} violation${dateViolations.length === 1 ? '' : 's'} on ${formatDate(dateKey)}`}
+                          >!
+                          </span>
+                          <div className="build-violation-popover" role="tooltip">
+                            <strong>{formatDate(dateKey)}</strong>
+                            {dateViolations.map((violation, index) => (
+                              <div className="build-violation-item" key={`${violation.violation_type}-${index}`}>
+                                <b>{violation.violation_type.split('_').map((part) => part.charAt(0) + part.slice(1).toLowerCase()).join(' ')}</b>
+                                <span>{violation.explanation}</span>
+                                <small>
+                                  Configured: {violation.configured_limit ?? '-'} · Actual: {violation.actual_value ?? '-'} · Penalty: {violation.penalty_amount.toLocaleString()}
+                                </small>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
                     {instances.map((instance) => (
                       <button
                         key={instance.id}

@@ -3,3 +3,4 @@ Django
  django-cors-headers
  psycopg
  python-dotenv
+ ortools==9.14.6206
