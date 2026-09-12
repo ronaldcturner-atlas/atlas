@@ -202,6 +202,21 @@ class SearchControlTests(TestCase):
 
     def test_continuation_renews_repairs_and_returns_no_worse_than_source(self):
         source = self.source(concentrated=True)
+        assignment = ContractUserAssignment.objects.filter(
+            physician__in=source.assignments.values('physician_id'),
+        ).select_related('contract').first()
+        assignment.contract.workload_settings = {
+            **(assignment.contract.workload_settings or {}),
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK',
+                'units': 'SHIFTS',
+                'max_value': 0,
+                'max_penalty_weight': 100,
+            }],
+            'max_days_in_row': 2,
+            'max_days_in_row_penalty_weight': 100,
+        }
+        assignment.contract.save(update_fields=['workload_settings'])
         before = build_violation_report(self.version, source)['total_score']
         def short_budget(**kwargs):
             return SearchBudget(**kwargs, stall_seconds=1, total_seconds=2)

@@ -580,6 +580,7 @@ class ContractSerializer(serializers.ModelSerializer):
             'domain_name',
             'name',
             'active',
+            'manual_assignment_only',
             'facility_ids',
             'workload_settings',
             'shift_settings',

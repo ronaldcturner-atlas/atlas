@@ -524,6 +524,7 @@ class Contract(models.Model):
     domain = models.ForeignKey(Domain, on_delete=models.CASCADE, related_name='contracts')
     name = models.CharField(max_length=255)
     active = models.BooleanField(default=True)
+    manual_assignment_only = models.BooleanField(default=False)
     facilities = models.ManyToManyField(Facility, blank=True, related_name='contracts')
     workload_settings = models.JSONField(default=dict, blank=True)
     shift_settings = models.JSONField(default=dict, blank=True)

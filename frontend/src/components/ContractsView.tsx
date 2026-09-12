@@ -4,6 +4,7 @@ type Domain = {
   id: number
   name: string
   active: boolean
+  manual_assignment_only: boolean
 }
 
 type Facility = {
@@ -169,6 +170,7 @@ type ContractFormState = {
   name: string
   domain: string
   active: boolean
+  manual_assignment_only: boolean
   facility_ids: number[]
   assigned_user_ids: number[]
   workload_settings: WorkloadSettings
@@ -239,6 +241,7 @@ function emptyFormState(): ContractFormState {
     name: '',
     domain: '',
     active: true,
+    manual_assignment_only: false,
     facility_ids: [],
     assigned_user_ids: [],
     workload_settings: {
@@ -388,6 +391,7 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
     name: contract.name,
     domain: String(contract.domain),
     active: contract.active,
+    manual_assignment_only: Boolean(contract.manual_assignment_only),
     facility_ids: Array.isArray(contract.facility_ids) ? contract.facility_ids : [],
     assigned_user_ids: contract.assigned_users.map((user) => user.id),
     workload_settings: {
@@ -433,6 +437,7 @@ function sanitizeFormPayload(formState: ContractFormState) {
     name: formState.name.trim(),
     domain: Number(formState.domain),
     active: formState.active,
+    manual_assignment_only: formState.manual_assignment_only,
     facility_ids: formState.facility_ids,
     assigned_user_ids: formState.assigned_user_ids,
     workload_settings: {
@@ -832,6 +837,7 @@ export default function ContractsView() {
               <th>Name</th>
               <th>Domain</th>
               <th>Status</th>
+              <th>Scheduling</th>
               <th>Users Assigned</th>
               <th>Actions</th>
             </tr>
@@ -842,6 +848,7 @@ export default function ContractsView() {
                 <td>{contract.name}</td>
                 <td>{contract.domain_name}</td>
                 <td>{contract.active ? 'Active' : 'Inactive'}</td>
+                <td>{contract.manual_assignment_only ? 'Manual only' : 'Optimizer'}</td>
                 <td>{contract.assigned_users_count}</td>
                 <td>
                   <div className="facility-actions">
@@ -911,7 +918,22 @@ export default function ContractsView() {
                   onChange={(event) => setFormState((current) => ({ ...current, active: event.target.checked }))}
                 />
               </label>
+
+              <label className="facility-field physician-active-field">
+                <span>Manual assignment only</span>
+                <input
+                  type="checkbox"
+                  checked={formState.manual_assignment_only}
+                  onChange={(event) => setFormState((current) => ({ ...current, manual_assignment_only: event.target.checked }))}
+                />
+              </label>
             </div>
+
+            {formState.manual_assignment_only && (
+              <div className="facilities-error">
+                Warning: Users assigned to this contract are ignored as optimization candidates. Every one of their shifts must be assigned manually. Their existing shifts remain occupied, are never moved or changed by the optimizer, and the optimizer schedules other users around them.
+              </div>
+            )}
 
             <div className="schedule-block-modal-tabs">
               <button type="button" className={activeTab === 'summary' ? 'active' : ''} onClick={() => setActiveTab('summary')}>Summary</button>
@@ -928,6 +950,7 @@ export default function ContractsView() {
                 <div className="contract-summary-grid">
                   <div className="request-existing-note">Domain: {summaryLabel.domainName}</div>
                   <div className="request-existing-note">Status: {formState.active ? 'Active' : 'Inactive'}</div>
+                  <div className="request-existing-note">Scheduling: {formState.manual_assignment_only ? 'Manual assignment only' : 'Optimizer managed'}</div>
                   <div className="request-existing-note">Facilities selected: {summaryLabel.facilityCount}</div>
                   <div className="request-existing-note">Users assigned: {summaryLabel.usersCount}</div>
                   <div className="request-existing-note">Workload period rules: {summaryLabel.workloadRuleCount}</div>

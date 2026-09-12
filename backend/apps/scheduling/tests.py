@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -37,6 +38,7 @@ from .optimizer import (
     _selected_physician_score_delta,
     _shift_hours,
     _validated_night_report_for_current_assignments,
+    _validate_schedule,
     _workload_schedule_score,
     _workload_rule_delta_from_totals,
 )
@@ -45,6 +47,31 @@ from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
+    def test_manual_only_assignments_skip_person_rules_but_still_flag_overstaffing(self):
+        physician_one = SimpleNamespace(id=1, active=True)
+        physician_two = SimpleNamespace(id=2, active=True)
+        shift = SimpleNamespace(
+            id=10,
+            facility_id=99,
+            required_staffing=1,
+            start_datetime=datetime(2026, 9, 9, 19, 0),
+            end_datetime=datetime(2026, 9, 10, 7, 0),
+        )
+
+        validation = _validate_schedule(
+            [shift],
+            [physician_one, physician_two],
+            defaultdict(list, {shift.id: [physician_one.id, physician_two.id]}),
+            {physician_one.id: set(), physician_two.id: set()},
+            {},
+            {physician_one.id, physician_two.id},
+        )
+
+        self.assertEqual(validation['final_overstaffed_violations'], 1)
+        self.assertEqual(validation['final_facility_ineligible_violations'], 0)
+        self.assertEqual(validation['final_overlap_violations'], 0)
+        self.assertEqual(validation['final_rest_violations'], 0)
+
     def test_anytime_timeout_result_requires_complete_valid_improvement(self):
         valid_scoring = {'validation': {
             'final_rest_violations': 0,
@@ -2159,6 +2186,47 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             day_assignments,
         )
         self.assertEqual(day_instance.assignments.count(), day_instance.required_staffing)
+
+    def test_optimizer_schedules_around_manual_assignment_only_contract(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        occupied_instance = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        placeholder = self._create_assignment_physician(
+            'placeholder.optimizer@example.com',
+            'Manual Placeholder',
+            facilities=[self.facility],
+        )
+        placeholder_contract = placeholder.contract_assignments.get(domain=self.domain).contract
+        placeholder_contract.manual_assignment_only = True
+        placeholder_contract.save(update_fields=['manual_assignment_only', 'updated_at'])
+        candidate = self._create_assignment_physician(
+            'candidate.optimizer@example.com',
+            'Optimizer Candidate',
+            facilities=[self.facility],
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=occupied_instance,
+            physician=placeholder,
+            created_by=self.scheduler_user,
+            is_locked=False,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/versions/{version.id}/optimize/',
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        occupied_physician_ids = set(
+            ScheduleShiftAssignment.objects.filter(shift_instance=occupied_instance)
+            .values_list('physician_id', flat=True)
+        )
+        self.assertEqual(occupied_physician_ids, {placeholder.id})
+        self.assertNotIn(candidate.id, occupied_physician_ids)
 
     def test_background_optimizer_can_be_left_and_reconnected(self):
         self.client.post(
@@ -5767,11 +5835,11 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
 
         breakdown = scoring['breakdown']
-        self.assertEqual(float(breakdown['consecutive_days_score']), 500.0)
-        self.assertEqual(float(breakdown['same_shift_score']), 8000.0)
-        self.assertEqual(float(breakdown['night_score']), 1400.0)
-        self.assertGreater(float(breakdown['weekend_score']), 0)
-        self.assertGreater(float(breakdown['facility_distribution_score']), 0)
+        self.assertEqual(float(breakdown['consecutive_days_score']), 0.0)
+        self.assertEqual(float(breakdown['same_shift_score']), 0.0)
+        self.assertEqual(float(breakdown['night_score']), 0.0)
+        self.assertEqual(float(breakdown['weekend_score']), 0.0)
+        self.assertEqual(float(breakdown['facility_distribution_score']), 0.0)
         self.assertEqual(
             breakdown['total_score'],
             sum(
@@ -6189,6 +6257,7 @@ class ContractApiTests(TestCase):
             'domain': self.domain.id,
             'name': 'Full Time 120 Hours',
             'active': True,
+            'manual_assignment_only': False,
             'facility_ids': [self.facility.id],
             'assigned_user_ids': [self.physician.id],
             'workload_settings': {
@@ -6271,6 +6340,16 @@ class ContractApiTests(TestCase):
         )
         self.assertEqual(payload['assigned_users_count'], 1)
 
+    def test_create_contract_can_enable_manual_assignment_only(self):
+        payload = self._build_payload()
+        payload['manual_assignment_only'] = True
+
+        response = self.client.post('/api/contracts/', data=payload, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.json()['manual_assignment_only'])
+        self.assertTrue(Contract.objects.get(id=response.json()['id']).manual_assignment_only)
+
     def test_edit_contract_updates_name_and_assignments(self):
         create_response = self.client.post('/api/contracts/', data=self._build_payload(), format='json')
         contract_id = create_response.json()['id']
@@ -6342,7 +6421,9 @@ class ContractApiTests(TestCase):
         self.assertTrue(reactivate_response.json()['active'])
 
     def test_duplicate_contract_creates_inactive_copy(self):
-        create_response = self.client.post('/api/contracts/', data=self._build_payload(), format='json')
+        payload = self._build_payload()
+        payload['manual_assignment_only'] = True
+        create_response = self.client.post('/api/contracts/', data=payload, format='json')
         contract_id = create_response.json()['id']
 
         duplicate_response = self.client.post(f'/api/contracts/{contract_id}/duplicate/', data={}, format='json')
@@ -6350,6 +6431,7 @@ class ContractApiTests(TestCase):
         self.assertEqual(duplicate_response.status_code, 201)
         duplicate_payload = duplicate_response.json()
         self.assertFalse(duplicate_payload['active'])
+        self.assertTrue(duplicate_payload['manual_assignment_only'])
         self.assertIn('(Copy)', duplicate_payload['name'])
         self.assertEqual(duplicate_payload['domain'], self.domain.id)
 

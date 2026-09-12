@@ -189,11 +189,11 @@ def _contract_target(contract, default_hours_target, default_shift_target):
                 'max_value': max_value,
                 'min_penalty_weight': _positive_decimal_or_default(
                     rule.get('min_penalty_weight'),
-                    DEFAULT_WORKLOAD_RULE_PENALTY,
+                    Decimal('0'),
                 ),
                 'max_penalty_weight': _positive_decimal_or_default(
                     rule.get('max_penalty_weight'),
-                    DEFAULT_WORKLOAD_RULE_PENALTY,
+                    Decimal('0'),
                 ),
             }
         )
@@ -237,8 +237,8 @@ def _with_workload_hour_override(target, override):
         'units': 'HOURS',
         'min_value': minimum,
         'max_value': maximum,
-        'min_penalty_weight': template.get('min_penalty_weight', DEFAULT_WORKLOAD_RULE_PENALTY),
-        'max_penalty_weight': template.get('max_penalty_weight', DEFAULT_WORKLOAD_RULE_PENALTY),
+        'min_penalty_weight': template.get('min_penalty_weight', Decimal('0')),
+        'max_penalty_weight': template.get('max_penalty_weight', Decimal('0')),
     }
     rules = [rule for rule in target.get('rules') or [] if rule['units'] != 'HOURS'] + [rule]
     values = [value for value in (minimum, maximum) if value is not None]
@@ -256,7 +256,7 @@ def _request_weight(contract, weight):
     configured = _decimal_or_none(settings.get(f'weight_{weight.lower()}'))
     if configured is not None:
         return configured
-    return Decimal(DEFAULT_REQUEST_WEIGHTS.get(weight, 30))
+    return Decimal('0')
 
 
 def _requests_for_shift(requests_by_physician_date, physician_id, instance):
@@ -838,8 +838,11 @@ def _state_from_assignments(assignments):
     return state, manual_pairs
 
 
-def canonical_assignment_snapshot(assignments, instances, selected_run=None):
+def canonical_assignment_snapshot(
+    assignments, instances, selected_run=None, preserve_physician_ids=None,
+):
     """Deduplicate and cap an assignment snapshot without mutating source rows."""
+    preserve_physician_ids = set(preserve_physician_ids or ())
     required_by_instance = {
         instance.id: instance.required_staffing for instance in instances
     }
@@ -868,7 +871,13 @@ def canonical_assignment_snapshot(assignments, instances, selected_run=None):
             duplicate_rows.append(assignment)
             continue
         required = required_by_instance.get(assignment.shift_instance_id)
-        if required is None or counts_by_instance[assignment.shift_instance_id] >= required:
+        if (
+            required is None
+            or (
+                counts_by_instance[assignment.shift_instance_id] >= required
+                and assignment.physician_id not in preserve_physician_ids
+            )
+        ):
             excess_rows.append(assignment)
             continue
         seen_pairs.add(pair)
@@ -884,17 +893,26 @@ def canonical_assignment_snapshot(assignments, instances, selected_run=None):
     }
 
 
-def _invalid_state_assignment_capacity(instances, state):
+def _invalid_state_assignment_capacity(instances, state, allowed_overstaff_physician_ids=None):
+    allowed_overstaff_physician_ids = set(allowed_overstaff_physician_ids or ())
     issues = []
     for instance in instances:
         physician_ids = state[instance.id]
         duplicate_count = len(physician_ids) - len(set(physician_ids))
         excess_count = max(len(physician_ids) - instance.required_staffing, 0)
-        if duplicate_count or excess_count:
+        disallowed_excess_count = max(
+            len([
+                physician_id for physician_id in physician_ids
+                if physician_id not in allowed_overstaff_physician_ids
+            ]) - instance.required_staffing,
+            0,
+        )
+        if duplicate_count or disallowed_excess_count:
             issues.append({
                 'shift_instance_id': instance.id,
                 'duplicate_count': duplicate_count,
                 'excess_count': excess_count,
+                'disallowed_excess_count': disallowed_excess_count,
                 'required_staffing': instance.required_staffing,
             })
     return issues
@@ -965,7 +983,9 @@ def _validate_schedule(
     state,
     eligible_facilities_by_physician,
     minimum_rest_by_physician,
+    manual_assignment_only_physician_ids=None,
 ):
+    manual_assignment_only_physician_ids = set(manual_assignment_only_physician_ids or ())
     active_physician_ids = {physician.id for physician in physicians if physician.active}
     instances_by_id = {instance.id: instance for instance in instances}
     intervals_by_physician = defaultdict(list)
@@ -981,13 +1001,18 @@ def _validate_schedule(
         for physician_id in physician_ids:
             if physician_id not in active_physician_ids:
                 inactive_physician_violations += 1
-            if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+            if (
+                physician_id not in manual_assignment_only_physician_ids
+                and instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set())
+            ):
                 facility_ineligible_violations += 1
             intervals_by_physician[physician_id].append(instance.id)
 
     overlap_violations = 0
     rest_violations = 0
     for physician_id, instance_ids in intervals_by_physician.items():
+        if physician_id in manual_assignment_only_physician_ids:
+            continue
         physician_instances = sorted(
             (
                 instances_by_id[instance_id]
@@ -1051,18 +1076,12 @@ def _workload_rule_penalty(contract, key, default):
 
 
 def _same_shift_rule(contract):
-    return (
-        _workload_rule_limit(
-            contract,
-            'max_same_shifts_in_row',
-            DEFAULT_MAX_SAME_SHIFT_STREAK,
-        ),
-        _workload_rule_penalty(
-            contract,
-            'max_same_shifts_in_row_penalty_weight',
-            DEFAULT_SAME_SHIFT_PENALTY,
-        ),
-    )
+    settings = contract.workload_settings if isinstance(contract.workload_settings, dict) else {}
+    limit = _decimal_or_none(settings.get('max_same_shifts_in_row'))
+    penalty = _decimal_or_none(settings.get('max_same_shifts_in_row_penalty_weight'))
+    if limit is None or limit <= 0 or penalty is None or penalty <= 0:
+        return None
+    return max(int(limit), 1), penalty
 
 
 def _night_rule_limit(contract, key, default):
@@ -1111,7 +1130,7 @@ def _night_rules_debug_payload(contract):
         'max_consecutive_night_shifts': _configured_positive_int(
             settings,
             'max_consecutive_night_shifts',
-        ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS,
+        ),
         'max_consecutive_night_shifts_penalty_weight': float(
             _configured_positive_penalty(
                 settings,
@@ -1181,7 +1200,7 @@ def _configured_positive_int(settings, key):
 def _configured_positive_penalty(settings, key, default):
     value = _decimal_or_none(settings.get(key))
     if value is None or value < 0:
-        return Decimal(str(default))
+        return Decimal('0')
     return value
 
 
@@ -1459,7 +1478,7 @@ def _night_block_extension_bonus(instances_by_id, state, contract_by_physician, 
     max_consecutive = _configured_positive_int(
         settings,
         'max_consecutive_night_shifts',
-    ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+    )
     min_consecutive = _configured_positive_int(
         settings,
         'min_consecutive_night_shifts',
@@ -1469,7 +1488,7 @@ def _night_block_extension_bonus(instances_by_id, state, contract_by_physician, 
         dates = {item.date for item in block}
         if instance.date not in dates:
             continue
-        if len(block) > max_consecutive:
+        if max_consecutive is not None and len(block) > max_consecutive:
             return Decimal('0')
         if (
             instance.date - timedelta(days=1) in dates
@@ -1491,11 +1510,13 @@ def _night_block_extension_bonus(instances_by_id, state, contract_by_physician, 
                 if min_consecutive is not None and len(block) <= min_consecutive
                 else Decimal('0')
             )
-            return -max(
-                DEFAULT_NIGHT_BLOCK_EXTENSION_BONUS,
-                days_after_penalty * Decimal(min(days_after, max_consecutive)),
+            configured_guidance = max(
+                days_after_penalty * Decimal(
+                    min(days_after, max_consecutive or max(days_after, 1))
+                ),
                 min_consecutive_bonus,
             )
+            return -configured_guidance
     return Decimal('0')
 
 
@@ -1623,6 +1644,8 @@ def _night_violation_report(
                         'max_penalty_weight',
                         DEFAULT_NIGHT_BALANCE_PENALTY,
                     )
+                    if penalty <= 0:
+                        continue
                     excess = count - int(max_shifts)
                     score += Decimal(excess) * penalty
                     violations.append(
@@ -1657,30 +1680,10 @@ def _night_violation_report(
                         }
                     )
 
-        if not configured_volume_rule:
-            excess = max(Decimal(night_count) - (default_target + Decimal('1')), Decimal('0'))
-            if excess > 0:
-                penalty = excess * excess * DEFAULT_NIGHT_BALANCE_PENALTY
-                score += penalty
-                violations.append(
-                    {
-                        'physician_id': physician_id,
-                        'physician': _physician_display_name(physician),
-                        'violation_type': 'NIGHT_CONCENTRATION',
-                        'dates_involved': [instance.date.isoformat() for instance in night_instances],
-                        'night_block_dates': [_block_dates(block) for block in night_blocks],
-                        'configured_limit': float(default_target + Decimal('1')),
-                        'actual_value': night_count,
-                        'penalty_weight': float(DEFAULT_NIGHT_BALANCE_PENALTY),
-                        'penalty': float(penalty),
-                        'explanation': 'Night-shift load is above the v0 default distribution target.',
-                    }
-                )
-
         max_consecutive = _configured_positive_int(
             settings,
             'max_consecutive_night_shifts',
-        ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+        )
         min_consecutive = _configured_positive_int(
             settings,
             'min_consecutive_night_shifts',
@@ -1696,7 +1699,11 @@ def _night_violation_report(
             DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
         )
         for block in night_blocks:
-            if min_consecutive is not None and len(block) < min_consecutive:
+            if (
+                min_consecutive is not None
+                and min_consecutive_penalty > 0
+                and len(block) < min_consecutive
+            ):
                 shortfall = min_consecutive - len(block)
                 penalty = Decimal(shortfall) * min_consecutive_penalty
                 score += penalty
@@ -1720,7 +1727,11 @@ def _night_violation_report(
                         'explanation': 'Night block is shorter than the configured minimum consecutive nights.',
                     }
                 )
-            if len(block) > max_consecutive:
+            if (
+                max_consecutive is not None
+                and consecutive_penalty > 0
+                and len(block) > max_consecutive
+            ):
                 excess = len(block) - max_consecutive
                 penalty = Decimal(excess) * consecutive_penalty
                 score += penalty
@@ -1748,21 +1759,16 @@ def _night_violation_report(
                 include_internal_heuristics
                 and
                 len(block) == 1
-                and (min_consecutive or max_consecutive) > 1
+                and (min_consecutive or max_consecutive or 0) > 1
+                and max(min_consecutive_penalty, consecutive_penalty) > 0
                 and (
                     block[0].date - timedelta(days=1) in assigned_night_dates
                     or block[0].date + timedelta(days=1) in assigned_night_dates
                 )
             ):
-                days_after_penalty = _configured_positive_penalty(
-                    settings,
-                    'days_off_after_night_block_penalty_weight',
-                    DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
-                )
                 score += max(
-                    DEFAULT_NIGHT_BLOCK_EXTENSION_BONUS,
-                    days_after_penalty * Decimal('2'),
-                )
+                    min_consecutive_penalty, consecutive_penalty,
+                ) * Decimal('2')
 
         assignments = sorted(
             assignments_by_physician[physician_id],
@@ -1774,7 +1780,7 @@ def _night_violation_report(
             'days_off_after_night_block_penalty_weight',
             DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
         )
-        if days_after is not None:
+        if days_after is not None and days_after_penalty > 0:
             for block in night_blocks:
                 block_instance_ids = {instance.id for instance in block}
                 block_end = block[-1]
@@ -1836,7 +1842,10 @@ def _night_violation_report(
             'days_off_before_next_night_shift_penalty_weight',
             DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
         )
-        if days_before_next_night_block is not None:
+        if (
+            days_before_next_night_block is not None
+            and days_before_next_night_block_penalty > 0
+        ):
             for prior_block, next_block in zip(night_blocks, night_blocks[1:]):
                 prior_block_end = prior_block[-1]
                 next_block_start = next_block[0]
@@ -1945,7 +1954,7 @@ def _night_violation_report(
                 'max_consecutive_night_shifts': _configured_positive_int(
                     settings,
                     'max_consecutive_night_shifts',
-                ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS,
+                ),
                 'assigned_blocks': [
                     {
                         'dates': _block_dates(block),
@@ -2104,19 +2113,18 @@ def _night_minimum_rules_for_contract(contract):
     rules = []
     for rule in _unique_night_period_rules(settings):
         min_shifts = _decimal_or_none(rule.get('min_shifts'))
-        if min_shifts is None or min_shifts <= 0:
+        penalty_weight = _configured_positive_penalty(
+            rule,
+            'min_penalty_weight',
+            DEFAULT_NIGHT_BALANCE_PENALTY,
+        )
+        if min_shifts is None or min_shifts <= 0 or penalty_weight <= 0:
             continue
         rules.append(
             {
                 'period_type': rule.get('period_type') or 'SCHEDULE_BLOCK',
                 'minimum': int(min_shifts),
-                'penalty_weight': float(
-                    _configured_positive_penalty(
-                        rule,
-                        'min_penalty_weight',
-                        DEFAULT_NIGHT_BALANCE_PENALTY,
-                    )
-                ),
+                'penalty_weight': float(penalty_weight),
             }
         )
     return rules
@@ -2269,18 +2277,6 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
         rules = [rule for rule in (settings.get('period_rules') or []) if isinstance(rule, dict)
                  and any(_decimal_or_none(rule.get(key)) is not None for key in ('min_volume', 'max_volume'))]
         if not rules:
-            count = Decimal(len(assigned[physician.id]))
-            excess = max(count - default_target - 1, Decimal('0'))
-            penalty = excess * excess * DEFAULT_WEEKEND_BALANCE_PENALTY
-            score += penalty
-            if details and penalty:
-                violations.append({
-                    'physician_id': physician.id, **_contract_rule_identity(contract),
-                    'violation_type': 'WEEKEND_CONCENTRATION', 'actual_value': float(count),
-                    'configured_limit': float(default_target + 1), 'penalty': float(penalty),
-                    'penalty_weight': float(DEFAULT_WEEKEND_BALANCE_PENALTY),
-                    'explanation': 'Weekend-shift concentration exceeds the default balancing target (squared excess penalty).',
-                })
             continue
         for rule in rules:
             period = rule.get('period_type') or 'SCHEDULE_BLOCK'
@@ -2294,7 +2290,9 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                     if limit is None:
                         continue
                     excess = max(limit - count if side == 'min' else count - limit, Decimal('0'))
-                    weight = _positive_decimal_or_default(rule.get(f'{side}_penalty_weight'), DEFAULT_WEEKEND_BALANCE_PENALTY)
+                    weight = _positive_decimal_or_default(
+                        rule.get(f'{side}_penalty_weight'), Decimal('0'),
+                    )
                     penalty = excess * weight
                     score += penalty
                     if details and penalty:
@@ -2382,7 +2380,10 @@ def _same_shift_violation_report(instances, physicians, state, contract_by_physi
         contract = contract_by_physician.get(physician_id)
         if contract is None:
             continue
-        max_streak, penalty = _same_shift_rule(contract)
+        same_shift_rule = _same_shift_rule(contract)
+        if same_shift_rule is None:
+            continue
+        max_streak, penalty = same_shift_rule
         streak_score, streaks = _same_shift_streak_score(
             sorted(occurrence_indexes),
             max_streak,
@@ -2442,7 +2443,10 @@ def _same_shift_candidate_delta(instances, physicians, state, contract_by_physic
         existing_template_id, existing_occurrence_index = existing_position
         if existing_template_id == shift_template_id:
             current_indexes.append(existing_occurrence_index)
-    max_streak, penalty = _same_shift_rule(contract)
+    same_shift_rule = _same_shift_rule(contract)
+    if same_shift_rule is None:
+        return Decimal('0')
+    max_streak, penalty = same_shift_rule
     current_score, _streaks = _same_shift_streak_score(
         sorted(current_indexes),
         max_streak,
@@ -2468,7 +2472,10 @@ def _same_shift_candidate_delta_from_indexes(
         (physician_id, shift_template_id),
         [],
     )
-    max_streak, penalty = _same_shift_rule(contract)
+    same_shift_rule = _same_shift_rule(contract)
+    if same_shift_rule is None:
+        return Decimal('0')
+    max_streak, penalty = same_shift_rule
     current_score, _streaks = _same_shift_streak_score(
         sorted(current_indexes), max_streak, penalty,
     )
@@ -2515,39 +2522,28 @@ def _distribution_score(
         if contract is None:
             continue
 
-        assigned_dates = sorted({instance.date for instance in physician_instances})
-        consecutive_days_score += _streak_excess_score(
-            assigned_dates,
-            _workload_rule_limit(
-                contract,
-                'max_days_in_row',
-                DEFAULT_MAX_CONSECUTIVE_DAYS,
-            ),
-            _workload_rule_penalty(
-                contract,
-                'max_days_in_row_penalty_weight',
-                DEFAULT_CONSECUTIVE_DAYS_PENALTY,
-            ),
+        workload_settings = (
+            contract.workload_settings
+            if isinstance(contract.workload_settings, dict)
+            else {}
         )
+        max_days = _decimal_or_none(workload_settings.get('max_days_in_row'))
+        max_days_penalty = _decimal_or_none(
+            workload_settings.get('max_days_in_row_penalty_weight')
+        )
+        if (
+            max_days is not None and max_days > 0
+            and max_days_penalty is not None and max_days_penalty > 0
+        ):
+            assigned_dates = sorted({instance.date for instance in physician_instances})
+            consecutive_days_score += _streak_excess_score(
+                assigned_dates, max(int(max_days), 1), max_days_penalty,
+            )
 
         facility_counts = defaultdict(int)
         for instance in physician_instances:
             facility_counts[instance.facility_id] += 1
 
-
-        eligible_facility_count = len(eligible_facilities_by_physician.get(physician.id, set()))
-        assigned_count = sum(facility_counts.values())
-        if eligible_facility_count > 1 and assigned_count > 0 and facility_counts:
-            concentration_limit = Decimal(str(ceil(assigned_count * 0.7)))
-            concentration_excess = max(
-                Decimal(max(facility_counts.values())) - concentration_limit,
-                Decimal('0'),
-            )
-            facility_distribution_score += (
-                concentration_excess
-                * concentration_excess
-                * DEFAULT_FACILITY_CONCENTRATION_PENALTY
-            )
 
     same_shift_score, _violations = _same_shift_violation_report(
         instances,
@@ -2586,6 +2582,20 @@ def _score_schedule(
     include_internal_night_heuristics=False,
 ):
     _FULL_SCORE_EVALUATIONS.set(_FULL_SCORE_EVALUATIONS.get() + 1)
+    manual_assignment_only_physician_ids = {
+        physician_id
+        for physician_id, contract in contract_by_physician.items()
+        if getattr(contract, 'manual_assignment_only', False)
+    }
+    scoring_physicians = [
+        physician for physician in physicians
+        if physician.id not in manual_assignment_only_physician_ids
+    ]
+    scoring_contract_by_physician = {
+        physician_id: contract
+        for physician_id, contract in contract_by_physician.items()
+        if physician_id not in manual_assignment_only_physician_ids
+    }
     instance_by_id = {instance.id: instance for instance in instances}
     physician_hours = defaultdict(lambda: Decimal('0'))
     physician_shifts = defaultdict(int)
@@ -2603,6 +2613,8 @@ def _score_schedule(
             max(instance.required_staffing - len(assigned_physician_ids), 0)
         ) * Decimal(COVERAGE_PENALTY)
         for physician_id in assigned_physician_ids:
+            if physician_id in manual_assignment_only_physician_ids:
+                continue
             physician_hours[physician_id] += _shift_hours(instance)
             physician_shifts[physician_id] += 1
             if instance.shift_template.night_shift:
@@ -2623,7 +2635,7 @@ def _score_schedule(
             request_rewards += rewards
 
     workload_score_rows = _workload_score_rows(
-        physicians,
+        scoring_physicians,
         instances,
         state,
         physician_hours,
@@ -2638,13 +2650,12 @@ def _score_schedule(
         ),
         Decimal('0'),
     )
-    underutilization_score = _underutilization_score(
-        physicians,
-        physician_shifts,
-        eligible_facilities_by_physician,
-    )
+    # There is no implicit "must use every physician" contract rule.
+    underutilization_score = Decimal('0')
 
     for (physician_id, request_date), schedule_requests in requests_by_physician_date.items():
+        if physician_id in manual_assignment_only_physician_ids:
+            continue
         physician_instance_ids = [
             instance_id
             for instance_id, physician_ids in state.items()
@@ -2692,6 +2703,7 @@ def _score_schedule(
         state,
         eligible_facilities_by_physician,
         minimum_rest_by_physician,
+        manual_assignment_only_physician_ids,
     )
     rest_score = Decimal(validation['final_rest_violations']) * Decimal(REST_VIOLATION_PENALTY)
     overlap_score = Decimal(validation['final_overlap_violations']) * Decimal(OVERLAP_VIOLATION_PENALTY)
@@ -2703,17 +2715,17 @@ def _score_schedule(
     )
     distribution_scores = _distribution_score(
         instances,
-        physicians,
+        scoring_physicians,
         state,
-        contract_by_physician,
+        scoring_contract_by_physician,
         eligible_facilities_by_physician,
         include_internal_night_heuristics=include_internal_night_heuristics,
     )
     _same_shift_score, same_shift_violations = _same_shift_violation_report(
         instances,
-        physicians,
+        scoring_physicians,
         state,
-        contract_by_physician,
+        scoring_contract_by_physician,
     )
     score = (
         coverage_score
@@ -2802,9 +2814,7 @@ def _selected_physician_score(
         (Decimal(row['score_contribution_exact']) for row in workload_rows),
         Decimal('0'),
     )
-    underutilization_score = _underutilization_score(
-        selected_physicians, physician_shifts, eligible_facilities_by_physician,
-    )
+    underutilization_score = Decimal('0')
 
     for (physician_id, request_date), schedule_requests in requests_by_physician_date.items():
         if physician_id not in selected_ids:
@@ -3729,11 +3739,15 @@ def _consecutive_day_break_candidates(state, instances_by_id, manual_pairs, cont
         contract = contract_by_physician.get(physician_id)
         if contract is None:
             continue
-        max_streak = _workload_rule_limit(
-            contract,
-            'max_days_in_row',
-            DEFAULT_MAX_CONSECUTIVE_DAYS,
-        )
+        settings = contract.workload_settings if isinstance(contract.workload_settings, dict) else {}
+        max_streak_value = _decimal_or_none(settings.get('max_days_in_row'))
+        penalty_value = _decimal_or_none(settings.get('max_days_in_row_penalty_weight'))
+        if (
+            max_streak_value is None or max_streak_value <= 0
+            or penalty_value is None or penalty_value <= 0
+        ):
+            continue
+        max_streak = max(int(max_streak_value), 1)
         streak_dates = []
         previous_date = None
         for current_date in sorted(instances_by_date):
@@ -4237,16 +4251,18 @@ def _solve_bounded_multi_physician_neighborhood(
         min_consecutive = _configured_positive_int(
             settings, 'min_consecutive_night_shifts',
         )
-        max_consecutive = (
-            _configured_positive_int(settings, 'max_consecutive_night_shifts')
-            or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+        max_consecutive = _configured_positive_int(
+            settings, 'max_consecutive_night_shifts',
         )
         max_consecutive_penalty = _configured_positive_penalty(
             settings,
             'max_consecutive_night_shifts_penalty_weight',
             DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
         )
-        for start_index in range(0, max(len(all_dates) - max_consecutive, 0)):
+        for start_index in range(
+            0,
+            max(len(all_dates) - max_consecutive, 0) if max_consecutive else 0,
+        ):
             window = all_dates[start_index:start_index + max_consecutive + 1]
             if all(
                 next_day == day + timedelta(days=1)
@@ -4276,7 +4292,6 @@ def _solve_bounded_multi_physician_neighborhood(
             else:
                 model.add(block_start <= 1 - previous)
             block_starts[day] = block_start
-            objective_terms.append(600000 * block_start)
         if min_consecutive and min_consecutive > 1:
             min_consecutive_penalty = _configured_positive_penalty(
                 settings,
@@ -4816,6 +4831,20 @@ def build_violation_report(schedule_version, optimizer_run=None):
         assignment.physician_id: assignment.contract
         for assignment in active_contract_assignments
     }
+    manual_assignment_only_physician_ids = {
+        physician_id
+        for physician_id, contract in contract_by_physician.items()
+        if contract.manual_assignment_only
+    }
+    scoring_physicians = [
+        physician for physician in physicians
+        if physician.id not in manual_assignment_only_physician_ids
+    ]
+    scoring_contract_by_physician = {
+        physician_id: contract
+        for physician_id, contract in contract_by_physician.items()
+        if physician_id not in manual_assignment_only_physician_ids
+    }
     minimum_rest_by_physician = {
         assignment.physician_id: _minimum_rest_hours(assignment.contract)
         for assignment in active_contract_assignments
@@ -4851,6 +4880,11 @@ def build_violation_report(schedule_version, optimizer_run=None):
         )
         for physician in physicians
     }
+    for physician_id in manual_assignment_only_physician_ids:
+        targets[physician_id] = {
+            'units': 'HOURS', 'target': Decimal('0'), 'minimum': Decimal('0'),
+            'maximum': Decimal('0'), 'rules': [],
+        }
     requests_by_physician_date = defaultdict(list)
     for schedule_request in (
         ScheduleRequest.objects.filter(
@@ -4876,9 +4910,9 @@ def build_violation_report(schedule_version, optimizer_run=None):
     )
     night_report = _night_violation_report(
         instances,
-        physicians,
+        scoring_physicians,
         state,
-        contract_by_physician,
+        scoring_contract_by_physician,
     )
     night_report = _validated_night_report_for_current_assignments(
         night_report,
@@ -4887,9 +4921,9 @@ def build_violation_report(schedule_version, optimizer_run=None):
     )
     request_rows = _request_scoring_rows(
         instances,
-        physicians,
+        scoring_physicians,
         state,
-        contract_by_physician,
+        scoring_contract_by_physician,
         requests_by_physician_date,
     )
     score_audit = _score_audit(scoring, night_report, request_rows)
@@ -4939,7 +4973,9 @@ def build_violation_report(schedule_version, optimizer_run=None):
         users[physician_id]['violations'].append(row)
         users[physician_id]['total_score'] += row['penalty_amount'] or 0
 
-    weekend_report = _weekend_volume_report(instances, physicians, state, contract_by_physician, details=True)
+    weekend_report = _weekend_volume_report(
+        instances, scoring_physicians, state, scoring_contract_by_physician, details=True,
+    )
     for violation in weekend_report['violations']:
         row = _report_violation_row(violation)
         users[violation['physician_id']]['violations'].append(row)
@@ -5369,10 +5405,19 @@ def optimize_schedule_version(
                 assignments_for_viewed_run(version, None)
                 .select_related('shift_instance', 'physician__user')
             )
+        manual_assignment_only_physician_ids = set(
+            ContractUserAssignment.objects.filter(
+                domain=version.domain,
+                contract__active=True,
+                contract__manual_assignment_only=True,
+                physician__active=True,
+            ).values_list('physician_id', flat=True)
+        )
         source_assignments, source_assignment_normalization = canonical_assignment_snapshot(
             raw_source_assignments,
             instances,
             selected_run=source_run,
+            preserve_physician_ids=manual_assignment_only_physician_ids,
         )
         source_assignment_count_raw = len(raw_source_assignments)
 
@@ -5383,7 +5428,11 @@ def optimize_schedule_version(
             if source_run is None and optimizer_run.run_kind not in ('COPY', 'BENCHMARK'):
                 assignments = [
                     row for row in source_assignments
-                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE or row.is_locked
+                    if (
+                        start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                        or row.is_locked
+                        or row.physician_id in manual_assignment_only_physician_ids
+                    )
                 ]
             else:
                 manual_seed_rows_by_pair = {}
@@ -5416,9 +5465,15 @@ def optimize_schedule_version(
                 assignments = (
                     [
                         row for row in source_assignments
-                        if row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                        if (
+                            row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                            and (
+                                start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                                or row.physician_id in manual_assignment_only_physician_ids
+                            )
+                        )
                     ]
-                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    if source_assignments
                     else []
                 ) + manual_overlay_rows + list(
                     ScheduleShiftAssignment.objects.filter(
@@ -5468,8 +5523,24 @@ def optimize_schedule_version(
             }
             for assignment in active_contract_assignments
         }
+        for physician_id in manual_assignment_only_physician_ids:
+            eligible_facilities_by_physician[physician_id] = set()
 
         state, manual_pairs = _state_from_assignments(assignments)
+        runless_manual_overlay_pairs = {
+            (assignment.shift_instance_id, assignment.physician_id)
+            for assignment in assignments
+            if (
+                assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
+                and assignment.optimizer_run_id is None
+            )
+        }
+        manual_pairs.update(
+            (instance_id, physician_id)
+            for instance_id, physician_ids in state.items()
+            for physician_id in physician_ids
+            if physician_id in manual_assignment_only_physician_ids
+        )
         source_visible_assignment_pairs = {
             (assignment.shift_instance_id, assignment.physician_id)
             for assignment in source_assignments
@@ -5516,6 +5587,14 @@ def optimize_schedule_version(
             )
             for physician in physicians
         }
+        for physician_id in manual_assignment_only_physician_ids:
+            targets[physician_id] = {
+                'units': 'HOURS',
+                'target': Decimal('0'),
+                'minimum': Decimal('0'),
+                'maximum': Decimal('0'),
+                'rules': [],
+            }
         workload_ranges_by_physician = {}
         workload_totals_by_physician = {}
         night_ranges_by_physician = {}
@@ -5745,10 +5824,13 @@ def optimize_schedule_version(
                 settings,
                 'min_consecutive_night_shifts',
             ) or 1
-            max_consecutive = _configured_positive_int(
-                settings,
-                'max_consecutive_night_shifts',
-            ) or DEFAULT_MAX_CONSECUTIVE_NIGHTS
+            max_consecutive = (
+                _configured_positive_int(
+                    settings,
+                    'max_consecutive_night_shifts',
+                )
+                or len(available_instances)
+            )
             max_feasible = min(max_consecutive, len(available_instances))
             preferred = [
                 length
@@ -9280,11 +9362,14 @@ def optimize_schedule_version(
             assignment.id for assignment in assignments
             if assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
             and not assignment.is_locked
+            and assignment.physician_id not in manual_assignment_only_physician_ids
         ]
         if unlocked_manual_ids:
             ScheduleShiftAssignment.objects.filter(id__in=unlocked_manual_ids).delete()
 
-        invalid_assignment_capacity = _invalid_state_assignment_capacity(instances, state)
+        invalid_assignment_capacity = _invalid_state_assignment_capacity(
+            instances, state, manual_assignment_only_physician_ids,
+        )
         if invalid_assignment_capacity:
             raise ValueError(
                 'Optimizer produced duplicate or over-capacity assignments; no run assignments were persisted. '
@@ -9299,7 +9384,13 @@ def optimize_schedule_version(
             optimizer_physician_ids = [
                 physician_id
                 for physician_id in state[instance.id]
-                if (instance.id, physician_id) not in manual_pairs
+                if (
+                    (instance.id, physician_id) not in manual_pairs
+                    or (
+                        physician_id in manual_assignment_only_physician_ids
+                        and (instance.id, physician_id) not in runless_manual_overlay_pairs
+                    )
+                )
             ]
             for physician_id in optimizer_physician_ids:
                 assignment_rows.append(ScheduleShiftAssignment(

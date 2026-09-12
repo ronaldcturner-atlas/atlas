@@ -3673,6 +3673,7 @@ def contract_duplicate(request, contract_id):
             domain=source_contract.domain,
             name=_build_duplicate_contract_name(source_contract),
             active=False,
+            manual_assignment_only=source_contract.manual_assignment_only,
             workload_settings=_copy_json_dict(source_contract.workload_settings),
             shift_settings=_copy_json_dict(source_contract.shift_settings),
             night_settings=_copy_json_dict(source_contract.night_settings),

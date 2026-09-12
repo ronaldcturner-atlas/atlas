@@ -53,15 +53,15 @@ class WeekendVolumeTests(SimpleTestCase):
         self.assertEqual(result['violations'][0]['shift_instance_ids'], [0])
         self.assertEqual(self.report(dates, [self.rule(maximum=0, weight=0)])['score'], 0)
 
-    def test_fallback_balancing_is_unchanged(self):
+    def test_missing_weekend_rule_has_no_implicit_penalty(self):
         block = SimpleNamespace(start_date=date(2027, 1, 1), end_date=date(2027, 1, 31))
         instances = [SimpleNamespace(id=i, date=date(2027, 1, 2+i), schedule_block=block,
                                     shift_template=SimpleNamespace(weekend_days=['Saturday', 'Sunday', 'Monday', 'Tuesday'])) for i in range(4)]
         physicians = [SimpleNamespace(id=i) for i in (1, 2)]
         contracts = {i: SimpleNamespace(id=i, name='Default', weekend_settings={}) for i in (1, 2)}
         result = o._weekend_volume_report(instances, physicians, {i: [1] for i in range(4)}, contracts, details=True)
-        self.assertEqual(result['score'], 100)
-        self.assertEqual(result['violations'][0]['violation_type'], 'WEEKEND_CONCENTRATION')
+        self.assertEqual(result['score'], 0)
+        self.assertEqual(result['violations'], [])
 
 
 class WeekendVolumeIntegrationTests(TestCase):
