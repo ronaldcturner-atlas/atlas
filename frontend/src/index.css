@@ -214,7 +214,12 @@ select option:checked{
 .request-builder-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
 .request-day-cell{min-width:0;min-height:88px;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.02);color:var(--sidebar-fg);text-align:left;display:flex;flex-direction:column;gap:6px;cursor:pointer}
 .request-day-cell:hover{background:rgba(255,255,255,0.05)}
-.request-day-selected{outline:2px solid var(--accent)}
+.request-day-selected{outline:2px solid #818cf8;background:rgba(67,56,202,0.42);color:#fff}
+.request-day-selected .request-day-header{color:#fff;font-weight:800}
+.request-day-bulk-pending{background:#075985;border-color:#38bdf8;color:#fff;box-shadow:inset 0 0 0 2px #38bdf8}
+.request-day-bulk-pending:hover{background:#0369a1}
+.request-day-bulk-pending .request-day-header{color:#fff;font-weight:800}
+.bulk-date-selection-indicator{padding:2px 5px;border-radius:999px;background:#e0f2fe;color:#075985;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.03em}
 .request-day-cell-disabled{background:rgba(255,255,255,0.01);border-style:dashed;cursor:not-allowed}
 .request-day-cell-empty{background:transparent;border:0;cursor:default}
 .request-day-header{display:flex;justify-content:space-between;align-items:center;font-size:12px}
@@ -242,6 +247,11 @@ select option:checked{
 .request-pattern-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end}
 .request-pattern-grid button{height:36px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .request-bulk-selected-dates{margin-top:10px;display:grid;gap:8px}
+.request-clear-user-selection{margin-left:10px;padding:4px 8px;border:1px solid rgba(147,197,253,0.55);border-radius:7px;background:rgba(30,64,175,0.28);color:#dbeafe;cursor:pointer;font-size:12px;font-weight:600}
+.request-clear-user-selection:hover:not(:disabled){background:rgba(37,99,235,0.45);border-color:#93c5fd;color:#fff}
+.request-clear-user-selection:disabled{opacity:0.45;cursor:not-allowed}
+.request-bulk-selected-dates .request-selected-date-chip{background:#1d4ed8;border-color:#60a5fa;color:#fff;font-weight:700;box-shadow:0 0 0 1px rgba(147,197,253,0.18)}
+.request-bulk-selected-dates .request-selected-date-chip:hover{background:#2563eb;border-color:#bfdbfe;color:#fff}
 .request-bulk-preview{margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(79,70,229,0.14);color:#c7d2fe;font-size:13px}
 
 @media (max-width: 1100px){

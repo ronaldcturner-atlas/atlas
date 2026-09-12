@@ -259,6 +259,7 @@ export default function RequestBuilderView({ block }: Props) {
   const [bulkWeight, setBulkWeight] = useState<Weight>('MEDIUM')
   const [bulkShiftTemplateIds, setBulkShiftTemplateIds] = useState<number[]>([])
   const [bulkSelectedDates, setBulkSelectedDates] = useState<string[]>([])
+  const [bulkPendingDates, setBulkPendingDates] = useState<string[]>([])
   const [patternMode, setPatternMode] = useState<BulkPatternMode>('SELECTED')
 
   const canEdit = block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD'
@@ -318,6 +319,7 @@ export default function RequestBuilderView({ block }: Props) {
   useEffect(() => {
     setVisibleMonth(startOfMonthUtc(parseIsoDateToUtc(block.start_date)))
     setSelectedDate(block.start_date)
+    setBulkPendingDates([])
     fetchContext()
   }, [block.id, block.start_date, block.end_date, block.build_status])
 
@@ -545,7 +547,7 @@ export default function RequestBuilderView({ block }: Props) {
     const anchorDay = selectedDateUtc.getUTCDay()
 
     if (patternMode === 'SELECTED') {
-      return [selectedDate]
+      return bulkPendingDates
     }
 
     if (patternMode === 'EVERY') {
@@ -605,6 +607,7 @@ export default function RequestBuilderView({ block }: Props) {
     const patternDates = collectPatternDates()
     if (patternMode === 'SELECTED') {
       setBulkSelectedDates((current) => Array.from(new Set([...current, ...patternDates])).sort())
+      setBulkPendingDates([])
       return
     }
     setBulkSelectedDates(patternDates)
@@ -658,6 +661,8 @@ export default function RequestBuilderView({ block }: Props) {
       if (selectedPhysicianId) {
         await fetchContext(selectedPhysicianId)
       }
+      setBulkSelectedDates([])
+      setBulkPendingDates([])
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save bulk requests.')
     } finally {
@@ -807,6 +812,7 @@ export default function RequestBuilderView({ block }: Props) {
               const dateKey = toIsoDateUtc(cell.date)
               const dateRequests = visibleRequestsByDate.get(dateKey) ?? []
               const isSelected = dateKey === selectedDate
+              const isBulkPending = patternMode === 'SELECTED' && bulkPendingDates.includes(dateKey)
 
               if (!cell.key.startsWith('empty-leading-') && !cell.inRange) {
                 return <div key={cell.key} className="request-day-cell request-day-cell-disabled" />
@@ -820,11 +826,21 @@ export default function RequestBuilderView({ block }: Props) {
                 <button
                   type="button"
                   key={cell.key}
-                  className={`request-day-cell ${isSelected ? 'request-day-selected' : ''}`}
-                  onClick={() => setSelectedDate(dateKey)}
+                  className={`request-day-cell ${isSelected ? 'request-day-selected' : ''} ${isBulkPending ? 'request-day-bulk-pending' : ''}`}
+                  onClick={() => {
+                    setSelectedDate(dateKey)
+                    if (contextData.is_scheduler_or_admin && patternMode === 'SELECTED') {
+                      setBulkPendingDates((current) => (
+                        current.includes(dateKey)
+                          ? current.filter((value) => value !== dateKey)
+                          : [...current, dateKey].sort()
+                      ))
+                    }
+                  }}
                 >
                   <div className="request-day-header">
                     <span>{cell.date.getUTCDate()}</span>
+                    {isBulkPending && <span className="bulk-date-selection-indicator">Selected</span>}
                   </div>
                   {dateRequests.map((item) => (
                     <div
@@ -962,7 +978,17 @@ export default function RequestBuilderView({ block }: Props) {
           </div>
           <div className="request-bulk-grid">
             <fieldset className="days-fieldset">
-              <legend>Select Users</legend>
+              <legend>
+                <span>Select Users</span>
+                <button
+                  type="button"
+                  className="request-clear-user-selection"
+                  onClick={() => setBulkPhysicianIds([])}
+                  disabled={!canEdit || bulkPhysicianIds.length === 0}
+                >
+                  Clear Selected Users
+                </button>
+              </legend>
               <div className="request-template-list">
                 {contextData.physicians.map((physician) => (
                   <label key={physician.id} className="day-option">
@@ -1063,12 +1089,23 @@ export default function RequestBuilderView({ block }: Props) {
           <div className="request-pattern-panel">
             <h4>Pattern Helper</h4>
             <div className="request-existing-note">
-              Anchor date: {formatDisplayDate(selectedDateUtc)}. Select a calendar date to change the anchor.
+              {patternMode === 'SELECTED'
+                ? `${bulkPendingDates.length} calendar date${bulkPendingDates.length === 1 ? '' : 's'} ready to add. Click dates to select or deselect them.`
+                : `Anchor date: ${formatDisplayDate(selectedDateUtc)}. Select a calendar date to change the anchor.`}
             </div>
             <div className="request-pattern-grid">
               <label className="facility-field">
                 <span>Pattern</span>
-                <select value={patternMode} onChange={(event) => setPatternMode(event.target.value as BulkPatternMode)}>
+                <select
+                  value={patternMode}
+                  onChange={(event) => {
+                    const nextMode = event.target.value as BulkPatternMode
+                    setPatternMode(nextMode)
+                    if (nextMode !== 'SELECTED') {
+                      setBulkPendingDates([])
+                    }
+                  }}
+                >
                   <option value="SELECTED">Selected dates only</option>
                   <option value="EVERY">Every selected day of week</option>
                   <option value="NTH">Nth selected day of month</option>
@@ -1076,8 +1113,12 @@ export default function RequestBuilderView({ block }: Props) {
                 </select>
               </label>
 
-              <button type="button" onClick={applyPattern} disabled={!canEdit}>
-                {patternMode === 'SELECTED' ? 'Add Selected Date' : 'Apply Pattern'}
+              <button
+                type="button"
+                onClick={applyPattern}
+                disabled={!canEdit || (patternMode === 'SELECTED' && bulkPendingDates.length === 0)}
+              >
+                {patternMode === 'SELECTED' ? 'Add Dates' : 'Apply Pattern'}
               </button>
             </div>
 
@@ -1085,7 +1126,13 @@ export default function RequestBuilderView({ block }: Props) {
               <strong>Selected Dates ({bulkSelectedDates.length})</strong>
               <div className="facility-chip-list">
                 {bulkSelectedDates.map((dateValue) => (
-                  <button key={dateValue} type="button" className="facility-chip" onClick={() => toggleBulkDate(dateValue)}>
+                  <button
+                    key={dateValue}
+                    type="button"
+                    className="facility-chip request-selected-date-chip"
+                    onClick={() => toggleBulkDate(dateValue)}
+                    title="Click to remove this date"
+                  >
                     {dateValue}
                   </button>
                 ))}

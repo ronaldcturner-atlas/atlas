@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import date
 from random import Random
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +43,81 @@ class FakeBudget:
 
 
 class AdaptiveSearchRoundTests(SimpleTestCase):
+    def test_assignment_distance_counts_changed_owners(self):
+        self.assertEqual(
+            optimizer._state_assignment_distance(
+                {1: [10], 2: [20], 3: [30]},
+                {1: [20], 2: [10], 3: [30]},
+            ),
+            2,
+        )
+
+    def test_violation_focuses_include_all_configured_score_families(self):
+        instances = [
+            SimpleNamespace(id=1, date=date(2026, 12, 4)),
+            SimpleNamespace(id=2, date=date(2026, 12, 5)),
+        ]
+        scoring = {
+            'workload_score_rows': [{
+                'physician_id': 1,
+                'rule_rows': [{
+                    'period_start': '2026-12-04',
+                    'period_end': '2026-12-05',
+                    'score_contribution': 80,
+                }],
+            }],
+            'same_shift_violations': [{
+                'physician_id': 2,
+                'dates_involved': ['2026-12-05'],
+                'penalty': 40,
+                'violation_type': 'SAME_SHIFT_STREAK',
+            }],
+        }
+        with patch.object(
+            optimizer, '_night_violation_report',
+            return_value={'night_violations': [{
+                'physician_id': 3,
+                'dates_involved': ['2026-12-04'],
+                'penalty_amount': 60,
+                'violation_type': 'MIN_CONSECUTIVE_NIGHTS',
+            }]},
+        ), patch.object(
+            optimizer, '_weekend_volume_report',
+            return_value={'violations': [{
+                'physician_id': 4,
+                'period_start': '2026-12-04',
+                'period_end': '2026-12-05',
+                'penalty': 20,
+                'violation_type': 'WEEKEND_OVER_MAXIMUM',
+            }]},
+        ), patch.object(
+            optimizer, '_request_scoring_rows',
+            return_value=[{
+                'physician_id': 5,
+                'dates_involved': ['2026-12-05'],
+                'penalty': 100,
+                'violation_type': 'REQUEST_SHIFT_ON_UNMET',
+            }],
+        ):
+            focuses = optimizer._adaptive_violation_focuses(
+                instances=instances,
+                physicians=[],
+                state={1: [], 2: []},
+                scoring=scoring,
+                contract_by_physician={},
+                requests_by_physician_date={},
+            )
+
+        self.assertEqual(
+            [focus['violation_type'] for focus in focuses],
+            [
+                'REQUEST_SHIFT_ON_UNMET', 'WORKLOAD',
+                'MIN_CONSECUTIVE_NIGHTS', 'SAME_SHIFT_STREAK',
+                'WEEKEND_OVER_MAXIMUM',
+            ],
+        )
+        self.assertEqual(focuses[0]['dates'], [date(2026, 12, 5)])
+
     def test_preserves_repair_order_and_returns_best_valid_state(self):
         calls = []
         budget = FakeBudget()

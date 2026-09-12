@@ -3996,7 +3996,10 @@ def _solve_bounded_multi_physician_neighborhood(
     *, instances, physicians, state, scoring, manual_pairs, targets,
     contract_by_physician, requests_by_physician_date,
     eligible_facilities_by_physician, minimum_rest_by_physician,
-    rng, time_limit_seconds=4,
+    rng, time_limit_seconds=4, focus_physician_ids=None,
+    focus_start=None, focus_end=None, cohort_size=10,
+    allow_non_improving=False, maximum_score_increase=None,
+    diversification_bias=False,
 ):
     """Rebuild a coupled cohort atomically with CP-SAT.
 
@@ -4029,23 +4032,52 @@ def _solve_bounded_multi_physician_neighborhood(
         ),
         reverse=True,
     )
-    source_ids = [p.id for p in ranked if penalty_by_physician[p.id] > 0][:4]
+    focus_physician_ids = set(focus_physician_ids or ())
+    source_ids = [
+        physician.id for physician in ranked
+        if physician.id in focus_physician_ids
+    ][:max(2, cohort_size // 2)]
+    source_ids.extend(
+        physician.id for physician in ranked
+        if penalty_by_physician[physician.id] > 0
+        and physician.id not in source_ids
+    )
+    source_ids = source_ids[:max(2, cohort_size // 2)]
     if not source_ids:
         return _copy_state(state), scoring, debug
-    receivers = sorted(
-        (p for p in physicians if p.id not in source_ids),
+    receiver_pool = sorted(
+        (
+            p for p in physicians
+            if p.id not in source_ids
+            and eligible_facilities_by_physician.get(p.id)
+        ),
         key=lambda physician: (
             0 if workload_rows.get(physician.id, {}).get('deviation_direction') == 'below_minimum' else 1,
             Decimal(str(workload_rows.get(physician.id, {}).get('assigned_hours', 0))),
             physician.id,
         ),
-    )[:6]
+    )[:max(cohort_size * 2, cohort_size)]
+    # Sample from a strong receiver pool so repeated neighborhoods do not use
+    # the same physicians merely because their current hours sort first.
+    receiver_count = max(cohort_size - len(source_ids), 0)
+    receivers = (
+        rng.sample(receiver_pool, min(receiver_count, len(receiver_pool)))
+        if receiver_pool and receiver_count
+        else []
+    )
     cohort_ids = set(source_ids).union(p.id for p in receivers)
     debug['physician_ids'] = sorted(cohort_ids)
+    debug['focus_physician_ids'] = sorted(focus_physician_ids)
+    debug['focus_start'] = focus_start.isoformat() if focus_start else None
+    debug['focus_end'] = focus_end.isoformat() if focus_end else None
 
     instances_by_id = {instance.id: instance for instance in instances}
     movable = []
     for instance in instances:
+        if focus_start is not None and instance.date < focus_start:
+            continue
+        if focus_end is not None and instance.date > focus_end:
+            continue
         for physician_id in state[instance.id]:
             if physician_id in cohort_ids and (instance.id, physician_id) not in manual_pairs:
                 movable.append((instance, physician_id))
@@ -4309,12 +4341,19 @@ def _solve_bounded_multi_physician_neighborhood(
                         int(min_consecutive_penalty * 60) * missing
                     )
 
-    # Keep ties diverse across restarts without overpowering configured rules.
+    # Ordinary repair prefers assignment stability. During a diversified
+    # restart, signed tie weights deliberately produce a different solution
+    # among otherwise equivalent neighborhood optima.
     for slot, (_instance, owner_id) in enumerate(movable):
         for physician_id in cohort_ids:
             variable = variables.get((slot, physician_id))
             if variable is not None and physician_id != owner_id:
-                objective_terms.append(rng.randint(1, 7) * variable)
+                tie_weight = (
+                    rng.randint(-7, 7)
+                    if diversification_bias
+                    else rng.randint(1, 7)
+                )
+                objective_terms.append(tie_weight * variable)
     model.minimize(sum(objective_terms))
 
     solver = cp_model.CpSolver()
@@ -4351,10 +4390,110 @@ def _solve_bounded_multi_physician_neighborhood(
     debug['breakdown_after'] = {
         key: float(value) for key, value in trial_scoring['breakdown'].items()
     }
-    if _optimization_priority(trial_scoring) < _optimization_priority(scoring):
+    score_increase = trial_scoring['score'] - scoring['score']
+    debug['assignment_distance'] = sum(
+        len(set(state[instance.id]).symmetric_difference(trial[instance.id]))
+        for instance in instances
+    ) // 2
+    acceptable_increase = (
+        maximum_score_increase is None
+        or score_increase <= Decimal(str(maximum_score_increase))
+    )
+    if (
+        _optimization_priority(trial_scoring) < _optimization_priority(scoring)
+        or (
+            allow_non_improving
+            and debug['assignment_distance'] > 0
+            and acceptable_increase
+        )
+    ):
         debug['accepted'] = True
+        debug['accepted_for_diversification'] = score_increase >= 0
         return trial, trial_scoring, debug
     return _copy_state(state), scoring, debug
+
+
+def _state_assignment_distance(left_state, right_state):
+    """Count assignment ownership changes between two complete states."""
+    instance_ids = set(left_state).union(right_state)
+    return sum(
+        len(
+            set(left_state.get(instance_id, ())).symmetric_difference(
+                right_state.get(instance_id, ())
+            )
+        )
+        for instance_id in instance_ids
+    ) // 2
+
+
+def _adaptive_violation_focuses(
+    *, instances, physicians, state, scoring, contract_by_physician,
+    requests_by_physician_date,
+):
+    """Return weighted physician/date seeds for destroy-and-repair windows.
+
+    These are derived from the authoritative score reports rather than from a
+    schedule-block-specific rule.  A restart can therefore target whichever
+    configured constraints are active in the current problem.
+    """
+    dates_by_iso = {instance.date.isoformat(): instance.date for instance in instances}
+    focuses = []
+
+    def add_focus(row, penalty=None):
+        physician_id = row.get('physician_id')
+        if physician_id is None:
+            return
+        dates = [
+            dates_by_iso[value]
+            for value in row.get('dates_involved', ())
+            if value in dates_by_iso
+        ]
+        for key in ('period_start', 'period_end'):
+            value = row.get(key)
+            if value in dates_by_iso:
+                dates.append(dates_by_iso[value])
+        amount = Decimal(str(
+            penalty
+            if penalty is not None
+            else row.get('penalty_amount', row.get('penalty', 0))
+        ))
+        if amount <= 0:
+            return
+        focuses.append({
+            'physician_ids': {physician_id},
+            'dates': sorted(set(dates)),
+            'penalty': amount,
+            'violation_type': row.get('violation_type', 'WORKLOAD'),
+        })
+
+    for row in scoring.get('workload_score_rows', ()):
+        for rule_row in row.get('rule_rows', ()):
+            if Decimal(str(rule_row.get('score_contribution', 0))) > 0:
+                add_focus(
+                    {'physician_id': row['physician_id'], **rule_row},
+                    rule_row['score_contribution'],
+                )
+    for row in scoring.get('same_shift_violations', ()):
+        add_focus(row)
+    for row in _night_violation_report(
+        instances, physicians, state, contract_by_physician,
+    ).get('night_violations', ()):
+        add_focus(row)
+    for row in _weekend_volume_report(
+        instances, physicians, state, contract_by_physician, details=True,
+    ).get('violations', ()):
+        add_focus(row)
+    for row in _request_scoring_rows(
+        instances, physicians, state, contract_by_physician,
+        requests_by_physician_date,
+    ):
+        add_focus(row)
+
+    return sorted(
+        focuses,
+        key=lambda focus: (focus['penalty'], len(focus['dates'])),
+        reverse=True,
+    )
 
 
 def _run_adaptive_search_rounds(
@@ -4397,14 +4536,48 @@ def _run_adaptive_search_rounds(
             debug['improvements'] += 1
 
     def diversify_from_best():
-        """Leave the local basin with several hard-valid swaps.
+        """Leave the local basin with violation-directed destroy and repair.
 
-        The global best remains untouched.  A restart must not stop after the
-        first improving swap: that is ordinary hill climbing and returns the
-        search to the same basin that just stalled.
+        The global best remains untouched. The exploration state may become
+        temporarily worse within a bounded temperature so subsequent repairs
+        can cross a local-score barrier.
         """
         exploration = _copy_state(best_state)
         exploration_scoring = best_scoring
+        focuses = _adaptive_violation_focuses(
+            instances=instances, physicians=physicians, state=best_state,
+            scoring=best_scoring,
+            contract_by_physician=contract_by_physician,
+            requests_by_physician_date=requests_by_physician_date,
+        )
+        focus = None
+        if focuses:
+            # Select among several expensive violations rather than repeatedly
+            # rebuilding the same highest-scoring physician cohort.
+            focus = rng.choice(focuses[:min(12, len(focuses))])
+        schedule_start = min(instance.date for instance in instances)
+        schedule_end = max(instance.date for instance in instances)
+        window_days = rng.choice((14, 21, 28, 42))
+        focus_dates = focus['dates'] if focus else []
+        anchor = rng.choice(focus_dates) if focus_dates else rng.choice(instances).date
+        focus_start = max(
+            schedule_start,
+            anchor - timedelta(days=rng.randrange(0, max(window_days // 3, 1) + 1)),
+        )
+        focus_end = min(
+            schedule_end,
+            focus_start + timedelta(days=window_days - 1),
+        )
+        # Later restarts are cooler: they may still leave the basin, but cannot
+        # discard an increasingly large fraction of the best score.
+        temperature_ratio = max(
+            Decimal('0.04'),
+            Decimal('0.16') - Decimal(debug.get('restarts', 0)) * Decimal('0.04'),
+        )
+        maximum_score_increase = max(
+            Decimal('5000'), best_scoring['score'] * temperature_ratio,
+        )
+        cohort_size = rng.choice((8, 10, 12))
         solver_state, solver_scoring, solver_debug = (
             _solve_bounded_multi_physician_neighborhood(
                 instances=instances, physicians=physicians,
@@ -4415,6 +4588,12 @@ def _run_adaptive_search_rounds(
                 eligible_facilities_by_physician=eligible_facilities_by_physician,
                 minimum_rest_by_physician=minimum_rest_by_physician,
                 rng=rng,
+                focus_physician_ids=(focus or {}).get('physician_ids'),
+                focus_start=focus_start, focus_end=focus_end,
+                cohort_size=cohort_size,
+                allow_non_improving=True,
+                maximum_score_increase=maximum_score_increase,
+                diversification_bias=True,
                 time_limit_seconds=min(
                     4,
                     max(
@@ -4428,11 +4607,29 @@ def _run_adaptive_search_rounds(
         if solver_debug.get('accepted'):
             exploration, exploration_scoring = solver_state, solver_scoring
             keep_progress(exploration, exploration_scoring)
-        pairs = _optimizer_pairs(exploration, manual_pairs)
+        focus_physician_ids = set((focus or {}).get('physician_ids', ()))
+        pairs = [
+            pair for pair in _optimizer_pairs(exploration, manual_pairs)
+            if (
+                focus_start <= instances_by_id[pair[0]].date <= focus_end
+                or pair[1] in focus_physician_ids
+            )
+        ]
         if len(pairs) < 2:
-            return _copy_state(best_state), {
-                'perturbed': False, 'attempts': 0,
+            return exploration, {
+                'perturbed': _state_assignment_distance(best_state, exploration) > 0,
+                'attempts': 0,
                 'constraint_solver': solver_debug,
+                'violation_focus': (focus or {}).get('violation_type'),
+                'focus_physician_ids': sorted(focus_physician_ids),
+                'focus_start': focus_start.isoformat(),
+                'focus_end': focus_end.isoformat(),
+                'cohort_size': cohort_size,
+                'maximum_score_increase': float(maximum_score_increase),
+                'score_after_kick': float(exploration_scoring['score']),
+                'distance_from_best': _state_assignment_distance(
+                    best_state, exploration,
+                ),
             }
         target_kicks = min(8, max(3, len(pairs) // 250))
         total_attempts = 0
@@ -4457,7 +4654,11 @@ def _run_adaptive_search_rounds(
                     right_instance_id=right[0], right_physician_id=right[1],
                 )
                 if result.get('legal'):
-                    candidates.append((result.get('score_delta', Decimal('0')), left, right, result))
+                    projected_score = (
+                        result.get('scoring') or {}
+                    ).get('score', exploration_scoring['score'] + result.get('score_delta', 0))
+                    if projected_score <= best_scoring['score'] + maximum_score_increase:
+                        candidates.append((result.get('score_delta', Decimal('0')), left, right, result))
             if not candidates:
                 break
             # Prefer a modest disruption, but deliberately continue after a
@@ -4483,9 +4684,18 @@ def _run_adaptive_search_rounds(
             'perturbed': bool(applied),
             'attempts': total_attempts,
             'constraint_solver': solver_debug,
+            'violation_focus': (focus or {}).get('violation_type'),
+            'focus_physician_ids': sorted(focus_physician_ids),
+            'focus_start': focus_start.isoformat(),
+            'focus_end': focus_end.isoformat(),
+            'cohort_size': cohort_size,
+            'maximum_score_increase': float(maximum_score_increase),
             'kicks_applied': len(applied),
             'kick_details': applied,
             'score_after_kick': float(exploration_scoring['score']),
+            'distance_from_best': _state_assignment_distance(
+                best_state, exploration,
+            ),
         }
 
     active_repairs = list(repairs)
