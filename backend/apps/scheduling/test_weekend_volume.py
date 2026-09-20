@@ -11,13 +11,23 @@ from .models import ContractUserAssignment, OptimizerRun, ScheduleShiftAssignmen
 
 
 class WeekendVolumeTests(SimpleTestCase):
-    def report(self, dates, rules, assigned=None, weekend_days=None):
+    def report(
+        self, dates, rules, assigned=None, weekend_days=None, settings=None,
+        night_shift=False,
+    ):
         block = SimpleNamespace(start_date=date(2026, 12, 1), end_date=date(2027, 1, 31))
-        template = SimpleNamespace(weekend_days=weekend_days or ['Saturday', 'Sunday'])
+        template = SimpleNamespace(
+            weekend_days=weekend_days or ['Saturday', 'Sunday'],
+            night_shift=night_shift,
+        )
         instances = [SimpleNamespace(id=i, date=day, schedule_block=block, shift_template=template)
                      for i, day in enumerate(dates)]
         physician = SimpleNamespace(id=1)
-        contract = SimpleNamespace(id=1, name='Test', weekend_settings={'period_rules': rules})
+        contract = SimpleNamespace(
+            id=1,
+            name='Test',
+            weekend_settings={**(settings or {}), 'period_rules': rules},
+        )
         state = {i: [1] if assigned is None or i in assigned else [] for i in range(len(dates))}
         return o._weekend_volume_report(instances, [physician], state, {1: contract}, details=True)
 
@@ -53,6 +63,53 @@ class WeekendVolumeTests(SimpleTestCase):
         self.assertEqual(result['violations'][0]['shift_instance_ids'], [0])
         self.assertEqual(self.report(dates, [self.rule(maximum=0, weight=0)])['score'], 0)
 
+    def test_weekend_designation_is_not_hard_coded_to_saturday_and_sunday(self):
+        monday_template = SimpleNamespace(weekend_days=['Monday'])
+        saturday_template = SimpleNamespace(weekend_days=['Monday'])
+        self.assertTrue(o._is_weekend_designated(SimpleNamespace(
+            date=date(2026, 12, 7), shift_template=monday_template,
+        )))
+        self.assertFalse(o._is_weekend_designated(SimpleNamespace(
+            date=date(2026, 12, 5), shift_template=saturday_template,
+        )))
+
+    def test_repair_targets_follow_each_templates_configured_weekend_days(self):
+        block = SimpleNamespace(
+            start_date=date(2026, 12, 1), end_date=date(2026, 12, 31),
+        )
+        instances = [
+            SimpleNamespace(
+                id=1, date=date(2026, 12, 7), schedule_block=block,
+                shift_template=SimpleNamespace(weekend_days=['Monday']),
+            ),
+            SimpleNamespace(
+                id=2, date=date(2026, 12, 12), schedule_block=block,
+                shift_template=SimpleNamespace(weekend_days=['Monday']),
+            ),
+        ]
+        physician = SimpleNamespace(id=11)
+        contract = SimpleNamespace(
+            id=3,
+            name='Configured weekends',
+            weekend_settings={
+                'min_consecutive_weekend_shifts': '2',
+                'min_consecutive_weekend_shifts_penalty_weight': '5000',
+            },
+        )
+        state = {1: [11], 2: [11]}
+        self.assertEqual(
+            o._weekend_repair_candidates(
+                instances, [physician], state, set(), {11: contract},
+            ),
+            [(11, 1)],
+        )
+        self.assertEqual(
+            o._weekend_repair_candidates(
+                instances, [physician], state, {(1, 11)}, {11: contract},
+            ),
+            [],
+        )
+
     def test_missing_weekend_rule_has_no_implicit_penalty(self):
         block = SimpleNamespace(start_date=date(2027, 1, 1), end_date=date(2027, 1, 31))
         instances = [SimpleNamespace(id=i, date=date(2027, 1, 2+i), schedule_block=block,
@@ -60,6 +117,114 @@ class WeekendVolumeTests(SimpleTestCase):
         physicians = [SimpleNamespace(id=i) for i in (1, 2)]
         contracts = {i: SimpleNamespace(id=i, name='Default', weekend_settings={}) for i in (1, 2)}
         result = o._weekend_volume_report(instances, physicians, {i: [1] for i in range(4)}, contracts, details=True)
+        self.assertEqual(result['score'], 0)
+        self.assertEqual(result['violations'], [])
+
+    def test_minimum_consecutive_weekend_shifts_penalizes_isolated_shifts(self):
+        settings = {
+            'min_consecutive_weekend_shifts': '2',
+            'min_consecutive_weekend_shifts_penalty_weight': '5000',
+        }
+        result = self.report(
+            [date(2026, 12, 5), date(2026, 12, 6), date(2026, 12, 12)],
+            [],
+            assigned={0, 2},
+            settings=settings,
+        )
+        self.assertEqual(result['score'], 10000)
+        self.assertEqual(
+            [row['violation_type'] for row in result['violations']],
+            ['MIN_CONSECUTIVE_WEEKEND_SHIFTS', 'MIN_CONSECUTIVE_WEEKEND_SHIFTS'],
+        )
+        self.assertTrue(all(row['actual_value'] == 1 for row in result['violations']))
+
+    def test_minimum_consecutive_weekend_shifts_accepts_two_day_block(self):
+        result = self.report(
+            [date(2026, 12, 5), date(2026, 12, 6)],
+            [],
+            settings={
+                'min_consecutive_weekend_shifts': '2',
+                'min_consecutive_weekend_shifts_penalty_weight': '5000',
+            },
+        )
+        self.assertEqual(result['score'], 0)
+        self.assertEqual(result['violations'], [])
+
+    def test_consecutive_weekends_are_counted_once_per_calendar_weekend(self):
+        result = self.report(
+            [
+                date(2026, 12, 5), date(2026, 12, 6),
+                date(2026, 12, 12), date(2026, 12, 13),
+            ],
+            [],
+            settings={
+                'min_consecutive_weekends': '2',
+                'min_consecutive_weekends_penalty_weight': '5000',
+            },
+        )
+        self.assertEqual(result['score'], 0)
+        self.assertEqual(result['violations'], [])
+
+    def test_minimum_consecutive_weekends_penalizes_each_short_streak(self):
+        result = self.report(
+            [date(2026, 12, 5), date(2026, 12, 19)],
+            [],
+            settings={
+                'min_consecutive_weekends': '2',
+                'min_consecutive_weekends_penalty_weight': '5000',
+            },
+        )
+        self.assertEqual(result['score'], 10000)
+        self.assertEqual(
+            [row['violation_type'] for row in result['violations']],
+            ['MIN_CONSECUTIVE_WEEKENDS', 'MIN_CONSECUTIVE_WEEKENDS'],
+        )
+        self.assertTrue(all(row['period_type'] == 'WEEKEND_STREAK' for row in result['violations']))
+
+    def test_maximum_consecutive_weekends_scores_only_excess_weekends(self):
+        result = self.report(
+            [date(2026, 12, 5), date(2026, 12, 12), date(2026, 12, 19)],
+            [],
+            settings={
+                'max_consecutive_weekends': '2',
+                'max_consecutive_weekends_penalty_weight': '3000',
+            },
+        )
+        self.assertEqual(result['score'], 3000)
+        self.assertEqual(result['violations'][0]['actual_value'], 3)
+        self.assertEqual(result['violations'][0]['configured_limit'], 2)
+
+    def test_friday_night_before_complete_weekend_off_is_scored_per_weekend(self):
+        result = self.report(
+            [date(2026, 12, 4), date(2026, 12, 5), date(2026, 12, 6)],
+            [],
+            assigned={0},
+            weekend_days=['Saturday', 'Sunday'],
+            night_shift=True,
+            settings={
+                'block_friday_night_before_weekend_off': True,
+                'block_friday_night_before_weekend_off_penalty_weight': '4000',
+            },
+        )
+        self.assertEqual(result['score'], 4000)
+        row = result['violations'][0]
+        self.assertEqual(row['violation_type'], 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF')
+        self.assertEqual(row['period_type'], 'WEEKEND')
+        self.assertEqual(row['period_start'], '2026-12-05')
+        self.assertEqual(row['period_end'], '2026-12-06')
+
+    def test_friday_rule_does_not_penalize_a_worked_weekend(self):
+        result = self.report(
+            [date(2026, 12, 4), date(2026, 12, 5), date(2026, 12, 6)],
+            [],
+            assigned={0, 1},
+            weekend_days=['Saturday', 'Sunday'],
+            night_shift=True,
+            settings={
+                'block_friday_night_before_weekend_off': True,
+                'block_friday_night_before_weekend_off_penalty_weight': '4000',
+            },
+        )
         self.assertEqual(result['score'], 0)
         self.assertEqual(result['violations'], [])
 

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.test import TestCase
 
@@ -36,7 +37,14 @@ class CoveragePriorityTests(TestCase):
         self.assertGreater(len(accepted), 1)
         self.assertTrue(all(row['score_after'] < row['score_before'] for row in accepted))
         self.assertEqual(summary['unfilled_shift_count'], 0)
-        self.assertLess(summary['final_score'], summary['initial_score'])
+        # The displayed starting penalty is the source run's immutable stored
+        # final penalty.  Current-rule rescoring remains available in debug
+        # diagnostics for tests and audits when rules changed after that run.
+        self.assertEqual(summary['initial_score'], float(source.final_score))
+        self.assertGreater(
+            summary['debug']['source_state_reported_score_before_pre_score_changes'],
+            summary['final_score'],
+        )
         result = OptimizerRun.objects.get(pk=summary['optimizer_run_id'])
         self.assertTrue(assignments_for_viewed_run(version, result).filter(
             shift_instance=instances[0], physician=physician, is_locked=True,
@@ -99,3 +107,48 @@ class CoveragePriorityTests(TestCase):
         self.assertEqual(contract.workload_settings, settings)
         self.assertEqual(build_violation_report(version, result)['total_score'], summary['final_score'])
         self.assertEqual(assignments_for_viewed_run(version, source).count(), 1)
+
+    def test_adaptive_search_starts_from_complete_construction_not_cheaper_incomplete_source(self):
+        version = Command()._build_fixture(SCALE_PROFILES[0], shifts_per_day=1)
+        contract = Contract.objects.get(domain=version.domain)
+        contract.workload_settings = {'period_rules': [{
+            'period_type': 'SCHEDULE_BLOCK', 'units': 'SHIFTS',
+            'min_value': '0', 'max_value': '1', 'max_penalty_weight': '100000',
+        }]}
+        contract.save(update_fields=['workload_settings'])
+        source = OptimizerRun.objects.create(
+            schedule_version=version, run_number=1,
+            status=OptimizerRun.Status.COMPLETED, is_active=True,
+            initial_score=0, final_score=0,
+        )
+        first = version.shift_instances.order_by('date').first()
+        physician = ContractUserAssignment.objects.filter(contract=contract).first().physician
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=first, physician=physician, optimizer_run=source,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        adaptive_start = {}
+
+        def retain_adaptive_start(**kwargs):
+            adaptive_start['unfilled'] = sum(
+                max(instance.required_staffing - len(kwargs['initial_state'][instance.id]), 0)
+                for instance in kwargs['instances']
+            )
+            return kwargs['initial_state'], kwargs['initial_scoring'], kwargs['debug']
+
+        with patch(
+            'apps.scheduling.optimizer._run_adaptive_search_rounds',
+            side_effect=retain_adaptive_start,
+        ):
+            summary = optimize_schedule_version(
+                version, source_run=source,
+                start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                seed=442, adaptive_runtime=True,
+            )
+
+        result = OptimizerRun.objects.get(pk=summary['optimizer_run_id'])
+        self.assertEqual(adaptive_start['unfilled'], 0)
+        self.assertEqual(summary['unfilled_shift_count'], 0)
+        self.assertEqual(assignments_for_viewed_run(version, result).count(), 31)
+        self.assertGreater(summary['final_score'], summary['initial_score'])

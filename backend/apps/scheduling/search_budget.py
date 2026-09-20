@@ -11,13 +11,14 @@ class SearchBudget:
     def __init__(self, *, started_at=None, stall_seconds=DEFAULT_STALL_SECONDS,
                  total_seconds=DEFAULT_TOTAL_SECONDS,
                  max_unproductive_restarts=DEFAULT_MAX_UNPRODUCTIVE_RESTARTS,
-                 clock=monotonic, stop_requested=lambda: False):
+                 score_floor=0, clock=monotonic, stop_requested=lambda: False):
         self.clock = clock
         self.started_at = clock() if started_at is None else started_at
         self.last_improvement = self.started_at
         self.stall_seconds = stall_seconds
         self.total_seconds = total_seconds
         self.stop_requested = stop_requested
+        self.score_floor = score_floor
         self.best_score = None
         self.best_coverage = None
         self.max_unproductive_restarts = max_unproductive_restarts
@@ -76,8 +77,8 @@ class SearchBudget:
     def reason(self):
         if self.stop_requested():
             return 'user_stop'
-        if self.best_score == 0:
-            return 'score_zero'
+        if self.best_score is not None and self.best_score <= self.score_floor:
+            return 'score_zero' if self.score_floor == 0 else 'proven_score_floor'
         now = self.clock()
         if now - self.started_at >= self.total_seconds:
             return 'overall_runtime_limit'

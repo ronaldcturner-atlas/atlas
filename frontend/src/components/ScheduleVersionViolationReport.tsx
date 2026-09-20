@@ -346,6 +346,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
           <span>Same shift score</span>
           <strong>{(report.score_breakdown.same_shift_score ?? 0).toFixed(1)}</strong>
         </div>
+        <div><span>Shift rule score</span><strong>{(report.score_breakdown.shift_rule_score ?? 0).toFixed(1)}</strong></div>
         <div><span>Weekend score</span><strong>{(report.score_breakdown.weekend_score ?? 0).toFixed(1)}</strong></div>
         <div><span>Consecutive days score</span><strong>{(report.score_breakdown.consecutive_days_score ?? 0).toFixed(1)}</strong></div>
         <div><span>Facility distribution score</span><strong>{(report.score_breakdown.facility_distribution_score ?? 0).toFixed(1)}</strong></div>

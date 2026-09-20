@@ -4,6 +4,7 @@ type ShiftTemplate = {
   id: number
   facility: number
   facility_name: string
+  facility_sort_order: number
   name: string
   start_time: string
   end_time: string
@@ -187,10 +188,11 @@ export default function ShiftsView() {
       if (a.active !== b.active) {
         return a.active ? -1 : 1
       }
-      if (a.facility_name !== b.facility_name) {
-        return a.facility_name.localeCompare(b.facility_name)
-      }
-      return a.name.localeCompare(b.name)
+      return a.facility_sort_order - b.facility_sort_order
+        || a.facility_name.localeCompare(b.facility_name)
+        || a.start_time.localeCompare(b.start_time)
+        || a.end_time.localeCompare(b.end_time)
+        || a.id - b.id
     }),
     [templates],
   )

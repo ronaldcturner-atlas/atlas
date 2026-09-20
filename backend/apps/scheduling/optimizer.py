@@ -3,7 +3,6 @@ from bisect import bisect_left, bisect_right
 from contextvars import ContextVar
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from datetime import timedelta
-from math import ceil
 from itertools import islice
 from heapq import nsmallest
 from functools import lru_cache
@@ -65,6 +64,7 @@ SAFE_BASELINE_PHASE_PASSES = 1
 SAFE_BASELINE_CANDIDATES_PER_REPAIR = 40
 SAFE_BASELINE_GENERAL_SWAPS = 50
 MAX_RUNTIME_SECONDS = 900
+MAX_CONSECUTIVE_EXHAUSTED_PIPELINE_EPOCHS = 3
 NIGHT_BLOCK_BUILDER_ENABLED = False
 NIGHT_BLOCK_BUILDER_DISABLED_REASON = 'Disabled after runtime regression'
 # Keep the inexpensive structural guidance even while the exhaustive block
@@ -72,6 +72,11 @@ NIGHT_BLOCK_BUILDER_DISABLED_REASON = 'Disabled after runtime regression'
 # slots as unrelated assignments and leaves local search with a prohibitively
 # large number of broken night blocks to repair.
 NIGHT_CONSTRUCTION_HEURISTICS_ENABLED = True
+
+
+def _next_exhausted_pipeline_epoch_count(current_count, *, productive):
+    """Reset exhaustion evidence on progress; otherwise add one full epoch."""
+    return 0 if productive else int(current_count) + 1
 
 
 def _physician_display_name(physician):
@@ -301,6 +306,17 @@ def _request_candidate_rank(schedule_requests, contract):
     """Preserve request-on preference without subtracting from final score."""
     score, _violations, _rewards = _request_score(schedule_requests, contract)
     for schedule_request in schedule_requests:
+        if (
+            schedule_request.weight == ScheduleRequest.Weight.FIXED
+            and schedule_request.request_type in {
+                ScheduleRequest.RequestType.DAY_OFF,
+                ScheduleRequest.RequestType.SHIFT_OFF,
+            }
+        ):
+            # FIXED is an optimizer obligation even when the contract has no
+            # configured numeric request penalty. Keep it out of the scalar
+            # score, but always rank a non-conflicting candidate ahead of it.
+            score += Decimal('1E+18')
         if schedule_request.request_type in {
             ScheduleRequest.RequestType.DAY_ON,
             ScheduleRequest.RequestType.SHIFT_ON,
@@ -2258,11 +2274,27 @@ def _night_recovery_candidate_penalty(instances, physicians, state, contract_by_
     return penalty
 
 
+def _is_weekend_designated(instance):
+    """Use the Shift Builder selection as the only weekend definition."""
+    day = getattr(instance, 'date', None)
+    template = getattr(instance, 'shift_template', None)
+    if day is None or template is None:
+        return False
+    return day.strftime('%A') in (getattr(template, 'weekend_days', None) or [])
+
+
 def _weekend_volume_report(instances, physicians, state, contracts, default_target=None, details=False):
-    """Score every configured volume period; retain balancing only without volume rules."""
+    """Score every configured weekend rule at its documented scope.
+
+    Volume rules are evaluated once per configured calendar month or schedule
+    block.  Consecutive-weekend-shift rules are evaluated once per contiguous
+    block of weekend-designated shift dates.  Consecutive-weekend rules are
+    evaluated once per streak of calendar weekends containing at least one
+    weekend-designated assignment.
+    """
     assigned = defaultdict(list)
     for instance in instances:
-        if instance.date.strftime('%A') in (instance.shift_template.weekend_days or []):
+        if _is_weekend_designated(instance):
             for pid in state.get(instance.id, []):
                 assigned[pid].append(instance)
     if default_target is None:
@@ -2276,8 +2308,6 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
         settings = contract.weekend_settings if isinstance(contract.weekend_settings, dict) else {}
         rules = [rule for rule in (settings.get('period_rules') or []) if isinstance(rule, dict)
                  and any(_decimal_or_none(rule.get(key)) is not None for key in ('min_volume', 'max_volume'))]
-        if not rules:
-            continue
         for rule in rules:
             period = rule.get('period_type') or 'SCHEDULE_BLOCK'
             if period not in windows:
@@ -2306,6 +2336,658 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                             'penalty_weight': float(weight), 'penalty': float(penalty),
                             'explanation': f"Weekend shifts are {'below the minimum' if side == 'min' else 'above the maximum'} for {start} through {end}.",
                         })
+
+        weekend_blocks = []
+        current_block = []
+        previous_date = None
+        for instance in sorted(
+            assigned[physician.id],
+            key=lambda item: (item.date, item.id),
+        ):
+            if (
+                previous_date is None
+                or instance.date == previous_date
+                or instance.date == previous_date + timedelta(days=1)
+            ):
+                current_block.append(instance)
+            else:
+                weekend_blocks.append(current_block)
+                current_block = [instance]
+            previous_date = instance.date
+        if current_block:
+            weekend_blocks.append(current_block)
+
+        for side, kind in (
+            ('min', 'MIN_CONSECUTIVE_WEEKEND_SHIFTS'),
+            ('max', 'MAX_CONSECUTIVE_WEEKEND_SHIFTS'),
+        ):
+            limit = _configured_positive_int(
+                settings,
+                f'{side}_consecutive_weekend_shifts',
+            )
+            weight = _configured_positive_penalty(
+                settings,
+                f'{side}_consecutive_weekend_shifts_penalty_weight',
+                Decimal('0'),
+            )
+            if limit is None or weight <= 0:
+                continue
+            for block in weekend_blocks:
+                actual = len(block)
+                deviation = (
+                    max(limit - actual, 0)
+                    if side == 'min'
+                    else max(actual - limit, 0)
+                )
+                penalty = Decimal(deviation) * weight
+                score += penalty
+                if details and penalty:
+                    violations.append({
+                        'physician_id': physician.id,
+                        **_contract_rule_identity(contract),
+                        'violation_type': kind,
+                        'period_type': 'WEEKEND_BLOCK',
+                        'period_start': block[0].date.isoformat(),
+                        'period_end': block[-1].date.isoformat(),
+                        'dates_involved': [instance.date.isoformat() for instance in block],
+                        'shift_instance_ids': [instance.id for instance in block],
+                        'configured_limit': limit,
+                        'actual_value': actual,
+                        'penalty_weight': float(weight),
+                        'penalty': float(penalty),
+                        'explanation': (
+                            f"Weekend shift block has {actual} consecutive shift(s); "
+                            f"the configured {'minimum' if side == 'min' else 'maximum'} is {limit}."
+                        ),
+                    })
+
+        # A weekend is keyed by its Monday-starting calendar week. Multiple
+        # assignments during the same weekend count as one worked weekend.
+        instances_by_weekend = defaultdict(list)
+        for instance in assigned[physician.id]:
+            weekend_start = instance.date - timedelta(days=instance.date.weekday())
+            instances_by_weekend[weekend_start].append(instance)
+        weekend_streaks = []
+        current_streak = []
+        previous_weekend = None
+        for weekend_start in sorted(instances_by_weekend):
+            if (
+                previous_weekend is None
+                or weekend_start == previous_weekend + timedelta(days=7)
+            ):
+                current_streak.append(weekend_start)
+            else:
+                weekend_streaks.append(current_streak)
+                current_streak = [weekend_start]
+            previous_weekend = weekend_start
+        if current_streak:
+            weekend_streaks.append(current_streak)
+
+        for side, kind in (
+            ('min', 'MIN_CONSECUTIVE_WEEKENDS'),
+            ('max', 'MAX_CONSECUTIVE_WEEKENDS'),
+        ):
+            limit = _configured_positive_int(settings, f'{side}_consecutive_weekends')
+            weight = _configured_positive_penalty(
+                settings,
+                f'{side}_consecutive_weekends_penalty_weight',
+                Decimal('0'),
+            )
+            if limit is None or weight <= 0:
+                continue
+            for streak in weekend_streaks:
+                actual = len(streak)
+                deviation = (
+                    max(limit - actual, 0)
+                    if side == 'min'
+                    else max(actual - limit, 0)
+                )
+                penalty = Decimal(deviation) * weight
+                score += penalty
+                if details and penalty:
+                    streak_instances = sorted(
+                        (
+                            instance
+                            for weekend_start in streak
+                            for instance in instances_by_weekend[weekend_start]
+                        ),
+                        key=lambda item: (item.date, item.id),
+                    )
+                    violations.append({
+                        'physician_id': physician.id,
+                        **_contract_rule_identity(contract),
+                        'violation_type': kind,
+                        'period_type': 'WEEKEND_STREAK',
+                        'period_start': streak[0].isoformat(),
+                        'period_end': (streak[-1] + timedelta(days=6)).isoformat(),
+                        'dates_involved': [
+                            instance.date.isoformat() for instance in streak_instances
+                        ],
+                        'shift_instance_ids': [instance.id for instance in streak_instances],
+                        'configured_limit': limit,
+                        'actual_value': actual,
+                        'penalty_weight': float(weight),
+                        'penalty': float(penalty),
+                        'explanation': (
+                            f"Worked-weekend streak contains {actual} consecutive weekend(s); "
+                            f"the configured {'minimum' if side == 'min' else 'maximum'} is {limit}."
+                        ),
+                    })
+
+        friday_rule_enabled = bool(
+            settings.get('block_friday_night_before_weekend_off')
+        )
+        friday_rule_weight = _configured_positive_penalty(
+            settings,
+            'block_friday_night_before_weekend_off_penalty_weight',
+            Decimal('0'),
+        )
+        if friday_rule_enabled and friday_rule_weight > 0 and instances:
+            schedule_block = getattr(instances[0], 'schedule_block', None)
+            block_start = (
+                schedule_block.start_date if schedule_block is not None
+                else min(instance.date for instance in instances)
+            )
+            block_end = (
+                schedule_block.end_date if schedule_block is not None
+                else max(instance.date for instance in instances)
+            )
+            assigned_instances = [
+                instance
+                for instance in instances
+                if physician.id in state.get(instance.id, ())
+            ]
+            assigned_by_date = defaultdict(list)
+            for instance in assigned_instances:
+                assigned_by_date[instance.date].append(instance)
+            for friday in sorted(
+                day for day in assigned_by_date
+                if day.weekday() == 4
+            ):
+                saturday = friday + timedelta(days=1)
+                sunday = friday + timedelta(days=2)
+                # Only evaluate complete weekends contained by this schedule
+                # block; otherwise the scorer cannot know whether it was off.
+                if friday < block_start or sunday > block_end:
+                    continue
+                friday_nights = [
+                    instance for instance in assigned_by_date[friday]
+                    if getattr(instance.shift_template, 'night_shift', False)
+                ]
+                if not friday_nights:
+                    continue
+                weekend_assignments = [
+                    instance
+                    for day in (saturday, sunday)
+                    for instance in assigned_by_date.get(day, ())
+                    if day.strftime('%A') in (
+                        instance.shift_template.weekend_days or []
+                    )
+                ]
+                if weekend_assignments:
+                    continue
+                penalty = friday_rule_weight
+                score += penalty
+                if details:
+                    violations.append({
+                        'physician_id': physician.id,
+                        **_contract_rule_identity(contract),
+                        'violation_type': 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF',
+                        'period_type': 'WEEKEND',
+                        'period_start': saturday.isoformat(),
+                        'period_end': sunday.isoformat(),
+                        'dates_involved': [friday.isoformat()],
+                        'shift_instance_ids': [instance.id for instance in friday_nights],
+                        'configured_limit': 'No Friday night before weekend off',
+                        'actual_value': 'Friday night assigned; Saturday and Sunday off',
+                        'penalty_weight': float(friday_rule_weight),
+                        'penalty': float(penalty),
+                        'explanation': (
+                            'A Friday night shift was assigned immediately before a '
+                            'complete Saturday-Sunday weekend off.'
+                        ),
+                    })
+    return {'score': score, 'violations': violations}
+
+
+def _weekend_repair_candidates(
+    instances, physicians, state, manual_pairs, contract_by_physician,
+):
+    """Return movable assignments named by the authoritative weekend report.
+
+    The report already applies each physician's contract settings and each
+    shift template's administrator-selected weekend days.  Deriving repair
+    targets from it prevents the search from inventing a Saturday/Sunday
+    definition that differs from scoring.
+    """
+    report = _weekend_volume_report(
+        instances, physicians, state, contract_by_physician, details=True,
+    )
+    targets = []
+    seen = set()
+    for violation in sorted(
+        report.get('violations', ()),
+        key=lambda row: (
+            -Decimal(str(row.get('penalty', 0))),
+            row.get('physician_id', 0),
+            row.get('period_start') or '',
+        ),
+    ):
+        physician_id = violation.get('physician_id')
+        for instance_id in violation.get('shift_instance_ids') or ():
+            pair = (physician_id, instance_id)
+            if (
+                physician_id in state.get(instance_id, ())
+                and (instance_id, physician_id) not in manual_pairs
+                and pair not in seen
+            ):
+                seen.add(pair)
+                targets.append(pair)
+    return targets
+
+
+def _repair_weekend_support_swaps(
+    *, instances, physicians, state, manual_pairs, targets,
+    contract_by_physician, requests_by_physician_date,
+    eligible_facilities_by_physician, minimum_rest_by_physician,
+    should_stop=lambda: False, candidate_limit=600, on_improvement=None,
+):
+    """Join or shorten configured weekend blocks without moving their anchor.
+
+    A minimum-weekend violation is usually not repaired by moving the isolated
+    assignment named by the violation: that merely creates another isolated
+    assignment elsewhere.  Instead, retain the violating assignment as an
+    anchor and exchange one of the physician's other movable assignments for a
+    configured weekend shift next to the anchor.  The authoritative complete
+    score remains the acceptance test, so this is safe for every combination
+    of contract rules and administrator-selected weekend days.
+    """
+    current = _copy_state(state)
+    current_scoring = _score_schedule(
+        instances, physicians, current, targets, contract_by_physician,
+        requests_by_physician_date, eligible_facilities_by_physician,
+        minimum_rest_by_physician,
+    )
+    instances_by_id = {instance.id: instance for instance in instances}
+    locked_open_instance_ids = {
+        instance.id for instance in instances if instance.is_locked_open
+    }
+    debug = {
+        'attempts': 0, 'legal_candidates': 0, 'scored_candidates': 0,
+        'accepts': [], 'rescans': 0, 'stopped_reason': 'candidates_exhausted',
+    }
+
+    weekend_date_counts_by_physician = {}
+
+    def assigned_weekend_dates(physician_id, exclude_instance_id=None):
+        date_counts = weekend_date_counts_by_physician.get(
+            physician_id, Counter(),
+        )
+        excluded_date = None
+        if exclude_instance_id is not None:
+            excluded_instance = instances_by_id[exclude_instance_id]
+            if (
+                physician_id in current.get(exclude_instance_id, ())
+                and _is_weekend_designated(excluded_instance)
+            ):
+                excluded_date = excluded_instance.date
+        return {
+            day
+            for day, count in date_counts.items()
+            if count - int(day == excluded_date) > 0
+        }
+
+    def joins_configured_weekend(day, existing_days):
+        if any(abs((day - other_day).days) == 1 for other_day in existing_days):
+            return True
+        day_week = day - timedelta(days=day.weekday())
+        return any(
+            abs((day_week - (
+                other_day - timedelta(days=other_day.weekday())
+            )).days) == 7
+            for other_day in existing_days
+        )
+
+    while not should_stop() and debug['attempts'] < candidate_limit:
+        report = _weekend_volume_report(
+            instances, physicians, current, contract_by_physician, details=True,
+        )
+        anchors = []
+        seen = set()
+        for violation in sorted(
+            report.get('violations', ()),
+            key=lambda row: -Decimal(str(row.get('penalty', 0))),
+        ):
+            physician_id = violation.get('physician_id')
+            violation_type = violation.get('violation_type') or ''
+            for instance_id in violation.get('shift_instance_ids') or ():
+                anchor = (instance_id, physician_id, violation_type)
+                if (
+                    physician_id in current.get(instance_id, ())
+                    and (instance_id, physician_id) not in manual_pairs
+                    and anchor not in seen
+                ):
+                    seen.add(anchor)
+                    anchors.append(anchor)
+        if not anchors:
+            debug['stopped_reason'] = 'no_weekend_targets'
+            break
+
+        debug['rescans'] += 1
+        movable_pairs = _optimizer_pairs(current, manual_pairs)
+        movable_by_physician = defaultdict(list)
+        for pair in movable_pairs:
+            movable_by_physician[pair[1]].append(pair)
+        weekend_date_counts_by_physician = defaultdict(Counter)
+        for instance_index, (
+            assigned_instance_id, assigned_physician_ids,
+        ) in enumerate(current.items()):
+            if instance_index % 64 == 0 and should_stop():
+                debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                break
+            assigned_instance = instances_by_id[assigned_instance_id]
+            if not _is_weekend_designated(assigned_instance):
+                continue
+            for assigned_physician_id in assigned_physician_ids:
+                weekend_date_counts_by_physician[
+                    assigned_physician_id
+                ][assigned_instance.date] += 1
+        if should_stop():
+            debug['stopped_reason'] = 'runtime_or_candidate_limit'
+            break
+
+        source_rows = []
+        for anchor_instance_id, physician_id, violation_type in anchors:
+            if should_stop():
+                debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                break
+            anchor_pair = (anchor_instance_id, physician_id)
+            support_pairs = [
+                pair for pair in movable_by_physician[physician_id]
+                if pair != anchor_pair
+            ]
+            support_pairs.sort(key=lambda pair: (
+                0 if not _is_weekend_designated(instances_by_id[pair[0]]) else 1,
+                abs((
+                    instances_by_id[pair[0]].date
+                    - instances_by_id[anchor_instance_id].date
+                ).days),
+                pair[0],
+            ))
+            support_pairs = support_pairs[:20]
+            if (
+                violation_type.startswith('MIN_')
+                or violation_type == 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF'
+            ):
+                sources = [*support_pairs, anchor_pair]
+            else:
+                sources = [anchor_pair, *support_pairs]
+            source_rows.extend(
+                (anchor_instance_id, violation_type, pair)
+                for pair in sources
+            )
+        source_rows = list(dict.fromkeys(source_rows))
+
+        ordered_rights = {}
+        for anchor_instance_id, violation_type, left_pair in source_rows:
+            if should_stop():
+                debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                break
+            left_instance_id, left_physician_id = left_pair
+            anchor_instance = instances_by_id[anchor_instance_id]
+            left_instance = instances_by_id[left_instance_id]
+            left_remaining = assigned_weekend_dates(
+                left_physician_id, left_instance_id,
+            )
+            candidates = []
+            for candidate_index, (
+                right_instance_id, right_physician_id,
+            ) in enumerate(movable_pairs):
+                if candidate_index % 64 == 0 and should_stop():
+                    debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                    break
+                if (
+                    right_instance_id == left_instance_id
+                    or right_physician_id == left_physician_id
+                ):
+                    continue
+                right_instance = instances_by_id[right_instance_id]
+                day_delta = abs((right_instance.date - anchor_instance.date).days)
+                if (
+                    violation_type == 'MIN_CONSECUTIVE_WEEKEND_SHIFTS'
+                    and (
+                        not _is_weekend_designated(right_instance)
+                        or day_delta != 1
+                    )
+                ):
+                    continue
+                if (
+                    violation_type == 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF'
+                    and (
+                        not _is_weekend_designated(right_instance)
+                        or day_delta not in {1, 2}
+                    )
+                ):
+                    continue
+                if (
+                    violation_type == 'MIN_CONSECUTIVE_WEEKENDS'
+                    and (
+                        not _is_weekend_designated(right_instance)
+                        or abs((
+                            right_instance.date
+                            - timedelta(days=right_instance.date.weekday())
+                            - (
+                                anchor_instance.date
+                                - timedelta(days=anchor_instance.date.weekday())
+                            )
+                        ).days) != 7
+                    )
+                ):
+                    continue
+                right_remaining = assigned_weekend_dates(
+                    right_physician_id, right_instance_id,
+                )
+                right_joins_left = (
+                    _is_weekend_designated(right_instance)
+                    and joins_configured_weekend(
+                        right_instance.date,
+                        left_remaining | {anchor_instance.date},
+                    )
+                )
+                left_joins_right = (
+                    _is_weekend_designated(left_instance)
+                    and joins_configured_weekend(
+                        left_instance.date, right_remaining,
+                    )
+                )
+                candidates.append((
+                    (
+                        -(int(right_joins_left) + int(left_joins_right)),
+                        0 if day_delta == 1 else 1,
+                        0 if right_joins_left else 1,
+                        0 if _is_weekend_designated(right_instance) else 1,
+                        abs(_shift_hours(right_instance) - _shift_hours(left_instance)),
+                        day_delta, right_physician_id, right_instance_id,
+                    ),
+                    (right_instance_id, right_physician_id),
+                ))
+            if should_stop():
+                break
+            ordered_rights[(
+                anchor_instance_id, violation_type,
+                left_instance_id, left_physician_id,
+            )] = [pair for _priority, pair in sorted(candidates)]
+
+        if should_stop():
+            debug['stopped_reason'] = 'runtime_or_candidate_limit'
+            break
+
+        accepted = False
+        maximum_rank = max((len(rows) for rows in ordered_rights.values()), default=0)
+        for rank in range(maximum_rank):
+            if accepted or should_stop() or debug['attempts'] >= candidate_limit:
+                break
+            for source_key, rights in ordered_rights.items():
+                if rank >= len(rights):
+                    continue
+                if should_stop() or debug['attempts'] >= candidate_limit:
+                    debug['stopped_reason'] = 'runtime_or_candidate_limit'
+                    break
+                left_pair = (source_key[2], source_key[3])
+                right_pair = rights[rank]
+                debug['attempts'] += 1
+                result = evaluate_plateau_pairwise_swap(
+                    instances=instances, physicians=physicians, state=current,
+                    instances_by_id=instances_by_id, manual_pairs=manual_pairs,
+                    locked_open_instance_ids=locked_open_instance_ids,
+                    targets=targets,
+                    contract_by_physician=contract_by_physician,
+                    requests_by_physician_date=requests_by_physician_date,
+                    eligible_facilities_by_physician=eligible_facilities_by_physician,
+                    minimum_rest_by_physician=minimum_rest_by_physician,
+                    current_score=current_scoring['score'],
+                    left_instance_id=left_pair[0],
+                    left_physician_id=left_pair[1],
+                    right_instance_id=right_pair[0],
+                    right_physician_id=right_pair[1],
+                )
+                if not result.get('legal'):
+                    continue
+                debug['legal_candidates'] += 1
+                if result.get('scoring') is not None:
+                    debug['scored_candidates'] += 1
+                if not result.get('improving'):
+                    continue
+                before = current_scoring['score']
+                current = result['state']
+                current_scoring = result['scoring']
+                accepted = True
+                detail = {
+                    'weekend_anchor_shift_instance_id': source_key[0],
+                    'weekend_violation_type': source_key[1],
+                    'left_shift_instance_id': left_pair[0],
+                    'left_physician_id': left_pair[1],
+                    'right_shift_instance_id': right_pair[0],
+                    'right_physician_id': right_pair[1],
+                    'score_before': float(before),
+                    'score_after': float(current_scoring['score']),
+                }
+                debug['accepts'].append(detail)
+                if on_improvement:
+                    on_improvement(current, current_scoring)
+                break
+        if not accepted:
+            break
+    return current, current_scoring, debug
+
+
+def _shift_period_report(instances, physicians, state, contracts, details=False):
+    """Score contract shift-group rules in their configured period windows."""
+    assigned_by_physician = defaultdict(list)
+    for instance in instances:
+        for physician_id in state.get(instance.id, ()):
+            assigned_by_physician[physician_id].append(instance)
+
+    score = Decimal('0')
+    violations = []
+    windows = {}
+    for physician in physicians:
+        contract = contracts.get(physician.id)
+        if contract is None:
+            continue
+        raw_settings = getattr(contract, 'shift_settings', {})
+        settings = raw_settings if isinstance(raw_settings, dict) else {}
+        for group_index, group in enumerate(settings.get('rules') or []):
+            if not isinstance(group, dict):
+                continue
+            template_ids = {
+                int(template_id)
+                for template_id in (group.get('shift_template_ids') or [])
+                if str(template_id).isdigit()
+            }
+            if not template_ids:
+                continue
+            group_label = group.get('label') or f'Shift rule group {group_index + 1}'
+            for rule in group.get('period_rules') or []:
+                if not isinstance(rule, dict):
+                    continue
+                minimum = _decimal_or_none(rule.get('min_value'))
+                maximum = _decimal_or_none(rule.get('max_value'))
+                if minimum is None and maximum is None:
+                    continue
+                period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+                if period_type not in {'WEEK', 'MONTH', 'SCHEDULE_BLOCK'}:
+                    period_type = 'SCHEDULE_BLOCK'
+                if period_type not in windows:
+                    windows[period_type] = _period_windows(instances, period_type)
+                units = 'SHIFTS' if rule.get('units') == 'SHIFTS' else 'HOURS'
+                normalized = {
+                    'period_type': period_type,
+                    'units': units,
+                    'min_value': minimum,
+                    'max_value': maximum,
+                    'min_penalty_weight': _positive_decimal_or_default(
+                        rule.get('min_penalty_weight'), Decimal('0'),
+                    ),
+                    'max_penalty_weight': _positive_decimal_or_default(
+                        rule.get('max_penalty_weight'), Decimal('0'),
+                    ),
+                }
+                for window_start, window_end in windows[period_type]:
+                    effective = _effective_workload_rule(
+                        normalized, window_start, window_end,
+                    )
+                    matching = [
+                        instance
+                        for instance in assigned_by_physician[physician.id]
+                        if instance.shift_template_id in template_ids
+                        and window_start <= instance.date <= window_end
+                    ]
+                    actual = (
+                        Decimal(len(matching))
+                        if units == 'SHIFTS'
+                        else sum((_shift_hours(instance) for instance in matching), Decimal('0'))
+                    )
+                    for side, kind in (
+                        ('min', 'SHIFT_GROUP_UNDER_MINIMUM'),
+                        ('max', 'SHIFT_GROUP_OVER_MAXIMUM'),
+                    ):
+                        limit = effective[f'{side}_value']
+                        if limit is None:
+                            continue
+                        deviation = max(
+                            limit - actual if side == 'min' else actual - limit,
+                            Decimal('0'),
+                        )
+                        weight = effective[f'{side}_penalty_weight']
+                        penalty = deviation * weight
+                        score += penalty
+                        if details and penalty:
+                            violations.append({
+                                'physician_id': physician.id,
+                                **_contract_rule_identity(contract),
+                                'violation_type': kind,
+                                'period_type': period_type,
+                                'period_start': window_start.isoformat(),
+                                'period_end': window_end.isoformat(),
+                                'dates_involved': [
+                                    instance.date.isoformat() for instance in matching
+                                ],
+                                'shift_instance_ids': [instance.id for instance in matching],
+                                'shift_template_ids': sorted(template_ids),
+                                'shift_rule_label': group_label,
+                                'configured_limit': float(limit),
+                                'actual_value': float(actual),
+                                'units': units,
+                                'penalty_weight': float(weight),
+                                'penalty': float(penalty),
+                                'proration': effective['proration'],
+                                'explanation': (
+                                    f"{group_label} {units.lower()} are "
+                                    f"{'below the minimum' if side == 'min' else 'above the maximum'} "
+                                    f"for {window_start} through {window_end}."
+                                ),
+                            })
     return {'score': score, 'violations': violations}
 
 
@@ -2551,17 +3233,25 @@ def _distribution_score(
         state,
         contract_by_physician,
     )
+    # Only contract-configured penalties belong in the authoritative objective.
+    # Internal night-clustering guidance may order construction candidates, but
+    # including it here makes persisted assignments score differently when a
+    # continuation run reloads them.  _night_candidate_delta retains that
+    # guidance without allowing it to alter global score acceptance.
     night_report = _night_violation_report(
         instances,
         physicians,
         state,
         contract_by_physician,
-        include_internal_heuristics=include_internal_night_heuristics,
+        include_internal_heuristics=False,
         default_target_override=default_night_target_override,
     )
     return {
         'consecutive_days_score': consecutive_days_score,
         'same_shift_score': same_shift_score,
+        'shift_rule_score': _shift_period_report(
+            instances, physicians, state, contract_by_physician,
+        )['score'],
         'night_score': night_report['score'],
         'weekend_score': _weekend_volume_report(
             instances, physicians, state, contract_by_physician, default_weekend_target,
@@ -2587,6 +3277,8 @@ def _score_schedule(
         for physician_id, contract in contract_by_physician.items()
         if getattr(contract, 'manual_assignment_only', False)
     }
+
+
     scoring_physicians = [
         physician for physician in physicians
         if physician.id not in manual_assignment_only_physician_ids
@@ -2760,6 +3452,191 @@ def _score_schedule(
         'workload_score_rows': workload_score_rows,
         'validation': validation,
         'same_shift_violations': same_shift_violations,
+    }
+
+
+def _fixed_shift_on_request_workload_floor(
+    instances, physicians, targets, requests_by_physician_date,
+    eligible_facilities_by_physician, state=None,
+    manual_assignment_only_physician_ids=None,
+):
+    """Prove workload penalties forced by exact Fixed Shift On requests.
+
+    The result is deliberately conservative. A request contributes only when
+    its date/template selection resolves to one eligible shift instance. Any
+    ambiguous or missing request is reported but is not used in the floor.
+    """
+    physician_by_id = {physician.id: physician for physician in physicians}
+    manual_assignment_only_physician_ids = set(
+        manual_assignment_only_physician_ids or ()
+    )
+    instances_by_date_template = defaultdict(list)
+    instances_by_id = {}
+    for instance in instances:
+        instances_by_id[instance.id] = instance
+        instances_by_date_template[(instance.date, instance.shift_template_id)].append(instance)
+
+    forced_instance_requests = defaultdict(lambda: defaultdict(set))
+    resolved_requests = []
+    unresolved_requests = []
+    fixed_request_count = 0
+    for (physician_id, request_date), requests in requests_by_physician_date.items():
+        for schedule_request in requests:
+            if not (
+                schedule_request.weight == ScheduleRequest.Weight.FIXED
+                and schedule_request.request_type == ScheduleRequest.RequestType.SHIFT_ON
+            ):
+                continue
+            fixed_request_count += 1
+            template_ids = {
+                template.id for template in schedule_request.shift_templates.all()
+            }
+            candidates = []
+            for template_id in template_ids:
+                candidates.extend(instances_by_date_template.get((request_date, template_id), ()))
+            eligible_facility_ids = eligible_facilities_by_physician.get(physician_id)
+            # A Shift On request is the assignment authority for a manual-only
+            # physician. Their optimizer eligibility is deliberately empty so
+            # search cannot add work, but that must not make a real shift
+            # instance disappear from request diagnostics.
+            if (
+                physician_id not in manual_assignment_only_physician_ids
+                and eligible_facility_ids is not None
+            ):
+                candidates = [
+                    instance for instance in candidates
+                    if instance.facility_id in eligible_facility_ids
+                ]
+            candidates = list({instance.id: instance for instance in candidates}.values())
+            request_payload = {
+                'request_id': schedule_request.id,
+                'physician_id': physician_id,
+                'date': request_date.isoformat(),
+                'shift_template_ids': sorted(template_ids),
+            }
+            if len(candidates) != 1:
+                unresolved_requests.append({
+                    **request_payload,
+                    'reason': 'no_matching_shift_instance' if not candidates else 'ambiguous_matching_shift_instances',
+                    'candidate_shift_instance_ids': sorted(instance.id for instance in candidates),
+                })
+                continue
+            instance = candidates[0]
+            forced_instance_requests[physician_id][instance.id].add(schedule_request.id)
+            resolved_requests.append({
+                **request_payload,
+                'shift_instance_id': instance.id,
+                'facility_id': instance.facility_id,
+                'hours': float(_shift_hours(instance)),
+                'satisfied_in_viewed_schedule': (
+                    physician_id in state.get(instance.id, ()) if state is not None else None
+                ),
+            })
+
+    assessment_rows = []
+    floor_rows = []
+    score_floor = Decimal('0')
+    for physician_id, forced_by_instance in forced_instance_requests.items():
+        target = targets.get(physician_id) or {}
+        forced_instances = [
+            instances_by_id[instance_id]
+            for instance_id in forced_by_instance
+            if instance_id in instances_by_id
+        ]
+        for rule in target.get('rules') or ():
+            for window_start, window_end in _period_windows(instances, rule['period_type']):
+                effective_rule = _effective_workload_rule(rule, window_start, window_end)
+                maximum = effective_rule['max_value']
+                if maximum is None:
+                    continue
+                window_instances = [
+                    instance for instance in forced_instances
+                    if window_start <= instance.date <= window_end
+                ]
+                if not window_instances:
+                    continue
+                required_value = (
+                    Decimal(len(window_instances))
+                    if effective_rule['units'] == 'SHIFTS'
+                    else sum((_shift_hours(instance) for instance in window_instances), Decimal('0'))
+                )
+                excess = max(required_value - maximum, Decimal('0'))
+                penalty = excess * effective_rule['max_penalty_weight']
+                assigned_instances = (
+                    [
+                        instance for instance in instances
+                        if window_start <= instance.date <= window_end
+                        and physician_id in state.get(instance.id, ())
+                    ]
+                    if state is not None else []
+                )
+                actual_value = (
+                    Decimal(len(assigned_instances))
+                    if state is not None and effective_rule['units'] == 'SHIFTS'
+                    else sum((_shift_hours(instance) for instance in assigned_instances), Decimal('0'))
+                    if state is not None else None
+                )
+                actual_excess = (
+                    max(actual_value - maximum, Decimal('0'))
+                    if actual_value is not None else None
+                )
+                actual_penalty = (
+                    actual_excess * effective_rule['max_penalty_weight']
+                    if actual_excess is not None else None
+                )
+                physician = physician_by_id.get(physician_id)
+                row = {
+                    'physician_id': physician_id,
+                    'physician': _physician_display_name(physician) if physician is not None else str(physician_id),
+                    'period_type': rule['period_type'],
+                    'period_start': window_start.isoformat(),
+                    'period_end': window_end.isoformat(),
+                    'units': effective_rule['units'],
+                    'fixed_request_required_value': float(required_value),
+                    'effective_max_value': float(maximum),
+                    'unavoidable_excess': float(excess),
+                    'penalty_weight': float(effective_rule['max_penalty_weight']),
+                    'score_floor_contribution': float(penalty),
+                    'actual_assigned_value': float(actual_value) if actual_value is not None else None,
+                    'actual_excess': float(actual_excess) if actual_excess is not None else None,
+                    'actual_penalty': float(actual_penalty) if actual_penalty is not None else None,
+                    'potentially_avoidable_penalty': (
+                        float(max(actual_penalty - penalty, Decimal('0')))
+                        if actual_penalty is not None else None
+                    ),
+                    'shift_instance_ids': sorted(instance.id for instance in window_instances),
+                    'request_ids': sorted({
+                        request_id
+                        for instance in window_instances
+                        for request_id in forced_by_instance[instance.id]
+                    }),
+                }
+                assessment_rows.append(row)
+                if penalty > 0:
+                    floor_rows.append(row)
+                score_floor += penalty
+
+    satisfied = [
+        row for row in resolved_requests
+        if row['satisfied_in_viewed_schedule'] is True
+    ]
+    unsatisfied = [
+        row for row in resolved_requests
+        if row['satisfied_in_viewed_schedule'] is False
+    ]
+    return {
+        'fixed_shift_on_request_count': fixed_request_count,
+        'resolved_request_count': len(resolved_requests),
+        'unresolved_request_count': len(unresolved_requests),
+        'satisfied_request_count': len(satisfied) if state is not None else None,
+        'unsatisfied_request_count': len(unsatisfied) if state is not None else None,
+        'all_resolved_requests_satisfied': not unsatisfied if state is not None else None,
+        'score_floor': float(score_floor),
+        'score_floor_exact': str(score_floor),
+        'assessment_rows': assessment_rows,
+        'floor_rows': floor_rows,
+        'resolved_requests': resolved_requests,
+        'unresolved_requests': unresolved_requests,
     }
 
 
@@ -3496,7 +4373,7 @@ def _request_repair_candidates(instances, physicians, state, manual_pairs, contr
         instances_by_date[instance.date].append(instance)
     for (physician_id, request_date), schedule_requests in requests_by_physician_date.items():
         contract = contract_by_physician.get(physician_id)
-        if contract is None:
+        if contract is None or getattr(contract, 'manual_assignment_only', False):
             continue
         for schedule_request in schedule_requests:
             if schedule_request.request_type not in {
@@ -3516,6 +4393,11 @@ def _request_repair_candidates(instances, physicians, state, manual_pairs, contr
             if any(physician_id in state[instance.id] for instance in matching_instances):
                 continue
             penalty = _request_weight(contract, schedule_request.weight)
+            if (
+                penalty <= 0
+                and schedule_request.weight != ScheduleRequest.Weight.FIXED
+            ):
+                continue
             for instance in matching_instances:
                 for current_owner_id in state[instance.id]:
                     if (instance.id, current_owner_id) in manual_pairs:
@@ -3542,7 +4424,7 @@ def _request_on_repair_candidates(instances, state, manual_pairs, contract_by_ph
     candidates = []
     for (physician_id, request_date), schedule_requests in requests_by_physician_date.items():
         contract = contract_by_physician.get(physician_id)
-        if contract is None:
+        if contract is None or getattr(contract, 'manual_assignment_only', False):
             continue
         for schedule_request in schedule_requests:
             if schedule_request.request_type not in {
@@ -3562,6 +4444,11 @@ def _request_on_repair_candidates(instances, state, manual_pairs, contract_by_ph
             if any(physician_id in state[instance.id] for instance in matching_instances):
                 continue
             penalty = _request_weight(contract, schedule_request.weight)
+            if (
+                penalty <= 0
+                and schedule_request.weight != ScheduleRequest.Weight.FIXED
+            ):
+                continue
             for instance in matching_instances:
                 for current_owner_id in state[instance.id]:
                     if (instance.id, current_owner_id) in manual_pairs:
@@ -3795,6 +4682,9 @@ def _repair_general_constraint_reassignments(
         ('request', _request_repair_candidates(
             instances, physicians, current, manual_pairs, contract_by_physician,
             requests_by_physician_date)),
+        ('weekend', _weekend_repair_candidates(
+            instances, physicians, current, manual_pairs,
+            contract_by_physician)),
         ('same_shift', _same_shift_break_candidates(
             instances, physicians, current, manual_pairs, contract_by_physician)),
         ('consecutive_days', _consecutive_day_break_candidates(
@@ -3881,6 +4771,9 @@ def _repair_general_constraint_swaps(
         ('request', _request_repair_candidates(
             instances, physicians, current, manual_pairs, contract_by_physician,
             requests_by_physician_date)),
+        ('weekend', _weekend_repair_candidates(
+            instances, physicians, current, manual_pairs,
+            contract_by_physician)),
         ('same_shift', _same_shift_break_candidates(
             instances, physicians, current, manual_pairs, contract_by_physician)),
         ('consecutive_days', _consecutive_day_break_candidates(
@@ -3997,9 +4890,10 @@ def _solve_bounded_multi_physician_neighborhood(
     contract_by_physician, requests_by_physician_date,
     eligible_facilities_by_physician, minimum_rest_by_physician,
     rng, time_limit_seconds=4, focus_physician_ids=None,
+    focus_instance_ids=None,
     focus_start=None, focus_end=None, cohort_size=10,
     allow_non_improving=False, maximum_score_increase=None,
-    diversification_bias=False,
+    diversification_bias=False, should_stop=None, clock=monotonic,
 ):
     """Rebuild a coupled cohort atomically with CP-SAT.
 
@@ -4008,6 +4902,18 @@ def _solve_bounded_multi_physician_neighborhood(
     accepts the result only after the authoritative full scorer validates it.
     """
     debug = {'attempts': 0, 'candidates': 0, 'accepted': False}
+    should_stop = should_stop or (lambda: False)
+    neighborhood_deadline = clock() + max(float(time_limit_seconds), 0)
+
+    def deadline_reached(stage):
+        if should_stop() or clock() >= neighborhood_deadline:
+            debug['stopped'] = True
+            debug['stopped_stage'] = stage
+            return True
+        return False
+
+    if deadline_reached('before_model_build'):
+        return _copy_state(state), scoring, debug
     penalty_by_physician = defaultdict(lambda: Decimal('0'))
     for row in scoring.get('workload_score_rows', []):
         penalty_by_physician[row['physician_id']] += Decimal(
@@ -4020,6 +4926,32 @@ def _solve_bounded_multi_physician_neighborhood(
         penalty_by_physician[violation['physician_id']] += Decimal(str(
             violation.get('penalty_amount', violation.get('penalty', 0))
         ))
+    for violation in scoring.get('same_shift_violations', []):
+        penalty_by_physician[violation['physician_id']] += Decimal(str(
+            violation.get('penalty_amount', violation.get('penalty', 0))
+        ))
+    for violation in _weekend_volume_report(
+        instances, physicians, state, contract_by_physician, details=True,
+    ).get('violations', []):
+        penalty_by_physician[violation['physician_id']] += Decimal(str(
+            violation.get('penalty_amount', violation.get('penalty', 0))
+        ))
+    for violation in _shift_period_report(
+        instances, physicians, state, contract_by_physician, details=True,
+    ).get('violations', []):
+        penalty_by_physician[violation['physician_id']] += Decimal(str(
+            violation.get('penalty_amount', violation.get('penalty', 0))
+        ))
+    for violation in _request_scoring_rows(
+        instances, physicians, state, contract_by_physician,
+        requests_by_physician_date,
+    ):
+        penalty_by_physician[violation['physician_id']] += Decimal(str(
+            violation.get('penalty_amount', violation.get('penalty', 0))
+        ))
+
+    if deadline_reached('after_violation_analysis'):
+        return _copy_state(state), scoring, debug
 
     workload_rows = {
         row['physician_id']: row for row in scoring.get('workload_score_rows', [])
@@ -4033,6 +4965,7 @@ def _solve_bounded_multi_physician_neighborhood(
         reverse=True,
     )
     focus_physician_ids = set(focus_physician_ids or ())
+    focus_instance_ids = set(focus_instance_ids or ())
     source_ids = [
         physician.id for physician in ranked
         if physician.id in focus_physician_ids
@@ -4045,6 +4978,36 @@ def _solve_bounded_multi_physician_neighborhood(
     source_ids = source_ids[:max(2, cohort_size // 2)]
     if not source_ids:
         return _copy_state(state), scoring, debug
+    # Prefer receivers already connected to the violated assignments.  These
+    # physicians are more likely to enable a useful exchange chain than an
+    # arbitrary low-workload receiver, while the latter remains available as
+    # a fallback.  This keeps the neighborhood generic across facilities,
+    # contracts, and schedule-block lengths.
+    connected_template_ids = {
+        instance.shift_template_id
+        for instance in instances
+        if (focus_start is None or instance.date >= focus_start)
+        and (focus_end is None or instance.date <= focus_end)
+        and (
+            instance.id in focus_instance_ids
+            or any(pid in source_ids for pid in state.get(instance.id, ()))
+        )
+    }
+    connected_facility_ids = {
+        instance.facility_id
+        for instance in instances
+        if (
+            instance.id in focus_instance_ids
+            or instance.shift_template_id in connected_template_ids
+        )
+    }
+    connected_owner_ids = {
+        pid
+        for instance in instances
+        if instance.shift_template_id in connected_template_ids
+        for pid in state.get(instance.id, ())
+        if pid not in source_ids
+    }
     receiver_pool = sorted(
         (
             p for p in physicians
@@ -4052,6 +5015,10 @@ def _solve_bounded_multi_physician_neighborhood(
             and eligible_facilities_by_physician.get(p.id)
         ),
         key=lambda physician: (
+            0 if physician.id in connected_owner_ids else 1,
+            0 if connected_facility_ids.intersection(
+                eligible_facilities_by_physician.get(physician.id, set())
+            ) else 1,
             0 if workload_rows.get(physician.id, {}).get('deviation_direction') == 'below_minimum' else 1,
             Decimal(str(workload_rows.get(physician.id, {}).get('assigned_hours', 0))),
             physician.id,
@@ -4060,20 +5027,35 @@ def _solve_bounded_multi_physician_neighborhood(
     # Sample from a strong receiver pool so repeated neighborhoods do not use
     # the same physicians merely because their current hours sort first.
     receiver_count = max(cohort_size - len(source_ids), 0)
-    receivers = (
-        rng.sample(receiver_pool, min(receiver_count, len(receiver_pool)))
-        if receiver_pool and receiver_count
-        else []
-    )
+    priority_receivers = [
+        physician for physician in receiver_pool
+        if physician.id in connected_owner_ids
+    ]
+    receivers = priority_receivers[:receiver_count]
+    remaining_receiver_count = receiver_count - len(receivers)
+    selected_receiver_ids = {physician.id for physician in receivers}
+    remaining_receiver_pool = [
+        physician for physician in receiver_pool
+        if physician.id not in selected_receiver_ids
+    ]
+    if remaining_receiver_count > 0 and remaining_receiver_pool:
+        receivers.extend(rng.sample(
+            remaining_receiver_pool,
+            min(remaining_receiver_count, len(remaining_receiver_pool)),
+        ))
     cohort_ids = set(source_ids).union(p.id for p in receivers)
     debug['physician_ids'] = sorted(cohort_ids)
     debug['focus_physician_ids'] = sorted(focus_physician_ids)
+    debug['focus_instance_ids'] = sorted(focus_instance_ids)
+    debug['connected_owner_ids'] = sorted(connected_owner_ids)
     debug['focus_start'] = focus_start.isoformat() if focus_start else None
     debug['focus_end'] = focus_end.isoformat() if focus_end else None
 
     instances_by_id = {instance.id: instance for instance in instances}
     movable = []
     for instance in instances:
+        if deadline_reached('collect_movable_assignments'):
+            return _copy_state(state), scoring, debug
         if focus_start is not None and instance.date < focus_start:
             continue
         if focus_end is not None and instance.date > focus_end:
@@ -4088,6 +5070,8 @@ def _solve_bounded_multi_physician_neighborhood(
     movable_pairs = {(instance.id, owner_id) for instance, owner_id in movable}
     external_indexes = {physician_id: _AssignmentIntervalIndex() for physician_id in cohort_ids}
     for instance in instances:
+        if deadline_reached('index_fixed_assignments'):
+            return _copy_state(state), scoring, debug
         for physician_id in state[instance.id]:
             if physician_id in cohort_ids and (instance.id, physician_id) not in movable_pairs:
                 external_indexes[physician_id].append(
@@ -4099,6 +5083,8 @@ def _solve_bounded_multi_physician_neighborhood(
     slot_candidates = defaultdict(list)
     request_assignment_terms = []
     for slot, (instance, owner_id) in enumerate(movable):
+        if deadline_reached('create_assignment_variables'):
+            return _copy_state(state), scoring, debug
         for physician_id in cohort_ids:
             if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
                 continue
@@ -4139,6 +5125,8 @@ def _solve_bounded_multi_physician_neighborhood(
                 model.add_at_most_one(same_instance)
 
     for left_slot, (left, _left_owner) in enumerate(movable):
+        if deadline_reached('create_pair_constraints'):
+            return _copy_state(state), scoring, debug
         for right_slot in range(left_slot + 1, len(movable)):
             right = movable[right_slot][0]
             for physician_id in cohort_ids:
@@ -4157,11 +5145,97 @@ def _solve_bounded_multi_physician_neighborhood(
             if physician_id in cohort_ids and (instance.id, physician_id) not in movable_pairs:
                 fixed_by_physician[physician_id].append(instance)
 
+    # Reusable assignment expressions for the remaining configured rule
+    # families.  A physician may have more than one eligible slot for a date
+    # or template occurrence, so model the OR explicitly instead of assuming
+    # one generated shift per day.
+    movable_vars_by_physician_date = defaultdict(list)
+    movable_vars_by_physician_instance = defaultdict(list)
+    for slot, (instance, _owner_id) in enumerate(movable):
+        for physician_id in cohort_ids:
+            variable = variables.get((slot, physician_id))
+            if variable is None:
+                continue
+            movable_vars_by_physician_date[physician_id, instance.date].append(variable)
+            movable_vars_by_physician_instance[
+                physician_id, instance.id
+            ].append(variable)
+
+    all_dates = sorted({instance.date for instance in instances})
+    worked_by_physician_date = {}
+    non_night_by_physician_date = {}
+    for physician_id in cohort_ids:
+        if deadline_reached('create_daily_assignment_variables'):
+            return _copy_state(state), scoring, debug
+        fixed_dates = {instance.date for instance in fixed_by_physician[physician_id]}
+        fixed_non_night_dates = {
+            instance.date
+            for instance in fixed_by_physician[physician_id]
+            if not instance.shift_template.night_shift
+        }
+        for day in all_dates:
+            date_vars = movable_vars_by_physician_date.get((physician_id, day), [])
+            if day in fixed_dates:
+                worked_by_physician_date[physician_id, day] = 1
+            elif not date_vars:
+                worked_by_physician_date[physician_id, day] = 0
+            else:
+                worked = model.new_bool_var(f'worked_{physician_id}_{day.isoformat()}')
+                for variable in date_vars:
+                    model.add(worked >= variable)
+                model.add(worked <= sum(date_vars))
+                worked_by_physician_date[physician_id, day] = worked
+
+            non_night_vars = [
+                variable
+                for slot, (instance, _owner_id) in enumerate(movable)
+                if instance.date == day
+                and not instance.shift_template.night_shift
+                and (variable := variables.get((slot, physician_id))) is not None
+            ]
+            if day in fixed_non_night_dates:
+                non_night_by_physician_date[physician_id, day] = 1
+            elif not non_night_vars:
+                non_night_by_physician_date[physician_id, day] = 0
+            else:
+                non_night = model.new_bool_var(
+                    f'non_night_{physician_id}_{day.isoformat()}'
+                )
+                for variable in non_night_vars:
+                    model.add(non_night >= variable)
+                model.add(non_night <= sum(non_night_vars))
+                non_night_by_physician_date[physician_id, day] = non_night
+
+    def model_or(values, name):
+        if any(isinstance(value, int) and value == 1 for value in values):
+            return 1
+        variables_only = [value for value in values if not isinstance(value, int)]
+        if not variables_only:
+            return 0
+        result = model.new_bool_var(name)
+        for value in variables_only:
+            model.add(result >= value)
+        model.add(result <= sum(variables_only))
+        return result
+
+    def model_and(left, right, name):
+        if isinstance(left, int):
+            return right if left else 0
+        if isinstance(right, int):
+            return left if right else 0
+        result = model.new_bool_var(name)
+        model.add(result <= left)
+        model.add(result <= right)
+        model.add(result >= left + right - 1)
+        return result
+
     objective_terms = list(request_assignment_terms)
     # DAY_ON and SHIFT_ON are scored for absence, not per assignment. Model
     # their satisfaction explicitly so the neighborhood cannot trade away a
     # high-priority requested shift merely to repair workload.
     for (physician_id, request_date), requests in requests_by_physician_date.items():
+        if deadline_reached('create_request_constraints'):
+            return _copy_state(state), scoring, debug
         if physician_id not in cohort_ids:
             continue
         contract = contract_by_physician.get(physician_id)
@@ -4217,6 +5291,8 @@ def _solve_bounded_multi_physician_neighborhood(
             )
     # Model the configured workload windows exactly in integer minutes/shifts.
     for physician_id in cohort_ids:
+        if deadline_reached('create_workload_constraints'):
+            return _copy_state(state), scoring, debug
         for rule in (targets.get(physician_id) or {}).get('rules') or []:
             for window_start, window_end in _period_windows(instances, rule['period_type']):
                 effective = _effective_workload_rule(rule, window_start, window_end)
@@ -4249,6 +5325,431 @@ def _solve_bounded_multi_physician_neighborhood(
                     model.add(over >= total - int(round(float(effective['max_value']) * scale)))
                     objective_terms.append(max(1, int(effective['max_penalty_weight'])) * over)
 
+    # Contract shift-group ranges use the same week/month/schedule-block
+    # windows and hour/shift units as the authoritative shift-rule scorer.
+    for physician_id in cohort_ids:
+        if deadline_reached('create_shift_group_constraints'):
+            return _copy_state(state), scoring, debug
+        contract = contract_by_physician.get(physician_id)
+        raw_settings = getattr(contract, 'shift_settings', {}) if contract is not None else {}
+        settings = raw_settings if isinstance(raw_settings, dict) else {}
+        for group_index, group in enumerate(settings.get('rules') or []):
+            if not isinstance(group, dict):
+                continue
+            template_ids = {
+                int(template_id)
+                for template_id in (group.get('shift_template_ids') or [])
+                if str(template_id).isdigit()
+            }
+            if not template_ids:
+                continue
+            for rule in group.get('period_rules') or []:
+                if not isinstance(rule, dict):
+                    continue
+                period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+                units = 'SHIFTS' if rule.get('units') == 'SHIFTS' else 'HOURS'
+                normalized = {
+                    'period_type': period_type,
+                    'units': units,
+                    'min_value': _decimal_or_none(rule.get('min_value')),
+                    'max_value': _decimal_or_none(rule.get('max_value')),
+                    'min_penalty_weight': _positive_decimal_or_default(
+                        rule.get('min_penalty_weight'), Decimal('0'),
+                    ),
+                    'max_penalty_weight': _positive_decimal_or_default(
+                        rule.get('max_penalty_weight'), Decimal('0'),
+                    ),
+                }
+                if normalized['min_value'] is None and normalized['max_value'] is None:
+                    continue
+                for window_start, window_end in _period_windows(instances, period_type):
+                    effective = _effective_workload_rule(
+                        normalized, window_start, window_end,
+                    )
+                    is_shifts = units == 'SHIFTS'
+                    scale = 1 if is_shifts else 60
+                    fixed_value = sum(
+                        1 if is_shifts else int(round(float(_shift_hours(instance) * 60)))
+                        for instance in fixed_by_physician[physician_id]
+                        if instance.shift_template_id in template_ids
+                        and window_start <= instance.date <= window_end
+                    )
+                    terms = []
+                    for slot, (instance, _owner_id) in enumerate(movable):
+                        variable = variables.get((slot, physician_id))
+                        if (
+                            variable is not None
+                            and instance.shift_template_id in template_ids
+                            and window_start <= instance.date <= window_end
+                        ):
+                            value = (
+                                1 if is_shifts
+                                else int(round(float(_shift_hours(instance) * 60)))
+                            )
+                            terms.append(value * variable)
+                    total = fixed_value + sum(terms)
+                    maximum_possible = fixed_value + sum(
+                        1 if is_shifts else int(round(float(_shift_hours(instance) * 60)))
+                        for slot, (instance, _owner_id) in enumerate(movable)
+                        if (slot, physician_id) in variables
+                        and instance.shift_template_id in template_ids
+                        and window_start <= instance.date <= window_end
+                    )
+                    if effective['min_value'] is not None:
+                        under = model.new_int_var(
+                            0, max(maximum_possible, int(effective['min_value'] * scale), 1),
+                            f'shift_group_under_{physician_id}_{group_index}_{window_start.isoformat()}',
+                        )
+                        model.add(
+                            under >= int(round(float(effective['min_value']) * scale)) - total
+                        )
+                        objective_terms.append(
+                            max(1, int(effective['min_penalty_weight'])) * under
+                        )
+                    if effective['max_value'] is not None:
+                        over = model.new_int_var(
+                            0, max(maximum_possible, int(effective['max_value'] * scale), 1),
+                            f'shift_group_over_{physician_id}_{group_index}_{window_start.isoformat()}',
+                        )
+                        model.add(
+                            over >= total - int(round(float(effective['max_value']) * scale))
+                        )
+                        objective_terms.append(
+                            max(1, int(effective['max_penalty_weight'])) * over
+                        )
+
+    # Weekend volume is part of the authoritative score and must participate
+    # in reconstruction.  Previously, a CP candidate could cheaply fix a
+    # workload or request violation by creating a much larger weekend cost.
+    for physician_id in cohort_ids:
+        if deadline_reached('create_weekend_constraints'):
+            return _copy_state(state), scoring, debug
+        contract = contract_by_physician.get(physician_id)
+        if contract is None:
+            continue
+        settings = (
+            contract.weekend_settings
+            if isinstance(contract.weekend_settings, dict) else {}
+        )
+        for rule in settings.get('period_rules') or []:
+            if not isinstance(rule, dict):
+                continue
+            period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+            for window_start, window_end in _period_windows(instances, period_type):
+                fixed_count = sum(
+                    1 for instance in fixed_by_physician[physician_id]
+                    if window_start <= instance.date <= window_end
+                    and instance.date.strftime('%A') in (
+                        instance.shift_template.weekend_days or []
+                    )
+                )
+                terms = []
+                for slot, (instance, _owner_id) in enumerate(movable):
+                    variable = variables.get((slot, physician_id))
+                    if (
+                        variable is not None
+                        and window_start <= instance.date <= window_end
+                        and instance.date.strftime('%A') in (
+                            instance.shift_template.weekend_days or []
+                        )
+                    ):
+                        terms.append(variable)
+                total = fixed_count + sum(terms)
+                maximum_possible = fixed_count + len(terms)
+                for side in ('min', 'max'):
+                    limit = _decimal_or_none(rule.get(f'{side}_volume'))
+                    weight = _decimal_or_none(rule.get(f'{side}_penalty_weight'))
+                    if limit is None or weight is None or weight <= 0:
+                        continue
+                    deviation = model.new_int_var(
+                        0, max(maximum_possible, int(limit), 1),
+                        f'weekend_{side}_{physician_id}_{window_start.isoformat()}',
+                    )
+                    if side == 'min':
+                        model.add(deviation >= int(limit) - total)
+                    else:
+                        model.add(deviation >= total - int(limit))
+                    objective_terms.append(int(weight * 60) * deviation)
+
+        weekend_by_date = {}
+        fixed_weekend_dates = {
+            instance.date
+            for instance in fixed_by_physician[physician_id]
+            if instance.date.strftime('%A') in (
+                instance.shift_template.weekend_days or []
+            )
+        }
+        for day in all_dates:
+            if day in fixed_weekend_dates:
+                weekend_by_date[day] = 1
+                continue
+            values = [
+                variables[slot, physician_id]
+                for slot, (instance, _owner_id) in enumerate(movable)
+                if (slot, physician_id) in variables
+                and instance.date == day
+                and day.strftime('%A') in (
+                    instance.shift_template.weekend_days or []
+                )
+            ]
+            weekend_by_date[day] = model_or(
+                values,
+                f'weekend_day_{physician_id}_{day.isoformat()}',
+            )
+
+        min_weekend_shifts = _configured_positive_int(
+            settings, 'min_consecutive_weekend_shifts',
+        )
+        min_weekend_shift_weight = _configured_positive_penalty(
+            settings,
+            'min_consecutive_weekend_shifts_penalty_weight',
+            Decimal('0'),
+        )
+        max_weekend_shifts = _configured_positive_int(
+            settings, 'max_consecutive_weekend_shifts',
+        )
+        max_weekend_shift_weight = _configured_positive_penalty(
+            settings,
+            'max_consecutive_weekend_shifts_penalty_weight',
+            Decimal('0'),
+        )
+        if min_weekend_shifts and min_weekend_shift_weight > 0:
+            for day in all_dates:
+                current = weekend_by_date.get(day, 0)
+                if isinstance(current, int) and current == 0:
+                    continue
+                previous = weekend_by_date.get(day - timedelta(days=1), 0)
+                block_start = model_and(
+                    current,
+                    1 - previous,
+                    f'weekend_shift_start_{physician_id}_{day.isoformat()}',
+                )
+                for offset in range(1, min_weekend_shifts):
+                    future = weekend_by_date.get(day + timedelta(days=offset), 0)
+                    missing = model_and(
+                        block_start,
+                        1 - future,
+                        f'weekend_shift_short_{physician_id}_{day.isoformat()}_{offset}',
+                    )
+                    objective_terms.append(
+                        int(min_weekend_shift_weight * 60) * missing
+                    )
+        if max_weekend_shifts and max_weekend_shift_weight > 0:
+            for start_index in range(max(len(all_dates) - max_weekend_shifts, 0)):
+                window = all_dates[start_index:start_index + max_weekend_shifts + 1]
+                if not all(
+                    next_day == day + timedelta(days=1)
+                    for day, next_day in zip(window, window[1:])
+                ):
+                    continue
+                values = [weekend_by_date.get(day, 0) for day in window]
+                if any(isinstance(value, int) and value == 0 for value in values):
+                    continue
+                if all(isinstance(value, int) and value == 1 for value in values):
+                    objective_terms.append(int(max_weekend_shift_weight * 60))
+                    continue
+                excess = model.new_bool_var(
+                    f'weekend_shift_excess_{physician_id}_{start_index}'
+                )
+                for value in values:
+                    model.add(excess <= value)
+                model.add(excess >= sum(values) - len(values) + 1)
+                objective_terms.append(int(max_weekend_shift_weight * 60) * excess)
+
+        weekend_starts = sorted({
+            day - timedelta(days=day.weekday())
+            for day in all_dates
+        })
+        worked_weekend = {
+            weekend_start: model_or(
+                [
+                    weekend_by_date.get(weekend_start + timedelta(days=offset), 0)
+                    for offset in range(7)
+                ],
+                f'worked_weekend_{physician_id}_{weekend_start.isoformat()}',
+            )
+            for weekend_start in weekend_starts
+        }
+        min_weekends = _configured_positive_int(
+            settings, 'min_consecutive_weekends',
+        )
+        min_weekends_weight = _configured_positive_penalty(
+            settings, 'min_consecutive_weekends_penalty_weight', Decimal('0'),
+        )
+        max_weekends = _configured_positive_int(
+            settings, 'max_consecutive_weekends',
+        )
+        max_weekends_weight = _configured_positive_penalty(
+            settings, 'max_consecutive_weekends_penalty_weight', Decimal('0'),
+        )
+        if min_weekends and min_weekends_weight > 0:
+            for weekend_start in weekend_starts:
+                current = worked_weekend[weekend_start]
+                if isinstance(current, int) and current == 0:
+                    continue
+                previous = worked_weekend.get(
+                    weekend_start - timedelta(days=7), 0,
+                )
+                streak_start = model_and(
+                    current,
+                    1 - previous,
+                    f'weekend_streak_start_{physician_id}_{weekend_start.isoformat()}',
+                )
+                for offset in range(1, min_weekends):
+                    future = worked_weekend.get(
+                        weekend_start + timedelta(days=7 * offset), 0,
+                    )
+                    missing = model_and(
+                        streak_start,
+                        1 - future,
+                        f'weekend_streak_short_{physician_id}_{weekend_start.isoformat()}_{offset}',
+                    )
+                    objective_terms.append(int(min_weekends_weight * 60) * missing)
+        if max_weekends and max_weekends_weight > 0:
+            for start_index in range(max(len(weekend_starts) - max_weekends, 0)):
+                window = weekend_starts[start_index:start_index + max_weekends + 1]
+                if not all(
+                    next_start == start + timedelta(days=7)
+                    for start, next_start in zip(window, window[1:])
+                ):
+                    continue
+                values = [worked_weekend[start] for start in window]
+                if any(isinstance(value, int) and value == 0 for value in values):
+                    continue
+                if all(isinstance(value, int) and value == 1 for value in values):
+                    objective_terms.append(int(max_weekends_weight * 60))
+                    continue
+                excess = model.new_bool_var(
+                    f'weekend_streak_excess_{physician_id}_{start_index}'
+                )
+                for value in values:
+                    model.add(excess <= value)
+                model.add(excess >= sum(values) - len(values) + 1)
+                objective_terms.append(int(max_weekends_weight * 60) * excess)
+
+        friday_weight = _configured_positive_penalty(
+            settings,
+            'block_friday_night_before_weekend_off_penalty_weight',
+            Decimal('0'),
+        )
+        if settings.get('block_friday_night_before_weekend_off') and friday_weight > 0:
+            block_start = min(all_dates) if all_dates else None
+            block_end = max(all_dates) if all_dates else None
+            fixed_friday_nights = {
+                instance.date
+                for instance in fixed_by_physician[physician_id]
+                if instance.date.weekday() == 4
+                and instance.shift_template.night_shift
+            }
+            for friday in (day for day in all_dates if day.weekday() == 4):
+                saturday = friday + timedelta(days=1)
+                sunday = friday + timedelta(days=2)
+                if block_start is None or friday < block_start or sunday > block_end:
+                    continue
+                friday_night = (
+                    1 if friday in fixed_friday_nights else model_or(
+                        [
+                            variables[slot, physician_id]
+                            for slot, (instance, _owner_id) in enumerate(movable)
+                            if (slot, physician_id) in variables
+                            and instance.date == friday
+                            and instance.shift_template.night_shift
+                        ],
+                        f'friday_night_{physician_id}_{friday.isoformat()}',
+                    )
+                )
+                weekend_work = model_or(
+                    [
+                        weekend_by_date.get(saturday, 0),
+                        weekend_by_date.get(sunday, 0),
+                    ],
+                    f'weekend_work_{physician_id}_{friday.isoformat()}',
+                )
+                violation = model_and(
+                    friday_night,
+                    1 - weekend_work,
+                    f'friday_before_weekend_off_{physician_id}_{friday.isoformat()}',
+                )
+                objective_terms.append(int(friday_weight * 60) * violation)
+
+    # Exact excess-day formulation: each fully worked window of max+1
+    # consecutive dates contributes one configured penalty, matching
+    # _streak_excess_score for longer streaks as overlapping windows.
+    for physician_id in cohort_ids:
+        if deadline_reached('create_consecutive_day_constraints'):
+            return _copy_state(state), scoring, debug
+        contract = contract_by_physician.get(physician_id)
+        if contract is None:
+            continue
+        workload_settings = (
+            contract.workload_settings
+            if isinstance(contract.workload_settings, dict) else {}
+        )
+        max_days = _configured_positive_int(workload_settings, 'max_days_in_row')
+        max_days_penalty = _configured_positive_penalty(
+            workload_settings, 'max_days_in_row_penalty_weight', Decimal('0'),
+        )
+        if max_days is None or max_days_penalty <= 0:
+            continue
+        for start_index in range(max(len(all_dates) - max_days, 0)):
+            window = all_dates[start_index:start_index + max_days + 1]
+            if not all(
+                next_day == day + timedelta(days=1)
+                for day, next_day in zip(window, window[1:])
+            ):
+                continue
+            values = [worked_by_physician_date[physician_id, day] for day in window]
+            if all(isinstance(value, int) and value == 1 for value in values):
+                objective_terms.append(int(max_days_penalty * 60))
+                continue
+            if any(isinstance(value, int) and value == 0 for value in values):
+                continue
+            excess = model.new_bool_var(
+                f'consecutive_day_excess_{physician_id}_{start_index}'
+            )
+            for value in values:
+                model.add(excess <= value)
+            model.add(excess >= sum(values) - len(values) + 1)
+            objective_terms.append(int(max_days_penalty * 60) * excess)
+
+    # Same-template streak penalties use occurrence order rather than calendar
+    # adjacency. This mirrors the authoritative report and remains valid for
+    # templates that do not occur every day.
+    instances_by_template = _instances_by_template(instances)
+    for physician_id in cohort_ids:
+        if deadline_reached('create_same_shift_constraints'):
+            return _copy_state(state), scoring, debug
+        contract = contract_by_physician.get(physician_id)
+        same_shift_rule = _same_shift_rule(contract) if contract is not None else None
+        if same_shift_rule is None:
+            continue
+        max_streak, penalty = same_shift_rule
+        fixed_ids = {instance.id for instance in fixed_by_physician[physician_id]}
+        for shift_template_id, template_instances in instances_by_template.items():
+            assigned = []
+            for instance in template_instances:
+                if instance.id in fixed_ids:
+                    assigned.append(1)
+                    continue
+                instance_vars = movable_vars_by_physician_instance.get(
+                    (physician_id, instance.id), []
+                )
+                assigned.append(sum(instance_vars) if instance_vars else 0)
+            for start_index in range(max(len(assigned) - max_streak, 0)):
+                values = assigned[start_index:start_index + max_streak + 1]
+                if any(isinstance(value, int) and value == 0 for value in values):
+                    continue
+                if all(isinstance(value, int) and value == 1 for value in values):
+                    objective_terms.append(int(penalty * 60))
+                    continue
+                excess = model.new_bool_var(
+                    f'same_shift_excess_{physician_id}_{shift_template_id}_{start_index}'
+                )
+                for value in values:
+                    model.add(excess <= value)
+                model.add(excess >= sum(values) - len(values) + 1)
+                objective_terms.append(int(penalty * 60) * excess)
+
     # A block-start proxy lets the solver move several nights together instead
     # of producing the isolated-night states that trap pairwise hill climbing.
     night_slots_by_physician_date = defaultdict(list)
@@ -4258,6 +5759,7 @@ def _solve_bounded_multi_physician_neighborhood(
             instance.date for instance in fixed_instances if instance.shift_template.night_shift
         }
     all_dates = sorted({instance.date for instance in instances})
+
     for slot, (instance, _owner_id) in enumerate(movable):
         if instance.shift_template.night_shift:
             for physician_id in cohort_ids:
@@ -4266,6 +5768,8 @@ def _solve_bounded_multi_physician_neighborhood(
                         variables[slot, physician_id]
                     )
     for physician_id in cohort_ids:
+        if deadline_reached('create_night_constraints'):
+            return _copy_state(state), scoring, debug
         night_by_date = {}
         for day in all_dates:
             if day in fixed_night_dates[physician_id]:
@@ -4280,6 +5784,53 @@ def _solve_bounded_multi_physician_neighborhood(
             night_by_date[day] = night
         contract = contract_by_physician.get(physician_id)
         settings = _night_settings(contract) if contract is not None else {}
+        # Configured night-volume rules, including deduplication of equivalent
+        # minimum rules, mirror the full scorer's period windows.
+        seen_minimums = set()
+        for rule in _unique_night_period_rules(settings):
+            period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+            for window_start, window_end in _period_windows(instances, period_type):
+                fixed_count = sum(
+                    1 for instance in fixed_by_physician[physician_id]
+                    if instance.shift_template.night_shift
+                    and window_start <= instance.date <= window_end
+                )
+                terms = [
+                    variable
+                    for slot, (instance, _owner_id) in enumerate(movable)
+                    if instance.shift_template.night_shift
+                    and window_start <= instance.date <= window_end
+                    and (variable := variables.get((slot, physician_id))) is not None
+                ]
+                total = fixed_count + sum(terms)
+                maximum_possible = fixed_count + len(terms)
+                min_shifts = _decimal_or_none(rule.get('min_shifts'))
+                min_weight = _decimal_or_none(rule.get('min_penalty_weight'))
+                minimum_key = (window_start, window_end, min_shifts)
+                if (
+                    min_shifts is not None and min_shifts > 0
+                    and min_weight is not None and min_weight > 0
+                    and minimum_key not in seen_minimums
+                ):
+                    seen_minimums.add(minimum_key)
+                    under = model.new_int_var(
+                        0, max(maximum_possible, int(min_shifts), 1),
+                        f'night_under_{physician_id}_{window_start.isoformat()}',
+                    )
+                    model.add(under >= int(min_shifts) - total)
+                    objective_terms.append(int(min_weight * 60) * under)
+                max_shifts = _decimal_or_none(rule.get('max_shifts'))
+                max_weight = _decimal_or_none(rule.get('max_penalty_weight'))
+                if (
+                    max_shifts is not None and max_shifts >= 0
+                    and max_weight is not None and max_weight > 0
+                ):
+                    over = model.new_int_var(
+                        0, max(maximum_possible, int(max_shifts), 1),
+                        f'night_over_{physician_id}_{window_start.isoformat()}',
+                    )
+                    model.add(over >= total - int(max_shifts))
+                    objective_terms.append(int(max_weight * 60) * over)
         min_consecutive = _configured_positive_int(
             settings, 'min_consecutive_night_shifts',
         )
@@ -4310,6 +5861,7 @@ def _solve_bounded_multi_physician_neighborhood(
                     int(max_consecutive_penalty * 60) * excess
                 )
         block_starts = {}
+        block_ends = {}
         for index, day in enumerate(all_dates):
             current_night = night_by_date[day]
             if isinstance(current_night, int) and current_night == 0:
@@ -4324,6 +5876,16 @@ def _solve_bounded_multi_physician_neighborhood(
             else:
                 model.add(block_start <= 1 - previous)
             block_starts[day] = block_start
+            following = night_by_date.get(day + timedelta(days=1), 0)
+            block_end = model.new_bool_var(f'block_end_{physician_id}_{index}')
+            model.add(block_end >= current_night - following)
+            model.add(block_end <= current_night)
+            if isinstance(following, int):
+                if following == 1:
+                    model.add(block_end == 0)
+            else:
+                model.add(block_end <= 1 - following)
+            block_ends[day] = block_end
         if min_consecutive and min_consecutive > 1:
             min_consecutive_penalty = _configured_positive_penalty(
                 settings,
@@ -4341,10 +5903,59 @@ def _solve_bounded_multi_physician_neighborhood(
                         int(min_consecutive_penalty * 60) * missing
                     )
 
+        # Model recovery penalties from the end of one night block. Summed
+        # threshold indicators reproduce the shortfall charged by the full
+        # scorer: the earlier the next assignment/block, the larger the cost.
+        days_after = _configured_positive_int(settings, 'days_off_after_night_block')
+        days_after_weight = _configured_positive_penalty(
+            settings, 'days_off_after_night_block_penalty_weight', Decimal('0'),
+        )
+        if days_after is not None and days_after_weight > 0:
+            for day, block_end in block_ends.items():
+                for threshold in range(1, days_after + 1):
+                    nearby_non_night = model_or(
+                        [
+                            non_night_by_physician_date.get(
+                                (physician_id, day + timedelta(days=offset)), 0,
+                            )
+                            for offset in range(1, threshold + 1)
+                        ],
+                        f'non_night_within_{physician_id}_{day.isoformat()}_{threshold}',
+                    )
+                    violation = model_and(
+                        block_end, nearby_non_night,
+                        f'night_recovery_{physician_id}_{day.isoformat()}_{threshold}',
+                    )
+                    objective_terms.append(int(days_after_weight * 60) * violation)
+
+        days_before = _configured_positive_int(
+            settings, 'days_off_before_next_night_shift',
+        )
+        days_before_weight = _configured_positive_penalty(
+            settings, 'days_off_before_next_night_shift_penalty_weight', Decimal('0'),
+        )
+        if days_before is not None and days_before_weight > 0:
+            for day, block_end in block_ends.items():
+                for threshold in range(2, days_before + 1):
+                    nearby_block_start = model_or(
+                        [
+                            block_starts.get(day + timedelta(days=offset), 0)
+                            for offset in range(2, threshold + 1)
+                        ],
+                        f'next_night_within_{physician_id}_{day.isoformat()}_{threshold}',
+                    )
+                    violation = model_and(
+                        block_end, nearby_block_start,
+                        f'next_night_recovery_{physician_id}_{day.isoformat()}_{threshold}',
+                    )
+                    objective_terms.append(int(days_before_weight * 60) * violation)
+
     # Ordinary repair prefers assignment stability. During a diversified
     # restart, signed tie weights deliberately produce a different solution
     # among otherwise equivalent neighborhood optima.
     for slot, (_instance, owner_id) in enumerate(movable):
+        if deadline_reached('create_stability_objective'):
+            return _copy_state(state), scoring, debug
         for physician_id in cohort_ids:
             variable = variables.get((slot, physician_id))
             if variable is not None and physician_id != owner_id:
@@ -4356,8 +5967,16 @@ def _solve_bounded_multi_physician_neighborhood(
                 objective_terms.append(tie_weight * variable)
     model.minimize(sum(objective_terms))
 
+    remaining_seconds = neighborhood_deadline - clock()
+    if should_stop() or remaining_seconds < 0.1:
+        debug['stopped'] = True
+        debug['stopped_stage'] = 'before_solver'
+        return _copy_state(state), scoring, debug
+
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = max(float(time_limit_seconds), 0.1)
+    solver.parameters.max_time_in_seconds = max(
+        min(float(time_limit_seconds), remaining_seconds), 0.1,
+    )
     solver.parameters.num_search_workers = 8
     solver.parameters.random_seed = rng.randrange(1, 2_000_000_000)
     status = solver.solve(model)
@@ -4426,6 +6045,36 @@ def _state_assignment_distance(left_state, right_state):
     ) // 2
 
 
+def _constraint_boundary_padding_days(contract_by_physician, maximum=7):
+    """Return bounded context needed around a reconstruction window.
+
+    Temporal rules can be violated just outside a selected date range. Moving
+    the boundary assignments as part of the same neighborhood gives CP-SAT a
+    chance to repair that interaction instead of merely observing it as fixed
+    context. The cap keeps long blocks computationally bounded.
+    """
+    configured = [1]
+    for contract in contract_by_physician.values():
+        night_settings = _night_settings(contract)
+        workload_settings = (
+            contract.workload_settings
+            if isinstance(contract.workload_settings, dict) else {}
+        )
+        for key in (
+            'min_consecutive_night_shifts',
+            'max_consecutive_night_shifts',
+            'days_off_after_night_block',
+            'days_off_before_next_night_shift',
+        ):
+            value = _configured_positive_int(night_settings, key)
+            if value is not None:
+                configured.append(value)
+        max_days = _configured_positive_int(workload_settings, 'max_days_in_row')
+        if max_days is not None:
+            configured.append(max_days)
+    return min(max(configured), maximum)
+
+
 def _adaptive_violation_focuses(
     *, instances, physicians, state, scoring, contract_by_physician,
     requests_by_physician_date,
@@ -4483,6 +6132,10 @@ def _adaptive_violation_focuses(
         instances, physicians, state, contract_by_physician, details=True,
     ).get('violations', ()):
         add_focus(row)
+    for row in _shift_period_report(
+        instances, physicians, state, contract_by_physician, details=True,
+    ).get('violations', ()):
+        add_focus(row)
     for row in _request_scoring_rows(
         instances, physicians, state, contract_by_physician,
         requests_by_physician_date,
@@ -4496,16 +6149,108 @@ def _adaptive_violation_focuses(
     )
 
 
+def _adaptive_repair_order(repairs, repair_stats, cycle):
+    """Spend continuation time on repairs that are producing global progress.
+
+    Every repair receives an initial trial.  Thereafter, productive repairs are
+    ranked by authoritative score reduction per second.  Repeatedly
+    unproductive repairs receive an exponentially increasing, bounded
+    cooldown instead of consuming the same four-second slice every cycle.
+    """
+    ordered = []
+    for original_index, repair_row in enumerate(repairs):
+        repair_name = repair_row[0]
+        stats = repair_stats.get(repair_name) or {}
+        if int(stats.get('cooldown_until_cycle', 0)) > cycle:
+            continue
+        calls = int(stats.get('calls', 0))
+        gain = float(
+            stats.get('recent_score_improvement', stats.get('score_improvement', 0)) or 0
+        )
+        runtime = max(float(
+            stats.get('recent_runtime_seconds', stats.get('runtime_seconds', 0)) or 0
+        ), 0.001)
+        if calls == 0:
+            category = 0  # Give every strategy one evidence-gathering slice.
+            rate = 0.0
+        elif gain > 0:
+            category = -1
+            rate = gain / runtime
+        else:
+            category = 1
+            rate = 0.0
+        ordered.append((
+            category,
+            -rate,
+            int(stats.get('consecutive_no_gain_calls', 0)),
+            original_index,
+            repair_row,
+        ))
+    return [row[-1] for row in sorted(ordered)]
+
+
+def _record_adaptive_repair_productivity(
+    stats, *, score_gain, runtime_seconds, cycle, attempts=None,
+):
+    """Update one repair's ROI and back it off after repeated zero-gain calls."""
+    stats['runtime_seconds'] = (
+        float(stats.get('runtime_seconds', 0) or 0) + float(runtime_seconds)
+    )
+    stats['score_improvement'] = float(stats.get('score_improvement', 0) or 0) + float(score_gain)
+    stats['recent_runtime_seconds'] = (
+        float(stats.get('recent_runtime_seconds', 0) or 0) * 0.7
+        + float(runtime_seconds)
+    )
+    stats['recent_score_improvement'] = (
+        float(stats.get('recent_score_improvement', 0) or 0) * 0.7
+        + float(score_gain)
+    )
+    empty_call = attempts == 0
+    if empty_call:
+        stats['consecutive_empty_calls'] = (
+            int(stats.get('consecutive_empty_calls', 0)) + 1
+        )
+    elif attempts is not None:
+        stats['consecutive_empty_calls'] = 0
+    if score_gain > 0:
+        stats['consecutive_no_gain_calls'] = 0
+        stats['cooldown_until_cycle'] = cycle
+    else:
+        zero_calls = int(stats.get('consecutive_no_gain_calls', 0)) + 1
+        stats['consecutive_no_gain_calls'] = zero_calls
+        if empty_call:
+            # Some repairs spend most of their slice constructing an
+            # authoritative report before discovering that the current state
+            # contains no move to evaluate. Retrying one after every small
+            # best or diversification wastes a large fraction of a long-block
+            # run. Keep checking it periodically, but back it off immediately
+            # and increasingly while it continues to return no candidates.
+            empty_calls = int(stats['consecutive_empty_calls'])
+            cooldown_cycles = min(12, 2 ** min(empty_calls + 1, 3))
+            stats['cooldown_until_cycle'] = cycle + cooldown_cycles + 1
+        elif zero_calls >= 2:
+            cooldown_cycles = min(8, 2 ** min(zero_calls - 2, 3))
+            stats['cooldown_until_cycle'] = cycle + cooldown_cycles + 1
+    total_runtime = max(float(stats.get('recent_runtime_seconds', 0) or 0), 0.001)
+    stats['score_improvement_per_second'] = (
+        float(stats['recent_score_improvement']) / total_runtime
+    )
+
+
 def _run_adaptive_search_rounds(
     *, instances, physicians, initial_state, initial_scoring, manual_pairs, targets,
     contract_by_physician, requests_by_physician_date,
     eligible_facilities_by_physician, minimum_rest_by_physician,
-    search_budget, rng, debug,
+    search_budget, rng, debug, progress_callback=None,
 ):
     """Repeat the current continuation neighborhoods while retaining the best valid state."""
     best_state = _copy_state(initial_state)
     best_scoring = initial_scoring
-    repairs = [
+    repairs = []
+    if _unfilled_slot_count(instances, initial_state):
+        repairs.append(('direct_coverage', _repair_direct_coverage, {}))
+    repairs.extend([
+        ('weekend_support_swaps', _repair_weekend_support_swaps, {}),
         ('general_reassignments', _repair_general_constraint_reassignments, {}),
         ('general_swaps', _repair_general_constraint_swaps, {}),
         ('workload_transfers', _repair_workload_transfers, {}),
@@ -4513,27 +6258,61 @@ def _run_adaptive_search_rounds(
         ('night_maximum', _repair_night_spacing_swaps, {'maximum_only': True}),
         ('night_recovery', _repair_recovery_day_swaps, {}),
         ('night_spacing', _repair_night_spacing_swaps, {}),
-    ]
+    ])
     repair_stats = debug.setdefault('repair_stats', {})
     debug.setdefault('restarts', 0)
+    debug.setdefault('proactive_restarts', 0)
+    debug.setdefault('best_chain_restarts', 0)
+    debug.setdefault('seed_epochs', 0)
+    debug.setdefault('pipeline_epoch_restarts', 0)
+    debug.setdefault('pipeline_epochs', [])
+    debug.setdefault('best_chain_details', [])
     debug.setdefault('restart_details', [])
     exploration_state = _copy_state(best_state)
     instances_by_id = {instance.id: instance for instance in instances}
     locked_open_instance_ids = {instance.id for instance in instances if instance.is_locked_open}
+    budget_clock = getattr(search_budget, 'clock', monotonic)
+    last_diversification_at = budget_clock()
+    pipeline_epoch_number = 1
+    pipeline_epoch_started_at = budget_clock()
+    pipeline_epoch_start_score = best_scoring['score']
+    pipeline_epoch_start_improvements = int(debug.get('improvements', 0))
+    pipeline_epoch_seed = None
+    pipeline_epoch_open = True
+    consecutive_exhausted_pipeline_epochs = 0
+    debug['pipeline_epoch_controller'] = 'productivity_driven'
+    debug['pipeline_epoch_seconds'] = None
+    debug.setdefault('consecutive_exhausted_pipeline_epochs', 0)
+    cycles_without_global_improvement = 0
+    best_generation = 0
+    proactive_restart_interval_seconds = min(
+        30,
+        max(float(getattr(search_budget, 'stall_seconds', 120)) / 4, 10),
+    )
 
     def keep_progress(candidate_state, candidate_scoring):
-        nonlocal best_state, best_scoring
+        nonlocal best_state, best_scoring, best_generation
+        candidate_priority = _state_result_priority(
+            instances, candidate_state, candidate_scoring,
+        )
         valid = (
-            _result_priority(
-                candidate_scoring, _unfilled_slot_count(instances, candidate_state),
-            )[0] == 0
+            candidate_priority[0] == 0
             and all(pid in candidate_state[sid] for sid, pid in manual_pairs)
         )
         search_budget.observe(candidate_scoring['score'], valid=valid)
-        if valid and _optimization_priority(candidate_scoring) < _optimization_priority(best_scoring):
+        if (
+            valid
+            and candidate_priority
+            < _state_result_priority(instances, best_state, best_scoring)
+        ):
             best_state = _copy_state(candidate_state)
             best_scoring = candidate_scoring
+            best_generation += 1
             debug['improvements'] += 1
+            if progress_callback is not None:
+                progress_callback(best_scoring['score'])
+            return True
+        return False
 
     def diversify_from_best():
         """Leave the local basin with violation-directed destroy and repair.
@@ -4542,6 +6321,22 @@ def _run_adaptive_search_rounds(
         temporarily worse within a bounded temperature so subsequent repairs
         can cross a local-score barrier.
         """
+        # Keep the entire diversification attempt bounded, not only its
+        # constraint-solver phase. Pairwise kick evaluation can be expensive
+        # on multi-month blocks because every candidate is fully rescored.
+        # Without this shared deadline a single restart could run far beyond
+        # the optimizer's absolute SearchBudget deadline.
+        diversification_deadline = min(
+            budget_clock() + 4,
+            search_budget.started_at + search_budget.total_seconds,
+        )
+
+        def diversification_should_stop():
+            return (
+                search_budget.reason() is not None
+                or budget_clock() >= diversification_deadline
+            )
+
         exploration = _copy_state(best_state)
         exploration_scoring = best_scoring
         focuses = _adaptive_violation_focuses(
@@ -4560,13 +6355,22 @@ def _run_adaptive_search_rounds(
         window_days = rng.choice((14, 21, 28, 42))
         focus_dates = focus['dates'] if focus else []
         anchor = rng.choice(focus_dates) if focus_dates else rng.choice(instances).date
-        focus_start = max(
+        core_start = max(
             schedule_start,
             anchor - timedelta(days=rng.randrange(0, max(window_days // 3, 1) + 1)),
         )
-        focus_end = min(
+        core_end = min(
             schedule_end,
-            focus_start + timedelta(days=window_days - 1),
+            core_start + timedelta(days=window_days - 1),
+        )
+        boundary_padding = _constraint_boundary_padding_days(
+            contract_by_physician,
+        )
+        focus_start = max(
+            schedule_start, core_start - timedelta(days=boundary_padding),
+        )
+        focus_end = min(
+            schedule_end, core_end + timedelta(days=boundary_padding),
         )
         # Later restarts are cooler: they may still leave the basin, but cannot
         # discard an increasingly large fraction of the best score.
@@ -4594,8 +6398,13 @@ def _run_adaptive_search_rounds(
                 allow_non_improving=True,
                 maximum_score_increase=maximum_score_increase,
                 diversification_bias=True,
+                should_stop=diversification_should_stop,
                 time_limit_seconds=min(
                     4,
+                    max(
+                        diversification_deadline - budget_clock(),
+                        0.1,
+                    ),
                     max(
                         search_budget.total_seconds
                         - (search_budget.clock() - search_budget.started_at),
@@ -4624,6 +6433,9 @@ def _run_adaptive_search_rounds(
                 'focus_physician_ids': sorted(focus_physician_ids),
                 'focus_start': focus_start.isoformat(),
                 'focus_end': focus_end.isoformat(),
+                'core_focus_start': core_start.isoformat(),
+                'core_focus_end': core_end.isoformat(),
+                'boundary_padding_days': boundary_padding,
                 'cohort_size': cohort_size,
                 'maximum_score_increase': float(maximum_score_increase),
                 'score_after_kick': float(exploration_scoring['score']),
@@ -4635,10 +6447,14 @@ def _run_adaptive_search_rounds(
         total_attempts = 0
         applied = []
         for kick_index in range(target_kicks):
+            if diversification_should_stop():
+                break
             pairs = _optimizer_pairs(exploration, manual_pairs)
             candidates = []
             attempt_limit = min(80, len(pairs) * 2)
             for _ in range(attempt_limit):
+                if diversification_should_stop():
+                    break
                 total_attempts += 1
                 left, right = rng.sample(pairs, 2)
                 result = evaluate_plateau_pairwise_swap(
@@ -4688,6 +6504,9 @@ def _run_adaptive_search_rounds(
             'focus_physician_ids': sorted(focus_physician_ids),
             'focus_start': focus_start.isoformat(),
             'focus_end': focus_end.isoformat(),
+            'core_focus_start': core_start.isoformat(),
+            'core_focus_end': core_end.isoformat(),
+            'boundary_padding_days': boundary_padding,
             'cohort_size': cohort_size,
             'maximum_score_increase': float(maximum_score_increase),
             'kicks_applied': len(applied),
@@ -4699,36 +6518,206 @@ def _run_adaptive_search_rounds(
         }
 
     active_repairs = list(repairs)
+
+    def launch_diversification(trigger):
+        nonlocal rng, active_repairs, exploration_state, last_diversification_at
+        diversification_started = monotonic()
+        restart_seed = rng.getrandbits(63)
+        rng = random.Random(restart_seed)
+        active_repairs = list(repairs)
+        exploration_state, restart_detail = diversify_from_best()
+        debug['restarts'] += 1
+        if trigger == 'proactive':
+            debug['proactive_restarts'] += 1
+        # A reconstructed state changes the available moves, so previously
+        # unproductive strategies deserve one new trial in the new basin.
+        # The exception is a repair that could not produce even one candidate:
+        # preserve that stronger cooldown and retry it periodically instead of
+        # paying its setup cost after every diversification.
+        for stats in repair_stats.values():
+            if int(stats.get('consecutive_empty_calls', 0)):
+                continue
+            stats['cooldown_until_cycle'] = debug['cycles']
+            stats['consecutive_no_gain_calls'] = 0
+        debug['restart_details'].append({
+            'restart': debug['restarts'],
+            'trigger': trigger,
+            'seed': restart_seed,
+            'runtime_seconds': monotonic() - diversification_started,
+            **restart_detail,
+        })
+        last_diversification_at = budget_clock()
+
+    def continue_from_new_best(previous_score, trigger_repair):
+        """Start a fresh seeded search from the newly improved global best."""
+        nonlocal rng, active_repairs, exploration_state, last_diversification_at
+        continuation_seed = rng.getrandbits(63)
+        rng = random.Random(continuation_seed)
+        exploration_state = _copy_state(best_state)
+        active_repairs = list(repairs)
+        # This is a continuation from a slightly better version of the same
+        # basin, not a reconstructed schedule.  Preserve each repair's
+        # productivity and cooldown evidence.  Clearing it here caused every
+        # small gain to re-enable all of the expensive zero-yield repairs,
+        # repeatedly spending four-second slices on strategies that had
+        # already demonstrated that they could not help this neighborhood.
+        # A true diversification restart below still reopens every strategy
+        # once because it materially changes the available moves.
+        debug['best_chain_restarts'] += 1
+        debug['best_chain_details'].append({
+            'chain': debug['best_chain_restarts'],
+            'trigger_repair': trigger_repair,
+            'seed': continuation_seed,
+            'score_before': float(previous_score),
+            'score_after': float(best_scoring['score']),
+        })
+        last_diversification_at = budget_clock()
+
+    def finish_pipeline_epoch(trigger):
+        nonlocal pipeline_epoch_open
+        if not pipeline_epoch_open:
+            return None
+        detail = {
+            'epoch': pipeline_epoch_number,
+            'seed': pipeline_epoch_seed,
+            'trigger': trigger,
+            'starting_score': float(pipeline_epoch_start_score),
+            'ending_score': float(best_scoring['score']),
+            'score_improvement': float(
+                max(pipeline_epoch_start_score - best_scoring['score'], Decimal('0'))
+            ),
+            'improvements': (
+                int(debug.get('improvements', 0))
+                - pipeline_epoch_start_improvements
+            ),
+            'runtime_seconds': budget_clock() - pipeline_epoch_started_at,
+        }
+        detail['productive'] = bool(
+            detail['score_improvement'] > 0 or detail['improvements'] > 0
+        )
+        debug['pipeline_epochs'].append(detail)
+        pipeline_epoch_open = False
+        return detail
+
+    def renew_pipeline_epoch(trigger):
+        """Reopen the complete repair portfolio from the global best."""
+        nonlocal rng, active_repairs, exploration_state, last_diversification_at
+        nonlocal pipeline_epoch_number, pipeline_epoch_started_at
+        nonlocal pipeline_epoch_start_score, pipeline_epoch_start_improvements
+        nonlocal pipeline_epoch_seed, pipeline_epoch_open
+        nonlocal consecutive_exhausted_pipeline_epochs
+        finished_epoch = finish_pipeline_epoch(trigger)
+        consecutive_exhausted_pipeline_epochs = (
+            _next_exhausted_pipeline_epoch_count(
+                consecutive_exhausted_pipeline_epochs,
+                productive=bool(
+                    finished_epoch and finished_epoch['productive']
+                ),
+            )
+        )
+        debug['consecutive_exhausted_pipeline_epochs'] = (
+            consecutive_exhausted_pipeline_epochs
+        )
+        if (
+            consecutive_exhausted_pipeline_epochs
+            >= MAX_CONSECUTIVE_EXHAUSTED_PIPELINE_EPOCHS
+        ):
+            # The selected runtime is a ceiling, not a quota. Once several
+            # complete, independently seeded repair portfolios have exhausted
+            # their search without improving the retained global best, stop
+            # early instead of repeating the same trial-and-error until time.
+            debug['productivity_exhausted'] = True
+            debug['restart_exhausted'] = True
+            return False
+        pipeline_epoch_seed = rng.getrandbits(63)
+        rng = random.Random(pipeline_epoch_seed)
+        pipeline_epoch_number += 1
+        pipeline_epoch_started_at = budget_clock()
+        pipeline_epoch_start_score = best_scoring['score']
+        pipeline_epoch_start_improvements = int(debug.get('improvements', 0))
+        pipeline_epoch_open = True
+        exploration_state = _copy_state(best_state)
+        active_repairs = list(repairs)
+        # Reopen each strategy once for the new basin while preserving its
+        # lifetime productivity evidence. That evidence prevents a fresh seed
+        # from repeatedly spending most of its budget on proven low-yield
+        # repairs, but the cleared cooldown still lets a strategy discover
+        # newly available moves.
+        for stats in repair_stats.values():
+            stats['cooldown_until_cycle'] = debug['cycles']
+        search_budget.restart_count = 0
+        search_budget.consecutive_unproductive_restarts = 0
+        search_budget.improved_since_restart = False
+        search_budget.restart_exhausted = False
+        search_budget.last_improvement = budget_clock()
+        debug['pipeline_epoch_restarts'] += 1
+        debug['seed_epochs'] += 1
+        last_diversification_at = budget_clock()
+        return True
+
     while True:
         stop_reason = search_budget.reason()
+        if stop_reason in (
+            'overall_runtime_limit', 'user_stop', 'score_zero',
+            'proven_score_floor',
+        ):
+            break
         if stop_reason == 'stall_limit':
             if not search_budget.restart_after_stall():
                 if search_budget.restart_exhausted:
+                    # A batch of unproductive seeds does not prove that the
+                    # current best is globally exhausted. Roll into another
+                    # independently seeded batch while preserving the absolute
+                    # runtime cap. This is the in-run equivalent of the manual
+                    # optimizer restarts that previously found later gains.
+                    elapsed = budget_clock() - search_budget.started_at
+                    remaining = search_budget.total_seconds - elapsed
+                    if remaining > 1:
+                        renewed = renew_pipeline_epoch('stalled_search_batch')
+                        cycles_without_global_improvement = 0
+                        if renewed:
+                            continue
+                        break
                     debug['restart_exhausted'] = True
                     debug['consecutive_unproductive_restarts'] = (
                         search_budget.consecutive_unproductive_restarts
                     )
                 break
-            restart_seed = rng.getrandbits(63)
-            rng = random.Random(restart_seed)
-            active_repairs = list(repairs)
-            rng.shuffle(active_repairs)
-            exploration_state, restart_detail = diversify_from_best()
-            debug['restarts'] += 1
-            debug['restart_details'].append({
-                'restart': debug['restarts'], 'seed': restart_seed, **restart_detail,
-            })
+            launch_diversification('stall')
+            cycles_without_global_improvement = 0
             continue
         if stop_reason is not None:
             break
+        if debug['cycles'] and (
+            cycles_without_global_improvement >= 2
+            or budget_clock() - last_diversification_at
+            >= proactive_restart_interval_seconds
+        ):
+            launch_diversification('proactive')
+            cycles_without_global_improvement = 0
+            if search_budget.reason() is not None:
+                continue
         debug['cycles'] += 1
+        cycle_number = debug['cycles']
+        cycle_score_before = best_scoring['score']
+        cycle_generation_before = best_generation
         cycle_instances = list(instances)
         rng.shuffle(cycle_instances)
-        for repair_name, repair, options in active_repairs:
+        scheduled_repairs = _adaptive_repair_order(
+            active_repairs, repair_stats, cycle_number,
+        )
+        # If every repair is cooling down, diversify immediately rather than
+        # spin through empty cycles until a cooldown expires.
+        if not scheduled_repairs:
+            launch_diversification('proactive')
+            cycles_without_global_improvement = 0
+            continue
+        for repair_name, repair, options in scheduled_repairs:
             if search_budget.reason() is not None:
                 break
             repair_started = monotonic()
             slice_end = repair_started + 4
+            score_before_repair = best_scoring['score']
             exploration_state, _, repair_debug = repair(
                 instances=cycle_instances, physicians=physicians,
                 state=exploration_state, manual_pairs=manual_pairs, targets=targets,
@@ -4751,7 +6740,26 @@ def _run_adaptive_search_rounds(
             stats['legal_candidates'] += repair_debug.get('legal_candidates', 0)
             stats['scored_candidates'] += repair_debug.get('scored_candidates', 0)
             stats['accepts'] += len(repair_debug['accepts'])
-            stats['runtime_seconds'] += monotonic() - repair_started
+            repair_runtime = monotonic() - repair_started
+            _record_adaptive_repair_productivity(
+                stats,
+                score_gain=max(score_before_repair - best_scoring['score'], Decimal('0')),
+                runtime_seconds=repair_runtime,
+                cycle=cycle_number,
+                attempts=repair_debug['attempts'],
+            )
+            if best_generation > cycle_generation_before:
+                continue_from_new_best(score_before_repair, repair_name)
+                break
+        if best_scoring['score'] < cycle_score_before:
+            cycles_without_global_improvement = 0
+        else:
+            cycles_without_global_improvement += 1
+    finish_pipeline_epoch(
+        'productivity_exhausted'
+        if debug.get('productivity_exhausted')
+        else search_budget.reason() or 'search_complete'
+    )
     return best_state, best_scoring, debug
 
 
@@ -5108,6 +7116,16 @@ def build_violation_report(schedule_version, optimizer_run=None):
             (schedule_request.physician_id, schedule_request.date)
         ].append(schedule_request)
 
+    fixed_request_diagnostic = _fixed_shift_on_request_workload_floor(
+        instances,
+        physicians,
+        targets,
+        requests_by_physician_date,
+        eligible_facilities_by_physician,
+        state=state,
+        manual_assignment_only_physician_ids=manual_assignment_only_physician_ids,
+    )
+
     scoring = _score_schedule(
         instances,
         physicians,
@@ -5156,7 +7174,21 @@ def build_violation_report(schedule_version, optimizer_run=None):
         physician_id = row['physician_id']
         if physician_id not in users:
             continue
-        users[physician_id]['workload_score'] = row
+        floor_rows = [
+            floor_row
+            for floor_row in fixed_request_diagnostic['floor_rows']
+            if floor_row['physician_id'] == physician_id
+        ]
+        users[physician_id]['workload_score'] = {
+            **row,
+            'fixed_request_floor_rows': floor_rows,
+            'fixed_request_assessment_rows': [
+                assessment
+                for assessment in fixed_request_diagnostic['assessment_rows']
+                if assessment['physician_id'] == physician_id
+            ],
+            'unavoidable_due_to_fixed_requests': bool(floor_rows),
+        }
         users[physician_id]['total_score'] += row['score_contribution']
 
     for violation in scoring['same_shift_violations']:
@@ -5196,6 +7228,24 @@ def build_violation_report(schedule_version, optimizer_run=None):
     if abs(weekend_rows_total - scoring['breakdown']['weekend_score']) > Decimal('0.0001'):
         score_audit['warnings'].append('Score/report mismatch detected: weekend_score does not equal listed weekend penalty rows.')
 
+    shift_rule_report = _shift_period_report(
+        instances, scoring_physicians, state, scoring_contract_by_physician, details=True,
+    )
+    for violation in shift_rule_report['violations']:
+        row = _report_violation_row(violation)
+        users[violation['physician_id']]['violations'].append(row)
+        users[violation['physician_id']]['total_score'] += row['penalty_amount'] or 0
+    shift_rule_rows_total = sum(
+        (Decimal(str(row['penalty'])) for row in shift_rule_report['violations']),
+        Decimal('0'),
+    )
+    score_audit['shift_rule_rows_total'] = float(shift_rule_rows_total)
+    score_audit['shift_rule_score'] = float(scoring['breakdown']['shift_rule_score'])
+    if abs(shift_rule_rows_total - scoring['breakdown']['shift_rule_score']) > Decimal('0.0001'):
+        score_audit['warnings'].append(
+            'Score/report mismatch detected: shift_rule_score does not equal listed shift-rule penalty rows.'
+        )
+
     for user in users.values():
         user['violations'] = sorted(user['violations'], key=_report_sort_key)
 
@@ -5205,6 +7255,28 @@ def build_violation_report(schedule_version, optimizer_run=None):
     if night_report['stale_violation_rows_dropped']:
         warnings.append('Dropped stale violation row.')
     warnings.extend(score_audit['warnings'])
+    for row in fixed_request_diagnostic['floor_rows']:
+        warnings.append(
+            f"Unavoidable request-compliant workload penalty: {row['physician']} has "
+            f"{row['fixed_request_required_value']:g} {row['units'].lower()} required by "
+            f"Fixed Shift On requests for {row['period_start']} through {row['period_end']}, "
+            f"above the configured maximum of {row['effective_max_value']:g}."
+        )
+    for row in fixed_request_diagnostic['assessment_rows']:
+        if not row['potentially_avoidable_penalty']:
+            continue
+        warnings.append(
+            f"Request check: Fixed Shift On requests require {row['fixed_request_required_value']:g} "
+            f"{row['units'].lower()} for {row['physician']} during {row['period_start']} through "
+            f"{row['period_end']}, within the configured maximum of {row['effective_max_value']:g}; "
+            f"the viewed schedule assigns {row['actual_assigned_value']:g}. The resulting "
+            f"{row['potentially_avoidable_penalty']:g}-point workload penalty is not forced by those requests."
+        )
+    if fixed_request_diagnostic['unresolved_request_count']:
+        warnings.append(
+            f"{fixed_request_diagnostic['unresolved_request_count']} Fixed Shift On request(s) "
+            'could not be resolved to one schedule shift instance; they were excluded from the proven score floor.'
+        )
     for violation in night_report['night_violations']:
         if violation['violation_type'] == 'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT':
             warnings.append(
@@ -5251,6 +7323,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
             for key, value in scoring['breakdown'].items()
         },
         'warnings': list(dict.fromkeys(warnings)),
+        'fixed_request_feasibility': fixed_request_diagnostic,
         'score_audit': score_audit,
         'debug': {
             'violations_recomputed_from_final_assignments': True,
@@ -5281,6 +7354,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
             ),
             'workload_score_total': float(scoring['breakdown']['workload_score']),
             'workload_score_rows': scoring['workload_score_rows'],
+            'fixed_request_feasibility': fixed_request_diagnostic,
             'night_block_assignment_ids_by_physician': {
                 str(item['physician_id']): [
                     block['shift_instance_ids']
@@ -5342,6 +7416,102 @@ def _result_priority(scoring, unfilled_shift_count):
 def _optimization_priority(scoring):
     """Lexicographic objective for complete candidate schedules."""
     return (scoring.get('fixed_request_on_unmet', 0), scoring['score'])
+
+
+def _state_result_priority(instances, state, scoring):
+    """Rank a concrete state without allowing a cheaper incomplete state to win."""
+    return _result_priority(scoring, _unfilled_slot_count(instances, state))
+
+
+def _repair_direct_coverage(
+    *, instances, physicians, state, manual_pairs, targets, contract_by_physician,
+    requests_by_physician_date, eligible_facilities_by_physician,
+    minimum_rest_by_physician, should_stop, candidate_limit=600,
+    on_improvement=None,
+):
+    """Greedily fill directly feasible open slots using the official score as a tie-breaker."""
+    del manual_pairs  # Additions cannot alter or remove preserved assignments.
+    instances_by_id = {instance.id: instance for instance in instances}
+    scoring_args = (
+        targets, contract_by_physician, requests_by_physician_date,
+        eligible_facilities_by_physician, minimum_rest_by_physician,
+    )
+    scoring = _score_schedule(instances, physicians, state, *scoring_args)
+    attempts = 0
+    legal_candidates = 0
+    scored_candidates = 0
+    accepts = []
+
+    while attempts < candidate_limit and not should_stop():
+        accepted = False
+        for instance in instances:
+            if should_stop() or attempts >= candidate_limit:
+                break
+            if instance.is_locked_open or len(state[instance.id]) >= instance.required_staffing:
+                continue
+
+            candidates = []
+            for physician in physicians:
+                if should_stop() or attempts >= candidate_limit:
+                    break
+                if physician.id in state[instance.id]:
+                    continue
+                attempts += 1
+                if not _can_assign_in_state(
+                    state, instances_by_id, instance, physician.id,
+                    eligible_facilities_by_physician, minimum_rest_by_physician,
+                ):
+                    continue
+                legal_candidates += 1
+                trial = _copy_state(state)
+                _add_to_state(trial, instance.id, physician.id)
+                verified = _score_schedule(
+                    instances, physicians, trial, *scoring_args,
+                )
+                scored_candidates += 1
+                if _has_hard_invalids(verified):
+                    continue
+                candidates.append((
+                    _state_result_priority(instances, trial, verified),
+                    physician.id,
+                    trial,
+                    verified,
+                ))
+
+            if not candidates:
+                continue
+            _priority, physician_id, state, scoring = min(
+                candidates, key=lambda row: (row[0], row[1]),
+            )
+            accepts.append({
+                'shift_instance_id': instance.id,
+                'physician_id': physician_id,
+                'unfilled_after': _unfilled_slot_count(instances, state),
+                'score_after': float(scoring['score']),
+            })
+            if on_improvement is not None:
+                on_improvement(state, scoring)
+            accepted = True
+            break
+
+        if not accepted:
+            break
+
+    if should_stop():
+        reason = 'time_budget'
+    elif attempts >= candidate_limit:
+        reason = 'candidate_budget'
+    elif _unfilled_slot_count(instances, state) == 0:
+        reason = 'coverage_complete'
+    else:
+        reason = 'no_directly_feasible_assignment'
+    return state, scoring, {
+        'attempts': attempts,
+        'legal_candidates': legal_candidates,
+        'scored_candidates': scored_candidates,
+        'accepts': accepts,
+        'stopped_reason': reason,
+    }
 
 
 def evaluate_plateau_pairwise_swap(
@@ -5499,9 +7669,16 @@ def optimize_schedule_version(
     allow_preview_benchmark=False,
     adaptive_runtime=False,
     stop_requested=None,
+    max_runtime_seconds=None,
+    progress_callback=None,
 ):
     _FULL_SCORE_EVALUATIONS.set(0)
     invocation_started_at = monotonic()
+    runtime_limit_seconds = int(
+        MAX_RUNTIME_SECONDS if max_runtime_seconds is None else max_runtime_seconds
+    )
+    if not 0 <= runtime_limit_seconds <= 4 * 60 * 60:
+        raise ValueError('Maximum optimizer runtime cannot exceed 240 minutes.')
     if schedule_version.status != ScheduleVersion.Status.BUILD:
         raise ValueError('Optimizer can only run on a BUILD Schedule Version.')
     allowed_schedule_block_statuses = (ScheduleBlock.BuildStatus.BUILD,)
@@ -5558,6 +7735,24 @@ def optimize_schedule_version(
                 status=OptimizerRun.Status.RUNNING,
                 seed=seed,
                 start_mode=start_mode,
+                started_from_run=(
+                    source_run
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    else None
+                ),
+                started_from_run_number=(
+                    source_run.run_number
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    and source_run is not None
+                    else None
+                ),
+                initial_score=(
+                    source_run.final_score
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    and source_run is not None
+                    else None
+                ),
+                max_runtime_seconds=runtime_limit_seconds,
                 run_kind=run_kind,
                 locked_open_shift_instance_ids=source_locked_open_ids,
             )
@@ -5566,6 +7761,43 @@ def optimize_schedule_version(
                 id=optimizer_run.id,
                 schedule_version=version,
             )
+            expected_started_from_run = (
+                source_run
+                if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                else None
+            )
+            expected_started_from_number = (
+                source_run.run_number
+                if expected_started_from_run is not None
+                else None
+            )
+            lineage_updates = []
+            if optimizer_run.started_from_run_id != (
+                expected_started_from_run.id if expected_started_from_run else None
+            ):
+                optimizer_run.started_from_run = expected_started_from_run
+                lineage_updates.append('started_from_run')
+            if optimizer_run.started_from_run_number != expected_started_from_number:
+                optimizer_run.started_from_run_number = expected_started_from_number
+                lineage_updates.append('started_from_run_number')
+            if (
+                expected_started_from_run is not None
+                and optimizer_run.initial_score != expected_started_from_run.final_score
+            ):
+                optimizer_run.initial_score = expected_started_from_run.final_score
+                lineage_updates.append('initial_score')
+            if lineage_updates:
+                optimizer_run.save(update_fields=lineage_updates)
+            runtime_limit_seconds = int(
+                max_runtime_seconds
+                if max_runtime_seconds is not None
+                else optimizer_run.max_runtime_seconds
+            )
+            if not 0 <= runtime_limit_seconds <= 4 * 60 * 60:
+                raise ValueError('Maximum optimizer runtime cannot exceed 240 minutes.')
+            if optimizer_run.max_runtime_seconds != runtime_limit_seconds:
+                optimizer_run.max_runtime_seconds = runtime_limit_seconds
+                optimizer_run.save(update_fields=['max_runtime_seconds'])
             if seed is not None and optimizer_run.seed != seed:
                 optimizer_run.seed = seed
                 optimizer_run.save(update_fields=['seed'])
@@ -5629,6 +7861,27 @@ def optimize_schedule_version(
             selected_run=source_run,
             preserve_physician_ids=manual_assignment_only_physician_ids,
         )
+        # A physician can be switched to a manual-only contract after an older
+        # optimizer run assigned them shifts.  Those optimizer-owned rows must
+        # not become frozen placeholder assignments in every later run.  Only
+        # assignments explicitly made by a scheduler are authoritative for a
+        # manual-only physician.
+        manual_only_optimizer_source_rows_dropped = sum(
+            1
+            for row in source_assignments
+            if (
+                row.physician_id in manual_assignment_only_physician_ids
+                and row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+            )
+        )
+        source_assignments = [
+            row
+            for row in source_assignments
+            if not (
+                row.physician_id in manual_assignment_only_physician_ids
+                and row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+            )
+        ]
         source_assignment_count_raw = len(raw_source_assignments)
 
         if source_assignments:
@@ -5723,6 +7976,16 @@ def optimize_schedule_version(
             assignment.physician_id: assignment.contract
             for assignment in active_contract_assignments
         }
+        scoring_physicians = [
+            physician
+            for physician in physicians
+            if physician.id not in manual_assignment_only_physician_ids
+        ]
+        scoring_contract_by_physician = {
+            physician_id: contract
+            for physician_id, contract in contract_by_physician.items()
+            if physician_id not in manual_assignment_only_physician_ids
+        }
         minimum_rest_by_physician = {
             assignment.physician_id: _minimum_rest_hours(assignment.contract)
             for assignment in active_contract_assignments
@@ -5770,6 +8033,104 @@ def optimize_schedule_version(
             loaded_start_assignment_pairs - source_visible_assignment_pairs
         )
         instances_by_id = {instance.id: instance for instance in instances}
+
+        requests = (
+            ScheduleRequest.objects.filter(
+                schedule_block=version.schedule_block,
+                date__gte=version.schedule_block.start_date,
+                date__lte=version.schedule_block.end_date,
+            )
+            .prefetch_related('shift_templates')
+        )
+        requests_by_physician_date = defaultdict(list)
+        for schedule_request in requests:
+            requests_by_physician_date[
+                (schedule_request.physician_id, schedule_request.date)
+            ].append(schedule_request)
+
+        # For a manual-only physician, a Shift On request is the scheduler's
+        # authoritative assignment instruction regardless of scope or weight.
+        # Seed it before any workload accounting or search, lock it like a
+        # manual assignment, and remove only replaceable optimizer occupants.
+        instances_by_date_template = defaultdict(list)
+        for instance in instances:
+            instances_by_date_template[
+                (instance.date, instance.shift_template_id)
+            ].append(instance)
+        manual_only_request_assignment_rows = []
+        manual_only_request_assignments_seeded = 0
+        manual_only_request_assignments_already_present = 0
+        manual_only_request_optimizer_owners_displaced = 0
+        manual_only_request_conflicts = []
+        for (physician_id, request_date), schedule_requests in requests_by_physician_date.items():
+            if physician_id not in manual_assignment_only_physician_ids:
+                continue
+            for schedule_request in schedule_requests:
+                if schedule_request.request_type != ScheduleRequest.RequestType.SHIFT_ON:
+                    continue
+                matching_instances = []
+                for template in schedule_request.shift_templates.all():
+                    matching_instances.extend(
+                        instances_by_date_template.get((request_date, template.id), ())
+                    )
+                matching_instances.sort(
+                    key=lambda item: (item.start_datetime, item.end_datetime, item.id)
+                )
+                if not matching_instances:
+                    manual_only_request_conflicts.append({
+                        'request_id': schedule_request.id,
+                        'physician_id': physician_id,
+                        'date': request_date.isoformat(),
+                        'reason': 'no_matching_shift_instance',
+                    })
+                    continue
+                instance = matching_instances[0]
+                pair = (instance.id, physician_id)
+                if physician_id in state[instance.id]:
+                    manual_pairs.add(pair)
+                    manual_only_request_assignments_already_present += 1
+                    continue
+
+                replaceable_owner_ids = [
+                    owner_id
+                    for owner_id in state[instance.id]
+                    if (instance.id, owner_id) not in manual_pairs
+                ]
+                while (
+                    len(state[instance.id]) >= instance.required_staffing
+                    and replaceable_owner_ids
+                ):
+                    owner_id = replaceable_owner_ids.pop()
+                    state[instance.id].remove(owner_id)
+                    manual_only_request_optimizer_owners_displaced += 1
+                if len(state[instance.id]) >= instance.required_staffing:
+                    manual_only_request_conflicts.append({
+                        'request_id': schedule_request.id,
+                        'physician_id': physician_id,
+                        'date': request_date.isoformat(),
+                        'shift_instance_id': instance.id,
+                        'reason': 'conflicts_with_existing_fixed_assignment',
+                    })
+
+                _add_to_state(state, instance.id, physician_id)
+                manual_pairs.add(pair)
+                manual_only_request_assignment_rows.append(
+                    ScheduleShiftAssignment(
+                        shift_instance=instance,
+                        physician_id=physician_id,
+                        created_by=created_by,
+                        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                        optimizer_run=optimizer_run,
+                        is_locked=True,
+                    )
+                )
+                manual_only_request_assignments_seeded += 1
+        if manual_only_request_assignment_rows:
+            ScheduleShiftAssignment.objects.bulk_create(
+                manual_only_request_assignment_rows,
+                batch_size=500,
+            )
+            assignments.extend(manual_only_request_assignment_rows)
 
         total_required_hours = sum(
             _shift_hours(instance) * instance.required_staffing
@@ -5862,19 +8223,15 @@ def optimize_schedule_version(
             night_ranges_by_physician[physician.id] = night_range_rows
             night_totals_by_physician[physician.id] = night_values
 
-        requests = (
-            ScheduleRequest.objects.filter(
-                schedule_block=version.schedule_block,
-                date__gte=version.schedule_block.start_date,
-                date__lte=version.schedule_block.end_date,
-            )
-            .prefetch_related('shift_templates')
+        fixed_request_diagnostic = _fixed_shift_on_request_workload_floor(
+            instances,
+            physicians,
+            targets,
+            requests_by_physician_date,
+            eligible_facilities_by_physician,
+            manual_assignment_only_physician_ids=manual_assignment_only_physician_ids,
         )
-        requests_by_physician_date = defaultdict(list)
-        for schedule_request in requests:
-            requests_by_physician_date[
-                (schedule_request.physician_id, schedule_request.date)
-            ].append(schedule_request)
+        proven_score_floor = Decimal(fixed_request_diagnostic['score_floor_exact'])
 
         source_state_scoring = _score_schedule(
             instances,
@@ -5924,33 +8281,198 @@ def optimize_schedule_version(
         nonnight_assignments_allowed_despite_recovery = 0
         open_slots_available = _unfilled_slot_count(instances, state)
         optimizer_search_started_at = monotonic()
-        search_budget = SearchBudget(started_at=optimizer_search_started_at,
-                                     stop_requested=stop_requested or (lambda: False))
+        search_budget_kwargs = dict(
+            # The advertised maximum applies to the entire optimizer
+            # invocation, including setup. Starting the absolute budget only
+            # after setup could consume the worker's finalization margin and
+            # cause a valid best state to be rolled back by the safety alarm.
+            started_at=invocation_started_at,
+            score_floor=proven_score_floor,
+            stop_requested=stop_requested or (lambda: False),
+        )
+        # Keep the constructor's default overridable by benchmark/test budget
+        # hooks for direct calls. API-selected and queued-run limits are
+        # explicit and therefore authoritative.
+        if max_runtime_seconds is not None:
+            search_budget_kwargs['total_seconds'] = runtime_limit_seconds
+        search_budget = SearchBudget(**search_budget_kwargs)
         adaptive_best_state = _copy_state(source_state_snapshot)
         adaptive_best_scoring = source_state_reported_scoring
         progress_ready = False
         progress_marker = None
         adaptive_debug = {'enabled': adaptive_runtime, 'cycles': 0, 'improvements': 0,
                           'attempts': 0, 'stall_seconds': search_budget.stall_seconds,
-                          'overall_seconds': search_budget.total_seconds}
+                          'overall_seconds': search_budget.total_seconds,
+                          'proven_score_floor': float(proven_score_floor)}
+        # Once construction has produced a complete valid schedule, reserve
+        # most of the remaining runtime for the adaptive portfolio and bounded
+        # reconstruction neighborhoods.  Without this handoff, a large fresh
+        # fill can consume the entire budget in single-move polishing.
+        adaptive_handoff_seconds = min(
+            600.0,
+            max(30.0, float(search_budget.total_seconds) * 0.40),
+        )
+        adaptive_continuation_started = False
+        adaptive_debug['primary_phase_budget_seconds'] = adaptive_handoff_seconds
 
         def observe_best(candidate_state, candidate_scoring):
             nonlocal adaptive_best_state, adaptive_best_scoring
-            valid = (_result_priority(candidate_scoring, _unfilled_slot_count(instances, candidate_state))[0] == 0
+            candidate_priority = _state_result_priority(
+                instances, candidate_state, candidate_scoring,
+            )
+            valid = (candidate_priority[0] == 0
+                     and candidate_scoring.get('fixed_request_on_unmet', 0) == 0
                      and all(pid in candidate_state[sid] for sid, pid in manual_pairs))
             search_budget.observe(candidate_scoring['score'], valid=valid)
             if (
                 valid
-                and _optimization_priority(candidate_scoring)
-                < _optimization_priority(adaptive_best_scoring)
+                and progress_callback is not None
+                and search_budget.best_score is not None
+            ):
+                progress_callback(search_budget.best_score)
+            if (
+                valid
+                and candidate_priority
+                < _state_result_priority(
+                    instances, adaptive_best_state, adaptive_best_scoring,
+                )
             ):
                 adaptive_best_state = _copy_state(candidate_state)
                 adaptive_best_scoring = candidate_scoring
                 return True
             return False
 
+        # A run must search only from the starting point selected by the
+        # scheduler.  Historical runs remain available as explicit starting
+        # choices, but they must not silently replace a fresh-fill or another
+        # run's independent result.
+        historical_elite_enabled = False
         if adaptive_runtime:
             observe_best(state, source_state_reported_scoring)
+            adaptive_debug['elite_archive'] = {
+                'enabled': False,
+                'reason': 'Runs retain independent results; historical runs are explicit starting points.',
+            }
+        if adaptive_runtime and historical_elite_enabled:
+            observe_best(state, source_state_reported_scoring)
+            # Preserve a small, diverse elite archive across runs. A fresh
+            # fill is still constructed and searched independently, but it
+            # must not forget a substantially better basin that remains valid
+            # under the current instances, contracts, requests, manual locks,
+            # and fixed Request On assignments. Historical scores are never
+            # trusted: every candidate is normalized and fully rescored now.
+            elite_debug = {
+                'candidates_considered': 0,
+                'valid_candidates': 0,
+                'selected_run_id': None,
+                'selected_run_number': None,
+                'selected_score': None,
+                'rejections': defaultdict(int),
+                'candidate_details': [],
+            }
+            prior_runs = OptimizerRun.objects.filter(
+                schedule_version=version,
+                status=OptimizerRun.Status.COMPLETED,
+                run_kind='OPTIMIZER',
+            ).exclude(id=optimizer_run.id)
+            lowest_score_runs = list(prior_runs.order_by(
+                'final_score', '-created_at', 'id',
+            )[:12])
+            recent_runs = list(prior_runs.order_by('-created_at', '-id')[:4])
+            elite_runs = []
+            seen_elite_run_ids = set()
+            for prior_run in [*lowest_score_runs, *recent_runs]:
+                if prior_run.id in seen_elite_run_ids:
+                    continue
+                seen_elite_run_ids.add(prior_run.id)
+                elite_runs.append(prior_run)
+
+            for prior_run in elite_runs:
+                elite_debug['candidates_considered'] += 1
+                detail = {
+                    'run_id': prior_run.id,
+                    'run_number': prior_run.run_number,
+                    'stored_score': float(prior_run.final_score or 0),
+                }
+                if set(prior_run.locked_open_shift_instance_ids or ()) != set(
+                    source_locked_open_ids
+                ):
+                    elite_debug['rejections']['locked_open_mismatch'] += 1
+                    detail['rejected_reason'] = 'locked_open_mismatch'
+                    elite_debug['candidate_details'].append(detail)
+                    continue
+                historical_rows = list(
+                    assignments_for_viewed_run(version, prior_run)
+                    .select_related('shift_instance', 'physician__user')
+                )
+                normalized_rows, normalization = canonical_assignment_snapshot(
+                    historical_rows,
+                    instances,
+                    selected_run=prior_run,
+                    preserve_physician_ids=manual_assignment_only_physician_ids,
+                )
+                normalized_rows = [
+                    row for row in normalized_rows
+                    if not (
+                        row.physician_id in manual_assignment_only_physician_ids
+                        and row.assignment_source
+                        == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                    )
+                ]
+                candidate_state, _candidate_manual_pairs = _state_from_assignments(
+                    normalized_rows
+                )
+                if not all(
+                    physician_id in candidate_state[instance_id]
+                    for instance_id, physician_id in manual_pairs
+                ):
+                    elite_debug['rejections']['manual_assignment_mismatch'] += 1
+                    detail['rejected_reason'] = 'manual_assignment_mismatch'
+                    elite_debug['candidate_details'].append(detail)
+                    continue
+                candidate_scoring = _score_schedule(
+                    instances,
+                    physicians,
+                    candidate_state,
+                    targets,
+                    contract_by_physician,
+                    requests_by_physician_date,
+                    eligible_facilities_by_physician,
+                    minimum_rest_by_physician,
+                    include_internal_night_heuristics=False,
+                )
+                candidate_priority = _state_result_priority(
+                    instances, candidate_state, candidate_scoring,
+                )
+                detail.update({
+                    'current_score': float(candidate_scoring['score']),
+                    'unfilled_shift_count': _unfilled_slot_count(
+                        instances, candidate_state,
+                    ),
+                    'fixed_request_on_unmet': int(
+                        candidate_scoring.get('fixed_request_on_unmet', 0)
+                    ),
+                    'normalization': normalization,
+                })
+                if candidate_priority[0] != 0:
+                    elite_debug['rejections']['incomplete_or_invalid'] += 1
+                    detail['rejected_reason'] = 'incomplete_or_invalid'
+                elif candidate_scoring.get('fixed_request_on_unmet', 0):
+                    elite_debug['rejections']['fixed_request_on_unmet'] += 1
+                    detail['rejected_reason'] = 'fixed_request_on_unmet'
+                else:
+                    elite_debug['valid_candidates'] += 1
+                    selected = observe_best(candidate_state, candidate_scoring)
+                    detail['selected'] = selected
+                    if selected:
+                        elite_debug['selected_run_id'] = prior_run.id
+                        elite_debug['selected_run_number'] = prior_run.run_number
+                        elite_debug['selected_score'] = float(
+                            candidate_scoring['score']
+                        )
+                elite_debug['candidate_details'].append(detail)
+            elite_debug['rejections'] = dict(elite_debug['rejections'])
+            adaptive_debug['elite_archive'] = elite_debug
             search_budget.observe_coverage(0)
         timed_out = False
         phase_running_when_stopped = None
@@ -5994,6 +8516,11 @@ def optimize_schedule_version(
         def runtime_exceeded():
             nonlocal progress_marker
             if adaptive_runtime:
+                if (
+                    progress_callback is not None
+                    and search_budget.best_score is not None
+                ):
+                    progress_callback(search_budget.best_score)
                 if not progress_ready:
                     # During construction, accepted assignments are progress
                     # even though no complete schedule can yet be scored.
@@ -6008,8 +8535,15 @@ def optimize_schedule_version(
                     ))
                 if search_budget.reason() is not None:
                     return True
+                if (
+                    progress_ready
+                    and not adaptive_continuation_started
+                    and runtime_seconds_elapsed() >= adaptive_handoff_seconds
+                ):
+                    adaptive_debug['primary_phase_handoff'] = True
+                    return True
                 return False
-            return runtime_seconds_elapsed() >= MAX_RUNTIME_SECONDS
+            return runtime_seconds_elapsed() >= runtime_limit_seconds
 
         def mark_timeout(phase):
             nonlocal timed_out
@@ -6295,6 +8829,10 @@ def optimize_schedule_version(
         initial_fill_shifts = defaultdict(int)
         initial_fill_template_indexes = defaultdict(list)
         initial_fill_intervals = defaultdict(_AssignmentIntervalIndex)
+        initial_fill_night_dates = defaultdict(set)
+        initial_fill_weekend_dates = defaultdict(set)
+        initial_fill_weekend_weeks = defaultdict(set)
+        initial_fill_assigned_dates = defaultdict(set)
         initial_fill_template_positions = _template_occurrence_positions(instances)
 
         def sync_initial_fill_counters():
@@ -6302,6 +8840,10 @@ def optimize_schedule_version(
             initial_fill_shifts.clear()
             initial_fill_template_indexes.clear()
             initial_fill_intervals.clear()
+            initial_fill_night_dates.clear()
+            initial_fill_weekend_dates.clear()
+            initial_fill_weekend_weeks.clear()
+            initial_fill_assigned_dates.clear()
             for assigned_instance in instances:
                 position = initial_fill_template_positions.get(assigned_instance.id)
                 for physician_id in state[assigned_instance.id]:
@@ -6310,6 +8852,15 @@ def optimize_schedule_version(
                     ))
                     initial_fill_hours[physician_id] += _shift_hours(assigned_instance)
                     initial_fill_shifts[physician_id] += 1
+                    initial_fill_assigned_dates[physician_id].add(assigned_instance.date)
+                    if assigned_instance.shift_template.night_shift:
+                        initial_fill_night_dates[physician_id].add(assigned_instance.date)
+                    if _is_weekend_designated(assigned_instance):
+                        initial_fill_weekend_dates[physician_id].add(assigned_instance.date)
+                        initial_fill_weekend_weeks[physician_id].add(
+                            assigned_instance.date
+                            - timedelta(days=assigned_instance.date.weekday())
+                        )
                     if position is not None:
                         template_id, occurrence_index = position
                         initial_fill_template_indexes[(physician_id, template_id)].append(occurrence_index)
@@ -6370,6 +8921,49 @@ def optimize_schedule_version(
                             instance.date,
                             shift_hours,
                         )
+                        workload_settings = (
+                            contract.workload_settings
+                            if isinstance(contract.workload_settings, dict)
+                            else {}
+                        )
+                        max_days_in_row = _configured_positive_int(
+                            workload_settings,
+                            'max_days_in_row',
+                        )
+                        max_days_penalty = _configured_positive_penalty(
+                            workload_settings,
+                            'max_days_in_row_penalty_weight',
+                            Decimal('0'),
+                        )
+                        assigned_dates = initial_fill_assigned_dates[physician.id]
+                        consecutive_days_delta = Decimal('0')
+                        if (
+                            instance.date not in assigned_dates
+                            and max_days_in_row is not None
+                            and max_days_penalty > 0
+                        ):
+                            left_length = 0
+                            prior_date = instance.date - timedelta(days=1)
+                            while prior_date in assigned_dates:
+                                left_length += 1
+                                prior_date -= timedelta(days=1)
+                            right_length = 0
+                            next_date = instance.date + timedelta(days=1)
+                            while next_date in assigned_dates:
+                                right_length += 1
+                                next_date += timedelta(days=1)
+                            before_excess = (
+                                max(left_length - max_days_in_row, 0)
+                                + max(right_length - max_days_in_row, 0)
+                            )
+                            after_excess = max(
+                                left_length + 1 + right_length - max_days_in_row,
+                                0,
+                            )
+                            consecutive_days_delta = (
+                                Decimal(after_excess - before_excess)
+                                * max_days_penalty
+                            )
                         same_shift_delta = _same_shift_candidate_delta_from_indexes(
                             contract,
                             initial_fill_template_positions,
@@ -6410,6 +9004,58 @@ def optimize_schedule_version(
                                 physician.id,
                                 instance,
                             )
+                            if phase == 'night':
+                                settings = _night_settings(contract)
+                                min_consecutive = _configured_positive_int(
+                                    settings,
+                                    'min_consecutive_night_shifts',
+                                )
+                                max_consecutive = _configured_positive_int(
+                                    settings,
+                                    'max_consecutive_night_shifts',
+                                )
+                                prior_dates = initial_fill_night_dates[physician.id]
+                                previous_date = instance.date - timedelta(days=1)
+                                previous_run_length = 0
+                                while previous_date in prior_dates:
+                                    previous_run_length += 1
+                                    previous_date -= timedelta(days=1)
+                                if previous_run_length:
+                                    projected_run_length = previous_run_length + 1
+                                    if (
+                                        max_consecutive is not None
+                                        and projected_run_length > max_consecutive
+                                    ):
+                                        night_block_priority = 3
+                                        night_block_deficit = projected_run_length - max_consecutive
+                                    elif (
+                                        min_consecutive is not None
+                                        and min_consecutive > 1
+                                        and projected_run_length <= min_consecutive
+                                    ):
+                                        night_block_priority = 0
+                                        night_block_deficit = max(
+                                            min_consecutive - projected_run_length,
+                                            0,
+                                        )
+                                    else:
+                                        night_block_priority = 1
+                                        night_block_deficit = 0
+                                elif min_consecutive is not None and min_consecutive > 1:
+                                    # Starting a block must remain neutral
+                                    # across contracts.  Giving it a worse
+                                    # rank than a contract with min=1 caused
+                                    # the latter physicians to absorb nearly
+                                    # every open night before workload limits
+                                    # could participate in the comparison.
+                                    night_block_priority = 1
+                                    night_block_deficit = 0
+                                else:
+                                    night_block_priority = 1
+                                    night_block_deficit = 0
+                            else:
+                                night_block_priority = 1
+                                night_block_deficit = 0
                             # The exhaustive delta repeatedly builds a complete
                             # night report for every candidate.  Retain it only
                             # with the opt-in block builder that owns that cost.
@@ -6435,6 +9081,85 @@ def optimize_schedule_version(
                             night_block_bonus = Decimal('0')
                             night_minimum_bonus = Decimal('0')
                             recovery_penalty = Decimal('0')
+                            night_block_priority = 1
+                            night_block_deficit = 0
+                        if _is_weekend_designated(instance):
+                            weekend_settings = (
+                                contract.weekend_settings
+                                if isinstance(contract.weekend_settings, dict)
+                                else {}
+                            )
+                            min_consecutive_weekend = _configured_positive_int(
+                                weekend_settings,
+                                'min_consecutive_weekend_shifts',
+                            )
+                            max_consecutive_weekend = _configured_positive_int(
+                                weekend_settings,
+                                'max_consecutive_weekend_shifts',
+                            )
+                            min_consecutive_weekends = _configured_positive_int(
+                                weekend_settings,
+                                'min_consecutive_weekends',
+                            )
+                            max_consecutive_weekends = _configured_positive_int(
+                                weekend_settings,
+                                'max_consecutive_weekends',
+                            )
+                            prior_weekend_dates = initial_fill_weekend_dates[physician.id]
+                            previous_weekend_date = instance.date - timedelta(days=1)
+                            previous_weekend_run_length = 0
+                            while previous_weekend_date in prior_weekend_dates:
+                                previous_weekend_run_length += 1
+                                previous_weekend_date -= timedelta(days=1)
+                            projected_weekend_run_length = (
+                                previous_weekend_run_length + 1
+                            )
+                            weekend_start = (
+                                instance.date
+                                - timedelta(days=instance.date.weekday())
+                            )
+                            prior_weekend_weeks = initial_fill_weekend_weeks[physician.id]
+                            opens_new_weekend = weekend_start not in prior_weekend_weeks
+                            previous_week = weekend_start - timedelta(days=7)
+                            previous_week_run_length = 0
+                            while previous_week in prior_weekend_weeks:
+                                previous_week_run_length += 1
+                                previous_week -= timedelta(days=7)
+                            projected_week_run_length = previous_week_run_length + 1
+                            if (
+                                previous_weekend_run_length
+                                and max_consecutive_weekend is not None
+                                and projected_weekend_run_length > max_consecutive_weekend
+                            ) or (
+                                opens_new_weekend
+                                and previous_week_run_length
+                                and max_consecutive_weekends is not None
+                                and projected_week_run_length > max_consecutive_weekends
+                            ):
+                                weekend_block_priority = 3
+                            elif (
+                                (
+                                    previous_weekend_run_length
+                                    and min_consecutive_weekend is not None
+                                    and min_consecutive_weekend > 1
+                                    and projected_weekend_run_length <= min_consecutive_weekend
+                                )
+                                or (
+                                    opens_new_weekend
+                                    and previous_week_run_length
+                                    and min_consecutive_weekends is not None
+                                    and min_consecutive_weekends > 1
+                                    and projected_week_run_length <= min_consecutive_weekends
+                                )
+                            ):
+                                weekend_block_priority = 0
+                            else:
+                                # New blocks and already-complete blocks stay
+                                # neutral so weekend construction does not
+                                # overpower workload or other contract rules.
+                                weekend_block_priority = 1
+                        else:
+                            weekend_block_priority = 1
                         if recovery_penalty > 0:
                             recovery_conflict_candidates += 1
 
@@ -6469,6 +9194,11 @@ def optimize_schedule_version(
                             (
                                 recovery_penalty > 0,
                                 request_score,
+                                consecutive_days_delta > 0,
+                                consecutive_days_delta,
+                                night_block_priority,
+                                weekend_block_priority,
+                                night_block_deficit,
                                 night_delta,
                                 night_pressure,
                                 workload_rank,
@@ -6501,6 +9231,11 @@ def optimize_schedule_version(
                     (
                         _has_recovery_conflict,
                         _request_score_value,
+                        _has_consecutive_days_penalty,
+                        _consecutive_days_delta,
+                        _night_block_priority,
+                        _weekend_block_priority,
+                        _night_block_deficit,
                         _night_delta_value,
                         _night_pressure_value,
                         _workload_rank,
@@ -6515,6 +9250,7 @@ def optimize_schedule_version(
                     ))
                     initial_fill_hours[selected_physician.id] += _shift_hours(instance)
                     initial_fill_shifts[selected_physician.id] += 1
+                    initial_fill_assigned_dates[selected_physician.id].add(instance.date)
                     selected_position = initial_fill_template_positions.get(instance.id)
                     if selected_position is not None:
                         template_id, occurrence_index = selected_position
@@ -6528,10 +9264,16 @@ def optimize_schedule_version(
                                 Decimal('1') if row['units'] == 'SHIFTS' else _shift_hours(instance)
                             )
                     if phase == 'night':
+                        initial_fill_night_dates[selected_physician.id].add(instance.date)
                         for row in night_ranges_by_physician[selected_physician.id]:
                             if row['window_start'] <= instance.date <= row['window_end']:
                                 key = (row['window_start'], row['window_end'])
                                 night_totals_by_physician[selected_physician.id][key] += Decimal('1')
+                    if _is_weekend_designated(instance):
+                        initial_fill_weekend_dates[selected_physician.id].add(instance.date)
+                        initial_fill_weekend_weeks[selected_physician.id].add(
+                            instance.date - timedelta(days=instance.date.weekday())
+                        )
                     assignments_made += 1
                     if phase == 'night':
                         night_block_assignment_successes += 1
@@ -6547,7 +9289,13 @@ def optimize_schedule_version(
             night_instances,
             key=lambda item: (item.date, item.start_datetime),
         )
-        non_night_instances = shuffle(non_night_instances)
+        # Weekend-block construction also needs yesterday's assignment to be
+        # visible when evaluating today. Randomize only simultaneous slots;
+        # shuffling the entire phase destroys that local structure.
+        non_night_instances = random_tie_sorted(
+            non_night_instances,
+            key=lambda item: (item.date, item.start_datetime),
+        )
         if not timed_out:
             fill_open_instances(night_instances, 'night')
         if not timed_out:
@@ -6578,7 +9326,11 @@ def optimize_schedule_version(
         )
         search_initial_score = initial_scoring['score']
         reported_initial_score = (
-            source_state_reported_score_before_pre_score_changes
+            (
+                float(source_run.final_score)
+                if source_run.final_score is not None
+                else source_state_reported_score_before_pre_score_changes
+            )
             if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
             and source_run is not None
             else search_initial_score
@@ -6700,6 +9452,9 @@ def optimize_schedule_version(
         pairwise_candidates_skipped_by_cap = 0
         pairwise_best_missed_candidate_if_any = None
         pairwise_accepts_after_rescan = 0
+        weekend_repairs_attempted = 0
+        weekend_repairs_accepted = 0
+        weekend_repair_rescan_rounds = 0
         score_before_final_plateau_repair = None
         score_after_final_plateau_repair = None
         final_plateau_repair_reason = 'not_run'
@@ -7043,7 +9798,7 @@ def optimize_schedule_version(
 
             accepted = 0
             attempts = 0
-            while attempts < candidate_budget and runtime_seconds_elapsed() < MAX_RUNTIME_SECONDS:
+            while attempts < candidate_budget and runtime_seconds_elapsed() < runtime_limit_seconds:
                 directed_candidates = _request_on_repair_candidates(
                     instances,
                     state,
@@ -7055,7 +9810,7 @@ def optimize_schedule_version(
                     break
                 improved_request = False
                 for requested_physician_id, from_physician_id, instance_id in directed_candidates:
-                    if attempts >= candidate_budget or runtime_seconds_elapsed() >= MAX_RUNTIME_SECONDS:
+                    if attempts >= candidate_budget or runtime_seconds_elapsed() >= runtime_limit_seconds:
                         break
                     attempts += 1
                     candidates_considered_before_timeout += 1
@@ -7215,7 +9970,267 @@ def optimize_schedule_version(
                     break
             return accepted
 
+        def repair_requested_shift_blocks(max_neighborhoods=4):
+            """Repair coupled request-on blocks before single-move search."""
+            nonlocal state, final_score, improvement_count
+            nonlocal request_repair_attempts, request_repair_improvements
+            nonlocal candidates_considered_before_timeout, iterations_run
+
+            accepted = 0
+            attempted_cluster_keys = set()
+            if not instances:
+                return accepted
+            schedule_start = min(instance.date for instance in instances)
+            schedule_end = max(instance.date for instance in instances)
+            boundary_padding = _constraint_boundary_padding_days(
+                contract_by_physician,
+            )
+
+            while accepted < max_neighborhoods and not runtime_exceeded():
+                directed = _request_on_repair_candidates(
+                    instances,
+                    state,
+                    manual_pairs,
+                    contract_by_physician,
+                    requests_by_physician_date,
+                )
+                if not directed:
+                    break
+
+                instances_by_requester = defaultdict(list)
+                for requested_physician_id, _owner_id, instance_id in directed:
+                    requested_instance = instances_by_id[instance_id]
+                    matching_requests = [
+                        request
+                        for request in requests_by_physician_date.get(
+                            (requested_physician_id, requested_instance.date), ()
+                        )
+                        if request.request_type in {
+                            ScheduleRequest.RequestType.DAY_ON,
+                            ScheduleRequest.RequestType.SHIFT_ON,
+                        }
+                        and (
+                            request.request_type == ScheduleRequest.RequestType.DAY_ON
+                            or requested_instance.shift_template_id in {
+                                template.id for template in request.shift_templates.all()
+                            }
+                        )
+                    ]
+                    is_fixed = any(
+                        request.weight == ScheduleRequest.Weight.FIXED
+                        for request in matching_requests
+                    )
+                    instances_by_requester[
+                        requested_physician_id, is_fixed
+                    ].append(requested_instance)
+
+                clusters = []
+                for (physician_id, is_fixed), requested_instances in instances_by_requester.items():
+                    ordered = sorted(
+                        {item.id: item for item in requested_instances}.values(),
+                        key=lambda item: (item.date, item.id),
+                    )
+                    current = []
+                    for requested_instance in ordered:
+                        if (
+                            current
+                            and requested_instance.date
+                            > current[-1].date + timedelta(days=1)
+                        ):
+                            clusters.append((physician_id, is_fixed, current))
+                            current = []
+                        current.append(requested_instance)
+                    if current:
+                        clusters.append((physician_id, is_fixed, current))
+
+                def cluster_penalty(item):
+                    physician_id, _is_fixed, requested_instances = item
+                    contract = contract_by_physician[physician_id]
+                    return sum(
+                        max(
+                            (
+                                _request_weight(contract, request.weight)
+                                for request in requests_by_physician_date.get(
+                                    (physician_id, requested_instance.date), ()
+                                )
+                                if request.request_type in {
+                                    ScheduleRequest.RequestType.DAY_ON,
+                                    ScheduleRequest.RequestType.SHIFT_ON,
+                                }
+                            ),
+                            default=Decimal('0'),
+                        )
+                        for requested_instance in requested_instances
+                    )
+
+                clusters.sort(key=lambda item: (
+                    not item[1],
+                    -cluster_penalty(item),
+                    item[2][0].date,
+                    item[0],
+                ))
+
+                improved_cluster = False
+                for physician_id, is_fixed, cluster in clusters:
+                    cluster_key = (
+                        physician_id,
+                        tuple(instance.id for instance in cluster),
+                    )
+                    if cluster_key in attempted_cluster_keys:
+                        continue
+                    attempted_cluster_keys.add(cluster_key)
+                    cluster_ids = {instance.id for instance in cluster}
+                    focus_start = max(
+                        schedule_start,
+                        cluster[0].date - timedelta(days=boundary_padding),
+                    )
+                    focus_end = min(
+                        schedule_end,
+                        cluster[-1].date + timedelta(days=boundary_padding),
+                    )
+                    current_scoring = _score_schedule(
+                        instances, physicians, state, targets,
+                        contract_by_physician, requests_by_physician_date,
+                        eligible_facilities_by_physician,
+                        minimum_rest_by_physician,
+                        include_internal_night_heuristics=True,
+                    )
+
+                    # First try the common corrected-request case directly:
+                    # exchange every requested shift in the compact block with
+                    # the requester's existing shift on that date. Evaluating
+                    # the whole block at once avoids transient rest conflicts
+                    # between the old day series and the new night series.
+                    direct_state = _copy_state(state)
+                    used_outgoing_ids = set()
+                    direct_possible = True
+                    for requested_instance in cluster:
+                        current_owners = [
+                            owner_id for owner_id in direct_state[requested_instance.id]
+                            if owner_id != physician_id
+                            and (requested_instance.id, owner_id) not in manual_pairs
+                        ]
+                        if not current_owners:
+                            direct_possible = False
+                            break
+                        current_owner_id = current_owners[0]
+                        outgoing_candidates = [
+                            candidate
+                            for candidate in instances
+                            if candidate.date == requested_instance.date
+                            and candidate.id != requested_instance.id
+                            and candidate.id not in used_outgoing_ids
+                            and physician_id in direct_state[candidate.id]
+                            and (candidate.id, physician_id) not in manual_pairs
+                            and current_owner_id not in direct_state[candidate.id]
+                        ]
+                        outgoing_candidates.sort(key=lambda candidate: (
+                            candidate.facility_id != requested_instance.facility_id,
+                            abs(
+                                _shift_hours(candidate)
+                                - _shift_hours(requested_instance)
+                            ),
+                            candidate.id,
+                        ))
+                        _replace_in_state(
+                            direct_state,
+                            requested_instance.id,
+                            current_owner_id,
+                            physician_id,
+                        )
+                        if outgoing_candidates:
+                            outgoing = outgoing_candidates[0]
+                            used_outgoing_ids.add(outgoing.id)
+                            _replace_in_state(
+                                direct_state,
+                                outgoing.id,
+                                physician_id,
+                                current_owner_id,
+                            )
+
+                    if direct_possible:
+                        direct_scoring = _score_schedule(
+                            instances, physicians, direct_state, targets,
+                            contract_by_physician, requests_by_physician_date,
+                            eligible_facilities_by_physician,
+                            minimum_rest_by_physician,
+                            include_internal_night_heuristics=True,
+                        )
+                        request_repair_attempts += 1
+                        phase_attempts['request_on_preflight'] += 1
+                        candidates_considered_before_timeout += 1
+                        iterations_run += 1
+                        if (
+                            not has_hard_invalids(direct_scoring)
+                            and is_optimization_improvement(direct_scoring)
+                        ):
+                            state = direct_state
+                            final_score = direct_scoring['score']
+                            improvement_count += 1
+                            request_repair_improvements += 1
+                            phase_improvements['request_on_preflight'] += 1
+                            accepted += 1
+                            improved_cluster = True
+                            break
+
+                    if not is_fixed:
+                        continue
+
+                    request_padding = min(boundary_padding, 1)
+                    focus_start = max(
+                        schedule_start,
+                        cluster[0].date - timedelta(days=request_padding),
+                    )
+                    focus_end = min(
+                        schedule_end,
+                        cluster[-1].date + timedelta(days=request_padding),
+                    )
+                    trial_state, trial_scoring, neighborhood_debug = (
+                        _solve_bounded_multi_physician_neighborhood(
+                            instances=instances,
+                            physicians=physicians,
+                            state=state,
+                            scoring=current_scoring,
+                            manual_pairs=manual_pairs,
+                            targets=targets,
+                            contract_by_physician=contract_by_physician,
+                            requests_by_physician_date=requests_by_physician_date,
+                            eligible_facilities_by_physician=(
+                                eligible_facilities_by_physician
+                            ),
+                            minimum_rest_by_physician=minimum_rest_by_physician,
+                            rng=rng,
+                            focus_physician_ids={physician_id},
+                            focus_instance_ids=cluster_ids,
+                            focus_start=focus_start,
+                            focus_end=focus_end,
+                            cohort_size=min(max(len(cluster_ids) + 3, 8), 16),
+                            time_limit_seconds=4,
+                            should_stop=lambda: search_budget.reason() is not None,
+                        )
+                    )
+                    request_repair_attempts += 1
+                    phase_attempts['request_on_preflight'] += 1
+                    candidates_considered_before_timeout += 1
+                    iterations_run += 1
+                    if not neighborhood_debug.get('accepted'):
+                        continue
+                    if not is_optimization_improvement(trial_scoring):
+                        continue
+                    state = trial_state
+                    final_score = trial_scoring['score']
+                    improvement_count += 1
+                    request_repair_improvements += 1
+                    phase_improvements['request_on_preflight'] += 1
+                    accepted += 1
+                    improved_cluster = True
+                    break
+                if not improved_cluster:
+                    break
+            return accepted
+
         request_preflight_started = runtime_seconds_elapsed()
+        repair_requested_shift_blocks()
         repair_requested_shifts_on(max(5000, max_candidates_per_repair * max(max_passes, 1)))
         phase_runtime_seconds['request_on_preflight'] += (
             runtime_seconds_elapsed() - request_preflight_started
@@ -7387,7 +10402,7 @@ def optimize_schedule_version(
         workload_revisit_debug = {'attempts': 0, 'accepts': [], 'stopped_reason': 'not_run'}
         if max_passes > 0 and not runtime_exceeded() and start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE:
             # Reserve at least half the configured budget for the other repair phases.
-            workload_deadline = min(MAX_RUNTIME_SECONDS / 2, runtime_seconds_elapsed() + 20)
+            workload_deadline = min(runtime_limit_seconds / 2, runtime_seconds_elapsed() + 20)
             state, _workload_scoring, workload_revisit_debug = _run_productive_repair_rounds(
                 _repair_workload_transfers, elapsed=runtime_seconds_elapsed,
                 deadline=workload_deadline, candidate_limit=2000,
@@ -7414,7 +10429,7 @@ def optimize_schedule_version(
 
         night_spacing_debug = {'attempts': 0, 'accepts': [], 'stopped_reason': 'not_run'}
         if max_passes > 0 and not runtime_exceeded() and start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE:
-            spacing_deadline = min(MAX_RUNTIME_SECONDS * 0.75, runtime_seconds_elapsed() + 20)
+            spacing_deadline = min(runtime_limit_seconds * 0.75, runtime_seconds_elapsed() + 20)
             maximum_started = runtime_seconds_elapsed()
             maximum_deadline = min(spacing_deadline, runtime_seconds_elapsed() + 8)
             state, _, maximum_debug = _repair_night_spacing_swaps(
@@ -7991,7 +11006,7 @@ def optimize_schedule_version(
             ))
             same_shift_started = runtime_seconds_elapsed()
             same_shift_deadline = (same_shift_started + 3 if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                                   else MAX_RUNTIME_SECONDS)
+                                   else runtime_limit_seconds)
             for from_physician_id, instance_id in same_shift_candidates:
                 if improved or runtime_seconds_elapsed() >= same_shift_deadline:
                     break
@@ -8052,7 +11067,7 @@ def optimize_schedule_version(
             ))
             consecutive_started = runtime_seconds_elapsed()
             consecutive_deadline = (consecutive_started + 3 if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                                    else MAX_RUNTIME_SECONDS)
+                                    else runtime_limit_seconds)
             for from_physician_id, instance_id in consecutive_day_candidates:
                 if improved or runtime_seconds_elapsed() >= consecutive_deadline:
                     break
@@ -8784,6 +11799,7 @@ def optimize_schedule_version(
                 minimum_repair_exhausted = True
                 break
 
+        weekend_had_targets = False
         if not runtime_exceeded():
             final_plateau_repair_reason = 'no_improving_candidate'
             workload_rows = plateau_scoring.get('workload_score_rows', [])
@@ -8940,6 +11956,314 @@ def optimize_schedule_version(
                 workload_micro_repair_accepted_details.append(detail)
                 accepted_pairwise_swap_details.append(detail)
                 break
+
+        # Weekend-only plateaus previously fell through this phase because its
+        # target set contained only workload and night violations.  Search the
+        # assignments named by the authoritative weekend report and rescan
+        # after every accepted swap.  Candidate ordering favors moves that join
+        # another configured weekend-designated assignment, but the complete
+        # official score remains the acceptance rule.  No weekday is assumed
+        # to be a weekend here; Shift Builder's per-template selections decide.
+        if not runtime_exceeded():
+            weekend_attempt_limit = min(
+                12000, max(4000, plateau_candidate_limit * 60),
+            )
+            weekend_round_limit = 12
+
+            weekend_date_counts_by_physician = {}
+
+            def assigned_weekend_dates(physician_id, exclude_instance_id=None):
+                date_counts = weekend_date_counts_by_physician.get(
+                    physician_id, Counter(),
+                )
+                excluded_date = None
+                if exclude_instance_id is not None:
+                    excluded_instance = instances_by_id[exclude_instance_id]
+                    if (
+                        physician_id in state.get(exclude_instance_id, ())
+                        and _is_weekend_designated(excluded_instance)
+                    ):
+                        excluded_date = excluded_instance.date
+                return {
+                    day
+                    for day, count in date_counts.items()
+                    if count - int(day == excluded_date) > 0
+                }
+
+            def joins_configured_weekend(day, existing_days):
+                if any(abs((day - other_day).days) == 1 for other_day in existing_days):
+                    return True
+                day_week = day - timedelta(days=day.weekday())
+                return any(
+                    abs((day_week - (
+                        other_day - timedelta(days=other_day.weekday())
+                    )).days) == 7
+                    for other_day in existing_days
+                )
+
+            while (
+                not runtime_exceeded()
+                and weekend_repair_rescan_rounds < weekend_round_limit
+                and weekend_repairs_attempted < weekend_attempt_limit
+            ):
+                weekend_report = _weekend_volume_report(
+                    instances, physicians, state, contract_by_physician,
+                    details=True,
+                )
+                anchor_targets = []
+                seen_anchors = set()
+                for violation in sorted(
+                    weekend_report.get('violations', ()),
+                    key=lambda row: -Decimal(str(row.get('penalty', 0))),
+                ):
+                    physician_id = violation.get('physician_id')
+                    violation_type = violation.get('violation_type') or ''
+                    for instance_id in violation.get('shift_instance_ids') or ():
+                        anchor = (instance_id, physician_id, violation_type)
+                        if (
+                            physician_id in state.get(instance_id, ())
+                            and (instance_id, physician_id) not in manual_pairs
+                            and anchor not in seen_anchors
+                        ):
+                            seen_anchors.add(anchor)
+                            anchor_targets.append(anchor)
+                if not anchor_targets:
+                    break
+                weekend_had_targets = True
+                weekend_repair_rescan_rounds += 1
+                movable_pairs = _optimizer_pairs(state, manual_pairs)
+                movable_by_physician = defaultdict(list)
+                for pair in movable_pairs:
+                    movable_by_physician[pair[1]].append(pair)
+                weekend_date_counts_by_physician = defaultdict(Counter)
+                for assigned_instance_id, assigned_physician_ids in state.items():
+                    assigned_instance = instances_by_id[assigned_instance_id]
+                    if not _is_weekend_designated(assigned_instance):
+                        continue
+                    for assigned_physician_id in assigned_physician_ids:
+                        weekend_date_counts_by_physician[
+                            assigned_physician_id
+                        ][assigned_instance.date] += 1
+
+                # For minimum-block and Friday-before-weekend violations, the
+                # isolated assignment is an anchor that should normally stay
+                # in place. Exchange one of that physician's other assignments
+                # for an adjacent configured-weekend shift. Moving the anchor
+                # itself simply recreates a one-day block elsewhere.
+                weekend_sources = []
+                for anchor_instance_id, physician_id, violation_type in anchor_targets:
+                    if runtime_exceeded():
+                        mark_timeout('final_plateau_repair')
+                        final_plateau_repair_reason = 'runtime_limit'
+                        break
+                    anchor_pair = (anchor_instance_id, physician_id)
+                    support_pairs = [
+                        pair for pair in movable_by_physician[physician_id]
+                        if pair != anchor_pair
+                    ]
+                    support_pairs.sort(key=lambda pair: (
+                        0 if not _is_weekend_designated(
+                            instances_by_id[pair[0]]
+                        ) else 1,
+                        abs((
+                            instances_by_id[pair[0]].date
+                            - instances_by_id[anchor_instance_id].date
+                        ).days),
+                        pair[0],
+                    ))
+                    support_pairs = support_pairs[:20]
+                    if (
+                        violation_type.startswith('MIN_')
+                        or violation_type == 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF'
+                    ):
+                        source_pairs = [*support_pairs, anchor_pair]
+                    else:
+                        source_pairs = [anchor_pair, *support_pairs]
+                    weekend_sources.extend(
+                        (anchor_instance_id, violation_type, pair)
+                        for pair in source_pairs
+                    )
+                weekend_sources = list(dict.fromkeys(weekend_sources))
+                ordered_rights = {}
+                for anchor_instance_id, violation_type, left_pair in weekend_sources:
+                    if runtime_exceeded():
+                        mark_timeout('final_plateau_repair')
+                        final_plateau_repair_reason = 'runtime_limit'
+                        break
+                    left_instance_id, left_physician_id = left_pair
+                    anchor_instance = instances_by_id[anchor_instance_id]
+                    left_instance = instances_by_id[left_instance_id]
+                    left_remaining = assigned_weekend_dates(
+                        left_physician_id, left_instance_id,
+                    )
+                    candidates = []
+                    for candidate_index, (
+                        right_instance_id, right_physician_id,
+                    ) in enumerate(movable_pairs):
+                        if candidate_index % 64 == 0 and runtime_exceeded():
+                            mark_timeout('final_plateau_repair')
+                            final_plateau_repair_reason = 'runtime_limit'
+                            break
+                        if (
+                            right_instance_id == left_instance_id
+                            or right_physician_id == left_physician_id
+                        ):
+                            continue
+                        right_instance = instances_by_id[right_instance_id]
+                        day_delta = abs((
+                            right_instance.date - anchor_instance.date
+                        ).days)
+                        if (
+                            violation_type == 'MIN_CONSECUTIVE_WEEKEND_SHIFTS'
+                            and (
+                                not _is_weekend_designated(right_instance)
+                                or day_delta != 1
+                            )
+                        ):
+                            continue
+                        if (
+                            violation_type == 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF'
+                            and (
+                                not _is_weekend_designated(right_instance)
+                                or day_delta not in {1, 2}
+                            )
+                        ):
+                            continue
+                        if (
+                            violation_type == 'MIN_CONSECUTIVE_WEEKENDS'
+                            and (
+                                not _is_weekend_designated(right_instance)
+                                or abs((
+                                    right_instance.date
+                                    - timedelta(days=right_instance.date.weekday())
+                                    - (
+                                        anchor_instance.date
+                                        - timedelta(days=anchor_instance.date.weekday())
+                                    )
+                                ).days) != 7
+                            )
+                        ):
+                            continue
+                        right_remaining = assigned_weekend_dates(
+                            right_physician_id, right_instance_id,
+                        )
+                        right_joins_left = (
+                            _is_weekend_designated(right_instance)
+                            and joins_configured_weekend(
+                                right_instance.date,
+                                left_remaining | {anchor_instance.date},
+                            )
+                        )
+                        left_joins_right = (
+                            _is_weekend_designated(left_instance)
+                            and joins_configured_weekend(
+                                left_instance.date, right_remaining,
+                            )
+                        )
+                        candidates.append((
+                            (
+                                -(int(right_joins_left) + int(left_joins_right)),
+                                0 if abs((
+                                    right_instance.date - anchor_instance.date
+                                ).days) == 1 else 1,
+                                0 if right_joins_left else 1,
+                                0 if _is_weekend_designated(right_instance) else 1,
+                                abs(
+                                    _shift_hours(right_instance)
+                                    - _shift_hours(left_instance)
+                                ),
+                                abs((right_instance.date - anchor_instance.date).days),
+                                right_physician_id,
+                                right_instance_id,
+                            ),
+                            (right_instance_id, right_physician_id),
+                        ))
+                    source_key = (
+                        anchor_instance_id, violation_type,
+                        left_instance_id, left_physician_id,
+                    )
+                    if runtime_exceeded():
+                        break
+                    ordered_rights[source_key] = [
+                        pair for _priority, pair in sorted(candidates)
+                    ]
+
+                if runtime_exceeded():
+                    break
+
+                # Interleave targets so one expensive violation cannot consume
+                # the entire bounded candidate budget before the others are
+                # examined. This matters for long, multi-month blocks.
+                accepted_weekend_swap = False
+                maximum_rank = max(
+                    (len(rows) for rows in ordered_rights.values()),
+                    default=0,
+                )
+                for rank in range(maximum_rank):
+                    if accepted_weekend_swap or runtime_exceeded():
+                        break
+                    for source_key in ordered_rights:
+                        rights = ordered_rights[source_key]
+                        if rank >= len(rights):
+                            continue
+                        if weekend_repairs_attempted >= weekend_attempt_limit:
+                            break
+                        right_pair = rights[rank]
+                        left_pair = (source_key[2], source_key[3])
+                        weekend_repairs_attempted += 1
+                        pairwise_candidates_considered += 1
+                        pairwise_swaps_attempted += 1
+                        final_plateau_repair_attempts += 1
+                        phase_attempts['final_plateau_repair'] += 1
+                        result = evaluate_plateau_pairwise_swap(
+                            instances=instances,
+                            physicians=physicians,
+                            state=state,
+                            instances_by_id=instances_by_id,
+                            manual_pairs=manual_pairs,
+                            locked_open_instance_ids=set(source_locked_open_ids),
+                            targets=targets,
+                            contract_by_physician=contract_by_physician,
+                            requests_by_physician_date=requests_by_physician_date,
+                            eligible_facilities_by_physician=(
+                                eligible_facilities_by_physician
+                            ),
+                            minimum_rest_by_physician=minimum_rest_by_physician,
+                            current_score=final_score,
+                            left_instance_id=left_pair[0],
+                            left_physician_id=left_pair[1],
+                            right_instance_id=right_pair[0],
+                            right_physician_id=right_pair[1],
+                        )
+                        if not result.get('legal') or not result.get('improving'):
+                            continue
+                        score_before_swap = final_score
+                        state = result['state']
+                        plateau_scoring = result['scoring']
+                        final_score = result['scoring']['score']
+                        improvement_count += 1
+                        weekend_repairs_accepted += 1
+                        final_plateau_repair_accepts += 1
+                        pairwise_swaps_accepted += 1
+                        phase_improvements['final_plateau_repair'] += 1
+                        plateau_improved = True
+                        accepted_weekend_swap = True
+                        final_plateau_repair_reason = 'improved'
+                        accepted_pairwise_swap_details.append({
+                            'action': 'weekend_violation_swap',
+                            'weekend_anchor_shift_instance_id': source_key[0],
+                            'weekend_violation_type': source_key[1],
+                            'left_shift_instance_id': left_pair[0],
+                            'left_physician_id': left_pair[1],
+                            'right_shift_instance_id': right_pair[0],
+                            'right_physician_id': right_pair[1],
+                            'score_before': float(score_before_swap),
+                            'score_after': float(final_score),
+                            'score_delta': float(result['score_delta']),
+                        })
+                        break
+                if not accepted_weekend_swap:
+                    break
 
         targeted_night_types = {
             'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT',
@@ -9460,7 +12784,11 @@ def optimize_schedule_version(
         if not plateau_improved and final_plateau_repair_reason != 'runtime_limit':
             final_plateau_repair_reason = (
                 'no_target_violations'
-                if not violating_workload_ids and not targeted_pairs
+                if (
+                    not violating_workload_ids
+                    and not targeted_pairs
+                    and not weekend_had_targets
+                )
                 else 'no_legal_improving_move_or_swap'
             )
         score_after_final_plateau_repair = float(final_score)
@@ -9495,6 +12823,7 @@ def optimize_schedule_version(
         if adaptive_runtime:
             observe_best(state, final_scoring)
             if search_budget.best_score is not None:
+                adaptive_continuation_started = True
                 state, final_scoring, adaptive_debug = _run_adaptive_search_rounds(
                     instances=instances, physicians=physicians,
                     initial_state=adaptive_best_state,
@@ -9505,6 +12834,7 @@ def optimize_schedule_version(
                     eligible_facilities_by_physician=eligible_facilities_by_physician,
                     minimum_rest_by_physician=minimum_rest_by_physician,
                     search_budget=search_budget, rng=rng, debug=adaptive_debug,
+                    progress_callback=progress_callback,
                 )
                 adaptive_best_state, adaptive_best_scoring = state, final_scoring
                 final_score = final_scoring['score']
@@ -9513,7 +12843,9 @@ def optimize_schedule_version(
                 source_state_restored_as_best = False
                 timed_out = False
             stopped_reason = (
-                'restart_exhausted'
+                'productivity_exhausted'
+                if adaptive_debug.get('productivity_exhausted')
+                else 'restart_exhausted'
                 if adaptive_debug.get('restart_exhausted')
                 else search_budget.reason() or 'no_complete_valid_schedule'
             )
@@ -9521,14 +12853,28 @@ def optimize_schedule_version(
             adaptive_debug['runtime_seconds'] = runtime_seconds_elapsed()
             adaptive_debug['seconds_since_improvement'] = monotonic() - search_budget.last_improvement
 
+        final_fixed_request_diagnostic = _fixed_shift_on_request_workload_floor(
+            instances,
+            physicians,
+            targets,
+            requests_by_physician_date,
+            eligible_facilities_by_physician,
+            state=state,
+            manual_assignment_only_physician_ids=manual_assignment_only_physician_ids,
+        )
+        adaptive_debug['reached_proven_score_floor'] = bool(
+            final_fixed_request_diagnostic['all_resolved_requests_satisfied']
+            and final_score <= proven_score_floor
+        )
+
         search_finished_at = monotonic()
         final_workload_range_counts = _workload_range_counts(final_scoring)
         same_shift_violations_final = len(final_scoring['same_shift_violations'])
         final_night_report = _night_violation_report(
             instances,
-            physicians,
+            scoring_physicians,
             state,
-            contract_by_physician,
+            scoring_contract_by_physician,
         )
         final_night_block_debug = _night_block_debug(
             instances,
@@ -9594,13 +12940,7 @@ def optimize_schedule_version(
             optimizer_physician_ids = [
                 physician_id
                 for physician_id in state[instance.id]
-                if (
-                    (instance.id, physician_id) not in manual_pairs
-                    or (
-                        physician_id in manual_assignment_only_physician_ids
-                        and (instance.id, physician_id) not in runless_manual_overlay_pairs
-                    )
-                )
+                if (instance.id, physician_id) not in manual_pairs
             ]
             for physician_id in optimizer_physician_ids:
                 assignment_rows.append(ScheduleShiftAssignment(
@@ -9653,12 +12993,18 @@ def optimize_schedule_version(
         unfilled_shift_count=unfilled_shift_count,
         coverage_improved_to_complete=coverage_improved_to_complete,
     )
-    completed_result = not timed_out or preserve_timeout_result
+    # Reaching a configured search boundary is a normal optimizer completion,
+    # not an execution failure.  A non-improving bounded result remains saved
+    # for comparison while the previous active run stays selected.
+    activate_result = not timed_out or preserve_timeout_result
 
     if preserve_timeout_result:
         message = 'Optimizer reached the runtime limit. Best complete improved schedule retained.'
     elif timed_out:
-        message = 'Optimizer stopped after runtime limit. Previous active run preserved.'
+        message = (
+            'Optimizer completed at the search limit without finding a better schedule. '
+            'This run was saved for comparison; the previous active run was preserved.'
+        )
     elif source_state_restored_as_best:
         message = 'Previous schedule retained; no better complete/valid result was found.'
     elif coverage_improved_to_complete:
@@ -9686,20 +13032,28 @@ def optimize_schedule_version(
         key: float(value)
         for key, value in final_scoring['breakdown'].items()
     }
-    if adaptive_runtime and completed_result:
+    if adaptive_runtime:
         total_minutes = search_budget.total_seconds / 60
         total_minutes_label = int(total_minutes) if total_minutes.is_integer() else total_minutes
         stop_label = {'stall_limit': f'{search_budget.stall_seconds:g} seconds without a new best schedule',
                       'overall_runtime_limit': f'the {total_minutes_label}-minute limit',
+                      'productivity_exhausted': 'several independently seeded search portfolios were exhausted without improvement',
                       'restart_exhausted': 'three diversified search windows without improvement',
-                      'user_stop': 'your Stop request', 'score_zero': 'score zero'}.get(stopped_reason, stopped_reason)
-        message = f'Optimizer finished after {stop_label}. Best complete valid schedule retained.'
+                      'user_stop': 'your Stop request', 'score_zero': 'score zero',
+                      'proven_score_floor': 'the proven request-compliant score floor'}.get(stopped_reason, stopped_reason)
+        if activate_result:
+            message = f'Optimizer finished after {stop_label}. Best complete valid schedule retained.'
+        else:
+            message = (
+                f'Optimizer finished after {stop_label} without finding a better schedule. '
+                'This run was saved for comparison; the previous active run was preserved.'
+            )
     final_validation = final_scoring['validation']
     final_request_rows = _request_scoring_rows(
         instances,
-        physicians,
+        scoring_physicians,
         state,
-        contract_by_physician,
+        scoring_contract_by_physician,
         requests_by_physician_date,
     )
     final_score_audit = _score_audit(
@@ -9740,6 +13094,7 @@ def optimize_schedule_version(
             'violations': final_scoring['request_violations'],
             'rewards': final_scoring['request_rewards'],
         },
+        'fixed_request_feasibility': final_fixed_request_diagnostic,
         'candidate_rest_rejections': rest_violations_blocked,
         'rest_violations_blocked': rest_violations_blocked,
             'debug': {
@@ -9749,6 +13104,19 @@ def optimize_schedule_version(
             'source_assignment_count': source_assignment_count,
             'source_assignment_count_raw': source_assignment_count_raw,
             'source_assignment_normalization': source_assignment_normalization,
+            'manual_only_optimizer_source_rows_dropped': (
+                manual_only_optimizer_source_rows_dropped
+            ),
+            'manual_only_request_assignments_seeded': (
+                manual_only_request_assignments_seeded
+            ),
+            'manual_only_request_assignments_already_present': (
+                manual_only_request_assignments_already_present
+            ),
+            'manual_only_request_optimizer_owners_displaced': (
+                manual_only_request_optimizer_owners_displaced
+            ),
+            'manual_only_request_conflicts': manual_only_request_conflicts,
             'seeded_assignment_count': len(assignments),
             'source_unique_assignment_count': len(source_visible_assignment_pairs),
             'copied_start_assignment_count': len(loaded_start_assignment_pairs),
@@ -9763,11 +13131,14 @@ def optimize_schedule_version(
             ),
             'source_state_restored_as_best': source_state_restored_as_best,
             'adaptive_runtime': adaptive_debug,
+            'fixed_request_feasibility': final_fixed_request_diagnostic,
+            'proven_score_floor': float(proven_score_floor),
+            'reached_proven_score_floor': adaptive_debug['reached_proven_score_floor'],
             'coverage_improved_to_complete': coverage_improved_to_complete,
             'source_unfilled_shift_count': source_unfilled_shift_count,
             'assignments_made_during_search': assignments_made_during_search,
             'improvements_during_search': improvements_during_search,
-            'initial_score_includes_internal_night_heuristics': True,
+            'initial_score_includes_internal_night_heuristics': False,
             'final_score_includes_internal_night_heuristics': False,
             'assignments_added_before_first_score': len(
                 assignment_pairs_added_before_first_score
@@ -9893,6 +13264,9 @@ def optimize_schedule_version(
             'pairwise_candidates_skipped_by_cap': pairwise_candidates_skipped_by_cap,
             'pairwise_best_missed_candidate_if_any': pairwise_best_missed_candidate_if_any,
             'pairwise_accepts_after_rescan': pairwise_accepts_after_rescan,
+            'weekend_repairs_attempted': weekend_repairs_attempted,
+            'weekend_repairs_accepted': weekend_repairs_accepted,
+            'weekend_repair_rescan_rounds': weekend_repair_rescan_rounds,
             'score_before_final_plateau_repair': score_before_final_plateau_repair,
             'score_after_final_plateau_repair': score_after_final_plateau_repair,
             'final_plateau_repair_reason': final_plateau_repair_reason,
@@ -10027,24 +13401,23 @@ def optimize_schedule_version(
         ),
     }
     with transaction.atomic():
-        if completed_result:
+        if activate_result:
             OptimizerRun.objects.filter(schedule_version=version, is_active=True).exclude(id=optimizer_run.id).update(is_active=False)
-        optimizer_run.status = (
-            OptimizerRun.Status.COMPLETED
-            if completed_result
-            else OptimizerRun.Status.FAILED
-        )
+        optimizer_run.status = OptimizerRun.Status.COMPLETED
         optimizer_run.initial_score = summary['initial_score']
         optimizer_run.final_score = summary['final_score']
         optimizer_run.score_breakdown = summary['score_breakdown']
         optimizer_run.optimizer_summary = summary
         optimizer_run.optimizer_debug = summary.get('debug', {})
         optimizer_run.score_is_stale = False
-        optimizer_run.is_active = completed_result
+        optimizer_run.is_active = activate_result
         if preserve_timeout_result:
             optimizer_run.notes = 'Runtime limit reached; best complete improved schedule retained.'
         elif timed_out:
-            optimizer_run.notes = 'Optimizer stopped after runtime limit. Previous active run preserved.'
+            optimizer_run.notes = (
+                'Search limit reached without improvement; run saved for comparison. '
+                'Previous active run preserved.'
+            )
         optimizer_run.save(update_fields=[
             'status',
             'initial_score',
@@ -10057,7 +13430,7 @@ def optimize_schedule_version(
             'notes',
             'score_is_stale',
         ])
-        if completed_result:
+        if activate_result:
             version.optimizer_summary = summary
             version.score_is_stale = False
             version.save(update_fields=['optimizer_summary', 'score_is_stale', 'updated_at'])

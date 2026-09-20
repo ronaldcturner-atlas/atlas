@@ -193,6 +193,51 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
             10.0,
         )
 
+    def test_manual_only_capacity_counts_only_exact_fixed_coverage(self):
+        self.instance.required_staffing = 2
+        self.instance.save(update_fields=['required_staffing'])
+        optimizer_contract, manual_contract = self.contracts
+        optimizer_contract.workload_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '0', 'max_value': '4',
+            }],
+        }
+        optimizer_contract.save(update_fields=['workload_settings'])
+        manual_contract.manual_assignment_only = True
+        manual_contract.workload_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '0', 'max_value': '100',
+            }],
+        }
+        manual_contract.save(update_fields=[
+            'manual_assignment_only', 'workload_settings', 'updated_at',
+        ])
+        fixed_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=self.instance,
+            physician=self.physicians[1],
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+
+        aggregate = self._run()['aggregate_feasibility']
+
+        self.assertEqual(aggregate['total_generated_required_hours'], 20)
+        self.assertEqual(aggregate['manual_only_fixed_hours'], 10)
+        self.assertEqual(aggregate['total_available_scheduled_hours'], 10)
+        self.assertEqual(aggregate['sum_effective_maximum_hours'], 4)
+        self.assertEqual(aggregate['status'], 'maximum_infeasible')
+
+        fixed_assignment.assignment_source = (
+            ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+        )
+        fixed_assignment.is_locked = False
+        fixed_assignment.save(update_fields=['assignment_source', 'is_locked'])
+        nonfixed_aggregate = self._run()['aggregate_feasibility']
+        self.assertEqual(nonfixed_aggregate['manual_only_fixed_hours'], 0)
+        self.assertEqual(nonfixed_aggregate['total_available_scheduled_hours'], 20)
+
     def test_aggregate_feasible(self):
         self._set_ranges(4, 6)
 

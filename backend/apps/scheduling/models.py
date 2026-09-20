@@ -99,7 +99,13 @@ class ShiftTemplate(models.Model):
         return self.generated_name()
 
     class Meta:
-        ordering = ['facility__name', 'name', 'start_time']
+        ordering = [
+            'facility__sort_order',
+            'facility__name',
+            'start_time',
+            'end_time',
+            'id',
+        ]
 
 
 class ShiftStatsGroup(models.Model):
@@ -234,11 +240,18 @@ class OptimizerRun(models.Model):
     copied_from_run = models.ForeignKey(
         'self', on_delete=models.SET_NULL, related_name='copies', null=True, blank=True,
     )
+    started_from_run = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, related_name='derived_runs', null=True, blank=True,
+    )
+    # Preserve the lineage label even if an administrator later deletes the
+    # source run.  The score itself is snapshotted in initial_score.
+    started_from_run_number = models.PositiveIntegerField(null=True, blank=True)
     run_kind = models.CharField(max_length=20, default='OPTIMIZER')
     locked_open_shift_instance_ids = models.JSONField(default=list, blank=True)
     start_mode = models.CharField(
         max_length=24, choices=StartMode.choices, default=StartMode.FRESH_FILL,
     )
+    max_runtime_seconds = models.PositiveIntegerField(default=900)
 
     def __str__(self):
         return f'{self.schedule_version_id}: Run {self.run_number}'
@@ -515,6 +528,10 @@ class OptimizerControl(models.Model):
     )
     stop_requested = models.BooleanField(default=False)
     started_at = models.DateTimeField(null=True, blank=True)
+    live_best_score = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+    )
+    progress_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 

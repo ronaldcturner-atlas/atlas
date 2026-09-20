@@ -429,7 +429,7 @@ export default function Calendar({ shiftsRefreshToken }: CalendarProps){
 
       {loadError && <div className="schedule-filter-error">{loadError}</div>}
       <div className="schedule-status-legend" aria-label="Schedule highlight legend">
-        <span className="shift-status-own">Your shift</span>
+        <span className="shift-status-own">My shifts</span>
         <span className="shift-status-posted-other">Posted by another user</span>
         <span className="shift-status-own-posted">Your posted shift</span>
         <span className="shift-status-own-pending">Your pending trade</span>

@@ -18,6 +18,9 @@ type ShiftTemplate = {
   facility: number
   name: string
   facility_name: string
+  facility_sort_order: number
+  start_time: string
+  end_time: string
   active: boolean
 }
 

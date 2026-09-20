@@ -68,6 +68,13 @@ class SearchBudgetTests(SimpleTestCase):
         self.now = 900
         self.assertEqual(self.budget.reason(), 'overall_runtime_limit')
 
+    def test_positive_proven_score_floor_finishes_search(self):
+        budget = SearchBudget(clock=lambda: 0, score_floor=80)
+        budget.observe(115, valid=True)
+        self.assertIsNone(budget.reason())
+        budget.observe(80, valid=True)
+        self.assertEqual(budget.reason(), 'proven_score_floor')
+
     def test_stall_restart_opens_new_window_without_extending_total_cap(self):
         self.now = 120
         self.assertEqual(self.budget.reason(), 'stall_limit')
@@ -178,7 +185,15 @@ class SearchControlTests(TestCase):
         self.assertFalse(OptimizerControl.objects.exists())
 
     def source(self, concentrated=False):
-        source = OptimizerRun.objects.create(schedule_version=self.version, run_number=1,
+        OptimizerRun.objects.filter(
+            schedule_version=self.version, is_active=True,
+        ).update(is_active=False)
+        run_number = (
+            OptimizerRun.objects.filter(schedule_version=self.version)
+            .order_by('-run_number').values_list('run_number', flat=True).first()
+            or 0
+        ) + 1
+        source = OptimizerRun.objects.create(schedule_version=self.version, run_number=run_number,
                                             status=OptimizerRun.Status.COMPLETED, is_active=True)
         physicians = list(ContractUserAssignment.objects.filter(domain=self.version.domain).values_list('physician_id', flat=True))
         for index, instance in enumerate(self.version.shift_instances.order_by('date')):
@@ -187,6 +202,50 @@ class SearchControlTests(TestCase):
                 assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
                 is_locked=index == 0)
         return source
+
+    def test_adaptive_search_does_not_silently_replace_selected_start_with_historical_elite(self):
+        elite = self.source(concentrated=False)
+        source = self.source(concentrated=True)
+        assignment = ContractUserAssignment.objects.filter(
+            physician__in=source.assignments.values('physician_id'),
+        ).select_related('contract').first()
+        assignment.contract.workload_settings = {
+            **(assignment.contract.workload_settings or {}),
+            'max_days_in_row': 1,
+            'max_days_in_row_penalty_weight': 100,
+        }
+        assignment.contract.save(update_fields=['workload_settings'])
+        elite_score = build_violation_report(self.version, elite)['total_score']
+        source_score = build_violation_report(self.version, source)['total_score']
+        self.assertLess(elite_score, source_score)
+        OptimizerRun.objects.filter(pk=elite.pk).update(
+            initial_score=elite_score, final_score=elite_score,
+        )
+        OptimizerRun.objects.filter(pk=source.pk).update(
+            initial_score=source_score, final_score=source_score,
+        )
+
+        def short_budget(**kwargs):
+            return SearchBudget(**kwargs, stall_seconds=.5, total_seconds=1)
+
+        with patch.object(optimizer_module, 'MAX_RUNTIME_SECONDS', 0), \
+             patch.object(optimizer_module, 'SearchBudget', side_effect=short_budget):
+            summary = optimize_schedule_version(
+                self.version,
+                source_run=source,
+                start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                seed=53,
+                adaptive_runtime=True,
+            )
+
+        archive = summary['debug']['adaptive_runtime']['elite_archive']
+        self.assertFalse(archive['enabled'])
+        self.assertIn('independent results', archive['reason'])
+        result = OptimizerRun.objects.get(pk=summary['optimizer_run_id'])
+        self.assertEqual(result.started_from_run_id, source.id)
+        self.assertEqual(result.started_from_run_number, source.run_number)
+        self.assertEqual(float(result.initial_score), source_score)
+        self.assertLessEqual(summary['final_score'], source_score)
 
     def test_stop_keeps_complete_source_and_locks(self):
         source = self.source()

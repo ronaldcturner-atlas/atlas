@@ -62,11 +62,10 @@ class GeneralizationBenchmarkTests(TestCase):
                     if runner.source:
                         self.assertEqual(source_pairs, set(assignments_for_viewed_run(version, runner.source)
                             .values_list('shift_instance_id', 'physician_id')))
+                    self.assertEqual(result.status, OptimizerRun.Status.COMPLETED)
                     if start == 'balanced':
-                        self.assertEqual(result.status, OptimizerRun.Status.COMPLETED)
                         self.assertEqual(summary['unfilled_shift_count'], 0)
                     else:
-                        self.assertEqual(result.status, OptimizerRun.Status.FAILED)
                         self.assertFalse(result.is_active)
 
     def test_matrix_covers_sizes_starts_and_incompatible_soft_limits(self):

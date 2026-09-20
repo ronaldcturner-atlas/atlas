@@ -39,6 +39,9 @@ type ShiftTemplateOption = {
   id: number
   name: string
   facility_name: string
+  facility_sort_order: number
+  start_time: string
+  end_time: string
   active_days_of_week: string[]
   weekend_days: string[]
 }
@@ -161,20 +164,27 @@ function formatDisplayDate(value: Date) {
   })
 }
 
+function isDateWithinBlock(value: string, startDate: string, endDate: string) {
+  return value >= startDate && value <= endDate
+}
+
 function getDaysForMonthGrid(monthDate: Date, minDate: Date, maxDate: Date) {
-  const first = startOfMonthUtc(monthDate)
-  const last = endOfMonthUtc(monthDate)
-  const leadingEmpty = first.getUTCDay()
+  const monthStart = startOfMonthUtc(monthDate)
+  const monthEnd = endOfMonthUtc(monthDate)
+  const first = minDate > monthStart ? minDate : monthStart
+  const last = maxDate < monthEnd ? maxDate : monthEnd
   const days: Array<{ key: string; date: Date; inRange: boolean }> = []
 
-  for (let i = 0; i < leadingEmpty; i += 1) {
+  if (first > last) {
+    return days
+  }
+
+  for (let i = 0; i < first.getUTCDay(); i += 1) {
     days.push({ key: `empty-leading-${i}`, date: first, inRange: false })
   }
 
-  for (let day = 1; day <= last.getUTCDate(); day += 1) {
-    const current = new Date(Date.UTC(monthDate.getUTCFullYear(), monthDate.getUTCMonth(), day))
-    const inRange = current >= minDate && current <= maxDate
-    days.push({ key: toIsoDateUtc(current), date: current, inRange })
+  for (let current = new Date(first.getTime()); current <= last; current = addDaysUtc(current, 1)) {
+    days.push({ key: toIsoDateUtc(current), date: current, inRange: true })
   }
 
   return days
@@ -319,6 +329,7 @@ export default function RequestBuilderView({ block }: Props) {
   useEffect(() => {
     setVisibleMonth(startOfMonthUtc(parseIsoDateToUtc(block.start_date)))
     setSelectedDate(block.start_date)
+    setBulkSelectedDates([])
     setBulkPendingDates([])
     fetchContext()
   }, [block.id, block.start_date, block.end_date, block.build_status])
@@ -326,14 +337,20 @@ export default function RequestBuilderView({ block }: Props) {
   const requestsByDateAndScope = useMemo(() => {
     const map = new Map<string, RequestItem>()
     for (const item of contextData?.requests ?? []) {
+      if (!isDateWithinBlock(item.date, block.start_date, block.end_date)) {
+        continue
+      }
       map.set(`${item.date}-${item.request_scope}`, item)
     }
     return map
-  }, [contextData])
+  }, [block.end_date, block.start_date, contextData])
 
   const visibleRequestsByDate = useMemo(() => {
     const map = new Map<string, RequestItem[]>()
     for (const item of contextData?.visible_requests ?? []) {
+      if (!isDateWithinBlock(item.date, block.start_date, block.end_date)) {
+        continue
+      }
       const current = map.get(item.date) ?? []
       current.push(item)
       map.set(item.date, current)
@@ -350,7 +367,7 @@ export default function RequestBuilderView({ block }: Props) {
     }
 
     return map
-  }, [contextData?.visible_requests])
+  }, [block.end_date, block.start_date, contextData?.visible_requests])
 
   const filteredPhysicians = useMemo(() => {
     const query = physicianSearch.trim().toLowerCase()
@@ -504,6 +521,11 @@ export default function RequestBuilderView({ block }: Props) {
       return
     }
 
+    if (!isDateWithinBlock(selectedDate, block.start_date, block.end_date)) {
+      setError('Select a date within this Schedule Block.')
+      return
+    }
+
     if (requestLimitMessage) {
       setError(requestLimitMessage)
       return
@@ -614,6 +636,9 @@ export default function RequestBuilderView({ block }: Props) {
   }
 
   const toggleBulkDate = (dateValue: string) => {
+    if (!isDateWithinBlock(dateValue, block.start_date, block.end_date)) {
+      return
+    }
     setBulkSelectedDates((current) => {
       if (current.includes(dateValue)) {
         return current.filter((value) => value !== dateValue)
@@ -630,6 +655,11 @@ export default function RequestBuilderView({ block }: Props) {
 
     if (!bulkSelectedDates.length) {
       setError('Select one or more dates for bulk requests.')
+      return
+    }
+
+    if (bulkSelectedDates.some((dateValue) => !isDateWithinBlock(dateValue, block.start_date, block.end_date))) {
+      setError('Every selected date must be within this Schedule Block.')
       return
     }
 
@@ -736,6 +766,10 @@ export default function RequestBuilderView({ block }: Props) {
         </div>
       )}
 
+      <div className="request-builder-range">
+        Request dates: {formatDisplayDate(blockStart)} through {formatDisplayDate(blockEnd)}
+      </div>
+
       <div className="request-counter-row">
         {(['HIGH', 'MEDIUM', 'LOW', 'WEEKEND'] as RequestCounterKey[]).map((key) => {
           const counter = contextData.request_counters[key]
@@ -813,10 +847,6 @@ export default function RequestBuilderView({ block }: Props) {
               const dateRequests = visibleRequestsByDate.get(dateKey) ?? []
               const isSelected = dateKey === selectedDate
               const isBulkPending = patternMode === 'SELECTED' && bulkPendingDates.includes(dateKey)
-
-              if (!cell.key.startsWith('empty-leading-') && !cell.inRange) {
-                return <div key={cell.key} className="request-day-cell request-day-cell-disabled" />
-              }
 
               if (cell.key.startsWith('empty-leading-')) {
                 return <div key={cell.key} className="request-day-cell request-day-cell-empty" />

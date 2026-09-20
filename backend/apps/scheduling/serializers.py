@@ -8,6 +8,7 @@ from apps.accounts.models import Physician
 from apps.facilities.models import Facility
 
 from .models import (
+    OptimizerControl,
     OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
@@ -85,6 +86,7 @@ class ShiftSerializer(serializers.ModelSerializer):
 
 class ShiftTemplateSerializer(serializers.ModelSerializer):
     facility_name = serializers.CharField(source='facility.name', read_only=True)
+    facility_sort_order = serializers.IntegerField(source='facility.sort_order', read_only=True)
     name = serializers.SerializerMethodField()
 
     class Meta:
@@ -93,6 +95,7 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
             'id',
             'facility',
             'facility_name',
+            'facility_sort_order',
             'name',
             'start_time',
             'end_time',
@@ -102,7 +105,7 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
             'default_staffing_count',
             'active',
         ]
-        read_only_fields = ['id', 'facility_name', 'name']
+        read_only_fields = ['id', 'facility_name', 'facility_sort_order', 'name']
 
     def _format_template_time(self, time_value):
         hour_24 = time_value.hour
@@ -351,6 +354,22 @@ class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
 class OptimizerRunSerializer(serializers.ModelSerializer):
     schedule_version_name = serializers.CharField(source='schedule_version.name', read_only=True)
     copied_from_run_number = serializers.IntegerField(source='copied_from_run.run_number', read_only=True)
+    started_at = serializers.SerializerMethodField()
+    live_best_score = serializers.SerializerMethodField()
+
+    def get_started_at(self, obj):
+        try:
+            control = obj.control
+        except OptimizerControl.DoesNotExist:
+            return None
+        return control.started_at
+
+    def get_live_best_score(self, obj):
+        try:
+            control = obj.control
+        except OptimizerControl.DoesNotExist:
+            return None
+        return control.live_best_score
 
     class Meta:
         model = OptimizerRun
@@ -360,6 +379,8 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'schedule_version_name',
             'run_number',
             'created_at',
+            'started_at',
+            'live_best_score',
             'created_by',
             'status',
             'seed',
@@ -373,9 +394,12 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'score_is_stale',
             'copied_from_run',
             'copied_from_run_number',
+            'started_from_run',
+            'started_from_run_number',
             'run_kind',
             'locked_open_shift_instance_ids',
             'start_mode',
+            'max_runtime_seconds',
         ]
         read_only_fields = fields
 
@@ -386,6 +410,22 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
         source='copied_from_run.run_number', read_only=True,
     )
     runtime_seconds = serializers.SerializerMethodField()
+    started_at = serializers.SerializerMethodField()
+    live_best_score = serializers.SerializerMethodField()
+
+    def get_started_at(self, obj):
+        try:
+            control = obj.control
+        except OptimizerControl.DoesNotExist:
+            return None
+        return control.started_at
+
+    def get_live_best_score(self, obj):
+        try:
+            control = obj.control
+        except OptimizerControl.DoesNotExist:
+            return None
+        return control.live_best_score
 
     def get_runtime_seconds(self, obj):
         annotated_runtime = getattr(obj, 'runtime_seconds_value', None)
@@ -397,11 +437,15 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = OptimizerRun
         fields = [
-            'id', 'schedule_version', 'run_number', 'created_at', 'status', 'seed',
+            'id', 'schedule_version', 'run_number', 'created_at', 'started_at',
+            'live_best_score', 'status', 'seed',
             'initial_score', 'final_score', 'is_active', 'score_is_stale',
             'copied_from_run', 'copied_from_run_number', 'run_kind',
+            'started_from_run', 'started_from_run_number',
             'locked_open_shift_instance_ids', 'start_mode',
+            'max_runtime_seconds',
             'runtime_seconds',
+            'notes',
         ]
         read_only_fields = fields
 
@@ -546,13 +590,23 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
         return obj.physician.display_name or obj.physician.user.get_full_name() or obj.physician.user.username
 
     def get_shift_template_details(self, obj):
+        templates = sorted(
+            obj.shift_templates.all(),
+            key=lambda template: (
+                template.facility.sort_order,
+                template.facility.name,
+                template.start_time,
+                template.end_time,
+                template.id,
+            ),
+        )
         return [
             {
                 'id': template.id,
                 'name': template.generated_name(),
                 'facility_name': template.facility.name,
             }
-            for template in obj.shift_templates.all()
+            for template in templates
         ]
 
 

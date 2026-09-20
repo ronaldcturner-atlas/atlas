@@ -101,12 +101,50 @@ class RequestScoringTests(SimpleTestCase):
             ),
             [],
         )
+
+    def test_zero_weight_request_on_does_not_consume_repair_candidates(self):
+        shift_date = date(2027, 2, 8)
+        template = SimpleNamespace(
+            id=13, generated_name=lambda: 'MCMP 7p-7a',
+        )
+        instance = SimpleNamespace(
+            id=80, date=shift_date, shift_template_id=template.id,
+        )
+        request = SimpleNamespace(
+            id=81,
+            physician_id=2,
+            physician=SimpleNamespace(id=2, display_name='Zero Weight'),
+            date=shift_date,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            request_scope=ScheduleRequest.RequestScope.USER,
+            weight=ScheduleRequest.Weight.HIGH,
+            shift_templates=FakeRelatedManager([template]),
+        )
+        requests = {(2, shift_date): [request]}
+        zero_weight_contract = SimpleNamespace(request_settings={
+            'weight_high': '',
+        })
+        state = defaultdict(list, {instance.id: [1]})
+
+        self.assertEqual(
+            _request_on_repair_candidates(
+                [instance], state, set(), {2: zero_weight_contract}, requests,
+            ),
+            [],
+        )
+        self.assertEqual(
+            _request_repair_candidates(
+                [instance], [SimpleNamespace(id=2, display_name='Zero Weight')], state, set(),
+                {2: zero_weight_contract}, requests,
+            ),
+            [],
+        )
         self.assertEqual(
             _request_on_repair_candidates(
                 [instance], state, set(),
                 {2: self.contract}, {(2, shift_date): [request]},
             ),
-            [],
+            [(2, 1, 80)],
         )
 
     def test_fixed_request_on_outranks_lower_soft_penalty(self):

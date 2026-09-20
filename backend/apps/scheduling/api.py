@@ -68,6 +68,18 @@ from .workload_feasibility import build_workload_feasibility
 
 
 STALE_OPTIMIZER_RUN_MINUTES = 10
+SHIFT_TEMPLATE_DISPLAY_ORDER = (
+    'facility__sort_order',
+    'facility__name',
+    'start_time',
+    'end_time',
+    'id',
+)
+
+
+def _ordered_shift_templates(queryset=None):
+    queryset = queryset if queryset is not None else ShiftTemplate.objects.all()
+    return queryset.select_related('facility').order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
 
 
 def _timezone_from_name(timezone_name):
@@ -879,7 +891,7 @@ def shift_detail(request, shift_id):
 @permission_classes([IsAuthenticated])
 def shift_templates_list_create(request):
     if request.method == 'GET':
-        templates = ShiftTemplate.objects.select_related('facility').all()
+        templates = _ordered_shift_templates()
 
         facility_id = request.query_params.get('facility')
         active_filter = request.query_params.get('active')
@@ -1148,7 +1160,7 @@ def _get_request_policy(physician, can_manage=False):
 
 def _get_available_shift_templates_for_date(target_date, eligible_facility_ids=None):
     day_name = target_date.strftime('%A')
-    templates = ShiftTemplate.objects.select_related('facility').filter(active=True)
+    templates = _ordered_shift_templates(ShiftTemplate.objects.filter(active=True))
     if eligible_facility_ids is not None:
         templates = templates.filter(facility_id__in=eligible_facility_ids)
     return [template for template in templates if day_name in (template.active_days_of_week or [])]
@@ -1180,6 +1192,8 @@ def _build_request_counters(block, physician, policy, exclude_request_ids=None):
             schedule_block=block,
             physician=physician,
             request_scope=ScheduleRequest.RequestScope.USER,
+            date__gte=block.start_date,
+            date__lte=block.end_date,
         )
         .exclude(id__in=exclude_request_ids)
         .prefetch_related('shift_templates__facility')
@@ -1304,7 +1318,11 @@ def _validate_request_payload(request_type, weight, shift_template_ids, availabl
 def schedule_block_requests_list(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
     requests = (
-        ScheduleRequest.objects.filter(schedule_block=block)
+        ScheduleRequest.objects.filter(
+            schedule_block=block,
+            date__gte=block.start_date,
+            date__lte=block.end_date,
+        )
         .select_related('physician__user')
         .prefetch_related('shift_templates__facility')
     )
@@ -1357,6 +1375,8 @@ def schedule_block_requests_context(request, block_id):
         ScheduleRequest.objects.filter(
             schedule_block=block,
             physician_id=selected_physician_id,
+            date__gte=block.start_date,
+            date__lte=block.end_date,
         )
         .select_related('physician__user')
         .prefetch_related('shift_templates__facility')
@@ -1373,14 +1393,18 @@ def schedule_block_requests_context(request, block_id):
     policy = _get_request_policy(selected_physician, can_manage) if selected_physician else None
 
     visible_requests = (
-        ScheduleRequest.objects.filter(schedule_block=block)
+        ScheduleRequest.objects.filter(
+            schedule_block=block,
+            date__gte=block.start_date,
+            date__lte=block.end_date,
+        )
         .select_related('physician__user')
         .prefetch_related('shift_templates__facility')
         if can_manage
         else request_items
     )
 
-    templates = ShiftTemplate.objects.select_related('facility').filter(active=True)
+    templates = _ordered_shift_templates(ShiftTemplate.objects.filter(active=True))
     if policy and policy['eligible_facility_ids'] is not None:
         templates = templates.filter(facility_id__in=policy['eligible_facility_ids'])
 
@@ -1554,6 +1578,8 @@ def schedule_block_request_detail(request, block_id, request_id):
         ScheduleRequest.objects.select_related('physician__user').prefetch_related('shift_templates__facility'),
         id=request_id,
         schedule_block=block,
+        date__gte=block.start_date,
+        date__lte=block.end_date,
     )
 
     can_manage = _can_manage_requests(request.user)
@@ -1803,8 +1829,12 @@ def _mark_schedule_score_stale(version, viewed_run=None):
 
 
 def _cleanup_stale_optimizer_runs(version):
-    if OptimizerControl.objects.filter(schedule_version=version,
-                                       created_at__gte=timezone.now() - timedelta(minutes=15)).exists():
+    # A control row means the background worker owns this run. Do not attempt
+    # to update the same OptimizerRun row while optimize_schedule_version holds
+    # its transaction lock: that made the build workspace wait indefinitely
+    # when a search overran. The enqueue path separately removes controls older
+    # than 15 minutes before deciding whether a new run may start.
+    if OptimizerControl.objects.filter(schedule_version=version).exists():
         return 0
     stale_before = timezone.now() - timedelta(minutes=STALE_OPTIMIZER_RUN_MINUTES)
     stale_runs = OptimizerRun.objects.filter(
@@ -1983,7 +2013,7 @@ def schedule_block_build_context(request, block_id):
             'optimizer_runs': (
                 OptimizerRunHistorySerializer(
                     selected_version.optimizer_runs
-                    .select_related('copied_from_run')
+                    .select_related('copied_from_run', 'control')
                     .annotate(runtime_seconds_value=Cast('optimizer_summary__runtime_seconds', FloatField()))
                     .defer('optimizer_summary', 'optimizer_debug', 'score_breakdown')
                     .order_by('-run_number'),
@@ -2107,6 +2137,21 @@ def _parse_optimizer_seed(request):
         return None, {'seed': 'seed must be an integer.'}
 
 
+def _parse_optimizer_max_runtime_seconds(request):
+    if 'max_runtime_minutes' not in request.data:
+        return None, None
+    value = request.data.get('max_runtime_minutes')
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None, {'max_runtime_minutes': 'Maximum runtime must be a whole number of minutes.'}
+    if str(value).strip() != str(minutes):
+        return None, {'max_runtime_minutes': 'Maximum runtime must be a whole number of minutes.'}
+    if not 1 <= minutes <= 240:
+        return None, {'max_runtime_minutes': 'Maximum runtime must be between 1 and 240 minutes.'}
+    return minutes * 60, None
+
+
 def _optimizer_start_options(request, version):
     start_mode = request.data.get('start_mode', OptimizerRun.StartMode.FRESH_FILL)
     if start_mode not in OptimizerRun.StartMode.values:
@@ -2129,6 +2174,9 @@ def _run_optimizer_response(request, version):
     seed, seed_error = _parse_optimizer_seed(request)
     if seed_error:
         return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    max_runtime_seconds, runtime_error = _parse_optimizer_max_runtime_seconds(request)
+    if runtime_error:
+        return Response(runtime_error, status=status.HTTP_400_BAD_REQUEST)
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
@@ -2145,8 +2193,11 @@ def _run_optimizer_response(request, version):
             token = UUID(str(token))
         except ValueError:
             return Response({'detail': 'Invalid search token.'}, status=400)
-        OptimizerControl.objects.filter(schedule_version=version,
-                                        created_at__lt=timezone.now() - timedelta(minutes=15)).delete()
+        OptimizerControl.objects.filter(
+            schedule_version=version,
+            started_at__isnull=True,
+            created_at__lt=timezone.now() - timedelta(minutes=15),
+        ).delete()
         try:
             with transaction.atomic():
                 control = OptimizerControl.objects.create(token=token, schedule_version=version, created_by=request.user)
@@ -2167,6 +2218,7 @@ def _run_optimizer_response(request, version):
         summary = optimize_schedule_version(
             version, created_by=request.user, seed=seed,
             start_mode=start_mode, source_run=source_run,
+            max_runtime_seconds=max_runtime_seconds,
             adaptive_runtime=control is not None, stop_requested=stop_requested,
         )
     except ValueError as optimizer_error:
@@ -2249,6 +2301,9 @@ def schedule_version_run_optimizer(request, version_id):
     seed, seed_error = _parse_optimizer_seed(request)
     if seed_error:
         return Response(seed_error, status=status.HTTP_400_BAD_REQUEST)
+    max_runtime_seconds, runtime_error = _parse_optimizer_max_runtime_seconds(request)
+    if runtime_error:
+        return Response(runtime_error, status=status.HTTP_400_BAD_REQUEST)
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
@@ -2267,6 +2322,7 @@ def schedule_version_run_optimizer(request, version_id):
         return Response({'detail': 'Invalid search token.'}, status=400)
     OptimizerControl.objects.filter(
         schedule_version=version,
+        started_at__isnull=True,
         created_at__lt=timezone.now() - timedelta(minutes=15),
     ).delete()
     try:
@@ -2297,6 +2353,24 @@ def schedule_version_run_optimizer(request, version_id):
                 status=OptimizerRun.Status.RUNNING,
                 seed=seed if seed is not None else secrets.randbits(63),
                 start_mode=start_mode,
+                started_from_run=(
+                    source_run
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    else None
+                ),
+                started_from_run_number=(
+                    source_run.run_number
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    and source_run is not None
+                    else None
+                ),
+                initial_score=(
+                    source_run.final_score
+                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                    and source_run is not None
+                    else None
+                ),
+                max_runtime_seconds=max_runtime_seconds or 15 * 60,
                 run_kind='OPTIMIZER',
                 locked_open_shift_instance_ids=locked_open_ids,
             )
@@ -2687,7 +2761,33 @@ def schedule_version_violation_report(request, version_id):
         id=version_id,
     )
     optimizer_run = _get_optimizer_run_for_version(version, request.query_params.get('optimizer_run_id'))
-    return Response(build_violation_report(version, optimizer_run=optimizer_run))
+    report = build_violation_report(version, optimizer_run=optimizer_run)
+    report['requests'] = []
+
+    requested_physician_id = request.query_params.get('physician_id')
+    if requested_physician_id:
+        try:
+            requested_physician_id = int(requested_physician_id)
+        except (TypeError, ValueError):
+            return Response(
+                {'physician_id': 'physician_id must be a valid integer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        get_object_or_404(Physician, id=requested_physician_id)
+        request_items = (
+            ScheduleRequest.objects.filter(
+                schedule_block=version.schedule_block,
+                physician_id=requested_physician_id,
+                date__gte=version.schedule_block.start_date,
+                date__lte=version.schedule_block.end_date,
+            )
+            .select_related('physician__user')
+            .prefetch_related('shift_templates__facility')
+        )
+        report['requests'] = ScheduleRequestSerializer(request_items, many=True).data
+
+    return Response(report)
 
 
 @api_view(['GET'])
@@ -3297,7 +3397,7 @@ def schedule_block_generate_shift_instances(request, block_id):
         templates = list(
             ShiftTemplate.objects.filter(active=True, facility__active=True)
             .select_related('facility')
-            .order_by('facility__name', 'start_time', 'id')
+            .order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
         )
         template_fingerprint = _shift_template_fingerprint(block, templates)
         if version.shift_template_fingerprint == template_fingerprint:

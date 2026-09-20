@@ -16,7 +16,7 @@ type PublishedShift = {
 }
 
 type StatsGroup = { id: number; name: string; shift_template_ids: number[] }
-type ShiftTemplateOption = { id: number; name: string; facility_name: string; start_time: string; active: boolean }
+type ShiftTemplateOption = { id: number; name: string; facility_name: string; facility_sort_order: number; start_time: string; end_time: string; active: boolean }
 
 function csrfToken() {
   return document.cookie.split(';').map((value) => value.trim()).find((value) => value.startsWith('csrftoken='))?.slice(10) ?? ''

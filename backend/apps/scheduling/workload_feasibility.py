@@ -23,8 +23,37 @@ def _number(value):
     return float(value) if value is not None else None
 
 
-def _request_off_feasibility(instances, contract_assignments, schedule_requests):
+def _manual_only_fixed_coverage_by_instance(
+    instances, visible_assignments, manual_only_physician_ids,
+):
+    """Return capped fixed coverage supplied by manual-only physicians."""
+    instance_by_id = {instance.id: instance for instance in instances}
+    physicians_by_instance = defaultdict(set)
+    for assignment in visible_assignments:
+        if (
+            assignment.physician_id in manual_only_physician_ids
+            and assignment.assignment_source
+            == ScheduleShiftAssignment.AssignmentSource.MANUAL
+            and assignment.is_locked
+            and assignment.shift_instance_id in instance_by_id
+        ):
+            physicians_by_instance[assignment.shift_instance_id].add(
+                assignment.physician_id
+            )
+    return {
+        instance_id: min(
+            len(physician_ids), instance_by_id[instance_id].required_staffing,
+        )
+        for instance_id, physician_ids in physicians_by_instance.items()
+    }
+
+
+def _request_off_feasibility(
+    instances, contract_assignments, schedule_requests,
+    manual_only_fixed_coverage=None,
+):
     """Find dates that cannot cover concurrent slots if requests off are honored."""
+    manual_only_fixed_coverage = manual_only_fixed_coverage or {}
     instances_by_date = defaultdict(list)
     for instance in instances:
         instances_by_date[instance.date].append(instance)
@@ -32,6 +61,8 @@ def _request_off_feasibility(instances, contract_assignments, schedule_requests)
     physicians = {}
     eligible_facilities = {}
     for assignment in contract_assignments:
+        if assignment.contract.manual_assignment_only:
+            continue
         physician = assignment.physician
         physicians[physician.id] = physician
         eligible_facilities[physician.id] = {
@@ -60,7 +91,12 @@ def _request_off_feasibility(instances, contract_assignments, schedule_requests)
     def maximum_slot_matching(active_instances):
         slots = []
         for instance in active_instances:
-            slots.extend([instance] * instance.required_staffing)
+            remaining_staffing = max(
+                instance.required_staffing
+                - manual_only_fixed_coverage.get(instance.id, 0),
+                0,
+            )
+            slots.extend([instance] * remaining_staffing)
         candidates_by_slot = [
             [
                 physician_id for physician_id in physicians
@@ -145,8 +181,9 @@ def _request_off_feasibility(instances, contract_assignments, schedule_requests)
         ),
         'scope_note': (
             'Honors all day-off and shift-off requests regardless of request weight and accounts for facility '
-            'eligibility and overlapping shifts. It does not include rest rules, workload limits, or other '
-            'cross-date constraints.'
+            'eligibility, overlapping shifts, and exact fixed coverage from manual-only physicians. '
+            'Manual-only physicians are not treated as available for other shifts. It does not include rest '
+            'rules, workload limits, or other cross-date constraints.'
         ),
     }
 
@@ -472,6 +509,10 @@ def _assignment_accounting(version, instances, optimizer_run):
 
 def _night_feasibility(version, instances, contract_assignments, optimizer_run):
     night_instances = [instance for instance in instances if instance.shift_template.night_shift]
+    optimizer_contract_assignments = [
+        assignment for assignment in contract_assignments
+        if not assignment.contract.manual_assignment_only
+    ]
     fixed_assignments = list(
         assignments_for_viewed_run(version, optimizer_run)
         .filter(
@@ -481,9 +522,25 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
         )
         .select_related('shift_instance')
     )
+    fixed_physicians_by_instance = defaultdict(set)
+    night_instance_by_id = {instance.id: instance for instance in night_instances}
+    for assignment in fixed_assignments:
+        if assignment.shift_instance_id in night_instance_by_id:
+            fixed_physicians_by_instance[assignment.shift_instance_id].add(
+                assignment.physician_id
+            )
+
+    def fixed_coverage(window_instances):
+        return sum(
+            min(
+                len(fixed_physicians_by_instance.get(instance.id, set())),
+                instance.required_staffing,
+            )
+            for instance in window_instances
+        )
     period_types = {
         rule.get('period_type') or 'SCHEDULE_BLOCK'
-        for assignment in contract_assignments
+        for assignment in optimizer_contract_assignments
         for rule in _unique_night_period_rules(
             assignment.contract.night_settings
             if isinstance(assignment.contract.night_settings, dict) else {}
@@ -504,7 +561,7 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
         )
 
     physician_constraints = {}
-    for contract_assignment in contract_assignments:
+    for contract_assignment in optimizer_contract_assignments:
         rules = _unique_night_period_rules(
             contract_assignment.contract.night_settings
             if isinstance(contract_assignment.contract.night_settings, dict) else {}
@@ -578,17 +635,14 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
                 if window_start <= instance.date <= window_end
             ]
             required = sum(instance.required_staffing for instance in window_instances)
-            fixed = [
-                assignment for assignment in fixed_assignments
-                if window_start <= assignment.shift_instance.date <= window_end
-            ]
-            remaining = max(required - len(fixed), 0)
+            window_fixed_coverage = fixed_coverage(window_instances)
+            remaining = max(required - window_fixed_coverage, 0)
             total_minimum = Decimal('0')
             total_maximum = Decimal('0')
             maximum_unbounded = False
             fixed_limit_violations = []
             overlapping_rule_conflicts = []
-            for contract_assignment in contract_assignments:
+            for contract_assignment in optimizer_contract_assignments:
                 constraints = physician_constraints[contract_assignment.physician_id]
                 if not constraints:
                     maximum_unbounded = True
@@ -633,7 +687,7 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
                 'period_start': window_start.isoformat(),
                 'period_end': window_end.isoformat(),
                 'required_night_shifts': required,
-                'fixed_manual_night_shifts': len(fixed),
+                'fixed_manual_night_shifts': window_fixed_coverage,
                 'remaining_night_shifts': remaining,
                 'remaining_minimum_night_shifts': _number(total_minimum),
                 'remaining_maximum_night_shifts': _number(bounded_maximum),
@@ -644,9 +698,13 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
             })
     return {
         'status': 'penalty_unavoidable' if any(row['status'] != 'feasible' for row in rows) else 'feasible',
-        'fixed_manual_night_shifts': len(fixed_assignments),
+        'fixed_manual_night_shifts': fixed_coverage(night_instances),
         'periods': rows,
-        'scope_note': 'Only locked manual night assignments are treated as fixed. Eligibility, rest, and exact night-block patterns are not included.',
+        'scope_note': (
+            'Locked manual night assignments, including manual-only physicians, are treated as fixed coverage. '
+            'Manual-only physicians contribute no additional night capacity. Eligibility, rest, and exact '
+            'night-block patterns are not included.'
+        ),
     }
 
 
@@ -873,13 +931,48 @@ def build_workload_feasibility(
         .prefetch_related('contract__facilities')
         .order_by('physician__display_name', 'physician__user__last_name', 'physician_id')
     )
-    physician_count = len(contract_assignments)
-    default_hours = available_hours / physician_count if physician_count else Decimal('0')
-    default_shifts = Decimal(required_slots) / physician_count if physician_count else Decimal('0')
+    manual_only_physician_ids = {
+        assignment.physician_id
+        for assignment in contract_assignments
+        if assignment.contract.manual_assignment_only
+    }
+    optimizer_contract_assignments = [
+        assignment for assignment in contract_assignments
+        if assignment.physician_id not in manual_only_physician_ids
+    ]
 
     detailed_run = optimizer_run if include_individual_diagnostics else None
     assignment_accounting, assignments = _assignment_accounting(
         version, instances, detailed_run,
+    )
+    visible_assignments = list(
+        assignments_for_viewed_run(version, optimizer_run)
+        .select_related('shift_instance__shift_template', 'physician__user')
+    )
+    manual_only_fixed_coverage = _manual_only_fixed_coverage_by_instance(
+        instances, visible_assignments, manual_only_physician_ids,
+    )
+    manual_only_fixed_hours = sum(
+        (
+            _shift_hours(instance)
+            * manual_only_fixed_coverage.get(instance.id, 0)
+            for instance in instances
+        ),
+        Decimal('0'),
+    )
+    manual_only_fixed_slots = sum(manual_only_fixed_coverage.values())
+    optimizer_required_hours = max(
+        available_hours - manual_only_fixed_hours, Decimal('0'),
+    )
+    optimizer_required_slots = max(required_slots - manual_only_fixed_slots, 0)
+    physician_count = len(optimizer_contract_assignments)
+    default_hours = (
+        optimizer_required_hours / physician_count
+        if physician_count else Decimal('0')
+    )
+    default_shifts = (
+        Decimal(optimizer_required_slots) / physician_count
+        if physician_count else Decimal('0')
     )
     assigned_instances = defaultdict(list)
     if detailed_run is not None:
@@ -904,7 +997,7 @@ def build_workload_feasibility(
     aggregate_max_unbounded = False
     physicians_without_hour_ranges = []
 
-    for contract_assignment in contract_assignments:
+    for contract_assignment in optimizer_contract_assignments:
         physician = contract_assignment.physician
         contract = contract_assignment.contract
         target = _version_contract_target(version, physician.id, contract, default_hours, default_shifts)
@@ -1004,10 +1097,10 @@ def build_workload_feasibility(
         physician_rows.append(physician_row)
 
     total_max = None if aggregate_max_unbounded else aggregate_max
-    if available_hours < aggregate_min:
+    if optimizer_required_hours < aggregate_min:
         status = 'minimum_infeasible'
         interpretation = 'Minimum requirements are collectively infeasible.'
-    elif total_max is not None and available_hours > total_max:
+    elif total_max is not None and optimizer_required_hours > total_max:
         status = 'maximum_infeasible'
         interpretation = 'Maximum requirements are collectively infeasible.'
     else:
@@ -1040,7 +1133,7 @@ def build_workload_feasibility(
     adjustment_preview = _fte_adjustment_preview(
         status,
         physician_rows,
-        available_hours,
+        optimizer_required_hours,
         aggregate_min,
         total_max,
     )
@@ -1060,6 +1153,7 @@ def build_workload_feasibility(
     )
     request_off_feasibility = _request_off_feasibility(
         instances, contract_assignments, request_off_rows,
+        manual_only_fixed_coverage,
     )
     if adjustment_preview:
         groups = defaultdict(lambda: {'physician_count': 0})
@@ -1117,10 +1211,17 @@ def build_workload_feasibility(
         'aggregate_feasibility': {
             'sum_effective_minimum_hours': _number(aggregate_min),
             'sum_effective_maximum_hours': _number(total_max),
-            'total_available_scheduled_hours': _number(available_hours),
-            'available_minus_total_minimum': _number(available_hours - aggregate_min),
+            'total_available_scheduled_hours': _number(optimizer_required_hours),
+            'total_generated_required_hours': _number(available_hours),
+            'manual_only_fixed_hours': _number(manual_only_fixed_hours),
+            'manual_only_fixed_shift_slots': manual_only_fixed_slots,
+            'manual_only_physician_count': len(manual_only_physician_ids),
+            'available_minus_total_minimum': _number(
+                optimizer_required_hours - aggregate_min
+            ),
             'total_maximum_minus_available': (
-                _number(total_max - available_hours) if total_max is not None else None
+                _number(total_max - optimizer_required_hours)
+                if total_max is not None else None
             ),
             'status': status,
             'interpretation': interpretation,

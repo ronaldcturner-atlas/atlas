@@ -107,6 +107,7 @@ type OptimizerSummary = {
     invalid_assignment_score?: number
     consecutive_days_score?: number
     same_shift_score?: number
+    shift_rule_score?: number
     night_score?: number
     weekend_score?: number
     facility_distribution_score?: number
@@ -148,6 +149,8 @@ type OptimizerRun = {
   schedule_version: number
   run_number: number
   created_at: string
+  started_at?: string | null
+  live_best_score?: string | number | null
   status: 'RUNNING' | 'COMPLETED' | 'FAILED'
   seed: number | string | null
   initial_score: string | number | null
@@ -156,12 +159,16 @@ type OptimizerRun = {
   score_is_stale: boolean
   copied_from_run: number | null
   copied_from_run_number: number | null
+  started_from_run: number | null
+  started_from_run_number: number | null
   run_kind: 'OPTIMIZER' | 'COPY' | 'BENCHMARK'
   locked_open_shift_instance_ids: number[]
   start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
+  max_runtime_seconds: number
   runtime_seconds?: number | null
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
+  notes?: string | null
 }
 
 type CalendarViolation = {
@@ -173,12 +180,27 @@ type CalendarViolation = {
   explanation: string
 }
 
+type CalendarRequest = {
+  id: number
+  physician: number
+  date: string
+  request_scope: 'USER' | 'ADMIN'
+  request_type: 'DAY_OFF' | 'SHIFT_OFF' | 'DAY_ON' | 'SHIFT_ON'
+  weight: 'LOW' | 'MEDIUM' | 'HIGH' | 'FIXED'
+  shift_template_details: Array<{
+    id: number
+    name: string
+    facility_name: string
+  }>
+}
+
 type ViolationReport = {
   users: Array<{
     user_id: number
     display_name: string
     violations: CalendarViolation[]
   }>
+  requests?: CalendarRequest[]
 }
 
 type PopoverPosition = {
@@ -210,6 +232,10 @@ type BuildContext = {
     sum_effective_minimum_hours: number
     sum_effective_maximum_hours: number | null
     total_available_scheduled_hours: number
+    total_generated_required_hours: number
+    manual_only_fixed_hours: number
+    manual_only_fixed_shift_slots: number
+    manual_only_physician_count: number
     available_minus_total_minimum: number
     total_maximum_minus_available: number | null
     status: 'minimum_infeasible' | 'maximum_infeasible' | 'aggregate_feasible'
@@ -329,6 +355,13 @@ function formatDate(value: string) {
   })
 }
 
+function readableRequestType(value: CalendarRequest['request_type']) {
+  return value
+    .split('_')
+    .map((part) => part.charAt(0) + part.slice(1).toLowerCase())
+    .join(' ')
+}
+
 function formatTimestamp(value: string) {
   return new Date(value).toLocaleString('en-US', {
     month: 'short',
@@ -364,28 +397,40 @@ function optimizerRunStatusLabel(run: OptimizerRun) {
 function optimizerRunScoreLabel(run: OptimizerRun) {
   if (!isCompletedOptimizerRun(run)) {
     return run.final_score === null || run.final_score === undefined
-      ? 'No completed score'
-      : `${formatScore(run.final_score)} partial score`
+      ? 'No final penalty'
+      : `${formatScore(run.final_score)} partial penalty`
   }
-  return `${formatScore(run.final_score)} final score`
+  return `Final penalty ${formatScore(run.final_score)}`
 }
 
 function optimizerRunLabel(run: OptimizerRun) {
   const copyLabel = run.copied_from_run_number ? ` - Copy of Run ${run.copied_from_run_number}` : ''
-  const startLabel = run.start_mode === 'CURRENT_SCHEDULE' ? 'Current schedule' : 'Fresh fill'
+  const startLabel = run.start_mode === 'CURRENT_SCHEDULE'
+    ? run.started_from_run_number
+      ? `Started from Run ${run.started_from_run_number}`
+      : 'Started from current schedule'
+    : 'Fresh fill'
   const runtimeLabel = run.runtime_seconds == null
     ? ''
     : ` - total time ${formatRuntimeMinutes(run.runtime_seconds)}`
   if (!isCompletedOptimizerRun(run)) {
     return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
   }
-  return `Run ${run.run_number}${copyLabel} - ${startLabel} - ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${copyLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
 }
 
 function formatRuntimeMinutes(runtimeSeconds: number) {
   const minutes = runtimeSeconds / 60
   const displayed = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1)
   return `${displayed} ${minutes === 1 ? 'minute' : 'minutes'}`
+}
+
+function formatElapsedTime(totalSeconds: number) {
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const minuteSeconds = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  return hours > 0 ? `${hours}:${minuteSeconds}` : minuteSeconds
 }
 
 function workloadRangeLabel(range: OptimizerSummary['workload_summary'][number]['effective_workload_range']) {
@@ -505,7 +550,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isStoppingOptimizer, setIsStoppingOptimizer] = useState(false)
   const optimizerControlRef = useRef<{ versionId: number; runId: number } | null>(null)
   const [optimizerPollingRunId, setOptimizerPollingRunId] = useState<number | null>(null)
+  const [optimizerStartedAt, setOptimizerStartedAt] = useState<string | null>(null)
+  const [optimizerElapsedSeconds, setOptimizerElapsedSeconds] = useState(0)
+  const [optimizerLiveBestScore, setOptimizerLiveBestScore] = useState<string | number | null>(null)
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
+  const [optimizerMaxRuntimeMinutes, setOptimizerMaxRuntimeMinutes] = useState(15)
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
   const [isMovingBackToBuild, setIsMovingBackToBuild] = useState(false)
@@ -616,14 +665,15 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     const rows = [
       ['run id', optimizerSummary.optimizer_run_id ?? selectedOptimizerRunId ?? ''],
       ['seed', optimizerSummary.seed ?? debug.seed ?? ''],
-      ['initial score', optimizerSummary.initial_score ?? optimizerSummary.total_score],
-      ['final score', optimizerSummary.final_score ?? optimizerSummary.total_score],
+      ['starting penalty', optimizerSummary.initial_score ?? optimizerSummary.total_score],
+      ['final penalty', optimizerSummary.final_score ?? optimizerSummary.total_score],
       ['iterations', optimizerSummary.iterations_run ?? 0],
       ['runtime seconds', optimizerSummary.runtime_seconds ?? debug.runtime_seconds ?? ''],
       ['request score', breakdown.request_score ?? 0],
       ['workload score', breakdown.workload_score ?? 0],
       ['night score', breakdown.night_score ?? 0],
       ['same shift score', breakdown.same_shift_score ?? 0],
+      ['shift rule score', breakdown.shift_rule_score ?? 0],
       ['coverage score', breakdown.coverage_score ?? 0],
       ['rest / overlap score', `${breakdown.rest_score ?? 0} / ${breakdown.overlap_score ?? 0}`],
       ['unfilled shifts', optimizerSummary.unfilled_shift_count],
@@ -731,9 +781,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           runId: runningRun.id,
         }
         setOptimizerPollingRunId(runningRun.id)
+        setOptimizerStartedAt(runningRun.started_at ?? null)
+        setOptimizerLiveBestScore(runningRun.live_best_score ?? null)
+        setOptimizerMaxRuntimeMinutes(Math.max(
+          1,
+          Math.round(runningRun.max_runtime_seconds / 60),
+        ))
+        setOptimizerStartMode(runningRun.start_mode)
       } else {
         optimizerControlRef.current = null
         setOptimizerPollingRunId(null)
+        setOptimizerStartedAt(null)
+        setOptimizerElapsedSeconds(0)
+        setOptimizerLiveBestScore(null)
         setIsStoppingOptimizer(false)
       }
       const returnedRunId = nextContext.selected_optimizer_run?.id ?? null
@@ -775,11 +835,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           })
           const run = await response.json().catch(() => null) as OptimizerRun | null
           if (!response.ok) throw new Error(apiError(run, 'Unable to refresh optimizer status.'))
+          if (run?.status === 'RUNNING') {
+            setOptimizerStartedAt(run.started_at ?? null)
+            setOptimizerLiveBestScore(run.live_best_score ?? null)
+          }
           if (run?.status !== 'RUNNING') {
             setIsOptimizing(false)
             setIsStoppingOptimizer(false)
+            setNotice(null)
             optimizerControlRef.current = null
             setOptimizerPollingRunId(null)
+            setOptimizerStartedAt(null)
+            setOptimizerElapsedSeconds(0)
+            setOptimizerLiveBestScore(null)
             await fetchContext(versionId, {
               preserveError: true,
               quiet: true,
@@ -788,9 +856,17 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             if (run?.status === 'COMPLETED') {
               setSelectedOptimizerRunId(run.id)
               updateOptimizerRunUrl(run.id)
-              setNotice(`Optimizer Run ${run.run_number} completed.`)
+              setNotice(
+                run.optimizer_summary?.message
+                  ? `Optimizer Run ${run.run_number} completed. ${run.optimizer_summary.message}`
+                  : `Optimizer Run ${run.run_number} completed.`,
+              )
             } else if (run?.status === 'FAILED') {
-              setError(`Optimizer Run ${run.run_number} did not complete.`)
+              setError(
+                run.notes
+                  ? `Optimizer Run ${run.run_number} did not complete. ${run.notes}`
+                  : `Optimizer Run ${run.run_number} did not complete. No failure reason was recorded.`,
+              )
             }
           }
         } catch (pollError) {
@@ -800,6 +876,26 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }, 3000)
     return () => window.clearInterval(timer)
   }, [isOptimizing, context?.selected_version?.id, optimizerPollingRunId])
+
+  useEffect(() => {
+    if (!isOptimizing || !optimizerStartedAt) {
+      setOptimizerElapsedSeconds(0)
+      setOptimizerLiveBestScore(null)
+      return
+    }
+    const startedAtMs = Date.parse(optimizerStartedAt)
+    if (!Number.isFinite(startedAtMs)) {
+      setOptimizerElapsedSeconds(0)
+      setOptimizerLiveBestScore(null)
+      return
+    }
+    const updateElapsed = () => {
+      setOptimizerElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)))
+    }
+    updateElapsed()
+    const timer = window.setInterval(updateElapsed, 1000)
+    return () => window.clearInterval(timer)
+  }, [isOptimizing, optimizerStartedAt])
 
   const moveBackToBuild = async () => {
     const confirmed = window.confirm(
@@ -1148,6 +1244,23 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     return values
   }, [selectedCalendarViolationUser])
 
+  const calendarRequests = useMemo(() => (
+    (calendarViolationReport?.requests ?? []).filter((item) => item.physician === calendarPhysicianId)
+  ), [calendarPhysicianId, calendarViolationReport?.requests])
+
+  const calendarRequestsByDate = useMemo(() => {
+    const values = new Map<string, CalendarRequest[]>()
+    for (const requestItem of calendarRequests) {
+      const rows = values.get(requestItem.date) ?? []
+      rows.push(requestItem)
+      values.set(requestItem.date, rows)
+    }
+    for (const rows of values.values()) {
+      rows.sort((left, right) => left.request_scope.localeCompare(right.request_scope))
+    }
+    return values
+  }, [calendarRequests])
+
   useEffect(() => {
     if (!calendarPhysicianId || !context?.selected_version) {
       setCalendarViolationReport(null)
@@ -1160,9 +1273,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setIsCalendarViolationLoading(true)
       setCalendarViolationError(null)
       try {
-        const query = selectedOptimizerRunId ? `?optimizer_run_id=${selectedOptimizerRunId}` : ''
+        const params = new URLSearchParams({ physician_id: String(calendarPhysicianId) })
+        if (selectedOptimizerRunId) {
+          params.set('optimizer_run_id', String(selectedOptimizerRunId))
+        }
         const response = await fetch(
-          `${API_BASE}/schedule-versions/${context.selected_version!.id}/violation-report/${query}`,
+          `${API_BASE}/schedule-versions/${context.selected_version!.id}/violation-report/?${params.toString()}`,
           { credentials: 'include' },
         )
         const data = await response.json().catch(() => null)
@@ -1257,6 +1373,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setError('Select a BUILD Schedule Version before running the optimizer.')
       return
     }
+    if (
+      !Number.isInteger(optimizerMaxRuntimeMinutes)
+      || optimizerMaxRuntimeMinutes < 1
+      || optimizerMaxRuntimeMinutes > 240
+    ) {
+      setError('Maximum runtime must be a whole number from 1 to 240 minutes.')
+      return
+    }
     const viewedRun = context.selected_optimizer_run ?? null
     if (optimizerStartMode === 'CURRENT_SCHEDULE') {
       if (!viewedRun) {
@@ -1294,6 +1418,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     try {
       closeAssignments()
       setIsOptimizing(true)
+      setOptimizerStartedAt(null)
+      setOptimizerElapsedSeconds(0)
+      setOptimizerLiveBestScore(null)
       setIsStoppingOptimizer(false)
       setError(null)
       setNotice(null)
@@ -1311,6 +1438,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             schedule_version_id: versionId,
             currently_viewed_run_id: viewedRun?.id ?? null,
             start_mode: optimizerStartMode,
+            max_runtime_minutes: optimizerMaxRuntimeMinutes,
             search_token: crypto.randomUUID(),
             background: true,
           }),
@@ -1330,6 +1458,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       optimizeErrorMessage = optimizeError instanceof Error ? optimizeError.message : 'Unable to run optimizer.'
       setError(optimizeErrorMessage)
       setIsOptimizing(false)
+      setOptimizerStartedAt(null)
+      setOptimizerElapsedSeconds(0)
+      setOptimizerLiveBestScore(null)
       optimizerControlRef.current = null
       setOptimizerPollingRunId(null)
     } finally {
@@ -1825,20 +1956,55 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
             </small>
           </div>
+
+          <label className="facility-field optimizer-runtime-control">
+            <span>Maximum Runtime</span>
+            <div className="optimizer-runtime-input">
+              <input
+                type="number"
+                min="1"
+                max="240"
+                step="1"
+                value={optimizerMaxRuntimeMinutes}
+                onChange={(event) => {
+                  const value = Number(event.target.value)
+                  setOptimizerMaxRuntimeMinutes(Number.isFinite(value) ? value : 15)
+                }}
+                disabled={isMutatingBuild}
+                aria-label="Maximum optimizer runtime in minutes"
+              />
+              <span>minutes</span>
+            </div>
+            <small>Choose 1–240 minutes for this run.</small>
+          </label>
         </div>
 
         <div className="build-workspace-optimizer-actions">
-          <span className="muted build-workspace-runtime-note">Diversifies after 120 seconds without improvement; stops after 3 unsuccessful diversified searches or a maximum of 15 minutes. You may leave this page while it runs.</span>
+          <span className="muted build-workspace-runtime-note">Continues from each new best schedule with a new search seed; diversifies after 120 seconds without improvement and stops after the selected maximum runtime. You may leave this page while it runs.</span>
           {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
             {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
           </button>}
-          <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
-            {isOptimizing
-              ? 'Running...'
-              : optimizerStartMode === 'CURRENT_SCHEDULE'
-                ? 'Run Optimizer from Current Schedule'
-                : 'Run Optimizer from Fresh Fill'}
-          </button>
+          <div className="optimizer-run-button-stack">
+            <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
+              {isOptimizing
+                ? 'Running...'
+                : optimizerStartMode === 'CURRENT_SCHEDULE'
+                  ? 'Run Optimizer from Current Schedule'
+                  : 'Run Optimizer from Fresh Fill'}
+            </button>
+            {isOptimizing && optimizerStartedAt && (
+              <>
+                <span className="optimizer-elapsed-time" role="timer" aria-live="off">
+                  Elapsed: {formatElapsedTime(optimizerElapsedSeconds)}
+                </span>
+                <span className="optimizer-live-best-score" aria-live="polite">
+                  Current best penalty: {optimizerLiveBestScore === null
+                    ? 'Building first complete schedule…'
+                    : formatScore(optimizerLiveBestScore)}
+                </span>
+              </>
+            )}
+          </div>
           <button
             type="button"
             className="secondary"
@@ -1885,7 +2051,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               <div className="feasibility-hover-panel workload-feasibility-hover-panel" role="tooltip">
                 <h3>Workload feasibility</h3>
                 <dl>
-                  <div><dt>Required hours</dt><dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd></div>
+                  <div><dt>Hours requiring optimization</dt><dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd></div>
+                  {context.workload_feasibility.manual_only_physician_count > 0 && (
+                    <>
+                      <div><dt>Total generated hours</dt><dd>{context.workload_feasibility.total_generated_required_hours.toFixed(1)}</dd></div>
+                      <div><dt>Fixed manual-only coverage</dt><dd>{context.workload_feasibility.manual_only_fixed_hours.toFixed(1)}</dd></div>
+                    </>
+                  )}
                   <div><dt>Combined minimum</dt><dd>{context.workload_feasibility.sum_effective_minimum_hours.toFixed(1)}</dd></div>
                   <div>
                     <dt>Combined maximum</dt>
@@ -1899,7 +2071,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 {context.workload_feasibility.physicians_without_hour_ranges.length > 0 && (
                   <p>{context.workload_feasibility.physicians_without_hour_ranges.length} active physician(s) are excluded from bounded totals because they do not have an applicable hour range.</p>
                 )}
-                <small>Aggregate feasibility does not account for eligibility, nights, rest, requests, or locks.</small>
+                <small>Manual-only users count only through their exact fixed assignments. This aggregate check does not account for eligibility, nights, rest, or requests.</small>
               </div>
             </div>
             <div className="feasibility-compact-item">
@@ -1951,9 +2123,21 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </div>
           <dl>
             <div>
-              <dt>Required hours</dt>
+              <dt>Hours requiring optimization</dt>
               <dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd>
             </div>
+            {context.workload_feasibility.manual_only_physician_count > 0 && (
+              <>
+                <div>
+                  <dt>Total generated hours</dt>
+                  <dd>{context.workload_feasibility.total_generated_required_hours.toFixed(1)}</dd>
+                </div>
+                <div>
+                  <dt>Fixed manual-only coverage</dt>
+                  <dd>{context.workload_feasibility.manual_only_fixed_hours.toFixed(1)}</dd>
+                </div>
+              </>
+            )}
             <div>
               <dt>Combined minimum</dt>
               <dd>{context.workload_feasibility.sum_effective_minimum_hours.toFixed(1)}</dd>
@@ -2264,7 +2448,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   <div>
                     <strong>Run {run.run_number}</strong>
                     <span>{optimizerRunStatusLabel(run)}</span>
-                    <span>{run.start_mode === 'CURRENT_SCHEDULE' ? 'Current schedule' : 'Fresh fill'}</span>
+                    <span>
+                      {run.start_mode === 'CURRENT_SCHEDULE'
+                        ? run.started_from_run_number
+                          ? `Started from Run ${run.started_from_run_number}`
+                          : 'Started from current schedule'
+                        : 'Fresh fill'}
+                    </span>
+                    <span>Starting penalty {formatScore(run.initial_score)}</span>
                     <span>{optimizerRunScoreLabel(run)}</span>
                     <span>{formatTimestamp(run.created_at)}</span>
                     {run.runtime_seconds != null && <span>Total time {formatRuntimeMinutes(run.runtime_seconds)}</span>}
@@ -2327,11 +2518,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           )}
           <div className="optimizer-summary-grid">
             <div>
-              <span>Initial score</span>
+              <span>Starting penalty</span>
               <strong>{(optimizerSummary.initial_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
             </div>
             <div>
-              <span>Final score</span>
+              <span>Final penalty</span>
               <strong>{(optimizerSummary.final_score ?? optimizerSummary.total_score).toFixed(1)}</strong>
             </div>
             <div>
@@ -2420,6 +2611,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               <div>
                 <span>Weekend score</span>
                 <strong>{(optimizerSummary.score_breakdown?.weekend_score ?? 0).toFixed(1)}</strong>
+              </div>
+              <div>
+                <span>Shift rule score</span>
+                <strong>{(optimizerSummary.score_breakdown?.shift_rule_score ?? 0).toFixed(1)}</strong>
               </div>
               <div>
                 <span>Facility score</span>
@@ -2560,8 +2755,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             <div className="build-calendar-filter-summary">
               <span>
                 {isCalendarViolationLoading
-                  ? 'Loading violations…'
-                  : `${selectedCalendarViolationUser?.display_name ?? 'Selected physician'} · ${selectedCalendarViolationUser?.violations.length ?? 0} violation(s)`}
+                  ? 'Loading violations and requests…'
+                  : `${selectedCalendarViolationUser?.display_name ?? 'Selected physician'} · ${selectedCalendarViolationUser?.violations.length ?? 0} violation(s) · ${calendarRequests.length} active request(s)`}
               </span>
               {calendarViolationError && <span className="build-calendar-filter-error">{calendarViolationError}</span>}
               <button type="button" onClick={() => setCalendarPhysicianId(null)}>Show all physicians</button>
@@ -2589,32 +2784,64 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   || instance.assignments.some((assignment) => assignment.physician === calendarPhysicianId)
                 ))
                 const dateViolations = calendarViolationsByDate.get(dateKey) ?? []
+                const dateRequests = calendarRequestsByDate.get(dateKey) ?? []
                 return (
                   <div key={cell.key} className="build-day">
                     <div className="build-day-heading">
                       <div className="build-day-number">{cell.date.getUTCDate()}</div>
-                      {dateViolations.length > 0 && (
-                        <div className="build-violation-hover">
-                          <span
-                            className="build-violation-icon"
-                            role="img"
-                            aria-label={`${dateViolations.length} violation${dateViolations.length === 1 ? '' : 's'} on ${formatDate(dateKey)}`}
-                          >!
-                          </span>
-                          <div className="build-violation-popover" role="tooltip">
-                            <strong>{formatDate(dateKey)}</strong>
-                            {dateViolations.map((violation, index) => (
-                              <div className="build-violation-item" key={`${violation.violation_type}-${index}`}>
-                                <b>{violation.violation_type.split('_').map((part) => part.charAt(0) + part.slice(1).toLowerCase()).join(' ')}</b>
-                                <span>{violation.explanation}</span>
-                                <small>
-                                  Configured: {violation.configured_limit ?? '-'} · Actual: {violation.actual_value ?? '-'} · Penalty: {violation.penalty_amount.toLocaleString()}
-                                </small>
-                              </div>
-                            ))}
+                      <div className="build-day-markers">
+                        {dateRequests.length > 0 && (
+                          <div className="build-request-hover">
+                            <span
+                              className="build-request-icon"
+                              role="img"
+                              aria-label={`${dateRequests.length} active request${dateRequests.length === 1 ? '' : 's'} on ${formatDate(dateKey)}`}
+                            >R
+                            </span>
+                            <div className="build-request-popover" role="tooltip">
+                              <strong>{formatDate(dateKey)} requests</strong>
+                              {dateRequests.map((requestItem) => (
+                                <div
+                                  className={`build-request-item build-request-item-${requestItem.request_scope.toLowerCase()}`}
+                                  key={requestItem.id}
+                                >
+                                  <b>{requestItem.request_scope === 'ADMIN' ? 'Admin request' : 'User request'}</b>
+                                  <span>
+                                    {readableRequestType(requestItem.request_type)} · {requestItem.weight.charAt(0) + requestItem.weight.slice(1).toLowerCase()}
+                                  </span>
+                                  <small>
+                                    {requestItem.shift_template_details.length
+                                      ? requestItem.shift_template_details.map((template) => `${template.name} (${template.facility_name})`).join(', ')
+                                      : 'Applies to the full day'}
+                                  </small>
+                                </div>
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      )}
+                        )}
+                        {dateViolations.length > 0 && (
+                          <div className="build-violation-hover">
+                            <span
+                              className="build-violation-icon"
+                              role="img"
+                              aria-label={`${dateViolations.length} violation${dateViolations.length === 1 ? '' : 's'} on ${formatDate(dateKey)}`}
+                            >!
+                            </span>
+                            <div className="build-violation-popover" role="tooltip">
+                              <strong>{formatDate(dateKey)}</strong>
+                              {dateViolations.map((violation, index) => (
+                                <div className="build-violation-item" key={`${violation.violation_type}-${index}`}>
+                                  <b>{violation.violation_type.split('_').map((part) => part.charAt(0) + part.slice(1).toLowerCase()).join(' ')}</b>
+                                  <span>{violation.explanation}</span>
+                                  <small>
+                                    Configured: {violation.configured_limit ?? '-'} · Actual: {violation.actual_value ?? '-'} · Penalty: {violation.penalty_amount.toLocaleString()}
+                                  </small>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     </div>
                     {instances.map((instance) => (
                       <button
