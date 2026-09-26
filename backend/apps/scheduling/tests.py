@@ -9,7 +9,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.db.models import Count
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -51,6 +51,7 @@ from .optimizer import (
     _workload_schedule_score,
     _workload_rule_delta_from_totals,
     _record_adaptive_repair_productivity,
+    optimize_schedule_version,
 )
 from .run_state import assignments_for_viewed_run
 from .serializers import ScheduleBlockSerializer
@@ -3117,6 +3118,104 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(run.max_runtime_seconds, 45 * 60)
         self.assertEqual(response.json()['max_runtime_seconds'], 45 * 60)
 
+    @override_settings(OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION=2)
+    def test_background_optimizer_accepts_two_independent_runs_and_rejects_third(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+
+        first = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 1101, 'start_mode': 'FRESH_FILL'},
+            format='json',
+        )
+        second = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 1102, 'start_mode': 'FRESH_FILL'},
+            format='json',
+        )
+        third = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 1103, 'start_mode': 'FRESH_FILL'},
+            format='json',
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(third.status_code, 409)
+        self.assertEqual(third.json()['optimizer_concurrency_limit'], 2)
+        self.assertEqual(
+            list(
+                OptimizerRun.objects.filter(schedule_version=version)
+                .order_by('run_number')
+                .values_list('run_number', 'seed')
+            ),
+            [(1, 1101), (2, 1102)],
+        )
+        self.assertEqual(
+            OptimizerControl.objects.filter(schedule_version=version).count(),
+            2,
+        )
+
+    @override_settings(OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION=2)
+    def test_parallel_run_number_is_assigned_when_submitted_not_completed(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+
+        first = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 1201}, format='json',
+        )
+        second = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 1202}, format='json',
+        )
+        first_run = OptimizerRun.objects.get(id=first.json()['id'])
+        second_run = OptimizerRun.objects.get(id=second.json()['id'])
+
+        second_run.status = OptimizerRun.Status.COMPLETED
+        second_run.save(update_fields=['status'])
+        first_run.status = OptimizerRun.Status.COMPLETED
+        first_run.save(update_fields=['status'])
+
+        first_run.refresh_from_db()
+        second_run.refresh_from_db()
+        self.assertEqual(first_run.run_number, 1)
+        self.assertEqual(second_run.run_number, 2)
+        self.assertLess(first_run.created_at, second_run.created_at)
+
+    @override_settings(OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION=2)
+    def test_two_workers_claim_distinct_parallel_controls(self):
+        from apps.scheduling.management.commands.run_optimizer_worker import Command
+
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        for seed in (1301, 1302):
+            response = self.client.post(
+                f'/api/schedule-versions/{version.id}/run-optimizer/',
+                data={'background': True, 'seed': seed}, format='json',
+            )
+            self.assertEqual(response.status_code, 202)
+
+        worker_one_control_id = Command()._claim_next()
+        worker_two_control_id = Command()._claim_next()
+
+        self.assertIsNotNone(worker_one_control_id)
+        self.assertIsNotNone(worker_two_control_id)
+        self.assertNotEqual(worker_one_control_id, worker_two_control_id)
+        self.assertEqual(
+            OptimizerControl.objects.filter(started_at__isnull=False).count(),
+            2,
+        )
+
     def test_background_optimizer_rejects_runtime_outside_admin_range(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -3168,6 +3267,101 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertFalse(OptimizerControl.objects.filter(optimizer_run=run).exists())
         optimize.assert_called_once()
         self.assertEqual(optimize.call_args.kwargs['max_runtime_seconds'], 900)
+
+    @override_settings(OPTIMIZER_ENABLE_PARALLEL_ISOLATION=True)
+    def test_background_worker_enables_isolated_optimizer_execution(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 4324}, format='json',
+        )
+
+        with patch(
+            'apps.scheduling.management.commands.run_optimizer_worker.optimize_schedule_version',
+            return_value={'final_score': 0},
+        ) as optimize:
+            call_command('run_optimizer_worker', '--once')
+
+        self.assertTrue(optimize.call_args.kwargs['isolated_run'])
+
+    def test_isolated_optimizer_preserves_shared_and_active_source_state(self):
+        version = self._create_build_version()
+        shift_instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        source_physician = self._create_assignment_physician(
+            'isolated.source@example.com', 'Isolated Source',
+            facilities=[self.facility],
+        )
+        candidate = self._create_assignment_physician(
+            'isolated.candidate@example.com', 'Isolated Candidate',
+            facilities=[self.facility],
+        )
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            seed=901,
+            initial_score=0,
+            final_score=0,
+            is_active=True,
+        )
+        source_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=shift_instance,
+            physician=source_physician,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=source_run,
+        )
+        shift_instance.status = ScheduleShiftInstance.Status.OPEN
+        shift_instance.is_locked_open = True
+        shift_instance.save(update_fields=['status', 'is_locked_open', 'updated_at'])
+        parallel_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            seed=902,
+            max_runtime_seconds=1,
+        )
+
+        result = optimize_schedule_version(
+            version,
+            created_by=self.scheduler_user,
+            optimizer_run=parallel_run,
+            seed=parallel_run.seed,
+            start_mode=parallel_run.start_mode,
+            source_run=source_run,
+            max_runtime_seconds=1,
+            isolated_run=True,
+        )
+
+        source_run.refresh_from_db()
+        parallel_run.refresh_from_db()
+        shift_instance.refresh_from_db()
+        source_assignment.refresh_from_db()
+        self.assertEqual(result['optimizer_run_id'], parallel_run.id)
+        self.assertEqual(parallel_run.status, OptimizerRun.Status.COMPLETED)
+        self.assertFalse(parallel_run.is_active)
+        self.assertTrue(source_run.is_active)
+        self.assertEqual(shift_instance.status, ScheduleShiftInstance.Status.OPEN)
+        self.assertTrue(shift_instance.is_locked_open)
+        self.assertEqual(source_assignment.optimizer_run_id, source_run.id)
+        self.assertEqual(source_assignment.physician_id, source_physician.id)
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=parallel_run,
+                physician=candidate,
+                shift_instance=shift_instance,
+            ).exists()
+        )
 
     def test_background_worker_fails_and_releases_job_after_safety_timeout(self):
         self.client.post(
@@ -4698,6 +4892,41 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(response.json()['next_viewed_run_id'], viewed_run.id)
         self.assertTrue(OptimizerRun.objects.filter(id=viewed_run.id).exists())
         self.assertTrue(OptimizerRun.objects.filter(id=active_run.id).exists())
+
+    def test_delete_optimizer_source_run_is_blocked_until_child_finishes(self):
+        version = self._create_build_version()
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            seed=1401,
+        )
+        child_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            seed=1402,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            started_from_run=source_run,
+            started_from_run_number=source_run.run_number,
+        )
+        OptimizerControl.objects.create(
+            token='00000000-0000-0000-0000-000000001402',
+            schedule_version=version,
+            created_by=self.scheduler_user,
+            optimizer_run=child_run,
+            source_run=source_run,
+        )
+
+        response = self.client.delete(f'/api/optimizer-runs/{source_run.id}/')
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['skipped_run_ids'], [
+            {'id': source_run.id, 'reason': 'optimizer_source'},
+        ])
+        self.assertTrue(OptimizerRun.objects.filter(id=source_run.id).exists())
 
     def test_bulk_delete_removes_eligible_runs_and_skips_protected_runs(self):
         self.client.post(

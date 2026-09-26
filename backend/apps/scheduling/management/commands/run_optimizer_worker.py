@@ -4,6 +4,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import close_old_connections, transaction
 from django.utils import timezone
@@ -127,6 +128,9 @@ class Command(BaseCommand):
                 adaptive_runtime=True,
                 stop_requested=stop_requested,
                 progress_callback=publish_progress,
+                isolated_run=bool(
+                    getattr(settings, 'OPTIMIZER_ENABLE_PARALLEL_ISOLATION', False)
+                ),
             )
         except Exception as exc:
             traceback.print_exc()

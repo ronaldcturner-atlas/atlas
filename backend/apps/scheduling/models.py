@@ -517,7 +517,11 @@ class ScheduleRequest(models.Model):
 class OptimizerControl(models.Model):
     """Cooperative cancellation, committed separately from the search transaction."""
     token = models.UUIDField(primary_key=True)
-    schedule_version = models.OneToOneField(ScheduleVersion, on_delete=models.CASCADE)
+    schedule_version = models.ForeignKey(
+        ScheduleVersion,
+        on_delete=models.CASCADE,
+        related_name='optimizer_controls',
+    )
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
     optimizer_run = models.OneToOneField(
         OptimizerRun, on_delete=models.CASCADE, related_name='control', null=True, blank=True,
@@ -533,6 +537,14 @@ class OptimizerControl(models.Model):
     )
     progress_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['schedule_version', 'started_at', 'created_at'],
+                name='sched_opt_control_claim_idx',
+            ),
+        ]
 
 
 class Contract(models.Model):

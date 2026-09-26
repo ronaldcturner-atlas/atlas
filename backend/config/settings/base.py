@@ -9,6 +9,15 @@ load_dotenv(BASE_DIR / ".env")
 SECRET_KEY = os.environ.get("SECRET_KEY", "unsafe-secret-key")
 DEBUG = os.environ.get("DEBUG", "False") == "True"
 
+# Kept at one until run-isolation tests pass; deployment can then explicitly
+# raise it without another schema change.
+OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION = int(
+    os.environ.get("OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION", "1")
+)
+OPTIMIZER_ENABLE_PARALLEL_ISOLATION = (
+    os.environ.get("OPTIMIZER_ENABLE_PARALLEL_ISOLATION", "False") == "True"
+)
+
 ALLOWED_HOSTS = ["*"]
 
 INSTALLED_APPS = [

@@ -29,6 +29,7 @@ services:
       DB_PORT: ${DB_PORT}
       DEBUG: ${DEBUG}
       SECRET_KEY: ${SECRET_KEY}
+      OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION: 2
     ports:
       - "8000:8000"
     volumes:
@@ -40,7 +41,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: sh -c "python manage.py migrate && python manage.py run_optimizer_worker"
+    command: python manage.py run_optimizer_worker
     env_file:
       - .env
     environment:
@@ -51,10 +52,34 @@ services:
       DB_PORT: ${DB_PORT}
       DEBUG: ${DEBUG}
       SECRET_KEY: ${SECRET_KEY}
+      OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION: 2
+      OPTIMIZER_ENABLE_PARALLEL_ISOLATION: "True"
     volumes:
       - ./backend:/app
     depends_on:
-      - postgres
+      - backend
+
+  optimizer-worker-2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python manage.py run_optimizer_worker
+    env_file:
+      - .env
+    environment:
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: ${DB_PORT}
+      DEBUG: ${DEBUG}
+      SECRET_KEY: ${SECRET_KEY}
+      OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION: 2
+      OPTIMIZER_ENABLE_PARALLEL_ISOLATION: "True"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - backend
 
 volumes:
   postgres_data:

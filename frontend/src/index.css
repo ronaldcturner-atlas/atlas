@@ -312,6 +312,14 @@ select option:checked{
 .build-workspace-optimizer-actions,.build-workspace-maintenance-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .build-workspace-runtime-note{flex:1 1 360px;line-height:1.35}
 .optimizer-run-button-stack{display:flex;flex-direction:column;align-items:stretch;gap:4px}
+.optimizer-capacity-label{font-size:11px;color:var(--text-muted);text-align:center}
+.optimizer-active-runs{grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:8px;margin-top:4px}
+.optimizer-active-run{display:grid;grid-template-columns:minmax(90px,.7fr) minmax(190px,1.5fr) auto;align-items:center;gap:12px;padding:9px 10px;border:1px solid #536985;border-radius:8px;background:#18263a}
+.optimizer-active-run>div{display:flex;flex-direction:column;gap:2px;min-width:0}
+.optimizer-active-run strong{color:#fff}
+.optimizer-active-run span{font-size:12px;color:#c9d8ea;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.optimizer-active-run button{white-space:nowrap}
+@media (max-width:800px){.optimizer-active-run{grid-template-columns:1fr}.optimizer-active-run button{justify-self:start}}
 .optimizer-elapsed-time{color:#dbeafe;font-size:12px;font-variant-numeric:tabular-nums;text-align:center;line-height:1.2}
 .optimizer-live-best-score{color:#bbf7d0;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;text-align:center;line-height:1.2}
 .build-workspace-maintenance-actions .optimizer-action-message{flex:1 1 280px;max-width:none}

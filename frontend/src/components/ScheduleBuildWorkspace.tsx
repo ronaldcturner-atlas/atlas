@@ -218,6 +218,13 @@ type BuildContext = {
   selected_version: ScheduleVersion | null
   optimizer_summary?: OptimizerSummary | null
   optimizer_runs?: OptimizerRun[]
+  optimizer_capacity?: {
+    limit: number
+    running_count: number
+    available_slots: number
+    running_run_ids: number[]
+    protected_source_run_ids: number[]
+  }
   selected_optimizer_run?: OptimizerRun | null
   run_state?: {
     viewed_run_id: number | null
@@ -562,13 +569,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const automaticGenerationKeyRef = useRef<string | null>(null)
-  const [isOptimizing, setIsOptimizing] = useState(false)
-  const [isStoppingOptimizer, setIsStoppingOptimizer] = useState(false)
-  const optimizerControlRef = useRef<{ versionId: number; runId: number } | null>(null)
-  const [optimizerPollingRunId, setOptimizerPollingRunId] = useState<number | null>(null)
-  const [optimizerStartedAt, setOptimizerStartedAt] = useState<string | null>(null)
-  const [optimizerElapsedSeconds, setOptimizerElapsedSeconds] = useState(0)
-  const [optimizerLiveBestScore, setOptimizerLiveBestScore] = useState<string | number | null>(null)
+  const [isLaunchingOptimizer, setIsLaunchingOptimizer] = useState(false)
+  const [stoppingOptimizerRunIds, setStoppingOptimizerRunIds] = useState<number[]>([])
+  const [optimizerClockMs, setOptimizerClockMs] = useState(() => Date.now())
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
   const [optimizerMaxRuntimeMinutes, setOptimizerMaxRuntimeMinutes] = useState(15)
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
@@ -789,29 +792,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       const nextContext = data as BuildContext
       setContext(nextContext)
       setOptimizerSummary(nextContext.optimizer_summary ?? null)
-      const runningRun = nextContext.optimizer_runs?.find((run) => run.status === 'RUNNING') ?? null
-      setIsOptimizing(Boolean(runningRun))
-      if (runningRun && nextContext.selected_version) {
-        optimizerControlRef.current = {
-          versionId: nextContext.selected_version.id,
-          runId: runningRun.id,
-        }
-        setOptimizerPollingRunId(runningRun.id)
-        setOptimizerStartedAt(runningRun.started_at ?? null)
-        setOptimizerLiveBestScore(runningRun.live_best_score ?? null)
-        setOptimizerMaxRuntimeMinutes(Math.max(
-          1,
-          Math.round(runningRun.max_runtime_seconds / 60),
-        ))
-        setOptimizerStartMode(runningRun.start_mode)
-      } else {
-        optimizerControlRef.current = null
-        setOptimizerPollingRunId(null)
-        setOptimizerStartedAt(null)
-        setOptimizerElapsedSeconds(0)
-        setOptimizerLiveBestScore(null)
-        setIsStoppingOptimizer(false)
-      }
       const returnedRunId = nextContext.selected_optimizer_run?.id ?? null
       if (requestedOptimizerRunId !== undefined || selectedOptimizerRunIdRef.current === null) {
         setSelectedOptimizerRunId(returnedRunId)
@@ -839,79 +819,69 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
+  const runningOptimizerRuns = (context?.optimizer_runs ?? []).filter((run) => run.status === 'RUNNING')
+  const runningOptimizerRunIds = runningOptimizerRuns.map((run) => run.id).join(',')
+
   useEffect(() => {
     const versionId = context?.selected_version?.id
-    const runningRunId = optimizerPollingRunId
-    if (!isOptimizing || !versionId || !runningRunId) return
-    const timer = window.setInterval(() => {
-      void (async () => {
-        try {
-          const response = await fetch(`${API_BASE}/optimizer-runs/${runningRunId}/?compact=1`, {
+    if (!versionId || !runningOptimizerRuns.length) return
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const responses = await Promise.all(runningOptimizerRuns.map(async (currentRun) => {
+          const response = await fetch(`${API_BASE}/optimizer-runs/${currentRun.id}/?compact=1`, {
             credentials: 'include', cache: 'no-store',
           })
           const run = await response.json().catch(() => null) as OptimizerRun | null
           if (!response.ok) throw new Error(apiError(run, 'Unable to refresh optimizer status.'))
-          if (run?.status === 'RUNNING') {
-            setOptimizerStartedAt(run.started_at ?? null)
-            setOptimizerLiveBestScore(run.live_best_score ?? null)
+          return run
+        }))
+        if (cancelled) return
+        const finishedRuns = responses.filter((run) => run && run.status !== 'RUNNING') as OptimizerRun[]
+        if (finishedRuns.length) {
+          setStoppingOptimizerRunIds((ids) => ids.filter((id) => !finishedRuns.some((run) => run.id === id)))
+          await fetchContext(versionId, {
+            preserveError: true,
+            quiet: true,
+            optimizerRunId: selectedOptimizerRunIdRef.current,
+          })
+          const failed = finishedRuns.find((run) => run.status === 'FAILED')
+          if (failed) {
+            setError(failed.notes
+              ? `Optimizer Run ${failed.run_number} did not complete. ${failed.notes}`
+              : `Optimizer Run ${failed.run_number} did not complete. No failure reason was recorded.`)
+          } else {
+            setNotice(finishedRuns.map((run) => `Optimizer Run ${run.run_number} completed.`).join(' '))
           }
-          if (run?.status !== 'RUNNING') {
-            setIsOptimizing(false)
-            setIsStoppingOptimizer(false)
-            setNotice(null)
-            optimizerControlRef.current = null
-            setOptimizerPollingRunId(null)
-            setOptimizerStartedAt(null)
-            setOptimizerElapsedSeconds(0)
-            setOptimizerLiveBestScore(null)
-            await fetchContext(versionId, {
-              preserveError: true,
-              quiet: true,
-              optimizerRunId: run?.status === 'COMPLETED' ? run.id : selectedOptimizerRunIdRef.current,
-            })
-            if (run?.status === 'COMPLETED') {
-              setSelectedOptimizerRunId(run.id)
-              updateOptimizerRunUrl(run.id)
-              setNotice(
-                run.optimizer_summary?.message
-                  ? `Optimizer Run ${run.run_number} completed. ${run.optimizer_summary.message}`
-                  : `Optimizer Run ${run.run_number} completed.`,
-              )
-            } else if (run?.status === 'FAILED') {
-              setError(
-                run.notes
-                  ? `Optimizer Run ${run.run_number} did not complete. ${run.notes}`
-                  : `Optimizer Run ${run.run_number} did not complete. No failure reason was recorded.`,
-              )
-            }
-          }
-        } catch (pollError) {
+          return
+        }
+        setContext((current) => current ? {
+          ...current,
+          optimizer_runs: (current.optimizer_runs ?? []).map((run) => (
+            responses.find((updated) => updated?.id === run.id) ?? run
+          )),
+        } : current)
+      } catch (pollError) {
+        if (!cancelled) {
           setError(pollError instanceof Error ? pollError.message : 'Unable to refresh optimizer status.')
         }
-      })()
-    }, 3000)
-    return () => window.clearInterval(timer)
-  }, [isOptimizing, context?.selected_version?.id, optimizerPollingRunId])
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  // IDs deliberately represent the polling set; score updates must not recreate the interval.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [context?.selected_version?.id, runningOptimizerRunIds])
 
   useEffect(() => {
-    if (!isOptimizing || !optimizerStartedAt) {
-      setOptimizerElapsedSeconds(0)
-      setOptimizerLiveBestScore(null)
-      return
-    }
-    const startedAtMs = Date.parse(optimizerStartedAt)
-    if (!Number.isFinite(startedAtMs)) {
-      setOptimizerElapsedSeconds(0)
-      setOptimizerLiveBestScore(null)
-      return
-    }
-    const updateElapsed = () => {
-      setOptimizerElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)))
-    }
-    updateElapsed()
-    const timer = window.setInterval(updateElapsed, 1000)
+    if (!runningOptimizerRuns.some((run) => run.started_at)) return
+    const timer = window.setInterval(() => setOptimizerClockMs(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [isOptimizing, optimizerStartedAt])
+  }, [runningOptimizerRunIds])
 
   const moveBackToBuild = async () => {
     const confirmed = window.confirm(
@@ -942,6 +912,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const selectedOptimizerRun = context?.selected_optimizer_run ?? null
   const optimizerRuns = context?.optimizer_runs ?? []
+  const isOptimizing = runningOptimizerRuns.length > 0
+  const optimizerCapacity = context?.optimizer_capacity ?? {
+    limit: 1,
+    running_count: runningOptimizerRuns.length,
+    available_slots: runningOptimizerRuns.length ? 0 : 1,
+    running_run_ids: runningOptimizerRuns.map((run) => run.id),
+    protected_source_run_ids: [],
+  }
   const completedOptimizerRuns = optimizerRuns.filter(isCompletedOptimizerRun)
   const selectedRunForActions = completedOptimizerRuns.find((run) => run.id === selectedOptimizerRunId)
     ?? selectedOptimizerRun
@@ -952,6 +930,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     if (run.is_active) return 'Activate another run before deleting the active run.'
     if (run.id === viewedOptimizerRunId) return 'View another run before deleting this run.'
     if (run.status === 'RUNNING') return 'Running optimizer runs cannot be deleted.'
+    if (optimizerCapacity.protected_source_run_ids.includes(run.id)) {
+      return 'This run is the starting schedule for an optimizer currently in progress.'
+    }
     return null
   }
   const eligibleSelectedRunIds = selectedRunIdsForDelete.filter((runId) => {
@@ -1430,17 +1411,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
 
     let optimizeErrorMessage: string | null = null
-    let queuedOptimizerRunId: number | undefined
     try {
       closeAssignments()
-      setIsOptimizing(true)
-      setOptimizerStartedAt(null)
-      setOptimizerElapsedSeconds(0)
-      setOptimizerLiveBestScore(null)
-      setIsStoppingOptimizer(false)
+      setIsLaunchingOptimizer(true)
       setError(null)
       setNotice(null)
-      setOptimizerSummary(null)
       setShowScoreDetails(false)
       setShowWorkloadDetails(false)
       setShowOptimizerDebug(false)
@@ -1466,19 +1441,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       }
 
       const queuedRun = data as OptimizerRun & { message?: string }
-      queuedOptimizerRunId = queuedRun.id
-      optimizerControlRef.current = { versionId, runId: queuedRun.id }
-      setOptimizerPollingRunId(queuedRun.id)
-      setNotice(queuedRun.message ?? 'Optimizer started. You may leave this page.')
+      setNotice(queuedRun.message ?? `Optimizer Run ${queuedRun.run_number} started. You may leave this page.`)
     } catch (optimizeError) {
       optimizeErrorMessage = optimizeError instanceof Error ? optimizeError.message : 'Unable to run optimizer.'
       setError(optimizeErrorMessage)
-      setIsOptimizing(false)
-      setOptimizerStartedAt(null)
-      setOptimizerElapsedSeconds(0)
-      setOptimizerLiveBestScore(null)
-      optimizerControlRef.current = null
-      setOptimizerPollingRunId(null)
     } finally {
       try {
         await fetchContext(versionId, {
@@ -1492,27 +1458,25 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           setError('Optimizer started, but its current status could not be refreshed.')
         }
       }
-      if (!queuedOptimizerRunId) {
-        setIsStoppingOptimizer(false)
-      }
+      setIsLaunchingOptimizer(false)
     }
   }
 
-  const stopOptimizer = async () => {
-    const control = optimizerControlRef.current
-    if (!control) return
-    setIsStoppingOptimizer(true)
+  const stopOptimizer = async (runId: number) => {
+    const versionId = context?.selected_version?.id
+    if (!versionId) return
+    setStoppingOptimizerRunIds((ids) => ids.includes(runId) ? ids : [...ids, runId])
     try {
-      const response = await fetch(`${API_BASE}/schedule-versions/${control.versionId}/stop-optimizer/`, {
+      const response = await fetch(`${API_BASE}/schedule-versions/${versionId}/stop-optimizer/`, {
         method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ optimizer_run_id: control.runId }),
+        body: JSON.stringify({ optimizer_run_id: runId }),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(apiError(data, 'Unable to request Stop.'))
       setNotice(data.detail)
     } catch (error) {
       setError(error instanceof Error ? error.message : 'Unable to request Stop.')
-      setIsStoppingOptimizer(false)
+      setStoppingOptimizerRunIds((ids) => ids.filter((id) => id !== runId))
     }
   }
 
@@ -1877,7 +1841,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const selectedRunCanActivate = context.run_state
     ? context.run_state.viewed_run_can_activate
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
-  const isMutatingBuild = isGenerating || isOptimizing || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isMutatingBuild = isBuildMutationBusy || isOptimizing
   const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
   const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
@@ -1963,7 +1928,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           <div className="optimizer-start-control">
             <label className="facility-field">
               <span>Optimizer Start</span>
-              <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as 'CURRENT_SCHEDULE' | 'FRESH_FILL')} disabled={isMutatingBuild}>
+              <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as 'CURRENT_SCHEDULE' | 'FRESH_FILL')} disabled={isBuildMutationBusy}>
                 <option value="CURRENT_SCHEDULE">Current Viewed Schedule</option>
                 <option value="FRESH_FILL">Fresh Fill</option>
               </select>
@@ -1988,7 +1953,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   const value = Number(event.target.value)
                   setOptimizerMaxRuntimeMinutes(Number.isFinite(value) ? value : 15)
                 }}
-                disabled={isMutatingBuild}
+                disabled={isBuildMutationBusy}
                 aria-label="Maximum optimizer runtime in minutes"
               />
               <span>minutes</span>
@@ -1999,29 +1964,24 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
         <div className="build-workspace-optimizer-actions">
           <span className="muted build-workspace-runtime-note">Continues from each new best schedule with a new search seed; diversifies after 120 seconds without improvement and stops after the selected maximum runtime. You may leave this page while it runs.</span>
-          {isOptimizing && <button type="button" onClick={stopOptimizer} disabled={isStoppingOptimizer}>
-            {isStoppingOptimizer ? 'Stopping — saving best schedule…' : 'Stop and Keep Best'}
-          </button>}
           <div className="optimizer-run-button-stack">
-            <button type="button" className="primary-action" onClick={runOptimizer} disabled={!canOptimize || !canOptimizeBuild || isMutatingBuild}>
-              {isOptimizing
-                ? 'Running...'
-                : optimizerStartMode === 'CURRENT_SCHEDULE'
-                  ? 'Run Optimizer from Current Schedule'
-                  : 'Run Optimizer from Fresh Fill'}
+            <button
+              type="button"
+              className="primary-action"
+              onClick={runOptimizer}
+              disabled={!canOptimize || !canOptimizeBuild || isBuildMutationBusy || optimizerCapacity.available_slots < 1}
+            >
+              {isLaunchingOptimizer
+                ? 'Starting...'
+                : optimizerCapacity.available_slots < 1
+                  ? `${optimizerCapacity.limit} Optimizers Running`
+                  : optimizerStartMode === 'CURRENT_SCHEDULE'
+                    ? 'Run Optimizer from Current Schedule'
+                    : 'Run Optimizer from Fresh Fill'}
             </button>
-            {isOptimizing && optimizerStartedAt && (
-              <>
-                <span className="optimizer-elapsed-time" role="timer" aria-live="off">
-                  Elapsed: {formatElapsedTime(optimizerElapsedSeconds)}
-                </span>
-                <span className="optimizer-live-best-score" aria-live="polite">
-                  Current best penalty: {optimizerLiveBestScore === null
-                    ? 'Building first complete schedule…'
-                    : formatScore(optimizerLiveBestScore)}
-                </span>
-              </>
-            )}
+            <span className="optimizer-capacity-label">
+              {optimizerCapacity.running_count} of {optimizerCapacity.limit} optimizer slots in use
+            </span>
           </div>
           <button
             type="button"
@@ -2032,6 +1992,39 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
           </button>
         </div>
+
+        {runningOptimizerRuns.length > 0 && (
+          <div className="optimizer-active-runs" aria-live="polite">
+            {runningOptimizerRuns.map((run) => {
+              const startedAtMs = run.started_at ? Date.parse(run.started_at) : Number.NaN
+              const elapsedSeconds = Number.isFinite(startedAtMs)
+                ? Math.max(0, Math.floor((optimizerClockMs - startedAtMs) / 1000))
+                : null
+              const stopping = stoppingOptimizerRunIds.includes(run.id)
+              return (
+                <div className="optimizer-active-run" key={run.id}>
+                  <div>
+                    <strong>Run {run.run_number}</strong>
+                    <span>{run.start_mode === 'FRESH_FILL' ? 'Fresh Fill' : `From Run ${run.started_from_run_number ?? '—'}`}</span>
+                  </div>
+                  <div>
+                    <span className="optimizer-elapsed-time" role="timer" aria-live="off">
+                      {elapsedSeconds === null ? 'Queued' : `Elapsed: ${formatElapsedTime(elapsedSeconds)}`}
+                    </span>
+                    <span className="optimizer-live-best-score">
+                      Current best penalty: {run.live_best_score === null || run.live_best_score === undefined
+                        ? 'Building first complete schedule…'
+                        : formatScore(run.live_best_score)}
+                    </span>
+                  </div>
+                  <button type="button" onClick={() => void stopOptimizer(run.id)} disabled={stopping}>
+                    {stopping ? 'Stopping — saving best…' : 'Stop and Keep Best'}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
 
         <div className="build-workspace-maintenance-actions">
           <button

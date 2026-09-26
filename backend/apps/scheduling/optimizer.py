@@ -8517,6 +8517,7 @@ def optimize_schedule_version(
     stop_requested=None,
     max_runtime_seconds=None,
     progress_callback=None,
+    isolated_run=False,
 ):
     _FULL_SCORE_EVALUATIONS.set(0)
     _SCORE_CACHE.set(OrderedDict())
@@ -8546,15 +8547,19 @@ def optimize_schedule_version(
         )
 
     with transaction.atomic():
-        version = (
-            ScheduleVersion.objects.select_for_update()
-            .select_related('schedule_block', 'domain')
-            .get(id=schedule_version.id)
+        version_queryset = ScheduleVersion.objects.select_related(
+            'schedule_block', 'domain',
         )
+        if not isolated_run:
+            version_queryset = version_queryset.select_for_update()
+        version = version_queryset.get(id=schedule_version.id)
         if start_mode not in OptimizerRun.StartMode.values:
             raise ValueError('Invalid optimizer start mode.')
         if source_run is not None:
-            source_run = OptimizerRun.objects.select_for_update().get(
+            source_run_queryset = OptimizerRun.objects
+            if not isolated_run:
+                source_run_queryset = source_run_queryset.select_for_update()
+            source_run = source_run_queryset.get(
                 id=source_run.id,
                 schedule_version=version,
                 status=OptimizerRun.Status.COMPLETED,
@@ -8607,7 +8612,10 @@ def optimize_schedule_version(
                 locked_open_shift_instance_ids=source_locked_open_ids,
             )
         else:
-            optimizer_run = OptimizerRun.objects.select_for_update().get(
+            optimizer_run_queryset = OptimizerRun.objects
+            if not isolated_run:
+                optimizer_run_queryset = optimizer_run_queryset.select_for_update()
+            optimizer_run = optimizer_run_queryset.get(
                 id=optimizer_run.id,
                 schedule_version=version,
             )
@@ -8676,17 +8684,26 @@ def optimize_schedule_version(
             shift_instance__date__lte=version.schedule_block.end_date,
         ).count()
         optimizer_assignments_deleted = 0
-        ScheduleShiftInstance.objects.filter(schedule_version=version).update(is_locked_open=False)
-        ScheduleShiftInstance.objects.filter(
-            schedule_version=version,
-            id__in=source_locked_open_ids,
-        ).update(is_locked_open=True)
+        if not isolated_run:
+            ScheduleShiftInstance.objects.filter(schedule_version=version).update(
+                is_locked_open=False,
+            )
+            ScheduleShiftInstance.objects.filter(
+                schedule_version=version,
+                id__in=source_locked_open_ids,
+            ).update(is_locked_open=True)
+        instances_queryset = _version_shift_instances_queryset(version)
+        if not isolated_run:
+            instances_queryset = instances_queryset.select_for_update()
         instances = list(
-            _version_shift_instances_queryset(version)
-            .select_for_update()
+            instances_queryset
             .select_related('facility', 'shift_template')
             .order_by('date', 'facility__name', 'start_datetime', 'id')
         )
+        if isolated_run:
+            source_locked_open_id_set = set(source_locked_open_ids)
+            for instance in instances:
+                instance.is_locked_open = instance.id in source_locked_open_id_set
         if source_run is not None:
             raw_source_assignments = list(
                 assignments_for_viewed_run(version, source_run)
@@ -13843,7 +13860,7 @@ def optimize_schedule_version(
             and not assignment.is_locked
             and assignment.physician_id not in manual_assignment_only_physician_ids
         ]
-        if unlocked_manual_ids:
+        if unlocked_manual_ids and not isolated_run:
             ScheduleShiftAssignment.objects.filter(id__in=unlocked_manual_ids).delete()
 
         invalid_assignment_capacity = _invalid_state_assignment_capacity(
@@ -13886,7 +13903,10 @@ def optimize_schedule_version(
 
         # Keep the snapshot atomic without one database round trip per slot.
         ScheduleShiftAssignment.objects.bulk_create(assignment_rows, batch_size=1000)
-        ScheduleShiftInstance.objects.bulk_update(changed_instances, ['status', 'updated_at'], batch_size=500)
+        if not isolated_run:
+            ScheduleShiftInstance.objects.bulk_update(
+                changed_instances, ['status', 'updated_at'], batch_size=500,
+            )
         persistence_finished_at = monotonic()
 
         persisted_visible_assignment_pairs = set(
@@ -13919,7 +13939,7 @@ def optimize_schedule_version(
     # Reaching a configured search boundary is a normal optimizer completion,
     # not an execution failure.  A non-improving bounded result remains saved
     # for comparison while the previous active run stays selected.
-    activate_result = not timed_out or preserve_timeout_result
+    activate_result = (not timed_out or preserve_timeout_result) and not isolated_run
 
     if preserve_timeout_result:
         message = 'Optimizer reached the runtime limit. Best complete improved schedule retained.'
@@ -13970,6 +13990,17 @@ def optimize_schedule_version(
             message = (
                 f'Optimizer finished after {stop_label} without finding a better schedule. '
                 'This run was saved for comparison; the previous active run was preserved.'
+            )
+    if isolated_run:
+        if source_state_restored_as_best:
+            message = (
+                'Independent optimizer run completed without improving its starting schedule. '
+                'The result was saved for comparison; the active schedule was not changed.'
+            )
+        else:
+            message = (
+                'Independent optimizer run completed and was saved for review. '
+                'The active schedule was not changed; activate this run if you want to use it.'
             )
     final_validation = final_scoring['validation']
     final_request_rows = _request_scoring_rows(

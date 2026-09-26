@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import UUID
 from time import monotonic
 
+from django.conf import settings
 from django.db.models import FloatField, Prefetch, Q
 from django.db.models.functions import Cast
 from django.db import transaction, IntegrityError
@@ -1885,14 +1886,16 @@ def _cleanup_stale_optimizer_runs(version):
     # its transaction lock: that made the build workspace wait indefinitely
     # when a search overran. The enqueue path separately removes controls older
     # than 15 minutes before deciding whether a new run may start.
-    if OptimizerControl.objects.filter(schedule_version=version).exists():
-        return 0
+    controlled_run_ids = OptimizerControl.objects.filter(
+        schedule_version=version,
+        optimizer_run_id__isnull=False,
+    ).values_list('optimizer_run_id', flat=True)
     stale_before = timezone.now() - timedelta(minutes=STALE_OPTIMIZER_RUN_MINUTES)
     stale_runs = OptimizerRun.objects.filter(
         schedule_version=version,
         status=OptimizerRun.Status.RUNNING,
         created_at__lt=stale_before,
-    )
+    ).exclude(id__in=controlled_run_ids)
     stale_count = stale_runs.count()
     if stale_count:
         stale_runs.update(
@@ -1901,6 +1904,40 @@ def _cleanup_stale_optimizer_runs(version):
             notes='Optimizer marked failed after exceeding stale running threshold.',
         )
     return stale_count
+
+
+def _optimizer_concurrency_limit():
+    return max(
+        1,
+        int(getattr(settings, 'OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION', 1)),
+    )
+
+
+def _running_optimizer_runs(version):
+    _cleanup_stale_optimizer_runs(version)
+    return version.optimizer_runs.filter(
+        status=OptimizerRun.Status.RUNNING,
+    ).order_by('run_number')
+
+
+def _optimizer_capacity(version):
+    running_runs = _running_optimizer_runs(version)
+    running_count = running_runs.count()
+    concurrency_limit = _optimizer_concurrency_limit()
+    protected_source_run_ids = list(
+        OptimizerControl.objects.filter(
+            schedule_version=version,
+            optimizer_run__status=OptimizerRun.Status.RUNNING,
+            source_run_id__isnull=False,
+        ).values_list('source_run_id', flat=True).distinct()
+    )
+    return {
+        'limit': concurrency_limit,
+        'running_count': running_count,
+        'available_slots': max(0, concurrency_limit - running_count),
+        'running_run_ids': list(running_runs.values_list('id', flat=True)),
+        'protected_source_run_ids': protected_source_run_ids,
+    }
 
 
 def _blocking_optimizer_run(version):
@@ -2084,6 +2121,17 @@ def schedule_block_build_context(request, block_id):
                 'viewed_run_is_editable': False, 'viewed_run_can_activate': False,
                 'viewed_run_can_copy': False, 'viewed_run_can_be_optimizer_source': False,
             },
+            'optimizer_capacity': (
+                _optimizer_capacity(selected_version)
+                if selected_version
+                else {
+                    'limit': _optimizer_concurrency_limit(),
+                    'running_count': 0,
+                    'available_slots': _optimizer_concurrency_limit(),
+                    'running_run_ids': [],
+                    'protected_source_run_ids': [],
+                }
+            ),
             'shift_instances': shift_instances,
             'workload_feasibility': workload_feasibility,
         }
@@ -2232,11 +2280,16 @@ def _run_optimizer_response(request, version):
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    # This legacy request-bound path still performs shared-state activation and
+    # therefore remains single-flight. Parallel searches use the background
+    # endpoint, where every worker runs against an isolated run snapshot.
     running_run = _blocking_optimizer_run(version)
     if running_run is not None:
         return Response({
             'detail': 'An optimizer run is already running for this schedule version.',
+            'optimizer_run_ids': [running_run.id],
             'optimizer_run_id': running_run.id,
+            'optimizer_concurrency_limit': 1,
         }, status=status.HTTP_409_CONFLICT)
     control = None
     token = request.data.get('search_token')
@@ -2380,11 +2433,42 @@ def schedule_version_run_optimizer(request, version_id):
     try:
         with transaction.atomic():
             locked_version = ScheduleVersion.objects.select_for_update().get(id=version.id)
-            running_run = _blocking_optimizer_run(locked_version)
-            if running_run is not None:
+            stale_controls = OptimizerControl.objects.filter(
+                schedule_version=locked_version,
+                started_at__isnull=True,
+                created_at__lt=timezone.now() - timedelta(minutes=15),
+            )
+            stale_run_ids = list(
+                stale_controls.exclude(optimizer_run_id=None).values_list(
+                    'optimizer_run_id', flat=True,
+                )
+            )
+            stale_controls.delete()
+            if stale_run_ids:
+                OptimizerRun.objects.filter(
+                    id__in=stale_run_ids,
+                    status=OptimizerRun.Status.RUNNING,
+                ).update(
+                    status=OptimizerRun.Status.FAILED,
+                    is_active=False,
+                    notes='Optimizer queue entry expired before a worker claimed it.',
+                )
+            running_runs = list(
+                OptimizerRun.objects.filter(
+                    schedule_version=locked_version,
+                    status=OptimizerRun.Status.RUNNING,
+                ).order_by('run_number').values_list('id', flat=True)
+            )
+            concurrency_limit = _optimizer_concurrency_limit()
+            if len(running_runs) >= concurrency_limit:
                 return Response({
-                    'detail': 'An optimizer run is already running for this schedule version.',
-                    'optimizer_run_id': running_run.id,
+                    'detail': (
+                        f'This schedule version already has {len(running_runs)} optimizer '
+                        f'run(s) in progress; the limit is {concurrency_limit}.'
+                    ),
+                    'optimizer_run_ids': running_runs,
+                    'optimizer_run_id': running_runs[0],
+                    'optimizer_concurrency_limit': concurrency_limit,
                 }, status=status.HTTP_409_CONFLICT)
             latest_number = (
                 OptimizerRun.objects.filter(schedule_version=locked_version)
@@ -2434,7 +2518,10 @@ def schedule_version_run_optimizer(request, version_id):
                 source_run=source_run,
             )
     except IntegrityError:
-        return Response({'detail': 'An optimizer search is already running.'}, status=409)
+        return Response(
+            {'detail': 'The optimizer run could not be numbered safely. Please try again.'},
+            status=409,
+        )
     payload = OptimizerRunSerializer(optimizer_run).data
     payload['message'] = 'Optimizer queued. You may leave this page; the search will continue.'
     return Response(payload, status=status.HTTP_202_ACCEPTED)
@@ -2598,6 +2685,19 @@ def optimizer_run_detail(request, run_id):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if OptimizerControl.objects.filter(
+            source_run=optimizer_run,
+            optimizer_run__status=OptimizerRun.Status.RUNNING,
+        ).exists():
+            return Response(
+                {
+                    'detail': 'Cannot delete a run while an optimizer is using it as its starting schedule.',
+                    'deleted_run_ids': [],
+                    'skipped_run_ids': [{'id': optimizer_run.id, 'reason': 'optimizer_source'}],
+                    'next_viewed_run_id': viewed_run_id,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if optimizer_run.status == OptimizerRun.Status.RUNNING:
             _cleanup_stale_optimizer_runs(optimizer_run.schedule_version)
             optimizer_run.refresh_from_db()
@@ -2684,6 +2784,13 @@ def optimizer_runs_bulk_delete(request, version_id):
     deleted_ids = []
     skipped = []
     assignments_deleted = 0
+    protected_source_run_ids = set(
+        OptimizerControl.objects.filter(
+            schedule_version=version,
+            optimizer_run__status=OptimizerRun.Status.RUNNING,
+            source_run_id__in=requested_ids,
+        ).values_list('source_run_id', flat=True)
+    )
     with transaction.atomic():
         # Do not lock the schedule version or a currently running row. The
         # optimizer owns those records for the duration of its search, while
@@ -2700,6 +2807,7 @@ def optimizer_runs_bulk_delete(request, version_id):
             if not run.is_active
             and run.id != viewed_run_id
             and run.status != OptimizerRun.Status.RUNNING
+            and run_id not in protected_source_run_ids
         ]
         locked_eligible_runs = {
             run.id: run
@@ -2718,6 +2826,8 @@ def optimizer_runs_bulk_delete(request, version_id):
                 reason = 'viewed_run'
             elif run.status == OptimizerRun.Status.RUNNING:
                 reason = 'running'
+            elif run.id in protected_source_run_ids:
+                reason = 'optimizer_source'
             if reason:
                 skipped.append({'id': run_id, 'reason': reason})
                 continue
