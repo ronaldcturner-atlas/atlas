@@ -1,7 +1,13 @@
 import React from 'react'
 import { useAuth } from '../contexts/AuthContext'
 
-export default function Topbar() {
+type TopbarProps = {
+  canSwitchView: boolean
+  userView: boolean
+  onUserViewChange: (userView: boolean) => void
+}
+
+export default function Topbar({ canSwitchView, userView, onUserViewChange }: TopbarProps) {
   const { user, logout, isLoading } = useAuth()
 
   const handleLogout = async () => {
@@ -14,6 +20,27 @@ export default function Topbar() {
       <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
         {user && (
           <>
+            {canSwitchView && (
+              <div className="view-mode-toggle" role="group" aria-label="Interface view">
+                <button
+                  type="button"
+                  className={!userView ? 'active' : ''}
+                  aria-pressed={!userView}
+                  onClick={() => onUserViewChange(false)}
+                >
+                  Scheduler view
+                </button>
+                <button
+                  type="button"
+                  className={userView ? 'active' : ''}
+                  aria-pressed={userView}
+                  onClick={() => onUserViewChange(true)}
+                >
+                  User view
+                </button>
+              </div>
+            )}
+            {!canSwitchView && <span className="view-mode-label">User view</span>}
             <div style={{ color: 'var(--sidebar-fg)', fontSize: '14px', fontWeight: '500' }}>
               {user.first_name} {user.last_name}
             </div>

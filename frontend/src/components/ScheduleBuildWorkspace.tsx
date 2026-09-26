@@ -275,6 +275,21 @@ type BuildContext = {
         physicians_requested_off: number
       }>
     }
+    weekend_feasibility: {
+      status: 'conflict_proven' | 'no_conflict_found'
+      weekend_shift_slots: number
+      fixed_weekend_shifts: number
+      checked_rule_count: number
+      conflicts: Array<{
+        rule: string
+        physician: string | null
+        period_start: string
+        period_end: string
+        explanation: string
+      }>
+      interpretation: string
+      scope_note: string
+    }
     fte_adjustment_preview: {
       direction: 'increase_maximum' | 'decrease_minimum'
       required_adjustment_hours: number
@@ -413,10 +428,11 @@ function optimizerRunLabel(run: OptimizerRun) {
   const runtimeLabel = run.runtime_seconds == null
     ? ''
     : ` - total time ${formatRuntimeMinutes(run.runtime_seconds)}`
+  const staleLabel = run.score_is_stale ? ' - stored under prior schedule/rules' : ''
   if (!isCompletedOptimizerRun(run)) {
-    return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
+    return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
   }
-  return `Run ${run.run_number}${copyLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${copyLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
 }
 
 function formatRuntimeMinutes(runtimeSeconds: number) {
@@ -1865,9 +1881,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
   const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
+  const weekendFeasibility = context?.workload_feasibility?.weekend_feasibility
   const allFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
     && nightFeasibility?.status === 'feasible'
     && requestOffFeasibility?.status === 'feasible'
+    && weekendFeasibility?.status === 'no_conflict_found'
   const nightCapacityShortfall = Math.max(0, ...(nightFeasibility?.periods.map((period) => (
     period.remaining_maximum_night_shifts === null
       ? 0
@@ -2045,7 +2063,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       {context.workload_feasibility && (
         <>
         {allFeasibilityChecksPass ? (
-          <section className="feasibility-compact-summary" aria-label="Feasibility checks passed">
+          <section className="feasibility-compact-summary" aria-label="Feasibility checks found no necessary conflict">
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Workload feasibility</strong>
               <div className="feasibility-hover-panel workload-feasibility-hover-panel" role="tooltip">
@@ -2108,6 +2126,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 </dl>
                 <p>{requestOffFeasibility?.interpretation}</p>
                 <small>{requestOffFeasibility?.scope_note}</small>
+              </div>
+            </div>
+            <div className="feasibility-compact-item">
+              <strong tabIndex={0}>Weekend feasibility</strong>
+              <div className="feasibility-hover-panel" role="tooltip">
+                <h3>Weekend feasibility</h3>
+                <dl>
+                  <div><dt>Weekend slots</dt><dd>{weekendFeasibility?.weekend_shift_slots ?? 0}</dd></div>
+                  <div><dt>Fixed assignments</dt><dd>{weekendFeasibility?.fixed_weekend_shifts ?? 0}</dd></div>
+                  <div><dt>Configured rules checked</dt><dd>{weekendFeasibility?.checked_rule_count ?? 0}</dd></div>
+                </dl>
+                <p>{weekendFeasibility?.interpretation}</p>
+                <small>{weekendFeasibility?.scope_note}</small>
               </div>
             </div>
           </section>
@@ -2320,6 +2351,37 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           ) : null}
           <small>{requestOffFeasibility?.scope_note}</small>
         </section>
+        <section
+          className={`weekend-feasibility-card weekend-feasibility-${weekendFeasibility?.status ?? 'no_conflict_found'}`}
+          aria-label="Weekend feasibility"
+        >
+          <div className="night-feasibility-heading">
+            <div>
+              <strong>Weekend feasibility</strong>
+              <span>{weekendFeasibility?.interpretation}</span>
+            </div>
+            <span className={`weekend-feasibility-badge weekend-feasibility-badge-${weekendFeasibility?.status ?? 'no_conflict_found'}`}>
+              {weekendFeasibility?.status === 'conflict_proven' ? 'Conflict proven' : 'No conflict found'}
+            </span>
+          </div>
+          <dl>
+            <div><dt>Weekend-designated slots</dt><dd>{weekendFeasibility?.weekend_shift_slots ?? 0}</dd></div>
+            <div><dt>Fixed weekend assignments</dt><dd>{weekendFeasibility?.fixed_weekend_shifts ?? 0}</dd></div>
+            <div><dt>Configured rules checked</dt><dd>{weekendFeasibility?.checked_rule_count ?? 0}</dd></div>
+          </dl>
+          {weekendFeasibility?.conflicts.length ? (
+            <div className="weekend-feasibility-conflicts">
+              {weekendFeasibility.conflicts.map((conflict, index) => (
+                <article key={`${conflict.rule}-${conflict.physician}-${conflict.period_start}-${index}`}>
+                  <strong>{conflict.rule}{conflict.physician ? ` · ${conflict.physician}` : ''}</strong>
+                  <span>{formatDate(conflict.period_start)}–{formatDate(conflict.period_end)}</span>
+                  <p>{conflict.explanation}</p>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          <small>{weekendFeasibility?.scope_note}</small>
+        </section>
         </>
         )}
         </>
@@ -2457,6 +2519,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     </span>
                     <span>Starting penalty {formatScore(run.initial_score)}</span>
                     <span>{optimizerRunScoreLabel(run)}</span>
+                    {run.score_is_stale && <span>Stored under prior schedule/rules</span>}
                     <span>{formatTimestamp(run.created_at)}</span>
                     {run.runtime_seconds != null && <span>Total time {formatRuntimeMinutes(run.runtime_seconds)}</span>}
                     <span>Seed {run.seed ?? '-'}</span>
@@ -2513,7 +2576,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         <section className="optimizer-summary-card" aria-live="polite">
           {selectedRunForActions?.score_is_stale && (
             <div className="optimizer-score-stale" role="status">
-              Score may be outdated after manual edits. Recalculate Score to refresh.
+              Score was stored before later schedule or rule changes. Recalculate Score before comparing it with current-rule runs.
             </div>
           )}
           <div className="optimizer-summary-grid">

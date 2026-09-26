@@ -6,6 +6,7 @@ type StoredRequestType = 'DAY_OFF' | 'SHIFT_OFF' | 'DAY_ON' | 'SHIFT_ON'
 type RequestType = 'NONE' | StoredRequestType
 type Weight = 'LOW' | 'MEDIUM' | 'HIGH' | 'FIXED'
 type BulkPatternMode = 'SELECTED' | 'EVERY' | 'NTH' | 'REMAINING'
+type CalendarRequestView = 'INDIVIDUAL' | 'BULK' | 'ALL'
 
 type ScheduleBlockSummary = {
   id: number
@@ -44,6 +45,7 @@ type ShiftTemplateOption = {
   end_time: string
   active_days_of_week: string[]
   weekend_days: string[]
+  night_shift: boolean
 }
 
 type RequestContextResponse = {
@@ -85,9 +87,12 @@ type BlockProp = {
 
 type Props = {
   block: BlockProp
+  forceUserView?: boolean
+  physicianId?: number | null
 }
 
 const API_BASE = 'http://localhost:8000/api'
+const NIGHTS_ONLY_STORAGE_KEY = 'atlas.requestBuilder.nightsOnly'
 
 const REQUEST_TYPES: Array<{ value: RequestType; label: string }> = [
   { value: 'NONE', label: 'None' },
@@ -241,7 +246,74 @@ function requestCalendarLabel(item: RequestItem) {
   return `${owner} ${templateLabel} ${direction} (${weight})`
 }
 
-export default function RequestBuilderView({ block }: Props) {
+function requestTypeLabel(requestType: StoredRequestType) {
+  return REQUEST_TYPES.find((option) => option.value === requestType)?.label ?? requestType
+}
+
+function requestWeightLabel(weight: Weight) {
+  return WEIGHTS.find((option) => option.value === weight)?.label ?? weight
+}
+
+function RequestCalendarChip({ item }: { item: RequestItem }) {
+  const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties | null>(null)
+
+  const showPopover = (event: React.MouseEvent<HTMLDivElement>) => {
+    const anchor = event.currentTarget.getBoundingClientRect()
+    const viewportPadding = 12
+    const popoverWidth = Math.min(320, window.innerWidth - (viewportPadding * 2))
+    const desiredHeight = Math.min(320, 96 + (item.shift_template_details.length * 22))
+    const roomBelow = window.innerHeight - anchor.bottom - viewportPadding
+    const roomAbove = anchor.top - viewportPadding
+    const openBelow = roomBelow >= Math.min(desiredHeight, 180) || roomBelow >= roomAbove
+    const availableHeight = Math.max(120, Math.min(320, openBelow ? roomBelow : roomAbove))
+    const left = Math.max(
+      viewportPadding,
+      Math.min(anchor.left, window.innerWidth - popoverWidth - viewportPadding),
+    )
+
+    setPopoverStyle({
+      left,
+      width: popoverWidth,
+      maxHeight: availableHeight,
+      ...(openBelow
+        ? { top: anchor.bottom - 1 }
+        : { bottom: window.innerHeight - anchor.top - 1 }),
+    })
+  }
+
+  return (
+    <div
+      className="request-chip-hover"
+      onMouseEnter={showPopover}
+      onMouseLeave={() => setPopoverStyle(null)}
+    >
+      <div className={`request-chip ${item.request_scope === 'ADMIN' ? 'request-chip-admin' : ''}`}>
+        {item.request_scope === 'ADMIN' ? 'Admin: ' : ''}{requestCalendarLabel(item)}
+      </div>
+      {popoverStyle && (
+        <div className="request-chip-popover" role="tooltip" style={popoverStyle}>
+          <strong>{item.physician_name}</strong>
+          <span>{formatDisplayDate(parseIsoDateToUtc(item.date))}</span>
+          <span>
+            {item.request_scope === 'ADMIN' ? 'Admin request' : 'User request'} · {requestTypeLabel(item.request_type)} · {requestWeightLabel(item.weight)}
+          </span>
+          {item.shift_template_details.length > 0 && (
+            <div className="request-chip-popover-shifts">
+              <b>{item.shift_template_details.length === 1 ? 'Shift' : 'All shifts'}</b>
+              <ul>
+                {item.shift_template_details.map((template) => (
+                  <li key={template.id}>{template.name} ({template.facility_name})</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function RequestBuilderView({ block, forceUserView = false, physicianId = null }: Props) {
   const [contextData, setContextData] = useState<RequestContextResponse | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
@@ -262,6 +334,13 @@ export default function RequestBuilderView({ block }: Props) {
   const [requestType, setRequestType] = useState<RequestType>('NONE')
   const [weight, setWeight] = useState<Weight>('MEDIUM')
   const [selectedShiftTemplateIds, setSelectedShiftTemplateIds] = useState<number[]>([])
+  const [nightsOnly, setNightsOnly] = useState(() => {
+    try {
+      return window.localStorage.getItem(NIGHTS_ONLY_STORAGE_KEY) === 'true'
+    } catch {
+      return false
+    }
+  })
 
   const [bulkPhysicianIds, setBulkPhysicianIds] = useState<number[]>([])
   const [bulkScope, setBulkScope] = useState<RequestScope>('USER')
@@ -271,10 +350,12 @@ export default function RequestBuilderView({ block }: Props) {
   const [bulkSelectedDates, setBulkSelectedDates] = useState<string[]>([])
   const [bulkPendingDates, setBulkPendingDates] = useState<string[]>([])
   const [patternMode, setPatternMode] = useState<BulkPatternMode>('SELECTED')
+  const [calendarRequestView, setCalendarRequestView] = useState<CalendarRequestView>('INDIVIDUAL')
 
   const canEdit = block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD'
+  const isSchedulerMode = Boolean(contextData?.is_scheduler_or_admin && !forceUserView)
 
-  const fetchContext = async (physicianId?: number) => {
+  const fetchContext = async (requestedPhysicianId?: number) => {
     const requestId = contextRequestId.current + 1
     contextRequestId.current = requestId
 
@@ -283,8 +364,9 @@ export default function RequestBuilderView({ block }: Props) {
       setError(null)
 
       const params = new URLSearchParams()
-      if (physicianId !== undefined && physicianId !== null) {
-        params.set('physician_id', String(physicianId))
+      const resolvedPhysicianId = forceUserView ? physicianId : requestedPhysicianId
+      if (resolvedPhysicianId !== undefined && resolvedPhysicianId !== null) {
+        params.set('physician_id', String(resolvedPhysicianId))
       }
       const query = params.toString()
       const url = query
@@ -305,11 +387,17 @@ export default function RequestBuilderView({ block }: Props) {
       if (requestId !== contextRequestId.current) {
         return
       }
+      if (forceUserView && physicianId === null) {
+        data.selected_physician_id = null
+        data.physicians = []
+        data.requests = []
+        data.visible_requests = []
+      }
       setContextData(data)
       setSelectedPhysicianId(data.selected_physician_id ?? (data.physicians[0]?.id ?? null))
       const availablePhysicianIds = new Set(data.physicians.map((physician) => physician.id))
       setBulkPhysicianIds((current) => (
-        data.is_scheduler_or_admin
+        data.is_scheduler_or_admin && !forceUserView
           ? current.filter((physicianId) => availablePhysicianIds.has(physicianId))
           : []
       ))
@@ -331,12 +419,25 @@ export default function RequestBuilderView({ block }: Props) {
     setSelectedDate(block.start_date)
     setBulkSelectedDates([])
     setBulkPendingDates([])
-    fetchContext()
-  }, [block.id, block.start_date, block.end_date, block.build_status])
+    setCalendarRequestView('INDIVIDUAL')
+    setSelectedScope('USER')
+    fetchContext(forceUserView ? physicianId ?? undefined : undefined)
+  }, [block.id, block.start_date, block.end_date, block.build_status, forceUserView, physicianId])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(NIGHTS_ONLY_STORAGE_KEY, String(nightsOnly))
+    } catch {
+      // The in-memory toggle still works when browser storage is unavailable.
+    }
+  }, [nightsOnly])
 
   const requestsByDateAndScope = useMemo(() => {
     const map = new Map<string, RequestItem>()
     for (const item of contextData?.requests ?? []) {
+      if (forceUserView && item.request_scope !== 'USER') {
+        continue
+      }
       if (!isDateWithinBlock(item.date, block.start_date, block.end_date)) {
         continue
       }
@@ -345,10 +446,27 @@ export default function RequestBuilderView({ block }: Props) {
     return map
   }, [block.end_date, block.start_date, contextData])
 
+  const calendarPhysicianIds = useMemo(() => (
+    calendarRequestView === 'ALL'
+      ? null
+      : new Set(
+        calendarRequestView === 'BULK' && bulkPhysicianIds.length > 0
+          ? bulkPhysicianIds
+          : selectedPhysicianId !== null
+            ? [selectedPhysicianId]
+            : [],
+      )
+  ), [bulkPhysicianIds, calendarRequestView, selectedPhysicianId])
+
   const visibleRequestsByDate = useMemo(() => {
     const map = new Map<string, RequestItem[]>()
     for (const item of contextData?.visible_requests ?? []) {
-      if (!isDateWithinBlock(item.date, block.start_date, block.end_date)) {
+      if (
+        (forceUserView && item.request_scope !== 'USER')
+        ||
+        (calendarPhysicianIds !== null && !calendarPhysicianIds.has(item.physician))
+        || !isDateWithinBlock(item.date, block.start_date, block.end_date)
+      ) {
         continue
       }
       const current = map.get(item.date) ?? []
@@ -367,7 +485,7 @@ export default function RequestBuilderView({ block }: Props) {
     }
 
     return map
-  }, [block.end_date, block.start_date, contextData?.visible_requests])
+  }, [block.end_date, block.start_date, calendarPhysicianIds, contextData?.visible_requests, forceUserView])
 
   const filteredPhysicians = useMemo(() => {
     const query = physicianSearch.trim().toLowerCase()
@@ -381,16 +499,24 @@ export default function RequestBuilderView({ block }: Props) {
     const key = `${selectedDate}-${selectedScope}`
     const existing = requestsByDateAndScope.get(key)
     if (!existing) {
-      setRequestType('NONE')
-      setWeight(selectedScope === 'ADMIN' ? 'FIXED' : 'MEDIUM')
-      setSelectedShiftTemplateIds([])
+      // A blank date is a new entry in the same request-entry sequence. Keep
+      // the user's current type, weight, and shift choice so similar requests
+      // can be entered back to back without rebuilding the form each time.
       return
     }
 
     setRequestType(existing.request_type)
     setWeight(existing.weight)
-    setSelectedShiftTemplateIds(existing.shift_template_ids)
-  }, [requestsByDateAndScope, selectedDate, selectedScope])
+    setSelectedShiftTemplateIds(
+      nightsOnly
+        ? existing.shift_template_ids.filter((templateId) => (
+          contextData?.shift_templates.some((template) => (
+            template.id === templateId && template.night_shift
+          ))
+        ))
+        : existing.shift_template_ids,
+    )
+  }, [contextData?.shift_templates, nightsOnly, requestsByDateAndScope, selectedDate, selectedScope])
 
   useEffect(() => {
     if (!contextData) {
@@ -410,8 +536,44 @@ export default function RequestBuilderView({ block }: Props) {
 
   const availableTemplatesForSelectedDate = useMemo(() => {
     const dayName = DAY_NAMES[selectedDateUtc.getUTCDay()]
-    return (contextData?.shift_templates ?? []).filter((template) => template.active_days_of_week.includes(dayName))
+    return (contextData?.shift_templates ?? []).filter((template) => (
+      template.active_days_of_week.includes(dayName)
+    ))
   }, [contextData?.shift_templates, selectedDateUtc])
+
+  const individualShiftTemplateOptions = useMemo(() => {
+    const templates = (contextData?.shift_templates ?? []).filter((template) => (
+      !nightsOnly || template.night_shift
+    ))
+    if (requestType === 'SHIFT_ON') {
+      const availableIds = new Set(availableTemplatesForSelectedDate.map((template) => template.id))
+      return templates.filter((template) => availableIds.has(template.id))
+    }
+    return templates
+  }, [availableTemplatesForSelectedDate, contextData?.shift_templates, nightsOnly, requestType])
+
+  const bulkShiftTemplateOptions = useMemo(() => {
+    const templates = contextData?.shift_templates ?? []
+    if (bulkRequestType !== 'SHIFT_ON') {
+      return templates
+    }
+
+    const targetDates = bulkSelectedDates.length ? bulkSelectedDates : [selectedDate]
+    const targetDayNames = targetDates.map((dateValue) => (
+      DAY_NAMES[parseIsoDateToUtc(dateValue).getUTCDay()]
+    ))
+    return templates.filter((template) => (
+      targetDayNames.every((dayName) => template.active_days_of_week.includes(dayName))
+    ))
+  }, [bulkRequestType, bulkSelectedDates, contextData?.shift_templates, selectedDate])
+
+  useEffect(() => {
+    if (bulkRequestType !== 'SHIFT_ON') {
+      return
+    }
+    const visibleTemplateIds = new Set(bulkShiftTemplateOptions.map((template) => template.id))
+    setBulkShiftTemplateIds((current) => current.filter((templateId) => visibleTemplateIds.has(templateId)))
+  }, [bulkRequestType, bulkShiftTemplateOptions])
 
   const daysInGrid = useMemo(() => getDaysForMonthGrid(visibleMonth, blockStart, blockEnd), [visibleMonth, blockStart, blockEnd])
 
@@ -483,7 +645,12 @@ export default function RequestBuilderView({ block }: Props) {
 
   const handlePhysicianChange = async (nextPhysicianId: number) => {
     setSelectedPhysicianId(nextPhysicianId)
+    setCalendarRequestView('INDIVIDUAL')
+    setBulkPendingDates([])
     await fetchContext(nextPhysicianId)
+    setRequestType('NONE')
+    setWeight(selectedScope === 'ADMIN' ? 'FIXED' : 'MEDIUM')
+    setSelectedShiftTemplateIds([])
   }
 
   const handleToggleTemplate = (templateId: number, singleSelect: boolean, forBulk = false) => {
@@ -531,6 +698,23 @@ export default function RequestBuilderView({ block }: Props) {
       return
     }
 
+    if (requestType === 'SHIFT_ON' && selectedShiftTemplateIds.length !== 1) {
+      setError('Select exactly one available shift for a Shift On request.')
+      return
+    }
+
+    if (requestType === 'SHIFT_OFF') {
+      if (!selectedShiftTemplateIds.length) {
+        setError('Select one or more shifts for a Shift Off request.')
+        return
+      }
+      const availableIds = new Set(availableTemplatesForSelectedDate.map((template) => template.id))
+      if (!selectedShiftTemplateIds.some((templateId) => availableIds.has(templateId))) {
+        setError('At least one selected Shift Off shift must occur on this date.')
+        return
+      }
+    }
+
     try {
       setIsSaving(true)
       setError(null)
@@ -557,6 +741,10 @@ export default function RequestBuilderView({ block }: Props) {
       }
 
       await fetchContext(selectedPhysicianId)
+      // Calendar clicks are also collected for the bulk "Selected dates only"
+      // workflow. Once an individual request is saved, those temporary visual
+      // selections are complete and must not remain highlighted on later edits.
+      setBulkPendingDates([])
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save request.')
     } finally {
@@ -663,6 +851,29 @@ export default function RequestBuilderView({ block }: Props) {
       return
     }
 
+    if (bulkRequestType === 'SHIFT_ON' && bulkShiftTemplateIds.length !== 1) {
+      setError('Select exactly one shift that is available on every selected date.')
+      return
+    }
+
+    if (bulkRequestType === 'SHIFT_OFF') {
+      if (!bulkShiftTemplateIds.length) {
+        setError('Select one or more shifts for a Shift Off request.')
+        return
+      }
+      const selectedTemplates = (contextData?.shift_templates ?? []).filter((template) => (
+        bulkShiftTemplateIds.includes(template.id)
+      ))
+      const dateWithoutApplicableShift = bulkSelectedDates.find((dateValue) => {
+        const dayName = DAY_NAMES[parseIsoDateToUtc(dateValue).getUTCDay()]
+        return !selectedTemplates.some((template) => template.active_days_of_week.includes(dayName))
+      })
+      if (dateWithoutApplicableShift) {
+        setError(`At least one selected Shift Off shift must occur on ${dateWithoutApplicableShift}.`)
+        return
+      }
+    }
+
     try {
       setIsBulkSaving(true)
       setError(null)
@@ -756,7 +967,7 @@ export default function RequestBuilderView({ block }: Props) {
     <div className="request-builder-root">
       {error && <div className="facilities-error">{error}</div>}
 
-      {!contextData.is_scheduler_or_admin && !contextData.physicians.length && (
+      {!isSchedulerMode && !contextData.physicians.length && (
         <div className="facilities-error">No physicians are linked to this user context. Calendar is shown in read-only mode.</div>
       )}
 
@@ -788,7 +999,7 @@ export default function RequestBuilderView({ block }: Props) {
       <div className="request-builder-toolbar">
         <div className="request-builder-physician">
           <span>Selected Physician</span>
-          {contextData.is_scheduler_or_admin ? (
+          {isSchedulerMode ? (
             <>
               <input
                 type="search"
@@ -797,18 +1008,30 @@ export default function RequestBuilderView({ block }: Props) {
                 placeholder="Search physicians"
                 aria-label="Search physicians"
               />
-              <select
-                value={selectedPhysicianId ?? ''}
-                onChange={(event) => void handlePhysicianChange(Number(event.target.value))}
-                disabled={!contextData.physicians.length}
-              >
-                {!contextData.physicians.length && <option value="">No physicians available</option>}
-                {physicianOptions.map((physician) => (
-                  <option key={physician.id} value={physician.id}>
-                    {physician.name}
-                  </option>
-                ))}
-              </select>
+              <div className="request-builder-physician-controls">
+                <select
+                  value={selectedPhysicianId ?? ''}
+                  onChange={(event) => void handlePhysicianChange(Number(event.target.value))}
+                  disabled={!contextData.physicians.length}
+                >
+                  {!contextData.physicians.length && <option value="">No physicians available</option>}
+                  {physicianOptions.map((physician) => (
+                    <option key={physician.id} value={physician.id}>
+                      {physician.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className={`request-calendar-view-button ${calendarRequestView === 'ALL' ? 'active' : ''}`}
+                  onClick={() => {
+                    setCalendarRequestView('ALL')
+                    setBulkPendingDates([])
+                  }}
+                >
+                  {calendarRequestView === 'ALL' ? 'Showing all' : 'View all'}
+                </button>
+              </div>
             </>
           ) : (
             <div className="request-builder-selected-name">{selectedPhysician?.name ?? 'No physician assigned'}</div>
@@ -846,7 +1069,11 @@ export default function RequestBuilderView({ block }: Props) {
               const dateKey = toIsoDateUtc(cell.date)
               const dateRequests = visibleRequestsByDate.get(dateKey) ?? []
               const isSelected = dateKey === selectedDate
-              const isBulkPending = patternMode === 'SELECTED' && bulkPendingDates.includes(dateKey)
+              const isBulkPending = (
+                calendarRequestView === 'BULK'
+                && patternMode === 'SELECTED'
+                && bulkPendingDates.includes(dateKey)
+              )
 
               if (cell.key.startsWith('empty-leading-')) {
                 return <div key={cell.key} className="request-day-cell request-day-cell-empty" />
@@ -859,7 +1086,11 @@ export default function RequestBuilderView({ block }: Props) {
                   className={`request-day-cell ${isSelected ? 'request-day-selected' : ''} ${isBulkPending ? 'request-day-bulk-pending' : ''}`}
                   onClick={() => {
                     setSelectedDate(dateKey)
-                    if (contextData.is_scheduler_or_admin && patternMode === 'SELECTED') {
+                    if (
+                      isSchedulerMode
+                      && calendarRequestView === 'BULK'
+                      && patternMode === 'SELECTED'
+                    ) {
                       setBulkPendingDates((current) => (
                         current.includes(dateKey)
                           ? current.filter((value) => value !== dateKey)
@@ -873,13 +1104,7 @@ export default function RequestBuilderView({ block }: Props) {
                     {isBulkPending && <span className="bulk-date-selection-indicator">Selected</span>}
                   </div>
                   {dateRequests.map((item) => (
-                    <div
-                      key={item.id}
-                      className={`request-chip ${item.request_scope === 'ADMIN' ? 'request-chip-admin' : ''}`}
-                      title={requestCalendarLabel(item)}
-                    >
-                      {item.request_scope === 'ADMIN' ? 'Admin: ' : ''}{requestCalendarLabel(item)}
-                    </div>
+                    <RequestCalendarChip key={item.id} item={item} />
                   ))}
                 </button>
               )
@@ -889,7 +1114,7 @@ export default function RequestBuilderView({ block }: Props) {
 
         <section className="request-editor">
           <h3>{formatDisplayDate(selectedDateUtc)}</h3>
-          {contextData.is_scheduler_or_admin && (
+          {isSchedulerMode && (
             <div className="request-scope-toggle">
               <button
                 type="button"
@@ -905,10 +1130,28 @@ export default function RequestBuilderView({ block }: Props) {
               >
                 Edit as Admin
               </button>
+              <button
+                type="button"
+                className={nightsOnly ? 'active' : ''}
+                aria-pressed={nightsOnly}
+                onClick={() => {
+                  const nextNightsOnly = !nightsOnly
+                  setNightsOnly(nextNightsOnly)
+                  if (nextNightsOnly) {
+                    setSelectedShiftTemplateIds((current) => current.filter((templateId) => (
+                      contextData.shift_templates.some((template) => (
+                        template.id === templateId && template.night_shift
+                      ))
+                    )))
+                  }
+                }}
+              >
+                Nights Only
+              </button>
             </div>
           )}
 
-          {!contextData.is_scheduler_or_admin && existingForSelectedDate.userRequest && (
+          {!isSchedulerMode && existingForSelectedDate.userRequest && (
             <div className="request-existing-note">Your existing request for this date is loaded below.</div>
           )}
 
@@ -938,9 +1181,9 @@ export default function RequestBuilderView({ block }: Props) {
 
           {shiftSelectionMode !== 'none' && (
             <fieldset className="days-fieldset">
-              <legend>Shift Templates On This Date</legend>
+              <legend>{requestType === 'SHIFT_ON' ? 'Available Shifts On This Date' : 'Shift Templates'}</legend>
               <div className="request-template-list">
-                {availableTemplatesForSelectedDate.map((template) => (
+                {individualShiftTemplateOptions.map((template) => (
                   <label key={template.id} className="day-option">
                     <input
                       type={shiftSelectionMode === 'single' ? 'radio' : 'checkbox'}
@@ -952,7 +1195,13 @@ export default function RequestBuilderView({ block }: Props) {
                     <span>{template.name} ({template.facility_name})</span>
                   </label>
                 ))}
-                {!availableTemplatesForSelectedDate.length && <div className="empty-state">No shift templates available on this date.</div>}
+                {!individualShiftTemplateOptions.length && (
+                  <div className="empty-state">
+                    {requestType === 'SHIFT_ON'
+                      ? 'No shift templates are available on this date.'
+                      : 'No shift templates are available.'}
+                  </div>
+                )}
               </div>
             </fieldset>
           )}
@@ -985,7 +1234,7 @@ export default function RequestBuilderView({ block }: Props) {
         </section>
       </div>
 
-      {contextData.is_scheduler_or_admin && (
+      {isSchedulerMode && (
         <section className="request-bulk-panel">
           <div className="request-bulk-header">
             <h3>Bulk Requests</h3>
@@ -1013,7 +1262,11 @@ export default function RequestBuilderView({ block }: Props) {
                 <button
                   type="button"
                   className="request-clear-user-selection"
-                  onClick={() => setBulkPhysicianIds([])}
+                  onClick={() => {
+                    setBulkPhysicianIds([])
+                    setBulkPendingDates([])
+                    setCalendarRequestView('INDIVIDUAL')
+                  }}
                   disabled={!canEdit || bulkPhysicianIds.length === 0}
                 >
                   Clear Selected Users
@@ -1027,10 +1280,14 @@ export default function RequestBuilderView({ block }: Props) {
                       checked={bulkPhysicianIds.includes(physician.id)}
                       onChange={() => {
                         setBulkPhysicianIds((current) => {
-                          if (current.includes(physician.id)) {
-                            return current.filter((value) => value !== physician.id)
+                          const next = current.includes(physician.id)
+                            ? current.filter((value) => value !== physician.id)
+                            : [...current, physician.id]
+                          setCalendarRequestView(next.length ? 'BULK' : 'INDIVIDUAL')
+                          if (!next.length) {
+                            setBulkPendingDates([])
                           }
-                          return [...current, physician.id]
+                          return next
                         })
                       }}
                     />
@@ -1085,7 +1342,7 @@ export default function RequestBuilderView({ block }: Props) {
               <fieldset className="days-fieldset">
                 <legend>Shift Templates</legend>
                 <div className="request-template-list">
-                  {(contextData.shift_templates ?? []).map((template) => (
+                  {bulkShiftTemplateOptions.map((template) => (
                     <label key={template.id} className="day-option">
                       <input
                         type={bulkShiftSelectionMode === 'single' ? 'radio' : 'checkbox'}
@@ -1097,6 +1354,13 @@ export default function RequestBuilderView({ block }: Props) {
                       <span>{template.name} ({template.facility_name})</span>
                     </label>
                   ))}
+                  {!bulkShiftTemplateOptions.length && (
+                    <div className="empty-state">
+                      {bulkRequestType === 'SHIFT_ON'
+                        ? 'No single shift is available on every selected date.'
+                        : 'No shift templates are available.'}
+                    </div>
+                  )}
                 </div>
               </fieldset>
             )}

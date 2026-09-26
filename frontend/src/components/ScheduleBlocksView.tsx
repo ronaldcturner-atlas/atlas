@@ -31,6 +31,7 @@ type ScheduleBlockFormState = {
 
 type ScheduleBlocksViewProps = {
   requestUserView?: boolean
+  previewPhysicianId?: number | null
   requestBlockId?: number | null
   onOpenRequests?: (blockId: number) => void
   onCloseRequests?: () => void
@@ -189,6 +190,7 @@ async function parseApiResponseError(response: Response) {
 
 export default function ScheduleBlocksView({
   requestUserView = false,
+  previewPhysicianId = null,
   requestBlockId = null,
   onOpenRequests,
   onCloseRequests,
@@ -274,10 +276,28 @@ export default function ScheduleBlocksView({
     setIsModalOpen(true)
   }, [blocks, requestBlockId])
 
-  const sortedBlocks = useMemo(
-    () => [...blocks].sort((a, b) => b.created_at.localeCompare(a.created_at)),
-    [blocks],
-  )
+  const sortedBlocks = useMemo(() => {
+    const newestScheduleFirst = (left: ScheduleBlock, right: ScheduleBlock) => (
+      right.start_date.localeCompare(left.start_date)
+      || right.end_date.localeCompare(left.end_date)
+      || right.created_at.localeCompare(left.created_at)
+    )
+    const sorted = [...blocks].sort(newestScheduleFirst)
+    if (!requestUserView) {
+      return sorted
+    }
+    const latestPublished = sorted
+      .filter((block) => block.published_at)
+      .sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0]
+    const today = new Date().toISOString().slice(0, 10)
+    const upcoming = sorted
+      .filter((block) => !block.published_at && block.end_date >= today)
+      .sort((a, b) => a.start_date.localeCompare(b.start_date))[0]
+    return Array.from(new Map(
+      [latestPublished, upcoming].filter((block): block is ScheduleBlock => Boolean(block))
+        .map((block) => [block.id, block]),
+    ).values()).sort(newestScheduleFirst)
+  }, [blocks, requestUserView])
 
   const requestTypeLabel = (requestType: string) => requestType
     .toLowerCase()
@@ -559,7 +579,10 @@ export default function ScheduleBlocksView({
     return (
       <div className="facilities-view-card">
         <div className="facilities-header">
-          <h2>My Requests</h2>
+          <div>
+            <h2>Schedule Blocks</h2>
+            <p className="user-view-helper">Choose Requests while a request period is open.</p>
+          </div>
         </div>
         {error && <div className="facilities-error">{error}</div>}
         <div className="scheduler-table-wrap">
@@ -567,12 +590,9 @@ export default function ScheduleBlocksView({
             <thead>
               <tr>
                 <th>Name</th>
-                <th>Schedule Dates</th>
-                <th>Request Opens</th>
-                <th>Request Closes</th>
-                <th>Status</th>
-                <th>My Entered Requests</th>
-                <th>Action</th>
+                <th>Requests Open</th>
+                <th>Requests Close</th>
+                <th>Requests</th>
               </tr>
             </thead>
             <tbody>
@@ -581,25 +601,18 @@ export default function ScheduleBlocksView({
                 return (
                   <tr key={block.id}>
                     <td>{block.name}</td>
-                    <td>{`${formatDate(block.start_date)} - ${formatDate(block.end_date)}`}</td>
                     <td>{formatDateTime(block.request_open_datetime)}</td>
                     <td>{formatDateTime(block.request_close_datetime)}</td>
-                    <td>{requestStatus}</td>
                     <td>
-                      {block.my_requests?.length ? (
-                        <div className="my-request-summary">
-                          {block.my_requests.map((item) => (
-                            <span key={item.id}>
-                              {formatDate(item.date)}: {requestTypeLabel(item.request_type)} ({item.weight.toLowerCase()})
-                            </span>
-                          ))}
-                        </div>
-                      ) : 'None'}
-                    </td>
-                    <td>
-                      {requestStatus === 'Open' && (block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') ? (
-                        <button type="button" onClick={() => openRequests(block)}>Enter Requests</button>
-                      ) : '—'}
+                      <button
+                        type="button"
+                        className={`user-request-button ${requestStatus === 'Open' ? 'user-request-button-open' : 'user-request-button-closed'}`}
+                        onClick={() => openRequests(block)}
+                        disabled={requestStatus !== 'Open' || (block.build_status !== 'PRE_BUILD' && block.build_status !== 'BUILD')}
+                        title={requestStatus === 'Open' ? 'Enter schedule requests' : `Request period is ${requestStatus.toLowerCase()}`}
+                      >
+                        Requests
+                      </button>
                     </td>
                   </tr>
                 )
@@ -614,7 +627,11 @@ export default function ScheduleBlocksView({
             <div className="shift-modal shift-modal-wide schedule-block-modal request-builder-modal" onClick={(event) => event.stopPropagation()}>
               <div className="shift-modal-header"><h2>Enter Requests</h2></div>
               <div className="shift-modal-body">
-                <RequestBuilderView block={openedBlock} />
+                <RequestBuilderView
+                  block={openedBlock}
+                  forceUserView
+                  physicianId={previewPhysicianId}
+                />
               </div>
               <div className="shift-modal-actions">
                 <button className="secondary" type="button" onClick={closeModal}>Back to My Requests</button>

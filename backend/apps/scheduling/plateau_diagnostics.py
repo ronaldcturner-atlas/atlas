@@ -121,6 +121,16 @@ def _hard_rejection(context, state, instance, physician_id, exclude_instance_id)
 
 
 def _scored_result(current_scoring, trial_scoring):
+    if trial_scoring is None:
+        return {
+            'legal': True,
+            'improving': False,
+            'score_delta': None,
+            'resulting_total_score': None,
+            'workload_score_delta': None,
+            'night_score_delta': None,
+            'rejection_reasons': ['incremental_screen_rejected_before_full_score'],
+        }
     delta = trial_scoring['score'] - current_scoring['score']
     reasons = []
     if trial_scoring['breakdown']['night_score'] > current_scoring['breakdown']['night_score']:

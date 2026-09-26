@@ -73,6 +73,23 @@ export default function Dashboard() {
     || user?.is_superuser
     || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())),
   )
+  const [userView, setUserView] = React.useState(() => {
+    try {
+      return window.localStorage.getItem('atlas-interface-view') === 'user'
+    } catch {
+      return false
+    }
+  })
+  const effectiveUserView = !canManageSchedules || userView
+
+  const changeUserView = React.useCallback((nextUserView: boolean) => {
+    setUserView(nextUserView)
+    try {
+      window.localStorage.setItem('atlas-interface-view', nextUserView ? 'user' : 'scheduler')
+    } catch {
+      // The selected view still works for this session without browser storage.
+    }
+  }, [])
 
   const pageTitle =
     buildBlockId !== null
@@ -82,13 +99,13 @@ export default function Dashboard() {
       : requestBlockId !== null
       ? 'Request Builder'
       : activeView === 'my-schedule'
-      ? 'Schedule'
+      ? 'My Schedule'
       : activeView === 'stats'
       ? 'Stats'
         : activeView === 'shift-builder'
           ? 'Shift Builder'
         : activeView === 'schedule-blocks'
-          ? canManageSchedules ? 'Schedule Blocks' : 'My Requests'
+          ? 'Schedule Blocks'
         : activeView === 'contracts'
           ? 'Contracts'
         : activeView === 'facilities'
@@ -100,10 +117,11 @@ export default function Dashboard() {
       navigate('/', { replace: true })
       return
     }
-    if (!canManageSchedules && (buildBlockId !== null || violationVersionId !== null)) {
-      navigate('/schedule-blocks', { replace: true })
+    const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'physicians'].includes(activeView)
+    if (effectiveUserView && (schedulerOnlyView || buildBlockId !== null || violationVersionId !== null)) {
+      navigate('/', { replace: true })
     }
-  }, [buildBlockId, canManageSchedules, location.pathname, navigate, violationVersionId])
+  }, [activeView, buildBlockId, effectiveUserView, location.pathname, navigate, violationVersionId])
 
   const handleFacilitiesChanged = React.useCallback(() => {
     setFacilitiesRefreshToken((current) => current + 1)
@@ -114,18 +132,23 @@ export default function Dashboard() {
       <Sidebar
         activeView={activeView}
         onSelectView={(view) => navigate(VIEW_PATHS[view])}
+        userView={effectiveUserView}
       />
       <div className="main-area">
-        <Topbar />
+        <Topbar
+          canSwitchView={canManageSchedules}
+          userView={effectiveUserView}
+          onUserViewChange={changeUserView}
+        />
         <main className="content">
           <h1 className="page-title">{pageTitle}</h1>
-          {activeView === 'my-schedule' && <Calendar shiftsRefreshToken={shiftsRefreshToken} />}
-          {activeView === 'stats' && <StatsView />}
-          {activeView === 'shift-builder' && <ShiftsView />}
-          {activeView === 'schedule-blocks' && violationVersionId !== null && (
+          {activeView === 'my-schedule' && <Calendar shiftsRefreshToken={shiftsRefreshToken} forceUserView={effectiveUserView} />}
+          {activeView === 'stats' && <StatsView limitedToHours={effectiveUserView} />}
+          {!effectiveUserView && activeView === 'shift-builder' && <ShiftsView />}
+          {!effectiveUserView && activeView === 'schedule-blocks' && violationVersionId !== null && (
             <ScheduleVersionViolationReport versionId={violationVersionId} />
           )}
-          {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId !== null && (
+          {!effectiveUserView && activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId !== null && (
             <ScheduleBuildWorkspace
               blockId={buildBlockId}
               onBack={() => navigate('/schedule-blocks')}
@@ -133,18 +156,19 @@ export default function Dashboard() {
           )}
           {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId === null && (
             <ScheduleBlocksView
-              requestUserView={!canManageSchedules}
+              requestUserView={effectiveUserView}
+              previewPhysicianId={effectiveUserView ? user?.physician_id ?? null : null}
               requestBlockId={requestBlockId}
               onOpenRequests={(blockId) => navigate(`/schedule-blocks/${blockId}/requests`)}
               onCloseRequests={() => navigate('/schedule-blocks')}
               onOpenBuild={(blockId) => navigate(`/schedule-blocks/${blockId}/build`)}
             />
           )}
-          {activeView === 'contracts' && <ContractsView />}
-          {activeView === 'facilities' && (
+          {!effectiveUserView && activeView === 'contracts' && <ContractsView />}
+          {!effectiveUserView && activeView === 'facilities' && (
             <FacilitiesView onFacilitiesChanged={handleFacilitiesChanged} />
           )}
-          {activeView === 'physicians' && <PhysiciansView />}
+          {!effectiveUserView && activeView === 'physicians' && <PhysiciansView />}
         </main>
       </div>
     </div>

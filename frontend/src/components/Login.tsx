@@ -27,8 +27,12 @@ export default function Login() {
     <div className="login-container">
       <div className="login-card">
         <div className="login-header">
-          <h1 className="login-title">Atlas</h1>
-          <p className="login-subtitle">Physician Scheduling</p>
+          <img
+            className="login-logo"
+            src="/atlas-logo.png"
+            alt="Atlas"
+          />
+          <p className="login-subtitle">Scheduling Platform</p>
         </div>
 
         <form onSubmit={handleSubmit} className="login-form">

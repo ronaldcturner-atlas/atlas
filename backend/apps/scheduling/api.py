@@ -1158,12 +1158,20 @@ def _get_request_policy(physician, can_manage=False):
     }
 
 
-def _get_available_shift_templates_for_date(target_date, eligible_facility_ids=None):
-    day_name = target_date.strftime('%A')
+def _get_eligible_shift_templates(eligible_facility_ids=None):
     templates = _ordered_shift_templates(ShiftTemplate.objects.filter(active=True))
     if eligible_facility_ids is not None:
         templates = templates.filter(facility_id__in=eligible_facility_ids)
-    return [template for template in templates if day_name in (template.active_days_of_week or [])]
+    return list(templates)
+
+
+def _get_available_shift_templates_for_date(target_date, eligible_facility_ids=None):
+    day_name = target_date.strftime('%A')
+    return [
+        template
+        for template in _get_eligible_shift_templates(eligible_facility_ids)
+        if day_name in (template.active_days_of_week or [])
+    ]
 
 
 def _request_counts_as_weekend(schedule_request, eligible_facility_ids=None):
@@ -1285,7 +1293,13 @@ def _serialize_physician_choice(physician):
     }
 
 
-def _validate_request_payload(request_type, weight, shift_template_ids, available_template_ids):
+def _validate_request_payload(
+    request_type,
+    weight,
+    shift_template_ids,
+    available_template_ids,
+    eligible_template_ids,
+):
     allowed_types = {choice[0] for choice in ScheduleRequest.RequestType.choices}
     if request_type not in allowed_types:
         return {'request_type': 'Invalid request type.'}
@@ -1305,9 +1319,25 @@ def _validate_request_payload(request_type, weight, shift_template_ids, availabl
     if request_type == ScheduleRequest.RequestType.SHIFT_ON and len(shift_template_ids) != 1:
         return {'shift_template_ids': 'Select exactly one shift template for Shift On requests.'}
 
-    invalid_template_ids = [template_id for template_id in shift_template_ids if template_id not in available_template_ids]
+    invalid_template_ids = [
+        template_id
+        for template_id in shift_template_ids
+        if template_id not in eligible_template_ids
+    ]
     if invalid_template_ids:
-        return {'shift_template_ids': 'One or more selected shift templates are not available on this date.'}
+        return {'shift_template_ids': 'One or more selected shift templates are not active or eligible for this physician.'}
+
+    if request_type == ScheduleRequest.RequestType.SHIFT_ON:
+        if shift_template_ids[0] not in available_template_ids:
+            return {'shift_template_ids': 'The selected Shift On template is not available on this date.'}
+
+    if request_type == ScheduleRequest.RequestType.SHIFT_OFF:
+        if not set(shift_template_ids).intersection(available_template_ids):
+            return {
+                'shift_template_ids': (
+                    'At least one selected Shift Off template must be available on this date.'
+                )
+            }
 
     return None
 
@@ -1511,17 +1541,30 @@ def schedule_block_request_upsert(request, block_id):
     except (TypeError, ValueError):
         return Response({'shift_template_ids': 'shift_template_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    available_templates = _get_available_shift_templates_for_date(
-        parsed_date,
-        policy['eligible_facility_ids'],
-    )
+    eligible_templates = _get_eligible_shift_templates(policy['eligible_facility_ids'])
+    eligible_template_ids = {template.id for template in eligible_templates}
+    day_name = parsed_date.strftime('%A')
+    available_templates = [
+        template
+        for template in eligible_templates
+        if day_name in (template.active_days_of_week or [])
+    ]
     available_template_ids = {template.id for template in available_templates}
 
-    payload_error = _validate_request_payload(request_type, weight, shift_template_ids, available_template_ids)
+    payload_error = _validate_request_payload(
+        request_type,
+        weight,
+        shift_template_ids,
+        available_template_ids,
+        eligible_template_ids,
+    )
     if payload_error:
         return Response(payload_error, status=status.HTTP_400_BAD_REQUEST)
 
     selected_templates = [
+        template for template in eligible_templates if template.id in shift_template_ids
+    ]
+    applicable_selected_templates = [
         template for template in available_templates if template.id in shift_template_ids
     ]
     existing_request = ScheduleRequest.objects.filter(
@@ -1537,7 +1580,7 @@ def schedule_block_request_upsert(request, block_id):
         parsed_date,
         request_type,
         weight,
-        selected_templates,
+        applicable_selected_templates,
         request_scope,
         [existing_request.id] if existing_request else None,
     )
@@ -1709,6 +1752,11 @@ def schedule_block_bulk_requests(request, block_id):
     plans = {}
     for physician in physicians:
         policy = _get_request_policy(physician, can_manage=True)
+        eligible_templates = _get_eligible_shift_templates(policy['eligible_facility_ids'])
+        eligible_template_ids = {template.id for template in eligible_templates}
+        selected_templates = [
+            template for template in eligible_templates if template.id in shift_template_ids
+        ]
         existing_target_ids = list(
             ScheduleRequest.objects.filter(
                 schedule_block=block,
@@ -1725,23 +1773,26 @@ def schedule_block_bulk_requests(request, block_id):
         )
 
         for parsed_date in parsed_dates:
-            available_templates = _get_available_shift_templates_for_date(
-                parsed_date,
-                policy['eligible_facility_ids'],
-            )
+            day_name = parsed_date.strftime('%A')
+            available_templates = [
+                template
+                for template in eligible_templates
+                if day_name in (template.active_days_of_week or [])
+            ]
             available_template_ids = {template.id for template in available_templates}
             payload_error = _validate_request_payload(
                 request_type,
                 weight,
                 shift_template_ids,
                 available_template_ids,
+                eligible_template_ids,
             )
             if payload_error:
                 payload_error['date'] = parsed_date.isoformat()
                 payload_error['physician_id'] = physician.id
                 return Response(payload_error, status=status.HTTP_400_BAD_REQUEST)
 
-            selected_templates = [
+            applicable_selected_templates = [
                 template for template in available_templates if template.id in shift_template_ids
             ]
             plans[(physician.id, parsed_date)] = selected_templates
@@ -1753,7 +1804,7 @@ def schedule_block_bulk_requests(request, block_id):
                 parsed_date,
                 request_type,
                 weight,
-                selected_templates,
+                applicable_selected_templates,
                 policy,
             )
             for key, increment in increments.items():
@@ -1992,6 +2043,7 @@ def schedule_block_build_context(request, block_id):
         }
         workload_feasibility['night_feasibility'] = feasibility_report['night_feasibility']
         workload_feasibility['request_off_feasibility'] = feasibility_report['request_off_feasibility']
+        workload_feasibility['weekend_feasibility'] = feasibility_report['weekend_feasibility']
 
     return Response(
         {

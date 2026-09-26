@@ -104,9 +104,10 @@ function formatClockValue(timeValue: string) {
 
 type CalendarProps = {
   shiftsRefreshToken: number
+  forceUserView?: boolean
 }
 
-export default function Calendar({ shiftsRefreshToken }: CalendarProps){
+export default function Calendar({ shiftsRefreshToken, forceUserView = false }: CalendarProps){
   const { user } = useAuth()
   const today = new Date()
   const physicianFilterRef = useRef<HTMLDetailsElement>(null)
@@ -328,7 +329,7 @@ export default function Calendar({ shiftsRefreshToken }: CalendarProps){
   const goPrev = () => setViewDate(d => new Date(d.getFullYear(), d.getMonth() - 1, 1))
   const goNext = () => setViewDate(d => new Date(d.getFullYear(), d.getMonth() + 1, 1))
   const goToday = () => setViewDate(new Date(today.getFullYear(), today.getMonth(), 1))
-  const canManage = Boolean(user?.is_staff || user?.is_superuser || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())))
+  const canManage = !forceUserView && Boolean(user?.is_staff || user?.is_superuser || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())))
   const myAssignments = allShifts.filter((shift) => shift.physician === myPhysicianId)
   const pendingTradeCount = trades.filter((trade) => trade.can_accept || trade.can_review).length
   const pendingTrades = trades.filter((trade) => ['PENDING_RECIPIENT', 'PENDING_SCHEDULER'].includes(trade.status))

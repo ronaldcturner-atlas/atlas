@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from decimal import Decimal
 from datetime import date
 from random import Random
@@ -44,7 +45,71 @@ class FakeBudget:
 
 
 class AdaptiveSearchRoundTests(SimpleTestCase):
-    def test_pipeline_exhaustion_requires_consecutive_unproductive_epochs(self):
+    def test_score_cache_key_is_exact_and_order_independent(self):
+        first = optimizer._score_cache_key({2: [9, 7], 1: []})
+        reordered = optimizer._score_cache_key({1: [], 2: [7, 9]})
+        changed = optimizer._score_cache_key({1: [], 2: [7, 10]})
+
+        self.assertEqual(first, reordered)
+        self.assertNotEqual(first, changed)
+        self.assertNotEqual(
+            first,
+            optimizer._score_cache_key(
+                {2: [9, 7], 1: []},
+                include_internal_night_heuristics=True,
+            ),
+        )
+
+    def test_score_schedule_reuses_exact_cached_result(self):
+        instances = [
+            SimpleNamespace(id=1, required_staffing=1),
+            SimpleNamespace(id=2, required_staffing=1),
+        ]
+        validation = {
+            'final_overlap_violations': 0,
+            'final_rest_violations': 0,
+            'final_duplicate_violations': 0,
+            'final_overstaffed_violations': 0,
+            'final_inactive_physician_violations': 0,
+            'final_facility_ineligible_violations': 0,
+        }
+        cache_token = optimizer._SCORE_CACHE.set(OrderedDict())
+        hits_token = optimizer._SCORE_CACHE_HITS.set(0)
+        misses_token = optimizer._SCORE_CACHE_MISSES.set(0)
+        evaluations_token = optimizer._FULL_SCORE_EVALUATIONS.set(0)
+        try:
+            with (
+                patch.object(optimizer, '_workload_score_rows', return_value=[]),
+                patch.object(optimizer, '_validate_schedule', return_value=validation),
+                patch.object(optimizer, '_distribution_score', return_value={}),
+                patch.object(
+                    optimizer,
+                    '_same_shift_violation_report',
+                    return_value=(Decimal('0'), []),
+                ),
+            ):
+                first = optimizer._score_schedule(
+                    instances, [], {1: [], 2: []}, {}, {}, {}, {}, {},
+                )
+                second = optimizer._score_schedule(
+                    list(reversed(instances)), [], {2: [], 1: []},
+                    {}, {}, {}, {}, {},
+                )
+            hits = optimizer._SCORE_CACHE_HITS.get()
+            misses = optimizer._SCORE_CACHE_MISSES.get()
+            evaluations = optimizer._FULL_SCORE_EVALUATIONS.get()
+        finally:
+            optimizer._SCORE_CACHE.reset(cache_token)
+            optimizer._SCORE_CACHE_HITS.reset(hits_token)
+            optimizer._SCORE_CACHE_MISSES.reset(misses_token)
+            optimizer._FULL_SCORE_EVALUATIONS.reset(evaluations_token)
+
+        self.assertIs(first, second)
+        self.assertEqual(hits, 1)
+        self.assertEqual(misses, 1)
+        self.assertEqual(evaluations, 1)
+
+    def test_pipeline_exhaustion_escalates_after_two_unproductive_epochs(self):
         exhausted_count = 0
         exhausted_count = optimizer._next_exhausted_pipeline_epoch_count(
             exhausted_count, productive=False,
@@ -59,14 +124,17 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
         )
         self.assertEqual(exhausted_count, 0)
 
-        for _ in range(optimizer.MAX_CONSECUTIVE_EXHAUSTED_PIPELINE_EPOCHS):
-            exhausted_count = optimizer._next_exhausted_pipeline_epoch_count(
-                exhausted_count, productive=False,
+        for _ in range(
+            optimizer.ZERO_GAIN_PIPELINE_EPOCHS_BEFORE_DEEP_RESTART
+        ):
+            exhausted_count, action = optimizer._pipeline_epoch_transition(
+                exhausted_count, productive=False, epoch_kind='soft',
             )
         self.assertEqual(
             exhausted_count,
-            optimizer.MAX_CONSECUTIVE_EXHAUSTED_PIPELINE_EPOCHS,
+            optimizer.ZERO_GAIN_PIPELINE_EPOCHS_BEFORE_DEEP_RESTART,
         )
+        self.assertEqual(action, 'deep_restart')
 
     def test_productive_search_is_not_interrupted_by_a_fixed_epoch_limit(self):
         class Clock:
@@ -265,6 +333,30 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
 
         self.assertEqual(stats['consecutive_empty_calls'], 0)
         self.assertEqual(stats['consecutive_no_gain_calls'], 0)
+
+    def test_deep_epoch_reset_preserves_failed_tactic_evidence(self):
+        repair_stats = {
+            'weekend_support_swaps': {
+                'epoch_calls': 5,
+                'recent_runtime_seconds': 12,
+                'recent_score_improvement': 0,
+                'consecutive_empty_calls': 3,
+                'consecutive_no_gain_calls': 4,
+                'cooldown_until_cycle': 99,
+            },
+        }
+
+        optimizer._reset_adaptive_repair_epoch_state(repair_stats, cycle=20)
+
+        stats = repair_stats['weekend_support_swaps']
+        self.assertEqual(stats['epoch_calls'], 0)
+        self.assertEqual(stats['recent_runtime_seconds'], 0)
+        self.assertEqual(stats['recent_score_improvement'], 0)
+        self.assertEqual(stats['consecutive_empty_calls'], 3)
+        self.assertEqual(stats['consecutive_no_gain_calls'], 4)
+        self.assertEqual(stats['cooldown_until_cycle'], 20)
+        self.assertEqual(stats['deep_epoch_resets'], 1)
+        self.assertEqual(optimizer._adaptive_repair_slice_seconds(stats), 1.0)
 
     def test_reconstruction_window_padding_uses_configured_temporal_rules(self):
         contracts = {

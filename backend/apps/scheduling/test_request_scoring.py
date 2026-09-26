@@ -12,6 +12,7 @@ from .optimizer import (
     _optimization_priority,
     _request_on_repair_candidates,
     _request_repair_candidates,
+    _requests_for_shift,
     _request_score,
 )
 
@@ -62,6 +63,45 @@ class RequestScoringTests(SimpleTestCase):
         self.assertEqual(score, Decimal('35000'))
         self.assertEqual(violations, 1)
         self.assertEqual(rewards, 0)
+
+    def test_mixed_shift_off_only_applies_to_matching_dated_shift(self):
+        request_date = date(2026, 11, 5)
+        applicable_template = SimpleNamespace(id=10)
+        unavailable_template = SimpleNamespace(id=11)
+        unrelated_template = SimpleNamespace(id=12)
+        request = SimpleNamespace(
+            request_type=ScheduleRequest.RequestType.SHIFT_OFF,
+            weight=ScheduleRequest.Weight.HIGH,
+            shift_templates=FakeRelatedManager([
+                applicable_template,
+                unavailable_template,
+            ]),
+        )
+        requests = {(2, request_date): [request]}
+        applicable_instance = SimpleNamespace(
+            date=request_date,
+            shift_template_id=applicable_template.id,
+        )
+        unrelated_instance = SimpleNamespace(
+            date=request_date,
+            shift_template_id=unrelated_template.id,
+        )
+        unavailable_template_on_another_date = SimpleNamespace(
+            date=date(2026, 11, 6),
+            shift_template_id=unavailable_template.id,
+        )
+
+        applicable_requests = _requests_for_shift(requests, 2, applicable_instance)
+        self.assertEqual(applicable_requests, [request])
+        self.assertEqual(
+            _request_score(applicable_requests, self.contract),
+            (Decimal('35000'), 1, 0),
+        )
+        self.assertEqual(_requests_for_shift(requests, 2, unrelated_instance), [])
+        self.assertEqual(
+            _requests_for_shift(requests, 2, unavailable_template_on_another_date),
+            [],
+        )
 
     def test_unmet_shift_on_creates_reassignment_candidate(self):
         shift_date = date(2026, 12, 3)

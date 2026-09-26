@@ -1,21 +1,15 @@
 import React from 'react'
-import { useAuth } from '../contexts/AuthContext'
 
 type SidebarProps = {
   activeView: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
   onSelectView: (view: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians') => void
+  userView: boolean
 }
 
-export default function Sidebar({ activeView, onSelectView }: SidebarProps){
-  const { user } = useAuth()
+export default function Sidebar({ activeView, onSelectView, userView }: SidebarProps){
   const [collapsed, setCollapsed] = React.useState(() => (
     window.localStorage.getItem('atlas-sidebar-collapsed') === 'true'
   ))
-  const canManageSchedules = Boolean(
-    user?.is_staff
-    || user?.is_superuser
-    || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())),
-  )
   const toggleCollapsed = () => {
     setCollapsed((current) => {
       const next = !current
@@ -27,8 +21,10 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
     <aside className={`sidebar${collapsed ? ' sidebar-collapsed' : ''}`}>
       <div className="sidebar-header">
         <div className="logo">
-          <span className="logo-mark">A</span>
-          <span className="logo-copy"><strong>Atlas</strong><small>Physician Scheduling</small></span>
+          <span className="logo-mark">
+            <img src="/atlas-logo.png" alt="" aria-hidden="true" />
+          </span>
+          <span className="logo-copy"><strong>Atlas</strong><small>Scheduling Platform</small></span>
         </div>
         <button
           type="button"
@@ -45,10 +41,10 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           type="button"
           className={activeView === 'my-schedule' ? 'active' : ''}
           onClick={() => onSelectView('my-schedule')}
-          title="Schedule"
+          title="My Schedule"
         >
           <span className="nav-icon" aria-hidden="true">▦</span>
-          <span className="nav-label">Schedule</span>
+          <span className="nav-label">My Schedule</span>
         </button>
         <button
           type="button"
@@ -59,6 +55,8 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           <span className="nav-icon" aria-hidden="true">▥</span>
           <span className="nav-label">Stats</span>
         </button>
+        {!userView && (
+          <>
         <button
           type="button"
           className={activeView === 'shift-builder' ? 'active' : ''}
@@ -68,15 +66,19 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           <span className="nav-icon" aria-hidden="true">✦</span>
           <span className="nav-label">Shift Builder</span>
         </button>
+          </>
+        )}
         <button
           type="button"
           className={activeView === 'schedule-blocks' ? 'active' : ''}
           onClick={() => onSelectView('schedule-blocks')}
-          title={canManageSchedules ? 'Schedule Blocks' : 'My Requests'}
+          title="Schedule Blocks"
         >
           <span className="nav-icon" aria-hidden="true">▤</span>
-          <span className="nav-label">{canManageSchedules ? 'Schedule Blocks' : 'My Requests'}</span>
+          <span className="nav-label">Schedule Blocks</span>
         </button>
+        {!userView && (
+          <>
         <button
           type="button"
           className={activeView === 'contracts' ? 'active' : ''}
@@ -104,6 +106,8 @@ export default function Sidebar({ activeView, onSelectView }: SidebarProps){
           <span className="nav-icon" aria-hidden="true">●</span>
           <span className="nav-label">Physicians</span>
         </button>
+          </>
+        )}
       </nav>
     </aside>
   )

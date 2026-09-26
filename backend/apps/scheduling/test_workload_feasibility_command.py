@@ -17,6 +17,7 @@ from .models import (
     ContractUserAssignment,
     OptimizerRun,
     ScheduleBlock,
+    ScheduleRequest,
     ScheduleShiftAssignment,
     ScheduleShiftInstance,
     ScheduleVersion,
@@ -237,6 +238,49 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         nonfixed_aggregate = self._run()['aggregate_feasibility']
         self.assertEqual(nonfixed_aggregate['manual_only_fixed_hours'], 0)
         self.assertEqual(nonfixed_aggregate['total_available_scheduled_hours'], 20)
+
+    def test_manual_only_shift_on_request_counts_as_fixed_coverage(self):
+        self.instance.required_staffing = 2
+        self.instance.save(update_fields=['required_staffing'])
+        optimizer_contract, manual_contract = self.contracts
+        optimizer_contract.workload_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '0', 'max_value': '10',
+            }],
+        }
+        optimizer_contract.save(update_fields=['workload_settings'])
+        manual_contract.manual_assignment_only = True
+        manual_contract.save(update_fields=[
+            'manual_assignment_only', 'updated_at',
+        ])
+        request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physicians[1],
+            date=self.instance.date,
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            weight=ScheduleRequest.Weight.MEDIUM,
+        )
+        request.shift_templates.add(self.instance.shift_template)
+
+        aggregate = self._run()['aggregate_feasibility']
+
+        self.assertEqual(aggregate['total_generated_required_hours'], 20)
+        self.assertEqual(aggregate['manual_only_fixed_hours'], 10)
+        self.assertEqual(aggregate['manual_only_fixed_shift_slots'], 1)
+        self.assertEqual(aggregate['total_available_scheduled_hours'], 10)
+        self.assertEqual(aggregate['status'], 'aggregate_feasible')
+
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=self.instance,
+            physician=self.physicians[1],
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        deduped = self._run()['aggregate_feasibility']
+        self.assertEqual(deduped['manual_only_fixed_hours'], 10)
+        self.assertEqual(deduped['manual_only_fixed_shift_slots'], 1)
 
     def test_aggregate_feasible(self):
         self._set_ranges(4, 6)

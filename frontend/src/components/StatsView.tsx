@@ -69,7 +69,11 @@ function displayHours(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(1)
 }
 
-export default function StatsView() {
+type StatsViewProps = {
+  limitedToHours?: boolean
+}
+
+export default function StatsView({ limitedToHours = false }: StatsViewProps) {
   const { user } = useAuth()
   const today = new Date()
   const [selectedMonth, setSelectedMonth] = useState(today.getMonth())
@@ -210,8 +214,8 @@ export default function StatsView() {
 
       {error && <div className="facilities-error">{error}</div>}
       {isLoading ? <div className="scheduler-loading">Loading statistics...</div> : activeStats === 'mine' ? (
-        <div className="stats-layout">
-          <div className="stats-shift-list">
+        <div className={`stats-layout${limitedToHours ? ' stats-layout-summary-only' : ''}`}>
+          {!limitedToHours && <div className="stats-shift-list">
             {visibleShifts.map((shift) => (
               <div className="stats-shift-row" key={shift.id}>
                 <span>{shift.facility_short_name || shift.facility_name} {displayClock(shift.start_time)}-{displayClock(shift.end_time)}</span>
@@ -220,7 +224,7 @@ export default function StatsView() {
               </div>
             ))}
             {!visibleShifts.length && <div className="empty-state">No shifts in this date range.</div>}
-          </div>
+          </div>}
           <aside className="stats-totals">
             <div><span>Total hours</span><strong>{displayHours(totalHours)}</strong></div>
             <div><span>Night hours</span><strong>{displayHours(nightHours)}</strong></div>
@@ -228,7 +232,7 @@ export default function StatsView() {
         </div>
       ) : (
         <>
-        {canManage && <details className="stats-group-manager">
+        {!limitedToHours && canManage && <details className="stats-group-manager">
           <summary>Manage custom columns</summary>
           <div className="stats-group-manager-content">
             {!!statsGroups.length && <div className="stats-group-existing">{statsGroups.map((group) => <div key={group.id}><strong>{group.name}</strong><span>{group.shift_template_ids.length} shifts</span><button type="button" onClick={() => { setEditingGroupId(group.id); setGroupName(group.name); setSelectedTemplateIds(group.shift_template_ids) }}>Edit</button><button type="button" className="danger" onClick={() => deleteGroup(group)}>Delete</button></div>)}</div>}
@@ -242,13 +246,13 @@ export default function StatsView() {
           </div>
         </details>}
         <div className="group-stats-scroll"><div className="group-stats-list">
-          <div className="group-stats-row group-stats-heading" style={{ gridTemplateColumns: `minmax(180px, 1fr) repeat(${2 + statsGroups.length}, 120px)` }}><span>User</span><span>Total hours</span><span>Night hours</span>{statsGroups.map((group) => <span key={group.id}>{group.name}</span>)}</div>
+          <div className="group-stats-row group-stats-heading" style={{ gridTemplateColumns: `minmax(180px, 1fr) repeat(${2 + (limitedToHours ? 0 : statsGroups.length)}, 120px)` }}><span>User</span><span>Total hours</span><span>Night hours</span>{!limitedToHours && statsGroups.map((group) => <span key={group.id}>{group.name}</span>)}</div>
           {groupStats.map((person) => (
-            <div className="group-stats-row" style={{ gridTemplateColumns: `minmax(180px, 1fr) repeat(${2 + statsGroups.length}, 120px)` }} key={person.id}>
+            <div className="group-stats-row" style={{ gridTemplateColumns: `minmax(180px, 1fr) repeat(${2 + (limitedToHours ? 0 : statsGroups.length)}, 120px)` }} key={person.id}>
               <strong>{person.name}</strong>
               <span>{displayHours(person.hours)}</span>
               <span>{displayHours(person.nightHours)}</span>
-              {statsGroups.map((group) => <span key={group.id}>{displayHours(person.customHours[group.id] ?? 0)}</span>)}
+              {!limitedToHours && statsGroups.map((group) => <span key={group.id}>{displayHours(person.customHours[group.id] ?? 0)}</span>)}
             </div>
           ))}
           {!groupStats.length && <div className="empty-state">No scheduled users in this date range.</div>}

@@ -31,7 +31,13 @@ from .models import (
     ShiftTemplate,
 )
 from .optimizer import (
+    _attach_published_weekend_context,
+    _adaptive_repair_order,
+    _adaptive_repair_slice_seconds,
+    _pipeline_epoch_transition,
+    _reset_adaptive_repair_epoch_state,
     _initial_fill_workload_guard,
+    _initial_fill_workload_scarcity,
     _night_volume_delta_from_totals,
     _night_volume_pressure_from_totals,
     _should_preserve_timeout_result,
@@ -41,14 +47,129 @@ from .optimizer import (
     _shift_hours,
     _validated_night_report_for_current_assignments,
     _validate_schedule,
+    _weekend_volume_report,
     _workload_schedule_score,
     _workload_rule_delta_from_totals,
+    _record_adaptive_repair_productivity,
 )
 from .run_state import assignments_for_viewed_run
 from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
+    def test_pipeline_epochs_escalate_to_one_deep_restart_then_stop(self):
+        count, action = _pipeline_epoch_transition(
+            0, productive=False, epoch_kind='initial',
+        )
+        self.assertEqual((count, action), (1, 'soft_restart'))
+
+        count, action = _pipeline_epoch_transition(
+            count, productive=False, epoch_kind='soft',
+        )
+        self.assertEqual((count, action), (2, 'deep_restart'))
+
+        count, action = _pipeline_epoch_transition(
+            count, productive=False, epoch_kind='deep',
+        )
+        self.assertEqual((count, action), (3, 'stop'))
+
+        count, action = _pipeline_epoch_transition(
+            2, productive=True, epoch_kind='deep',
+        )
+        self.assertEqual((count, action), (0, 'soft_restart'))
+
+    def test_deep_epoch_reset_preserves_lifetime_diagnostics(self):
+        stats = {
+            'general_swaps': {
+                'calls': 14,
+                'epoch_calls': 8,
+                'runtime_seconds': 22.0,
+                'score_improvement': 5000.0,
+                'recent_runtime_seconds': 9.0,
+                'recent_score_improvement': 0.5,
+                'consecutive_empty_calls': 3,
+                'consecutive_no_gain_calls': 7,
+                'cooldown_until_cycle': 99,
+            },
+        }
+
+        _reset_adaptive_repair_epoch_state(stats, cycle=42)
+
+        row = stats['general_swaps']
+        self.assertEqual(row['calls'], 14)
+        self.assertEqual(row['runtime_seconds'], 22.0)
+        self.assertEqual(row['score_improvement'], 5000.0)
+        self.assertEqual(row['epoch_calls'], 0)
+        self.assertEqual(row['recent_score_improvement'], 0.0)
+        self.assertEqual(row['consecutive_empty_calls'], 3)
+        self.assertEqual(row['consecutive_no_gain_calls'], 7)
+        self.assertEqual(row['cooldown_until_cycle'], 42)
+        self.assertEqual(row['deep_epoch_resets'], 1)
+        self.assertEqual(_adaptive_repair_slice_seconds(row), 1.0)
+
+    def test_adaptive_repair_controller_preserves_exploration_with_smaller_slices(self):
+        productive = {
+            'calls': 4,
+            'recent_score_improvement': 800,
+            'recent_runtime_seconds': 4,
+            'consecutive_no_gain_calls': 0,
+        }
+        exhausted = {
+            'calls': 8,
+            'recent_score_improvement': 0,
+            'recent_runtime_seconds': 16,
+            'consecutive_no_gain_calls': 5,
+            'cooldown_until_cycle': 9,
+        }
+        untried = {}
+        repairs = [
+            ('exhausted', object(), {}),
+            ('untried', object(), {}),
+            ('productive', object(), {}),
+        ]
+        stats = {
+            'productive': productive,
+            'exhausted': exhausted,
+            'untried': untried,
+        }
+
+        cooling_order = _adaptive_repair_order(repairs, stats, cycle=8)
+        retry_order = _adaptive_repair_order(repairs, stats, cycle=9)
+
+        self.assertEqual([row[0] for row in cooling_order], ['productive', 'untried'])
+        self.assertEqual(
+            [row[0] for row in retry_order],
+            ['productive', 'untried', 'exhausted'],
+        )
+        self.assertEqual(_adaptive_repair_slice_seconds(productive), 4.0)
+        self.assertEqual(_adaptive_repair_slice_seconds(untried), 4.0)
+        self.assertEqual(_adaptive_repair_slice_seconds(exhausted), 1.0)
+
+    def test_adaptive_repair_zero_gain_backoff_uses_retained_global_score(self):
+        stats = {
+            'calls': 1,
+            'runtime_seconds': 4,
+            'score_improvement': 0,
+        }
+
+        _record_adaptive_repair_productivity(
+            stats, score_gain=0, runtime_seconds=4, cycle=1, attempts=100,
+        )
+        _record_adaptive_repair_productivity(
+            stats, score_gain=0, runtime_seconds=4, cycle=2, attempts=100,
+        )
+
+        self.assertEqual(stats['consecutive_no_gain_calls'], 2)
+        self.assertGreater(stats['cooldown_until_cycle'], 2)
+        self.assertEqual(_adaptive_repair_slice_seconds(stats), 1.5)
+
+        _record_adaptive_repair_productivity(
+            stats, score_gain=500, runtime_seconds=1, cycle=6, attempts=1,
+        )
+        self.assertEqual(stats['consecutive_no_gain_calls'], 0)
+        self.assertEqual(stats['cooldown_until_cycle'], 6)
+        self.assertEqual(_adaptive_repair_slice_seconds(stats), 4.0)
+
     def test_manual_only_assignments_skip_person_rules_but_still_flag_overstaffing(self):
         physician_one = SimpleNamespace(id=1, active=True)
         physician_two = SimpleNamespace(id=2, active=True)
@@ -274,6 +395,49 @@ class SchedulingTests(TestCase):
         valid_candidates = [(rank, 'reduced-contract-physician')]
         self.assertEqual(min(valid_candidates)[1], 'reduced-contract-physician')
         self.assertEqual(debug['ranking_penalty'], 2)
+
+    def test_initial_fill_scarcity_uses_remaining_capacity_in_each_period(self):
+        month_start = date(2027, 1, 1)
+        month_end = date(2027, 1, 31)
+        block_end = date(2027, 3, 31)
+        rows = [
+            {
+                'window_start': month_start, 'window_end': month_end,
+                'units': 'HOURS', 'min_value': Decimal('80'),
+            },
+            {
+                'window_start': month_start, 'window_end': block_end,
+                'units': 'SHIFTS', 'min_value': Decimal('20'),
+            },
+        ]
+        totals = {
+            (month_start, month_end, 'HOURS'): Decimal('40'),
+            (month_start, block_end, 'SHIFTS'): Decimal('5'),
+        }
+        self.assertEqual(
+            _initial_fill_workload_scarcity(
+                rows, totals, {0: Decimal('50'), 1: Decimal('30')}, month_start,
+            ),
+            Decimal('0.8'),
+        )
+        self.assertEqual(
+            _initial_fill_workload_scarcity(
+                rows, totals, {0: Decimal('200'), 1: Decimal('30')}, month_start,
+            ),
+            Decimal('0.5'),
+        )
+        self.assertEqual(
+            _initial_fill_workload_scarcity(
+                rows, totals, {0: Decimal('1'), 1: Decimal('30')}, month_start,
+            ),
+            Decimal('1'),
+        )
+        self.assertEqual(
+            _initial_fill_workload_scarcity(
+                rows, totals, {0: Decimal('50'), 1: Decimal('30')}, date(2027, 2, 1),
+            ),
+            Decimal('0.5'),
+        )
 
     def test_shift_template_generated_name_uses_facility_short_name(self):
         facility = Facility.objects.create(name='Berkeley Hospital', short_name='Berkeley')
@@ -1183,6 +1347,103 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(context_response.json()['request_counters']['WEEKEND']['used'], 1)
 
+    def test_shift_off_allows_extra_templates_when_one_occurs_on_request_date(self):
+        friday_only_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(12, 0),
+            end_time=time(22, 0),
+            active_days_of_week=['Friday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-02',  # Thursday
+                'request_scope': 'USER',
+                'request_type': 'SHIFT_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [self.shift_template.id, friday_only_template.id],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        saved_request = ScheduleRequest.objects.get(schedule_block=self.block)
+        self.assertEqual(
+            set(saved_request.shift_templates.values_list('id', flat=True)),
+            {self.shift_template.id, friday_only_template.id},
+        )
+
+    def test_shift_off_rejects_selection_when_no_template_occurs_on_request_date(self):
+        friday_only_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(12, 0),
+            end_time=time(22, 0),
+            active_days_of_week=['Friday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-02',  # Thursday
+                'request_scope': 'USER',
+                'request_type': 'SHIFT_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [friday_only_template.id],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('shift_template_ids', response.json())
+        self.assertEqual(ScheduleRequest.objects.count(), 0)
+
+    def test_bulk_shift_off_preserves_all_templates_when_each_date_has_a_match(self):
+        friday_only_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(12, 0),
+            end_time=time(22, 0),
+            active_days_of_week=['Friday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={
+                'physician_ids': [self.physician.id],
+                'dates': ['2026-07-02', '2026-07-03'],
+                'request_scope': 'USER',
+                'request_type': 'SHIFT_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [self.shift_template.id, friday_only_template.id],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['saved_count'], 2)
+        for saved_request in ScheduleRequest.objects.filter(schedule_block=self.block):
+            self.assertEqual(
+                set(saved_request.shift_templates.values_list('id', flat=True)),
+                {self.shift_template.id, friday_only_template.id},
+            )
+
     def test_normal_user_request_list_hides_admin_request(self):
         ScheduleRequest.objects.create(
             schedule_block=self.block,
@@ -1677,6 +1938,136 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(affected['shortage'], 2)
         self.assertEqual(affected['physicians_requested_off'], 2)
 
+    def test_weekend_feasibility_uses_designated_days_and_configured_weights(self):
+        physician = self._create_assignment_physician(
+            'weekend-volume@example.com', 'Weekend Volume', facilities=[self.facility],
+        )
+        contract = ContractUserAssignment.objects.get(physician=physician).contract
+        self.day_template.weekend_days = ['Monday']
+        self.day_template.save(update_fields=['weekend_days'])
+        version = self._create_build_version()
+        self._create_shift_instance(version, self.day_template, self.block.start_date)
+        self._create_shift_instance(version, self.overnight_template, self.block.start_date)
+        contract.weekend_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'min_volume': 2,
+                'min_penalty_weight': 0,
+            }],
+        }
+        contract.save(update_fields=['weekend_settings'])
+        url = f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}'
+        unweighted = self.client.get(url).json()['workload_feasibility']['weekend_feasibility']
+        self.assertEqual(unweighted['weekend_shift_slots'], 1)
+        self.assertEqual(unweighted['status'], 'no_conflict_found')
+        self.assertEqual(unweighted['checked_rule_count'], 0)
+
+        contract.weekend_settings['period_rules'][0]['min_penalty_weight'] = 100
+        contract.save(update_fields=['weekend_settings'])
+        weighted = self.client.get(url).json()['workload_feasibility']['weekend_feasibility']
+        self.assertEqual(weighted['status'], 'conflict_proven')
+        self.assertTrue(any(row['rule'] == 'Weekend minimum' for row in weighted['conflicts']))
+
+    def test_weekend_feasibility_counts_manual_only_shift_on_as_fixed(self):
+        regular = self._create_assignment_physician(
+            'weekend-regular@example.com', 'Weekend Regular', facilities=[self.facility],
+        )
+        contract = ContractUserAssignment.objects.get(physician=regular).contract
+        contract.weekend_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'min_volume': 1,
+                'min_penalty_weight': 100,
+            }],
+        }
+        contract.save(update_fields=['weekend_settings'])
+        manual = self._create_assignment_physician(
+            'weekend-manual@example.com', 'Weekend Manual', facilities=[self.facility],
+        )
+        manual_contract = ContractUserAssignment.objects.get(physician=manual).contract
+        manual_contract.manual_assignment_only = True
+        manual_contract.save(update_fields=['manual_assignment_only'])
+        self.day_template.weekend_days = ['Monday']
+        self.day_template.save(update_fields=['weekend_days'])
+        version = self._create_build_version()
+        self._create_shift_instance(version, self.day_template, self.block.start_date)
+        request = ScheduleRequest.objects.create(
+            schedule_block=self.block, physician=manual, date=self.block.start_date,
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            weight=ScheduleRequest.Weight.FIXED,
+        )
+        request.shift_templates.add(self.day_template)
+
+        report = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        ).json()['workload_feasibility']['weekend_feasibility']
+        self.assertEqual(report['fixed_weekend_shifts'], 1)
+        self.assertEqual(report['status'], 'conflict_proven')
+        self.assertTrue(any(row['rule'] == 'Combined weekend minimums' for row in report['conflicts']))
+
+    def test_weekend_feasibility_detects_isolated_fixed_minimum_streak(self):
+        physician = self._create_assignment_physician(
+            'weekend-streak@example.com', 'Weekend Streak', facilities=[self.facility],
+        )
+        contract = ContractUserAssignment.objects.get(physician=physician).contract
+        contract.weekend_settings = {
+            'min_consecutive_weekend_shifts': 2,
+            'min_consecutive_weekend_shifts_penalty_weight': 100,
+        }
+        contract.save(update_fields=['weekend_settings'])
+        self.day_template.weekend_days = ['Monday']
+        self.day_template.save(update_fields=['weekend_days'])
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance, physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+
+        report = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        ).json()['workload_feasibility']['weekend_feasibility']
+        self.assertEqual(report['status'], 'conflict_proven')
+        self.assertTrue(any(
+            row['rule'] == 'Minimum consecutive weekend shifts'
+            for row in report['conflicts']
+        ))
+
+    def test_weekend_feasibility_checks_friday_night_only_when_configured(self):
+        physician = self._create_assignment_physician(
+            'friday-weekend@example.com', 'Friday Weekend', facilities=[self.facility],
+        )
+        contract = ContractUserAssignment.objects.get(physician=physician).contract
+        version = self._create_build_version(date(2026, 7, 3), date(2026, 7, 5))
+        instance = self._create_shift_instance(
+            version, self.overnight_template, date(2026, 7, 3),
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance, physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        url = f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}'
+        contract.weekend_settings = {
+            'block_friday_night_before_weekend_off': True,
+            'block_friday_night_before_weekend_off_penalty_weight': 0,
+        }
+        contract.save(update_fields=['weekend_settings'])
+        self.assertEqual(
+            self.client.get(url).json()['workload_feasibility']['weekend_feasibility']['status'],
+            'no_conflict_found',
+        )
+        contract.weekend_settings['block_friday_night_before_weekend_off_penalty_weight'] = 100
+        contract.save(update_fields=['weekend_settings'])
+        report = self.client.get(url).json()['workload_feasibility']['weekend_feasibility']
+        self.assertEqual(report['status'], 'conflict_proven')
+        self.assertTrue(any(
+            row['rule'] == 'Friday night before weekend off'
+            for row in report['conflicts']
+        ))
+
     def test_request_off_feasibility_does_not_add_nonoverlapping_staffing(self):
         for index in range(2):
             self._create_assignment_physician(
@@ -1811,6 +2202,77 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(period['remaining_night_shifts'], 0)
         self.assertEqual(period['remaining_minimum_night_shifts'], 0)
         self.assertEqual(period['remaining_maximum_night_shifts'], 0)
+
+    def test_night_feasibility_subtracts_manual_only_shift_on_requests(self):
+        regular = self._create_assignment_physician(
+            'regular.request.nights@example.com', 'Regular Request Nights',
+            facilities=[self.facility],
+        )
+        regular_contract = ContractUserAssignment.objects.get(
+            physician=regular,
+        ).contract
+        regular_contract.night_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'min_shifts': 0,
+                'max_shifts': 0,
+            }],
+        }
+        regular_contract.save(update_fields=['night_settings'])
+        manual_only = self._create_assignment_physician(
+            'manual.request.nights@example.com', 'Manual Request Nights',
+            facilities=[self.facility],
+        )
+        manual_contract = ContractUserAssignment.objects.get(
+            physician=manual_only,
+        ).contract
+        manual_contract.manual_assignment_only = True
+        manual_contract.save(update_fields=[
+            'manual_assignment_only', 'updated_at',
+        ])
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(
+            id=generated.json()['schedule_version']['id'],
+        )
+        night_instance = ScheduleShiftInstance.objects.get(
+            schedule_version=version, shift_template=self.overnight_template,
+        )
+        request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=manual_only,
+            date=night_instance.date,
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            weight=ScheduleRequest.Weight.MEDIUM,
+            created_by=self.scheduler_user,
+        )
+        request.shift_templates.add(self.overnight_template)
+
+        response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        )
+
+        night = response.json()['workload_feasibility']['night_feasibility']
+        period = night['periods'][0]
+        self.assertEqual(night['status'], 'feasible')
+        self.assertEqual(period['required_night_shifts'], 1)
+        self.assertEqual(period['fixed_manual_night_shifts'], 1)
+        self.assertEqual(period['remaining_night_shifts'], 0)
+        self.assertEqual(period['remaining_maximum_night_shifts'], 0)
+
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=night_instance,
+            physician=manual_only,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        deduped = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        ).json()['workload_feasibility']['night_feasibility']['periods'][0]
+        self.assertEqual(deduped['fixed_manual_night_shifts'], 1)
+        self.assertEqual(deduped['remaining_night_shifts'], 0)
 
     def test_night_feasibility_excludes_manual_only_unused_capacity(self):
         regular = self._create_assignment_physician(
@@ -3530,6 +3992,53 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             for physician in block_physicians
         ))
 
+    def test_fresh_fill_reserves_scarce_eligible_capacity_for_workload_minimum(self):
+        version = self._create_build_version(date(2027, 1, 1), date(2027, 1, 2))
+        other_facility = Facility.objects.create(
+            name='Other Hospital', short_name='Other', timezone='UTC',
+        )
+        shared_template = ShiftTemplate.objects.create(
+            facility=self.facility, start_time=time(7, 0), end_time=time(16, 0),
+            active_days_of_week=[], weekend_days=[], night_shift=False,
+            default_staffing_count=1, active=True,
+        )
+        flexible_template = ShiftTemplate.objects.create(
+            facility=other_facility, start_time=time(7, 0), end_time=time(16, 0),
+            active_days_of_week=[], weekend_days=[], night_shift=False,
+            default_staffing_count=1, active=True,
+        )
+        restricted = self._create_assignment_physician(
+            'restricted@example.com', 'Restricted Physician', facilities=[self.facility],
+        )
+        flexible = self._create_assignment_physician(
+            'flexible@example.com', 'Flexible Physician',
+            facilities=[self.facility, other_facility],
+        )
+        for physician in (restricted, flexible):
+            contract = Contract.objects.get(user_assignments__physician=physician)
+            contract.workload_settings = {'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'SHIFTS',
+                'min_value': '1', 'max_value': '1',
+                'min_penalty_weight': '10000', 'max_penalty_weight': '10000',
+            }]}
+            contract.save(update_fields=['workload_settings', 'updated_at'])
+        shared = self._create_shift_instance(version, shared_template, date(2027, 1, 1))
+        flexible_only = self._create_shift_instance(version, flexible_template, date(2027, 1, 2))
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'seed': 919}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['initial_score'], 0)
+        self.assertEqual(
+            set(ScheduleShiftAssignment.objects.filter(
+                shift_instance__schedule_version=version,
+            ).values_list('shift_instance_id', 'physician_id')),
+            {(shared.id, restricted.id), (flexible_only.id, flexible.id)},
+        )
+
     def test_fresh_fill_builds_admin_designated_weekend_shift_blocks(self):
         version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 9))
         weekend_template = ShiftTemplate.objects.create(
@@ -3574,6 +4083,96 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             response.json()['debug']['initial_score_breakdown']['weekend_score'],
             0.0,
         )
+
+    def test_weekend_scoring_loads_adjacent_published_schedule_context(self):
+        weekend_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(19, 0),
+            active_days_of_week=['Saturday', 'Sunday'],
+            weekend_days=['Saturday', 'Sunday'],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        physician = self._create_assignment_physician(
+            'published.boundary@example.com',
+            'Published Boundary',
+            facilities=[self.facility],
+        )
+        contract = Contract.objects.get(user_assignments__physician=physician)
+        contract.weekend_settings = {
+            'min_consecutive_weekend_shifts': 2,
+            'min_consecutive_weekend_shifts_penalty_weight': 10000,
+            'max_consecutive_weekends': 3,
+            'max_consecutive_weekends_penalty_weight': 10000,
+        }
+        contract.save(update_fields=['weekend_settings', 'updated_at'])
+
+        previous_block = ScheduleBlock.objects.create(
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 10, 31),
+            request_open_datetime=timezone.make_aware(datetime(2026, 7, 1, 12, 0)),
+            request_close_datetime=timezone.make_aware(datetime(2026, 7, 15, 12, 0)),
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        previous_version = ScheduleVersion.objects.create(
+            schedule_block=previous_block,
+            domain=self.domain,
+            version_number=1,
+            name='Published',
+            status=ScheduleVersion.Status.ARCHIVED,
+        )
+        prior_instance = ScheduleShiftInstance.objects.create(
+            schedule_block=previous_block,
+            schedule_version=previous_version,
+            shift_template=weekend_template,
+            facility=self.facility,
+            date=date(2026, 10, 31),
+            start_datetime=timezone.make_aware(datetime(2026, 10, 31, 7, 0)),
+            end_datetime=timezone.make_aware(datetime(2026, 10, 31, 19, 0)),
+            required_staffing=1,
+        )
+        prior_run = OptimizerRun.objects.create(
+            schedule_version=previous_version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=prior_instance,
+            physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=prior_run,
+        )
+
+        current_version = self._create_build_version(
+            date(2026, 11, 1), date(2026, 11, 1),
+        )
+        current_instance = self._create_shift_instance(
+            current_version, weekend_template, date(2026, 11, 1),
+        )
+        contracts = {physician.id: contract}
+
+        context = _attach_published_weekend_context(
+            current_version,
+            [current_instance],
+            contracts,
+        )
+        report = _weekend_volume_report(
+            [current_instance],
+            [physician],
+            {current_instance.id: [physician.id]},
+            contracts,
+            details=True,
+        )
+
+        self.assertEqual(
+            [instance.id for instance in context[physician.id]],
+            [prior_instance.id],
+        )
+        self.assertEqual(report, {'score': 0, 'violations': []})
 
     def test_chronological_fresh_fill_respects_configured_max_days_in_row(self):
         version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 6))

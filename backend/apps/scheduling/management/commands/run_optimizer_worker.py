@@ -1,5 +1,6 @@
 import time
 import signal
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 
@@ -128,6 +129,7 @@ class Command(BaseCommand):
                 progress_callback=publish_progress,
             )
         except Exception as exc:
+            traceback.print_exc()
             OptimizerRun.objects.filter(
                 id=control.optimizer_run_id,
                 status=OptimizerRun.Status.RUNNING,

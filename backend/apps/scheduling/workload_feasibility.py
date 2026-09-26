@@ -7,6 +7,9 @@ from .optimizer import (
     _version_contract_target,
     _decimal_or_none,
     _effective_workload_rule,
+    _is_weekend_designated,
+    _configured_positive_int,
+    _configured_positive_penalty,
     _minimum_rest_hours,
     _overlaps,
     _period_windows,
@@ -24,10 +27,26 @@ def _number(value):
 
 
 def _manual_only_fixed_coverage_by_instance(
-    instances, visible_assignments, manual_only_physician_ids,
+    instances, visible_assignments, manual_only_physician_ids, schedule_requests,
 ):
-    """Return capped fixed coverage supplied by manual-only physicians."""
+    """Return capped fixed coverage supplied by manual-only physicians.
+
+    A Shift On request is an authoritative fixed assignment for a physician
+    whose contract is manual-assignment-only. Count that instruction before an
+    optimizer run has materialized its locked assignment row, while deduping it
+    against any row that already exists.
+    """
     instance_by_id = {instance.id: instance for instance in instances}
+    instances_by_date_template = defaultdict(list)
+    for instance in instances:
+        instances_by_date_template[(instance.date, instance.shift_template_id)].append(
+            instance
+        )
+    for matching_instances in instances_by_date_template.values():
+        matching_instances.sort(
+            key=lambda item: (item.start_datetime, item.end_datetime, item.id)
+        )
+
     physicians_by_instance = defaultdict(set)
     for assignment in visible_assignments:
         if (
@@ -39,6 +58,27 @@ def _manual_only_fixed_coverage_by_instance(
         ):
             physicians_by_instance[assignment.shift_instance_id].add(
                 assignment.physician_id
+            )
+
+    for schedule_request in schedule_requests:
+        if (
+            schedule_request.physician_id not in manual_only_physician_ids
+            or schedule_request.request_type != ScheduleRequest.RequestType.SHIFT_ON
+        ):
+            continue
+        matching_instances = []
+        for template in schedule_request.shift_templates.all():
+            matching_instances.extend(
+                instances_by_date_template.get(
+                    (schedule_request.date, template.id), ()
+                )
+            )
+        matching_instances.sort(
+            key=lambda item: (item.start_datetime, item.end_datetime, item.id)
+        )
+        if matching_instances:
+            physicians_by_instance[matching_instances[0].id].add(
+                schedule_request.physician_id
             )
     return {
         instance_id: min(
@@ -507,8 +547,17 @@ def _assignment_accounting(version, instances, optimizer_run):
     return accounting, run_assignments
 
 
-def _night_feasibility(version, instances, contract_assignments, optimizer_run):
+def _night_feasibility(
+    version, instances, contract_assignments, optimizer_run,
+    manual_only_fixed_coverage=None,
+):
+    manual_only_fixed_coverage = manual_only_fixed_coverage or {}
     night_instances = [instance for instance in instances if instance.shift_template.night_shift]
+    manual_only_physician_ids = {
+        assignment.physician_id
+        for assignment in contract_assignments
+        if assignment.contract.manual_assignment_only
+    }
     optimizer_contract_assignments = [
         assignment for assignment in contract_assignments
         if not assignment.contract.manual_assignment_only
@@ -525,7 +574,10 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
     fixed_physicians_by_instance = defaultdict(set)
     night_instance_by_id = {instance.id: instance for instance in night_instances}
     for assignment in fixed_assignments:
-        if assignment.shift_instance_id in night_instance_by_id:
+        if (
+            assignment.physician_id not in manual_only_physician_ids
+            and assignment.shift_instance_id in night_instance_by_id
+        ):
             fixed_physicians_by_instance[assignment.shift_instance_id].add(
                 assignment.physician_id
             )
@@ -533,7 +585,8 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
     def fixed_coverage(window_instances):
         return sum(
             min(
-                len(fixed_physicians_by_instance.get(instance.id, set())),
+                len(fixed_physicians_by_instance.get(instance.id, set()))
+                + manual_only_fixed_coverage.get(instance.id, 0),
                 instance.required_staffing,
             )
             for instance in window_instances
@@ -701,9 +754,249 @@ def _night_feasibility(version, instances, contract_assignments, optimizer_run):
         'fixed_manual_night_shifts': fixed_coverage(night_instances),
         'periods': rows,
         'scope_note': (
-            'Locked manual night assignments, including manual-only physicians, are treated as fixed coverage. '
+            'Locked manual night assignments and Shift On requests for manual-only physicians are treated as fixed coverage. '
             'Manual-only physicians contribute no additional night capacity. Eligibility, rest, and exact '
             'night-block patterns are not included.'
+        ),
+    }
+
+
+def _weekend_feasibility(
+    instances, contract_assignments, visible_assignments, schedule_requests,
+):
+    """Report necessary, contract-defined weekend conditions, not a solver verdict.
+
+    Only locked assignments and manual-only Shift On instructions are treated
+    as inevitable. Candidate capacity is intentionally optimistic: ignoring
+    rest and competing rules cannot manufacture a false impossibility.
+    """
+    weekend_instances = [item for item in instances if _is_weekend_designated(item)]
+    instance_by_id = {item.id: item for item in instances}
+    by_date_template = defaultdict(list)
+    for item in instances:
+        by_date_template[(item.date, item.shift_template_id)].append(item)
+    for matches in by_date_template.values():
+        matches.sort(key=lambda item: (item.start_datetime, item.id))
+
+    manual_only_ids = {
+        row.physician_id for row in contract_assignments
+        if row.contract.manual_assignment_only
+    }
+    fixed_by_instance = defaultdict(set)
+    for row in visible_assignments:
+        if row.is_locked and row.shift_instance_id in instance_by_id:
+            fixed_by_instance[row.shift_instance_id].add(row.physician_id)
+    for request in schedule_requests:
+        if (request.physician_id not in manual_only_ids
+                or request.request_type != ScheduleRequest.RequestType.SHIFT_ON):
+            continue
+        matches = sorted(
+            (item for template in request.shift_templates.all()
+             for item in by_date_template.get((request.date, template.id), ())),
+            key=lambda item: (item.start_datetime, item.id),
+        )
+        if matches:
+            fixed_by_instance[matches[0].id].add(request.physician_id)
+
+    optimizer_rows = [
+        row for row in contract_assignments if row.physician_id not in manual_only_ids
+    ]
+    fixed_weekend = {
+        item.id: fixed_by_instance.get(item.id, set())
+        for item in weekend_instances
+    }
+    conflicts = []
+    checked_rules = 0
+    period_bounds = defaultdict(dict)
+    for row in optimizer_rows:
+        physician_id = row.physician_id
+        physician = _physician_display_name(row.physician)
+        settings = row.contract.weekend_settings if isinstance(row.contract.weekend_settings, dict) else {}
+        eligible_facilities = {facility.id for facility in row.contract.facilities.all()}
+        eligible = [
+            item for item in weekend_instances
+            if item.facility_id in eligible_facilities
+        ]
+        fixed = [
+            item for item in weekend_instances
+            if physician_id in fixed_weekend[item.id]
+        ]
+        for rule in settings.get('period_rules') or []:
+            if not isinstance(rule, dict):
+                continue
+            period = rule.get('period_type') or 'SCHEDULE_BLOCK'
+            for start, end in _period_windows(instances, period):
+                key = (period, start, end)
+                fixed_count = sum(start <= item.date <= end for item in fixed)
+                possible_extra = sum(
+                    max(item.required_staffing - len(fixed_weekend[item.id]), 0)
+                    for item in eligible if start <= item.date <= end
+                    and physician_id not in fixed_weekend[item.id]
+                )
+                bounds = period_bounds[key].setdefault(physician_id, {'minimum': Decimal('0'), 'maximum': None, 'fixed': fixed_count})
+                for side in ('min', 'max'):
+                    limit = _decimal_or_none(rule.get(f'{side}_volume'))
+                    weight = _configured_positive_penalty(rule, f'{side}_penalty_weight', Decimal('0'))
+                    if limit is None or weight <= 0:
+                        continue
+                    checked_rules += 1
+                    if side == 'min':
+                        bounds['minimum'] = max(bounds['minimum'], limit)
+                        if Decimal(fixed_count + possible_extra) < limit:
+                            conflicts.append({
+                                'rule': 'Weekend minimum', 'physician': physician,
+                                'period_start': start.isoformat(), 'period_end': end.isoformat(),
+                                'explanation': f'{physician} can work at most {fixed_count + possible_extra} eligible weekend shifts in this period; the configured minimum is {limit:g}.',
+                            })
+                    else:
+                        bounds['maximum'] = limit if bounds['maximum'] is None else min(bounds['maximum'], limit)
+                        if Decimal(fixed_count) > limit:
+                            conflicts.append({
+                                'rule': 'Weekend maximum', 'physician': physician,
+                                'period_start': start.isoformat(), 'period_end': end.isoformat(),
+                                'explanation': f'{physician} already has {fixed_count} fixed weekend shifts; the configured maximum is {limit:g}.',
+                            })
+
+        # A locked streak beyond a configured maximum cannot be repaired.
+        for field, label, dates in (
+            ('max_consecutive_weekend_shifts', 'Consecutive weekend shifts', sorted(item.date for item in fixed)),
+            ('max_consecutive_weekends', 'Consecutive worked weekends', sorted({item.date - timedelta(days=item.date.weekday()) for item in fixed})),
+        ):
+            limit = _configured_positive_int(settings, field)
+            weight = _configured_positive_penalty(settings, f'{field}_penalty_weight', Decimal('0'))
+            if limit is None or weight <= 0:
+                continue
+            checked_rules += 1
+            streak = []
+            step = timedelta(days=7 if field.endswith('weekends') else 1)
+            for day in dates:
+                if streak and day != streak[-1] and day != streak[-1] + step:
+                    streak = []
+                streak.append(day)
+                if len(streak) == limit + 1:
+                    conflicts.append({
+                        'rule': label, 'physician': physician,
+                        'period_start': streak[0].isoformat(), 'period_end': day.isoformat(),
+                        'explanation': f'{physician} has more than {limit} locked consecutive weekend {"weeks" if field.endswith("weekends") else "shifts"}.',
+                    })
+
+        # If even the optimistic connected component containing a fixed shift
+        # is shorter than a configured minimum, no reassignment can repair it.
+        candidate_by_date = defaultdict(int)
+        for item in weekend_instances:
+            fixed_here = physician_id in fixed_weekend[item.id]
+            if fixed_here:
+                candidate_by_date[item.date] += 1
+            if item.facility_id in eligible_facilities:
+                candidate_by_date[item.date] += max(
+                    item.required_staffing - len(fixed_weekend[item.id]), 0,
+                )
+        for field, label, unit in (
+            ('min_consecutive_weekend_shifts', 'Minimum consecutive weekend shifts', timedelta(days=1)),
+            ('min_consecutive_weekends', 'Minimum consecutive worked weekends', timedelta(days=7)),
+        ):
+            limit = _configured_positive_int(settings, field)
+            weight = _configured_positive_penalty(settings, f'{field}_penalty_weight', Decimal('0'))
+            if limit is None or weight <= 0 or not fixed:
+                continue
+            checked_rules += 1
+            if unit.days == 1:
+                potential = candidate_by_date
+                fixed_keys = {item.date for item in fixed}
+            else:
+                potential = {
+                    day - timedelta(days=day.weekday()): 1
+                    for day, count in candidate_by_date.items() if count
+                }
+                fixed_keys = {
+                    item.date - timedelta(days=item.date.weekday()) for item in fixed
+                }
+            component = []
+
+            def report_short_component(days):
+                if not days or not fixed_keys.intersection(days):
+                    return
+                capacity = sum(potential[day] for day in days)
+                if capacity < limit:
+                    conflicts.append({
+                        'rule': label, 'physician': physician,
+                        'period_start': days[0].isoformat(),
+                        'period_end': days[-1].isoformat(),
+                        'explanation': f'{physician} has a fixed weekend assignment here, but at most {capacity} consecutive {"worked weekends" if unit.days == 7 else "weekend shifts"} can fit; the configured minimum is {limit}.',
+                    })
+
+            for day in sorted(potential):
+                if component and day != component[-1] + unit:
+                    report_short_component(component)
+                    component = []
+                component.append(day)
+            report_short_component(component)
+
+        friday_weight = _configured_positive_penalty(
+            settings, 'block_friday_night_before_weekend_off_penalty_weight', Decimal('0'),
+        )
+        if settings.get('block_friday_night_before_weekend_off') and friday_weight > 0:
+            checked_rules += 1
+            block_start = instances[0].schedule_block.start_date if instances else None
+            block_end = instances[0].schedule_block.end_date if instances else None
+            for friday_instance in instances:
+                friday = friday_instance.date
+                if (friday.weekday() != 4 or not friday_instance.shift_template.night_shift
+                        or physician_id not in fixed_by_instance[friday_instance.id]
+                        or block_start is None or friday < block_start
+                        or friday + timedelta(days=2) > block_end):
+                    continue
+                weekend_dates = {friday + timedelta(days=1), friday + timedelta(days=2)}
+                if any(candidate_by_date.get(day, 0) for day in weekend_dates):
+                    continue
+                conflicts.append({
+                    'rule': 'Friday night before weekend off', 'physician': physician,
+                    'period_start': friday.isoformat(),
+                    'period_end': (friday + timedelta(days=2)).isoformat(),
+                    'explanation': f'{physician} has a fixed Friday night, but no eligible weekend-designated Saturday or Sunday shift can follow it.',
+                })
+
+    for (period, start, end), bounds_by_physician in period_bounds.items():
+        window = [item for item in weekend_instances if start <= item.date <= end]
+        required = sum(item.required_staffing for item in window)
+        fixed_count = sum(min(len(fixed_weekend[item.id]), item.required_staffing) for item in window)
+        remaining = max(required - fixed_count, 0)
+        minimum_remaining = sum(max(row['minimum'] - row['fixed'], Decimal('0')) for row in bounds_by_physician.values())
+        if minimum_remaining > remaining:
+            conflicts.append({
+                'rule': 'Combined weekend minimums', 'physician': None,
+                'period_start': start.isoformat(), 'period_end': end.isoformat(),
+                'explanation': f'{minimum_remaining:g} additional weekend assignments are needed for configured minimums, but only {remaining} slots remain.',
+            })
+        if len(bounds_by_physician) == len(optimizer_rows) and all(
+            row['maximum'] is not None for row in bounds_by_physician.values()
+        ):
+            maximum_remaining = sum(max(row['maximum'] - row['fixed'], Decimal('0')) for row in bounds_by_physician.values())
+            if Decimal(remaining) > maximum_remaining:
+                conflicts.append({
+                    'rule': 'Combined weekend maximums', 'physician': None,
+                    'period_start': start.isoformat(), 'period_end': end.isoformat(),
+                    'explanation': f'{remaining} weekend slots remain, but configured maximums allow only {maximum_remaining:g} more assignments.',
+                })
+
+    return {
+        'status': 'conflict_proven' if conflicts else 'no_conflict_found',
+        'weekend_shift_slots': sum(item.required_staffing for item in weekend_instances),
+        'fixed_weekend_shifts': sum(
+            min(len(fixed_weekend[item.id]), item.required_staffing)
+            for item in weekend_instances
+        ),
+        'checked_rule_count': checked_rules,
+        'conflicts': conflicts,
+        'interpretation': (
+            f'{len(conflicts)} unavoidable weekend-rule conflict(s) found.' if conflicts
+            else 'No unavoidable conflict found by the weekend capacity and locked-streak checks.'
+        ),
+        'scope_note': (
+            'Uses Shift Builder weekend designations and only positively weighted contract rules. '
+            'Locked assignments and manual-only Shift On requests count as fixed; manual-only users add no flexible capacity. '
+            'A clear result does not prove a penalty-free schedule: rest, overlap, requests, and interactions '
+            'between rules require the full optimizer.'
         ),
     }
 
@@ -949,8 +1242,16 @@ def build_workload_feasibility(
         assignments_for_viewed_run(version, optimizer_run)
         .select_related('shift_instance__shift_template', 'physician__user')
     )
+    schedule_requests = list(
+        ScheduleRequest.objects.filter(
+            schedule_block=block,
+            date__gte=block.start_date,
+            date__lte=block.end_date,
+        ).prefetch_related('shift_templates')
+    )
     manual_only_fixed_coverage = _manual_only_fixed_coverage_by_instance(
         instances, visible_assignments, manual_only_physician_ids,
+        schedule_requests,
     )
     manual_only_fixed_hours = sum(
         (
@@ -980,12 +1281,7 @@ def build_workload_feasibility(
             assigned_instances[assignment.physician_id].append(assignment.shift_instance)
     requests_by_physician_date = defaultdict(list)
     if detailed_run is not None:
-        requests = ScheduleRequest.objects.filter(
-            schedule_block=block,
-            date__gte=block.start_date,
-            date__lte=block.end_date,
-        ).prefetch_related('shift_templates')
-        for schedule_request in requests:
+        for schedule_request in schedule_requests:
             requests_by_physician_date[
                 (schedule_request.physician_id, schedule_request.date)
             ].append(schedule_request)
@@ -1139,21 +1435,21 @@ def build_workload_feasibility(
     )
     night_feasibility = _night_feasibility(
         version, instances, contract_assignments, optimizer_run,
+        manual_only_fixed_coverage,
     )
-    request_off_rows = list(
-        ScheduleRequest.objects.filter(
-            schedule_block=block,
-            date__gte=block.start_date,
-            date__lte=block.end_date,
-            request_type__in=[
-                ScheduleRequest.RequestType.DAY_OFF,
-                ScheduleRequest.RequestType.SHIFT_OFF,
-            ],
-        ).prefetch_related('shift_templates')
-    )
+    request_off_rows = [
+        schedule_request for schedule_request in schedule_requests
+        if schedule_request.request_type in {
+            ScheduleRequest.RequestType.DAY_OFF,
+            ScheduleRequest.RequestType.SHIFT_OFF,
+        }
+    ]
     request_off_feasibility = _request_off_feasibility(
         instances, contract_assignments, request_off_rows,
         manual_only_fixed_coverage,
+    )
+    weekend_feasibility = _weekend_feasibility(
+        instances, contract_assignments, visible_assignments, schedule_requests,
     )
     if adjustment_preview:
         groups = defaultdict(lambda: {'physician_count': 0})
@@ -1231,5 +1527,6 @@ def build_workload_feasibility(
         },
         'night_feasibility': night_feasibility,
         'request_off_feasibility': request_off_feasibility,
+        'weekend_feasibility': weekend_feasibility,
         'reduced_contract_focus': reduced_rows,
     }
