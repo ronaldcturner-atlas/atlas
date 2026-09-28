@@ -9,6 +9,7 @@ type ScheduleBlock = {
   start_date: string
   end_date: string
   build_status: BuildStatus
+  published_at: string | null
 }
 
 type DomainOption = {
@@ -26,6 +27,11 @@ type ScheduleVersion = {
   status: 'BUILD' | 'PREVIEW' | 'ARCHIVED'
   shift_instance_count: number
   score_is_stale: boolean
+  published_optimizer_run: {
+    id: number
+    run_number: number
+    final_score: string | number | null
+  } | null
 }
 
 type ShiftInstance = {
@@ -83,6 +89,7 @@ type OptimizerSummary = {
   runtime_seconds?: number
   timed_out?: boolean
   stopped_reason?: string
+  optimization_focus?: 'STANDARD' | 'DISTRIBUTION'
   unfilled_shift_count: number
   assignments_made: number
   candidate_rest_rejections?: number
@@ -112,6 +119,12 @@ type OptimizerSummary = {
     weekend_score?: number
     facility_distribution_score?: number
     total_score: number
+  }
+  proportionality?: {
+    total: number
+    facility: number
+    time_of_day: number
+    is_penalty: false
   }
   debug?: Record<string, unknown> | string
   request_violations_summary?: {
@@ -156,6 +169,7 @@ type OptimizerRun = {
   initial_score: string | number | null
   final_score: string | number | null
   is_active: boolean
+  is_published: boolean
   score_is_stale: boolean
   copied_from_run: number | null
   copied_from_run_number: number | null
@@ -165,6 +179,7 @@ type OptimizerRun = {
   locked_open_shift_instance_ids: number[]
   start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
   max_runtime_seconds: number
+  optimization_focus: 'STANDARD' | 'DISTRIBUTION'
   runtime_seconds?: number | null
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
@@ -208,6 +223,44 @@ type PopoverPosition = {
   top?: number
   bottom?: number
   maxHeight: number
+}
+
+type OptimizerPreflight = {
+  status: 'ready' | 'conflict'
+  has_conflicts: boolean
+  conflict_count: number
+  detail: string
+  start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
+  source_run_id: number | null
+  source_run_number: number | null
+  unresolved_requests: Array<{
+    request_id: number
+    physician_id: number
+    physician: string
+    date: string
+    reason: string
+  }>
+  conflicts: Array<{
+    shift_instance_id: number
+    date: string
+    facility: string
+    shift: string
+    required_staffing: number
+    mandatory_assignments: number
+    overstaffed_by: number
+    contributors: Array<{
+      physician_id: number
+      physician: string
+      sources: Array<{
+        type: 'LOCKED_ASSIGNMENT' | 'MANUAL_ONLY_ASSIGNMENT' | 'AUTHORITATIVE_SHIFT_ON_REQUEST'
+        label: string
+        assignment_id?: number
+        request_id?: number
+        request_scope?: 'USER' | 'ADMIN'
+        request_weight?: 'LOW' | 'MEDIUM' | 'HIGH' | 'FIXED'
+      }>
+    }>
+  }>
 }
 
 type BuildContext = {
@@ -265,6 +318,8 @@ type BuildContext = {
         remaining_maximum_night_shifts: number | null
         status: 'feasible' | 'penalty_unavoidable'
         interpretation: string
+        fixed_limit_violations?: Array<unknown>
+        overlapping_rule_conflicts?: Array<unknown>
       }>
     }
     request_off_feasibility: {
@@ -327,6 +382,15 @@ type Props = {
 }
 
 const API_BASE = 'http://localhost:8000/api'
+const DEFAULT_OPTIMIZER_RUNTIME_MINUTES = 120
+const OPTIMIZER_RUNTIME_STORAGE_KEY = 'atlas-optimizer-max-runtime-minutes'
+
+function storedOptimizerRuntimeMinutes() {
+  const stored = Number(window.localStorage.getItem(OPTIMIZER_RUNTIME_STORAGE_KEY))
+  return Number.isInteger(stored) && stored >= 1 && stored <= 240
+    ? stored
+    : DEFAULT_OPTIMIZER_RUNTIME_MINUTES
+}
 
 function parseIsoDateToUtc(value: string) {
   const [year, month, day] = value.split('-').map(Number)
@@ -436,10 +500,14 @@ function optimizerRunLabel(run: OptimizerRun) {
     ? ''
     : ` - total time ${formatRuntimeMinutes(run.runtime_seconds)}`
   const staleLabel = run.score_is_stale ? ' - stored under prior schedule/rules' : ''
+  const publishedLabel = run.is_published ? ' - PUBLISHED' : ''
+  const focusLabel = run.optimization_focus === 'DISTRIBUTION'
+    ? ' - Facility/Shift distribution focus'
+    : ''
   if (!isCompletedOptimizerRun(run)) {
-    return `Run ${run.run_number} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
+    return `Run ${run.run_number}${publishedLabel}${focusLabel} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
   }
-  return `Run ${run.run_number}${copyLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${publishedLabel}${copyLabel}${focusLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
 }
 
 function formatRuntimeMinutes(runtimeSeconds: number) {
@@ -474,14 +542,9 @@ function formatTime(value: string) {
   return minutes === 0 ? `${hour}${suffix}` : `${hour}:${String(minutes).padStart(2, '0')}${suffix}`
 }
 
-function physicianLastName(name: string) {
-  const parts = name.trim().split(/\s+/)
-  return parts[parts.length - 1] || name
-}
-
 function shiftLabel(instance: ShiftInstance) {
   const staffing = `${instance.assigned_count}/${instance.required_staffing}`
-  const names = instance.assignments.map((assignment) => physicianLastName(assignment.physician_name))
+  const names = instance.assignments.map((assignment) => assignment.physician_name)
   const assignedLabel = names.length
     ? `${names[0]}${names.length > 1 ? ` +${names.length - 1}` : ''}`
     : ''
@@ -573,7 +636,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [stoppingOptimizerRunIds, setStoppingOptimizerRunIds] = useState<number[]>([])
   const [optimizerClockMs, setOptimizerClockMs] = useState(() => Date.now())
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
-  const [optimizerMaxRuntimeMinutes, setOptimizerMaxRuntimeMinutes] = useState(15)
+  const [optimizerSourceRunId, setOptimizerSourceRunId] = useState<number | null>(null)
+  const [optimizerPreflight, setOptimizerPreflight] = useState<OptimizerPreflight | null>(null)
+  const [isOptimizerPreflightLoading, setIsOptimizerPreflightLoading] = useState(false)
+  const [optimizerMaxRuntimeMinutes, setOptimizerMaxRuntimeMinutes] = useState(storedOptimizerRuntimeMinutes)
+  const [optimizerFocus, setOptimizerFocus] = useState<'STANDARD' | 'DISTRIBUTION'>('STANDARD')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
   const [isMovingBackToBuild, setIsMovingBackToBuild] = useState(false)
@@ -607,6 +674,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [calendarViolationReport, setCalendarViolationReport] = useState<ViolationReport | null>(null)
   const [calendarViolationError, setCalendarViolationError] = useState<string | null>(null)
   const [isCalendarViolationLoading, setIsCalendarViolationLoading] = useState(false)
+  const [isUnlockingPhysicianShifts, setIsUnlockingPhysicianShifts] = useState(false)
   const [lockAssignment, setLockAssignment] = useState(false)
   const [lockOpen, setLockOpen] = useState(false)
   const [popoverPosition, setPopoverPosition] = useState<PopoverPosition | null>(null)
@@ -619,6 +687,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     selectedOptimizerRunIdRef.current = runId
     setSelectedOptimizerRunIdState(runId)
   }
+
+  useEffect(() => {
+    if (
+      Number.isInteger(optimizerMaxRuntimeMinutes)
+      && optimizerMaxRuntimeMinutes >= 1
+      && optimizerMaxRuntimeMinutes <= 240
+    ) {
+      window.localStorage.setItem(
+        OPTIMIZER_RUNTIME_STORAGE_KEY,
+        String(optimizerMaxRuntimeMinutes),
+      )
+    }
+  }, [optimizerMaxRuntimeMinutes])
 
   const closeAssignments = () => {
     assignmentLoadIdRef.current += 1
@@ -792,6 +873,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       const nextContext = data as BuildContext
       setContext(nextContext)
       setOptimizerSummary(nextContext.optimizer_summary ?? null)
+      const completedRuns = (nextContext.optimizer_runs ?? []).filter(isCompletedOptimizerRun)
+      setOptimizerSourceRunId((current) => (
+        completedRuns.some((run) => run.id === current)
+          ? current
+          : nextContext.selected_optimizer_run?.status === 'COMPLETED'
+            ? nextContext.selected_optimizer_run.id
+            : completedRuns[0]?.id ?? null
+      ))
       const returnedRunId = nextContext.selected_optimizer_run?.id ?? null
       if (requestedOptimizerRunId !== undefined || selectedOptimizerRunIdRef.current === null) {
         setSelectedOptimizerRunId(returnedRunId)
@@ -883,6 +972,55 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     return () => window.clearInterval(timer)
   }, [runningOptimizerRunIds])
 
+  useEffect(() => {
+    const versionId = context?.selected_version?.id
+    if (!versionId || !context.shift_instances.length || context.schedule_block.published_at) {
+      setOptimizerPreflight(null)
+      return
+    }
+    let cancelled = false
+    const sourceRunId = optimizerStartMode === 'CURRENT_SCHEDULE'
+      ? optimizerSourceRunId
+      : context.selected_optimizer_run?.id ?? null
+    setIsOptimizerPreflightLoading(true)
+    void fetch(`${API_BASE}/schedule-versions/${versionId}/optimizer-preflight/`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        start_mode: optimizerStartMode,
+        source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE' ? sourceRunId : null,
+        currently_viewed_run_id: optimizerStartMode === 'FRESH_FILL' ? sourceRunId : null,
+      }),
+    })
+      .then(async (response) => {
+        const data = await response.json().catch(() => null)
+        if (!response.ok) throw new Error(apiError(data, 'Unable to check mandatory assignment conflicts.'))
+        if (!cancelled) setOptimizerPreflight(data as OptimizerPreflight)
+      })
+      .catch((preflightError) => {
+        if (!cancelled) {
+          setOptimizerPreflight(null)
+          setError(preflightError instanceof Error
+            ? preflightError.message
+            : 'Unable to check mandatory assignment conflicts.')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsOptimizerPreflightLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    context?.selected_version?.id,
+    context?.selected_optimizer_run?.id,
+    context?.shift_instances,
+    context?.schedule_block.published_at,
+    optimizerSourceRunId,
+    optimizerStartMode,
+  ])
+
   const moveBackToBuild = async () => {
     const confirmed = window.confirm(
       'Move this schedule block back to BUILD? Users will no longer be viewing it as preview, and scheduler edits/optimization will be enabled again.',
@@ -921,12 +1059,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     protected_source_run_ids: [],
   }
   const completedOptimizerRuns = optimizerRuns.filter(isCompletedOptimizerRun)
+  const optimizerSourceRun = completedOptimizerRuns.find((run) => run.id === optimizerSourceRunId) ?? null
   const selectedRunForActions = completedOptimizerRuns.find((run) => run.id === selectedOptimizerRunId)
     ?? selectedOptimizerRun
   const activeOptimizerRun = optimizerRuns.find((run) => run.is_active) ?? null
   const viewedOptimizerRunId = context?.run_state?.viewed_run_id ?? selectedOptimizerRunId
 
   const runDeleteProtectionReason = (run: OptimizerRun) => {
+    if (run.is_published) return 'Unpublish this Schedule Block before changing its published run.'
     if (run.is_active) return 'Activate another run before deleting the active run.'
     if (run.id === viewedOptimizerRunId) return 'View another run before deleting this run.'
     if (run.status === 'RUNNING') return 'Running optimizer runs cannot be deleted.'
@@ -1229,6 +1369,18 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     calendarViolationReport?.users.find((user) => user.user_id === calendarPhysicianId) ?? null
   ), [calendarPhysicianId, calendarViolationReport])
 
+  const selectedCalendarPhysician = useMemo(() => (
+    calendarPhysicians.find((physician) => physician.id === calendarPhysicianId) ?? null
+  ), [calendarPhysicianId, calendarPhysicians])
+
+  const selectedPhysicianLockedShiftCount = useMemo(() => (
+    (context?.shift_instances ?? []).reduce((count, instance) => (
+      count + instance.assignments.filter((assignment) => (
+        assignment.physician === calendarPhysicianId && assignment.is_locked
+      )).length
+    ), 0)
+  ), [calendarPhysicianId, context?.shift_instances])
+
   const calendarViolationsByDate = useMemo(() => {
     const values = new Map<string, CalendarViolation[]>()
     for (const violation of selectedCalendarViolationUser?.violations ?? []) {
@@ -1370,6 +1522,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setError('Select a BUILD Schedule Version before running the optimizer.')
       return
     }
+    if (optimizerPreflight?.has_conflicts) {
+      setError(optimizerPreflight.detail)
+      return
+    }
     if (
       !Number.isInteger(optimizerMaxRuntimeMinutes)
       || optimizerMaxRuntimeMinutes < 1
@@ -1379,24 +1535,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       return
     }
     const viewedRun = context.selected_optimizer_run ?? null
+    const sourceRun = (context.optimizer_runs ?? []).find(
+      (run) => run.id === optimizerSourceRunId && isCompletedOptimizerRun(run),
+    ) ?? null
     if (optimizerStartMode === 'CURRENT_SCHEDULE') {
-      if (!viewedRun) {
-        setError('Select a completed optimizer run before optimizing from the current schedule.')
+      if (!sourceRun) {
+        setError('Select a completed optimizer run to use as the starting schedule.')
         return
       }
-      if (context.run_state && !context.run_state.viewed_run_can_be_optimizer_source) {
-        setError('Activate this run before optimizing from it.')
-        return
-      }
-      if (
-        context.run_state?.viewed_run_id !== undefined
-        && context.run_state.viewed_run_id !== viewedRun.id
-      ) {
-        setError('The viewed optimizer run changed. Refresh the workspace and try again.')
-        return
-      }
-      const viewedScore = Number(viewedRun.final_score ?? optimizerSummary?.final_score)
-      if (Number.isFinite(viewedScore) && viewedScore === 0) {
+      const sourceScore = Number(sourceRun.final_score)
+      if (Number.isFinite(sourceScore) && sourceScore === 0) {
         setError(null)
         setNotice('This schedule already has score 0. No optimizer run was started.')
         return
@@ -1428,8 +1576,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           body: JSON.stringify({
             schedule_version_id: versionId,
             currently_viewed_run_id: viewedRun?.id ?? null,
+            source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE' ? sourceRun?.id ?? null : null,
             start_mode: optimizerStartMode,
             max_runtime_minutes: optimizerMaxRuntimeMinutes,
+            optimization_focus: optimizerFocus,
             search_token: crypto.randomUUID(),
             background: true,
           }),
@@ -1484,6 +1634,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     const versionId = context?.selected_version?.id
     const runId = selectedRunForActions?.id
     if (!versionId || !runId) return
+    if (optimizerPreflight?.has_conflicts) {
+      setError(optimizerPreflight.detail)
+      return
+    }
     try {
       setIsRecalculatingScore(true)
       setError(null)
@@ -1789,6 +1943,44 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     } finally { setIsAssignmentSaving(false) }
   }
 
+  const unlockSelectedPhysicianShifts = async () => {
+    if (!calendarPhysicianId || !context?.selected_version) return
+    const physicianName = selectedCalendarPhysician?.name ?? 'this physician'
+    const confirmed = window.confirm(
+      `Unlock all ${selectedPhysicianLockedShiftCount} locked shift${selectedPhysicianLockedShiftCount === 1 ? '' : 's'} for ${physicianName}? The assignments will remain on the schedule.`,
+    )
+    if (!confirmed) return
+
+    try {
+      setIsUnlockingPhysicianShifts(true)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(
+        `${API_BASE}/schedule-versions/${context.selected_version.id}/physicians/${calendarPhysicianId}/unlock-assignments/`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ optimizer_run_id: selectedOptimizerRunId }),
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to unlock this physician’s shifts.'))
+      }
+      await fetchContext(context.selected_version.id, {
+        optimizerRunId: selectedOptimizerRunIdRef.current,
+        quiet: true,
+        preserveError: true,
+      })
+      setNotice(data?.detail ?? `Unlocked all locked shifts for ${physicianName}.`)
+    } catch (unlockError) {
+      setError(unlockError instanceof Error ? unlockError.message : 'Unable to unlock this physician’s shifts.')
+    } finally {
+      setIsUnlockingPhysicianShifts(false)
+    }
+  }
+
   if (isLoading && !context) {
     return <div className="scheduler-loading">Loading Schedule Build Workspace...</div>
   }
@@ -1808,22 +2000,17 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const canOptimizeBuild = context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
     && context.shift_instances.length > 0
-  const viewedRunCanBeOptimizerSource = context.run_state
-    ? context.run_state.viewed_run_can_be_optimizer_source
-    : Boolean(context.selected_optimizer_run && isCompletedOptimizerRun(context.selected_optimizer_run))
-  const viewedScore = Number(
-    context.selected_optimizer_run?.final_score ?? optimizerSummary?.final_score,
-  )
+  const sourceScore = Number(optimizerSourceRun?.final_score)
   const currentScheduleIsZero = optimizerStartMode === 'CURRENT_SCHEDULE'
-    && Number.isFinite(viewedScore) && viewedScore === 0
-  const optimizerUnavailableReason = currentScheduleIsZero
+    && Number.isFinite(sourceScore) && sourceScore === 0
+  const optimizerUnavailableReason = optimizerPreflight?.has_conflicts
+    ? optimizerPreflight.detail
+    : currentScheduleIsZero
     ? 'This schedule already has score 0. No optimizer run will be started.'
     : !canOptimizeBuild
       ? 'Run Optimizer is available only while the Schedule Block and Schedule Version are in BUILD with generated shifts.'
-      : optimizerStartMode === 'CURRENT_SCHEDULE' && !context.selected_optimizer_run
-      ? 'Select a completed optimizer run before optimizing from the current schedule.'
-      : optimizerStartMode === 'CURRENT_SCHEDULE' && !viewedRunCanBeOptimizerSource
-        ? 'Activate this run before optimizing from it.'
+      : optimizerStartMode === 'CURRENT_SCHEDULE' && !optimizerSourceRun
+        ? 'Select a completed optimizer run to use as the starting schedule.'
         : null
   // Keep preflight-rejected actions clickable so selecting Run Optimizer always
   // results in either a request/loading state or a visible explanation.
@@ -1841,13 +2028,36 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const selectedRunCanActivate = context.run_state
     ? context.run_state.viewed_run_can_activate
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
-  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || isUnlockingPhysicianShifts || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const isMutatingBuild = isBuildMutationBusy || isOptimizing
   const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
   const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
   const weekendFeasibility = context?.workload_feasibility?.weekend_feasibility
+  const nightPeriodTone = (period: NonNullable<typeof nightFeasibility>['periods'][number]) => {
+    if (period.status === 'feasible') return 'green'
+    const violatesMaximum = Boolean(
+      period.fixed_limit_violations?.length
+      || period.overlapping_rule_conflicts?.length
+      || (
+        period.remaining_maximum_night_shifts !== null
+        && period.remaining_night_shifts > period.remaining_maximum_night_shifts
+      ),
+    )
+    return violatesMaximum ? 'red' : 'yellow'
+  }
+  const nightFeasibilityTone = nightFeasibility?.status === 'feasible'
+    ? 'green'
+    : nightFeasibility?.periods.some((period) => nightPeriodTone(period) === 'red')
+      ? 'red'
+      : 'yellow'
+  const weekendFeasibilityTone = weekendFeasibility?.status === 'no_conflict_found'
+    ? 'green'
+    : weekendFeasibility?.conflicts.some((conflict) => !conflict.rule.toLowerCase().includes('minimum'))
+      ? 'red'
+      : 'yellow'
   const allFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
+    && !optimizerPreflight?.has_conflicts
     && nightFeasibility?.status === 'feasible'
     && requestOffFeasibility?.status === 'feasible'
     && weekendFeasibility?.status === 'no_conflict_found'
@@ -1888,6 +2098,57 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       {error && <div className="facilities-error">{error}</div>}
       {notice && <div className="contract-saved-banner">{notice}</div>}
+      {context.schedule_block.published_at && (
+        <div className="contract-saved-banner" role="status">
+          Published schedule snapshot
+          {context.selected_version?.published_optimizer_run
+            ? ` · Run ${context.selected_version.published_optimizer_run.run_number} · final penalty ${formatScore(context.selected_version.published_optimizer_run.final_score)}`
+            : ' · Manual schedule (no optimizer run)'}
+          . Scores and diagnostics are frozen at publication; unpublish the block to evaluate current contracts and requests.
+        </div>
+      )}
+
+      {optimizerPreflight?.has_conflicts && (
+        <section className="optimizer-preflight-conflicts" role="alert" aria-label="Mandatory assignment conflicts">
+          <div className="optimizer-preflight-conflicts-header">
+            <div>
+              <h3>Resolve mandatory assignment conflicts</h3>
+              <p>{optimizerPreflight.detail}</p>
+            </div>
+            <strong>{optimizerPreflight.conflict_count} conflicting shift{optimizerPreflight.conflict_count === 1 ? '' : 's'}</strong>
+          </div>
+          <div className="optimizer-preflight-conflict-list">
+            {optimizerPreflight.conflicts.map((conflict) => (
+              <article key={conflict.shift_instance_id} className="optimizer-preflight-conflict">
+                <div>
+                  <strong>{formatDate(conflict.date)} · {conflict.facility} · {conflict.shift}</strong>
+                  <span>
+                    Staffing capacity {conflict.required_staffing}; {conflict.mandatory_assignments} mandatory assignments
+                    {' '}({conflict.overstaffed_by} over capacity)
+                  </span>
+                </div>
+                <ul>
+                  {conflict.contributors.map((contributor) => (
+                    <li key={contributor.physician_id}>
+                      <strong>{contributor.physician}</strong>
+                      <span>
+                        {contributor.sources.map((source) => (
+                          source.type === 'AUTHORITATIVE_SHIFT_ON_REQUEST'
+                            ? `${source.label} #${source.request_id} (${source.request_scope}, ${source.request_weight})`
+                            : source.label
+                        )).join(' + ')}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </article>
+            ))}
+          </div>
+          <p className="optimizer-preflight-block-note">
+            Optimization and score recalculation are disabled until every conflict is resolved.
+          </p>
+        </section>
+      )}
 
       <div className="build-workspace-controls">
         <div className="build-workspace-control-fields">
@@ -1929,13 +2190,30 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             <label className="facility-field">
               <span>Optimizer Start</span>
               <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as 'CURRENT_SCHEDULE' | 'FRESH_FILL')} disabled={isBuildMutationBusy}>
-                <option value="CURRENT_SCHEDULE">Current Viewed Schedule</option>
+                <option value="CURRENT_SCHEDULE">Previous Optimizer Run</option>
                 <option value="FRESH_FILL">Fresh Fill</option>
               </select>
             </label>
+            {optimizerStartMode === 'CURRENT_SCHEDULE' && (
+              <label className="facility-field">
+                <span>Starting Run</span>
+                <select
+                  value={optimizerSourceRunId ?? ''}
+                  onChange={(event) => setOptimizerSourceRunId(Number(event.target.value))}
+                  disabled={isBuildMutationBusy || completedOptimizerRuns.length === 0}
+                >
+                  {!completedOptimizerRuns.length && <option value="">No completed runs</option>}
+                  {completedOptimizerRuns.map((run) => (
+                    <option key={run.id} value={run.id}>
+                      Run {run.run_number} · penalty {formatScore(run.final_score)}{run.is_active ? ' · Active' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <small>
               {optimizerStartMode === 'CURRENT_SCHEDULE'
-                ? 'Uses the currently displayed assignments as the optimizer starting point. Locked edits are preserved; unlocked edits may change.'
+                ? 'Uses the selected completed run as an independent starting snapshot. It does not need to be viewed or active.'
                 : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
             </small>
           </div>
@@ -1951,15 +2229,41 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 value={optimizerMaxRuntimeMinutes}
                 onChange={(event) => {
                   const value = Number(event.target.value)
-                  setOptimizerMaxRuntimeMinutes(Number.isFinite(value) ? value : 15)
+                  setOptimizerMaxRuntimeMinutes(
+                    Number.isFinite(value) ? value : DEFAULT_OPTIMIZER_RUNTIME_MINUTES,
+                  )
                 }}
                 disabled={isBuildMutationBusy}
                 aria-label="Maximum optimizer runtime in minutes"
               />
               <span>minutes</span>
             </div>
-            <small>Choose 1–240 minutes for this run.</small>
+            <small>Defaults to 120 minutes. Your most recent setting is remembered until you change it.</small>
           </label>
+
+          <fieldset className="optimizer-focus-control" disabled={isBuildMutationBusy}>
+            <legend>Optimizer Focus</legend>
+            <label>
+              <input
+                type="radio"
+                name="optimizer-focus"
+                value="STANDARD"
+                checked={optimizerFocus === 'STANDARD'}
+                onChange={() => setOptimizerFocus('STANDARD')}
+              />
+              Standard optimization
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="optimizer-focus"
+                value="DISTRIBUTION"
+                checked={optimizerFocus === 'DISTRIBUTION'}
+                onChange={() => setOptimizerFocus('DISTRIBUTION')}
+              />
+              Facility/Shift distribution focus
+            </label>
+          </fieldset>
         </div>
 
         <div className="build-workspace-optimizer-actions">
@@ -1969,14 +2273,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               type="button"
               className="primary-action"
               onClick={runOptimizer}
-              disabled={!canOptimize || !canOptimizeBuild || isBuildMutationBusy || optimizerCapacity.available_slots < 1}
+              disabled={!canOptimize || !canOptimizeBuild || isBuildMutationBusy || isOptimizerPreflightLoading || Boolean(optimizerPreflight?.has_conflicts) || optimizerCapacity.available_slots < 1}
             >
               {isLaunchingOptimizer
                 ? 'Starting...'
                 : optimizerCapacity.available_slots < 1
                   ? `${optimizerCapacity.limit} Optimizers Running`
                   : optimizerStartMode === 'CURRENT_SCHEDULE'
-                    ? 'Run Optimizer from Current Schedule'
+                    ? `Run Optimizer from Run ${optimizerSourceRun?.run_number ?? '—'}`
                     : 'Run Optimizer from Fresh Fill'}
             </button>
             <span className="optimizer-capacity-label">
@@ -1987,7 +2291,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             type="button"
             className="secondary"
             onClick={() => void recalculateScore()}
-            disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild}
+            disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild || isOptimizerPreflightLoading || Boolean(optimizerPreflight?.has_conflicts)}
           >
             {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
           </button>
@@ -2006,6 +2310,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   <div>
                     <strong>Run {run.run_number}</strong>
                     <span>{run.start_mode === 'FRESH_FILL' ? 'Fresh Fill' : `From Run ${run.started_from_run_number ?? '—'}`}</span>
+                    {run.optimization_focus === 'DISTRIBUTION' && <span>Facility/Shift distribution focus</span>}
                   </div>
                   <div>
                     <span className="optimizer-elapsed-time" role="timer" aria-live="off">
@@ -2214,7 +2519,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     {context.workload_feasibility.fte_adjustment_preview.total_applicable_fte.toFixed(2)} FTE
                     {context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte === null
                       ? ''
-                      : ` (${context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte.toFixed(2)} hours per FTE)`}.
+                      : ` (${context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte.toFixed(0)} hours per FTE)`}.
                   </p>
                   <div className="workload-feasibility-preview-table-wrap">
                     <table>
@@ -2243,9 +2548,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     <span>Hours per FTE</span>
                     <input
                       type="number"
-                      min="0.01"
+                      min="1"
                       max="1000"
-                      step="0.01"
+                      step="1"
                       value={workloadHoursPerFte || String(context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte ?? '')}
                       onChange={(event) => setWorkloadHoursPerFte(event.target.value)}
                     />
@@ -2270,7 +2575,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           )}
         </section>
         <section
-          className={`night-feasibility-card night-feasibility-${context.workload_feasibility.night_feasibility.status}`}
+          className={`night-feasibility-card night-feasibility-${nightFeasibilityTone}`}
           aria-label="Residual night-shift feasibility"
         >
           <div className="night-feasibility-heading">
@@ -2278,8 +2583,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               <strong>Night-shift feasibility</strong>
               <span>{context.workload_feasibility.night_feasibility.status === 'feasible' ? 'All remaining nights fit within preferred limits' : 'Coverage is possible, but a night-volume penalty cannot be avoided'}</span>
             </div>
-            <span className={`night-feasibility-badge night-feasibility-badge-${context.workload_feasibility.night_feasibility.status}`}>
-              {context.workload_feasibility.night_feasibility.status === 'feasible' ? 'Within limits' : 'Penalty unavoidable'}
+            <span className={`night-feasibility-badge night-feasibility-badge-${nightFeasibilityTone}`}>
+              {nightFeasibilityTone === 'green'
+                ? 'Within limits'
+                : nightFeasibilityTone === 'red'
+                  ? 'Maximum violation'
+                  : 'Minimum shortfall'}
             </span>
           </div>
           {nightCapacityShortfall > 0 && (
@@ -2289,11 +2598,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             </div>
           )}
           <div className="night-feasibility-periods">
-            {context.workload_feasibility.night_feasibility.periods.map((period) => (
-              <article className={`night-period-card night-period-${period.status}`} key={`${period.period_type}-${period.period_start}-${period.period_end}`}>
+            {context.workload_feasibility.night_feasibility.periods.map((period) => {
+              const periodTone = nightPeriodTone(period)
+              return (
+              <article className={`night-period-card night-period-${periodTone}`} key={`${period.period_type}-${period.period_start}-${period.period_end}`}>
                 <header>
                   <strong>{nightPeriodLabel(period.period_type, period.period_start, period.period_end)}</strong>
-                  <span>{period.status === 'feasible' ? 'Within limits' : 'Penalty unavoidable'}</span>
+                  <span>{periodTone === 'green' ? 'Within limits' : periodTone === 'red' ? 'Maximum violation' : 'Minimum shortfall'}</span>
                 </header>
                 <dl>
                   <div><dt>Required</dt><dd>{period.required_night_shifts}</dd></div>
@@ -2306,7 +2617,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 </dl>
                 <p>{period.interpretation}</p>
               </article>
-            ))}
+              )
+            })}
           </div>
           <div className="night-feasibility-fixed-summary">
             <strong>{context.workload_feasibility.night_feasibility.fixed_manual_night_shifts}</strong>
@@ -2345,7 +2657,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           <small>{requestOffFeasibility?.scope_note}</small>
         </section>
         <section
-          className={`weekend-feasibility-card weekend-feasibility-${weekendFeasibility?.status ?? 'no_conflict_found'}`}
+          className={`weekend-feasibility-card weekend-feasibility-${weekendFeasibilityTone}`}
           aria-label="Weekend feasibility"
         >
           <div className="night-feasibility-heading">
@@ -2353,8 +2665,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               <strong>Weekend feasibility</strong>
               <span>{weekendFeasibility?.interpretation}</span>
             </div>
-            <span className={`weekend-feasibility-badge weekend-feasibility-badge-${weekendFeasibility?.status ?? 'no_conflict_found'}`}>
-              {weekendFeasibility?.status === 'conflict_proven' ? 'Conflict proven' : 'No conflict found'}
+            <span className={`weekend-feasibility-badge weekend-feasibility-badge-${weekendFeasibilityTone}`}>
+              {weekendFeasibilityTone === 'green'
+                ? 'No conflict found'
+                : weekendFeasibilityTone === 'red'
+                  ? 'Maximum violation'
+                  : 'Minimum shortfall'}
             </span>
           </div>
           <dl>
@@ -2405,6 +2721,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               </label>
               <div className="optimizer-run-status">
                 <span>Viewing Run {selectedRunForActions.run_number}{selectedRunForActions.copied_from_run_number ? ` — Copy of Run ${selectedRunForActions.copied_from_run_number}` : ''}</span>
+                {selectedRunForActions.is_published && <strong>Published</strong>}
                 {selectedRunForActions.is_active ? (
                   <strong>Active</strong>
                 ) : (
@@ -2428,12 +2745,18 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 >
                   Activate
                 </button>
-                <Link
-                  className="secondary build-workspace-link-button"
-                  to={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
-                >
-                  Violations
-                </Link>
+                {context.schedule_block.published_at && !selectedRunForActions.is_published ? (
+                  <button type="button" className="secondary" disabled title="Only the frozen published-run report is available for a published schedule.">
+                    Violations
+                  </button>
+                ) : (
+                  <Link
+                    className="secondary build-workspace-link-button"
+                    to={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
+                  >
+                    Violations
+                  </Link>
+                )}
                 <button
                   type="button"
                   className="secondary danger-action"
@@ -2502,6 +2825,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   </label>
                   <div>
                     <strong>Run {run.run_number}</strong>
+                    {run.is_published && <strong>Published</strong>}
                     <span>{optimizerRunStatusLabel(run)}</span>
                     <span>
                       {run.start_mode === 'CURRENT_SCHEDULE'
@@ -2512,6 +2836,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     </span>
                     <span>Starting penalty {formatScore(run.initial_score)}</span>
                     <span>{optimizerRunScoreLabel(run)}</span>
+                    <span>{run.optimization_focus === 'DISTRIBUTION' ? 'Facility/Shift distribution focus' : 'Standard optimization'}</span>
                     {run.score_is_stale && <span>Stored under prior schedule/rules</span>}
                     <span>{formatTimestamp(run.created_at)}</span>
                     {run.runtime_seconds != null && <span>Total time {formatRuntimeMinutes(run.runtime_seconds)}</span>}
@@ -2535,7 +2860,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     >
                       Activate
                     </button>
-                    {isCompletedOptimizerRun(run) ? (
+                    {isCompletedOptimizerRun(run) && (!context.schedule_block.published_at || run.is_published) ? (
                       <Link
                         className="secondary build-workspace-link-button"
                         to={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
@@ -2673,8 +2998,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <strong>{(optimizerSummary.score_breakdown?.shift_rule_score ?? 0).toFixed(1)}</strong>
               </div>
               <div>
-                <span>Facility score</span>
-                <strong>{(optimizerSummary.score_breakdown?.facility_distribution_score ?? 0).toFixed(1)}</strong>
+                <span>Facility proportionality</span>
+                <strong>{(optimizerSummary.proportionality?.facility ?? 0).toFixed(1)}</strong>
+              </div>
+              <div>
+                <span>Time proportionality</span>
+                <strong>{(optimizerSummary.proportionality?.time_of_day ?? 0).toFixed(1)}</strong>
               </div>
               <div>
                 <span>Request violations</span>
@@ -2815,6 +3144,17 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   : `${selectedCalendarViolationUser?.display_name ?? 'Selected physician'} · ${selectedCalendarViolationUser?.violations.length ?? 0} violation(s) · ${calendarRequests.length} active request(s)`}
               </span>
               {calendarViolationError && <span className="build-calendar-filter-error">{calendarViolationError}</span>}
+              <button
+                type="button"
+                className="build-calendar-unlock-button"
+                onClick={() => void unlockSelectedPhysicianShifts()}
+                disabled={!canEditAssignments || isMutatingBuild || selectedPhysicianLockedShiftCount === 0}
+                title={selectedPhysicianLockedShiftCount === 0 ? 'This physician has no locked shifts in the current schedule.' : undefined}
+              >
+                {isUnlockingPhysicianShifts
+                  ? 'Unlocking…'
+                  : `Unlock all locked shifts (${selectedPhysicianLockedShiftCount})`}
+              </button>
               <button type="button" onClick={() => setCalendarPhysicianId(null)}>Show all physicians</button>
             </div>
           )}

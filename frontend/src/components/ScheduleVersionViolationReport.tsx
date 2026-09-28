@@ -99,6 +99,15 @@ type ViolationUser = {
   workload_score?: WorkloadScoreRow | null
 }
 
+type ProportionalityTarget = {
+  target_min: number
+  target_max: number
+  theoretical_floor: number
+  neutral_baseline: number
+  quality_percent: number
+  quality_band: 'TARGET' | 'REASONABLE' | 'IMPROVEMENT_AVAILABLE'
+}
+
 type ViolationReport = {
   schedule_version: ScheduleVersion
   schedule_block: ScheduleBlock
@@ -111,6 +120,26 @@ type ViolationReport = {
   } | null
   total_score: number
   score_breakdown: Record<string, number>
+  proportionality?: {
+    total: number
+    facility: number
+    time_of_day: number
+    targets?: {
+      facility?: ProportionalityTarget
+      time_of_day?: ProportionalityTarget
+    }
+    is_penalty: false
+  }
+  rule_summary: Array<{
+    score_component: string
+    area: string
+    contract_name: string | null
+    rule_name: string
+    scope: string | null
+    configured: string | null
+    violation_count: number
+    total_penalty: number
+  }>
   warnings: string[]
   debug?: {
     violations_recomputed_from_final_assignments?: boolean
@@ -159,6 +188,24 @@ function prettyType(value: string) {
     .split('_')
     .map((part) => part.charAt(0) + part.slice(1).toLowerCase())
     .join(' ')
+}
+
+function proportionalityBandLabel(value: ProportionalityTarget['quality_band']) {
+  if (value === 'TARGET') return 'Target range'
+  if (value === 'REASONABLE') return 'Reasonable'
+  return 'Improvement available'
+}
+
+function ProportionalityTargetContext({ target }: { target?: ProportionalityTarget }) {
+  if (!target) {
+    return <b>Lower is better.</b>
+  }
+  return (
+    <b>
+      Calculated target: {target.target_min.toFixed(1)}–{target.target_max.toFixed(1)}.{' '}
+      Distribution quality: {target.quality_percent.toFixed(0)}% — {proportionalityBandLabel(target.quality_band)}.
+    </b>
+  )
 }
 
 function assignmentLabel(detail: AssignmentDetail) {
@@ -235,6 +282,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
   const [report, setReport] = useState<ViolationReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [activeTab, setActiveTab] = useState<'details' | 'summary'>('details')
 
   useEffect(() => {
     let cancelled = false
@@ -313,6 +361,90 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
         </div>
       )}
 
+      <div className="violation-report-tabs" role="tablist" aria-label="Violation report views">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'details'}
+          className={activeTab === 'details' ? 'active' : ''}
+          onClick={() => setActiveTab('details')}
+        >
+          Details
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'summary'}
+          className={activeTab === 'summary' ? 'active' : ''}
+          onClick={() => setActiveTab('summary')}
+        >
+          Summary
+        </button>
+      </div>
+
+      {activeTab === 'summary' && (
+        <div className="violation-summary-view" role="tabpanel">
+          <div className="violation-summary-total">
+            <span>Total schedule-block penalty</span>
+            <strong>{report.total_score.toFixed(1)}</strong>
+            <p>The rule totals below reconcile to the official penalty score for this schedule block.</p>
+          </div>
+
+          <div className="proportionality-context-grid">
+            <section>
+              <h3>Facility proportionality</h3>
+              <strong>{(report.proportionality?.facility ?? 0).toFixed(1)}</strong>
+              <p><ProportionalityTargetContext target={report.proportionality?.targets?.facility} /> This measures how closely each eligible non-nocturnist physician's facility mix follows the available optimizer-controlled shift supply.</p>
+            </section>
+            <section>
+              <h3>Time proportionality</h3>
+              <strong>{(report.proportionality?.time_of_day ?? 0).toFixed(1)}</strong>
+              <p><ProportionalityTargetContext target={report.proportionality?.targets?.time_of_day} /> This measures how closely each eligible non-nocturnist physician's early, midday, and late shift mix follows the available optimizer-controlled shift supply.</p>
+            </section>
+          </div>
+          <p className="proportionality-context-note">
+            These proportionality values are not penalties and are not included in the total score. Each target is specific to this block: its lower edge accounts for unavoidable whole-shift rounding, and its upper edge represents removing at least 85% of the imbalance expected from an opportunity-weighted neutral allocation. Date-level rules can make the lower edge unattainable. The values remain tie-breakers used only when the official penalty does not increase.
+          </p>
+
+          <div className="violation-table-wrap">
+            <table className="scheduler-table violation-table violation-summary-table">
+              <thead>
+                <tr>
+                  <th>Rule area</th>
+                  <th>Contract</th>
+                  <th>Rule</th>
+                  <th>Scope</th>
+                  <th>Configured</th>
+                  <th>Violations</th>
+                  <th>Total penalty</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.rule_summary.map((row, index) => (
+                  <tr key={`${row.score_component}-${row.contract_name}-${row.rule_name}-${index}`}>
+                    <td>{row.area}</td>
+                    <td>{row.contract_name ?? 'All contracts'}</td>
+                    <td>{row.rule_name}</td>
+                    <td>{row.scope ? prettyType(row.scope) : '-'}</td>
+                    <td>{row.configured ?? '-'}</td>
+                    <td>{row.violation_count}</td>
+                    <td>{row.total_penalty.toFixed(1)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <th colSpan={6}>Total schedule-block penalty</th>
+                  <th>{report.rule_summary.reduce((sum, row) => sum + row.total_penalty, 0).toFixed(1)}</th>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div hidden={activeTab !== 'details'} role="tabpanel">
+
       <div className="optimizer-summary-panel">
         <div>
           <span>Total score</span>
@@ -349,10 +481,14 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
         <div><span>Shift rule score</span><strong>{(report.score_breakdown.shift_rule_score ?? 0).toFixed(1)}</strong></div>
         <div><span>Weekend score</span><strong>{(report.score_breakdown.weekend_score ?? 0).toFixed(1)}</strong></div>
         <div><span>Consecutive days score</span><strong>{(report.score_breakdown.consecutive_days_score ?? 0).toFixed(1)}</strong></div>
-        <div><span>Facility distribution score</span><strong>{(report.score_breakdown.facility_distribution_score ?? 0).toFixed(1)}</strong></div>
+        <div><span>Facility proportionality</span><strong>{(report.proportionality?.facility ?? 0).toFixed(1)}</strong></div>
+        <div><span>Time proportionality</span><strong>{(report.proportionality?.time_of_day ?? 0).toFixed(1)}</strong></div>
         <div><span>Underutilization score</span><strong>{(report.score_breakdown.underutilization_score ?? 0).toFixed(1)}</strong></div>
         <div><span>Invalid assignment score</span><strong>{(report.score_breakdown.invalid_assignment_score ?? 0).toFixed(1)}</strong></div>
       </div>
+      <p className="proportionality-context-note">
+        Lower facility and time proportionality values are better. Their block-specific calculated target ranges appear on the Summary tab. They are not penalties and are not included in Total score; the optimizer uses them only to prefer a more even distribution when the official penalty does not increase.
+      </p>
 
       <div className="violation-user-list">
         {report.users.map((user) => (
@@ -442,6 +578,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             )}
           </section>
         ))}
+      </div>
       </div>
     </div>
   )

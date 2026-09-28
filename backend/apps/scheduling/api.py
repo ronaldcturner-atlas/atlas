@@ -8,6 +8,7 @@ from uuid import UUID
 from time import monotonic
 
 from django.conf import settings
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import FloatField, Prefetch, Q
 from django.db.models.functions import Cast
 from django.db import transaction, IntegrityError
@@ -47,6 +48,7 @@ from .optimizer import (
     recalculate_schedule_version_score,
 )
 from .run_state import (
+    assignments_for_viewed_run,
     get_active_optimizer_run,
     get_viewed_optimizer_run,
     resolve_build_workspace_run_context,
@@ -198,17 +200,21 @@ def published_schedule(request):
             pointer += timedelta(days=1)
 
     active_runs = {}
-    for active_run in (
-        OptimizerRun.objects.filter(
-            schedule_version__schedule_block__in=published_blocks,
-            is_active=True,
-            status=OptimizerRun.Status.COMPLETED,
-        )
-        .select_related('schedule_version')
-        .order_by('schedule_version_id', '-run_number')
-    ):
-        active_runs.setdefault(active_run.schedule_version_id, active_run)
-    active_run_ids = [active_run.id for active_run in active_runs.values()]
+    published_versions = ScheduleVersion.objects.filter(
+        schedule_block__in=published_blocks,
+    ).select_related('published_optimizer_run')
+    for version in published_versions:
+        published_run = version.published_optimizer_run
+        if published_run is None:
+            # Compatibility for legacy published rows before publication
+            # snapshots were introduced. The migration backfills normal cases.
+            published_run = version.optimizer_runs.filter(
+                is_active=True,
+                status=OptimizerRun.Status.COMPLETED,
+            ).order_by('-run_number').first()
+        if published_run is not None:
+            active_runs[version.id] = published_run
+    active_run_ids = [published_run.id for published_run in active_runs.values()]
     published_assignments = (
         ScheduleShiftAssignment.objects.filter(
             shift_instance__schedule_block__in=published_blocks,
@@ -1866,7 +1872,7 @@ def _build_workspace_forbidden_response():
 def _schedule_version_queryset(block):
     return (
         ScheduleVersion.objects.filter(schedule_block=block)
-        .select_related('domain')
+        .select_related('domain', 'published_optimizer_run')
     )
 
 
@@ -1983,8 +1989,12 @@ def _set_active_run_locked_open(instance, is_locked_open):
 
 
 def _mark_contract_domain_scores_stale(contract):
-    ScheduleVersion.objects.filter(domain=contract.domain).update(score_is_stale=True)
-    OptimizerRun.objects.filter(schedule_version__domain=contract.domain).update(score_is_stale=True)
+    editable_versions = ScheduleVersion.objects.filter(
+        domain=contract.domain,
+        schedule_block__published_at__isnull=True,
+    )
+    editable_versions.update(score_is_stale=True)
+    OptimizerRun.objects.filter(schedule_version__in=editable_versions).update(score_is_stale=True)
 
 
 def _shift_instance_queryset(version, optimizer_run=None):
@@ -2067,7 +2077,7 @@ def schedule_block_build_context(request, block_id):
         else []
     )
     workload_feasibility = None
-    if selected_version:
+    if selected_version and block.published_at is None:
         feasibility_report = build_workload_feasibility(
             selected_version, selected_optimizer_run,
             include_individual_diagnostics=False,
@@ -2102,7 +2112,7 @@ def schedule_block_build_context(request, block_id):
             'optimizer_runs': (
                 OptimizerRunHistorySerializer(
                     selected_version.optimizer_runs
-                    .select_related('copied_from_run', 'control')
+                    .select_related('copied_from_run', 'control', 'schedule_version')
                     .annotate(runtime_seconds_value=Cast('optimizer_summary__runtime_seconds', FloatField()))
                     .defer('optimizer_summary', 'optimizer_debug', 'score_breakdown')
                     .order_by('-run_number'),
@@ -2173,6 +2183,8 @@ def schedule_version_workload_hour_adjustment(request, version_id):
         return Response({'hours_per_fte': 'Enter a valid number.'}, status=status.HTTP_400_BAD_REQUEST)
     if hours_per_fte <= 0 or hours_per_fte > Decimal('1000'):
         return Response({'hours_per_fte': 'Enter a value greater than 0 and no more than 1000.'}, status=status.HTTP_400_BAD_REQUEST)
+    if hours_per_fte != hours_per_fte.to_integral_value():
+        return Response({'hours_per_fte': 'Enter a whole number of hours.'}, status=status.HTTP_400_BAD_REQUEST)
 
     report = build_workload_feasibility(version)
     preview = report['aggregate_feasibility'].get('fte_adjustment_preview')
@@ -2252,11 +2264,36 @@ def _parse_optimizer_max_runtime_seconds(request):
     return minutes * 60, None
 
 
+def _parse_optimizer_focus(request):
+    value = request.data.get(
+        'optimization_focus', OptimizerRun.OptimizationFocus.STANDARD,
+    )
+    if value not in OptimizerRun.OptimizationFocus.values:
+        return None, {
+            'optimization_focus': 'Use STANDARD or DISTRIBUTION.'
+        }
+    return value, None
+
+
 def _optimizer_start_options(request, version):
     start_mode = request.data.get('start_mode', OptimizerRun.StartMode.FRESH_FILL)
     if start_mode not in OptimizerRun.StartMode.values:
         return None, None, {'start_mode': 'Use CURRENT_SCHEDULE or FRESH_FILL.'}
-    run_id = request.data.get('currently_viewed_run_id') or request.data.get('optimizer_run_id')
+    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE:
+        run_id = (
+            request.data.get('source_run_id')
+            or request.data.get('currently_viewed_run_id')
+            or request.data.get('optimizer_run_id')
+        )
+        if run_id in (None, ''):
+            return None, None, {
+                'source_run_id': 'Select a completed run in this schedule version.'
+            }
+    else:
+        # Fresh Fill does not inherit optimizer assignments from a historical
+        # result. The viewed run is accepted only so explicitly locked manual
+        # assignments and locked-open shifts remain fixed.
+        run_id = request.data.get('currently_viewed_run_id') or request.data.get('optimizer_run_id')
     source_run = None
     if run_id not in (None, ''):
         try:
@@ -2266,8 +2303,212 @@ def _optimizer_start_options(request, version):
                 status=OptimizerRun.Status.COMPLETED,
             )
         except (TypeError, ValueError, OptimizerRun.DoesNotExist):
-            return None, None, {'currently_viewed_run_id': 'Select a completed run in this schedule version.'}
+            error_field = (
+                'source_run_id'
+                if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+                else 'currently_viewed_run_id'
+            )
+            return None, None, {error_field: 'Select a completed run in this schedule version.'}
     return start_mode, source_run, None
+
+
+def _optimizer_authoritative_coverage_preflight(version, start_mode, source_run):
+    """Report immutable assignment/request combinations that exceed capacity."""
+    instances = list(
+        ScheduleShiftInstance.objects.filter(
+            schedule_version=version,
+            date__gte=version.schedule_block.start_date,
+            date__lte=version.schedule_block.end_date,
+        )
+        .select_related('facility', 'shift_template')
+        .order_by('date', 'start_datetime', 'id')
+    )
+    instance_by_id = {instance.id: instance for instance in instances}
+    instances_by_date_template = {}
+    for instance in instances:
+        instances_by_date_template.setdefault(
+            (instance.date, instance.shift_template_id), [],
+        ).append(instance)
+
+    manual_only_physician_ids = set(
+        ContractUserAssignment.objects.filter(
+            domain=version.domain,
+            contract__active=True,
+            contract__manual_assignment_only=True,
+            physician__active=True,
+        ).values_list('physician_id', flat=True)
+    )
+    raw_assignments = list(
+        assignments_for_viewed_run(version, source_run)
+        .select_related('shift_instance', 'physician__user')
+    )
+    normalized_assignments, _normalization = canonical_assignment_snapshot(
+        raw_assignments,
+        instances,
+        selected_run=source_run,
+        preserve_physician_ids=manual_only_physician_ids,
+    )
+    normalized_assignments = [
+        assignment
+        for assignment in normalized_assignments
+        if not (
+            assignment.physician_id in manual_only_physician_ids
+            and assignment.assignment_source
+            == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+        )
+    ]
+
+    contributors_by_instance = {}
+
+    def physician_name(physician):
+        return (
+            physician.user.get_full_name()
+            or physician.display_name
+            or physician.user.username
+        )
+
+    for assignment in normalized_assignments:
+        if assignment.shift_instance_id not in instance_by_id:
+            continue
+        # A previous run is only the optimizer's starting state. Unlocked
+        # optimizer assignments remain movable and must yield to newer
+        # authoritative Shift On requests. Only assignments that are actually
+        # fixed should participate in the capacity preflight.
+        include = (
+            assignment.is_locked
+            or assignment.physician_id in manual_only_physician_ids
+        )
+        if not include:
+            continue
+        key = (assignment.shift_instance_id, assignment.physician_id)
+        contributors_by_instance.setdefault(assignment.shift_instance_id, {})[key] = {
+            'physician_id': assignment.physician_id,
+            'physician': physician_name(assignment.physician),
+            'sources': [{
+                'type': 'LOCKED_ASSIGNMENT' if assignment.is_locked else 'MANUAL_ONLY_ASSIGNMENT',
+                'label': (
+                    'Locked manual assignment'
+                    if assignment.is_locked
+                    else 'Manual-only assignment'
+                ),
+                'assignment_id': assignment.id,
+            }],
+        }
+
+    requests = list(
+        ScheduleRequest.objects.filter(
+            schedule_block=version.schedule_block,
+            physician_id__in=manual_only_physician_ids,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            date__gte=version.schedule_block.start_date,
+            date__lte=version.schedule_block.end_date,
+        )
+        .select_related('physician__user')
+        .prefetch_related('shift_templates')
+        .order_by('date', 'id')
+    )
+    unresolved_requests = []
+    for schedule_request in requests:
+        matching_instances = []
+        for template in schedule_request.shift_templates.all():
+            matching_instances.extend(
+                instances_by_date_template.get(
+                    (schedule_request.date, template.id), (),
+                )
+            )
+        matching_instances.sort(
+            key=lambda item: (item.start_datetime, item.end_datetime, item.id)
+        )
+        if not matching_instances:
+            unresolved_requests.append({
+                'request_id': schedule_request.id,
+                'physician_id': schedule_request.physician_id,
+                'physician': physician_name(schedule_request.physician),
+                'date': schedule_request.date.isoformat(),
+                'reason': 'No matching dated shift exists.',
+            })
+            continue
+        instance = matching_instances[0]
+        key = (instance.id, schedule_request.physician_id)
+        contributor = contributors_by_instance.setdefault(instance.id, {}).setdefault(
+            key,
+            {
+                'physician_id': schedule_request.physician_id,
+                'physician': physician_name(schedule_request.physician),
+                'sources': [],
+            },
+        )
+        contributor['sources'].append({
+            'type': 'AUTHORITATIVE_SHIFT_ON_REQUEST',
+            'label': 'Authoritative manual-only Shift On request',
+            'request_id': schedule_request.id,
+            'request_scope': schedule_request.request_scope,
+            'request_weight': schedule_request.weight,
+        })
+
+    conflicts = []
+    for instance_id, contributors_by_pair in contributors_by_instance.items():
+        instance = instance_by_id[instance_id]
+        contributors = list(contributors_by_pair.values())
+        if len(contributors) <= instance.required_staffing:
+            continue
+        conflicts.append({
+            'shift_instance_id': instance.id,
+            'date': instance.date.isoformat(),
+            'facility': instance.facility.name,
+            'shift': instance.shift_template.name,
+            'required_staffing': instance.required_staffing,
+            'mandatory_assignments': len(contributors),
+            'overstaffed_by': len(contributors) - instance.required_staffing,
+            'contributors': contributors,
+        })
+
+    return {
+        'status': 'conflict' if conflicts else 'ready',
+        'has_conflicts': bool(conflicts),
+        'conflict_count': len(conflicts),
+        'conflicts': conflicts,
+        'unresolved_requests': unresolved_requests,
+        'start_mode': start_mode,
+        'source_run_id': source_run.id if source_run is not None else None,
+        'source_run_number': source_run.run_number if source_run is not None else None,
+        'detail': (
+            f'{len(conflicts)} shift(s) have more mandatory assignments than staffing capacity. '
+            'Resolve the highlighted locked assignments and authoritative requests before optimizing or scoring.'
+            if conflicts
+            else 'No mandatory assignment capacity conflicts were found.'
+        ),
+    }
+
+
+def _optimizer_preflight_response(version, start_mode, source_run):
+    report = _optimizer_authoritative_coverage_preflight(
+        version, start_mode, source_run,
+    )
+    if report['has_conflicts']:
+        return Response(
+            {'detail': report['detail'], 'optimizer_preflight': report},
+            status=status.HTTP_409_CONFLICT,
+        )
+    return None
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_optimizer_preflight(request, version_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+    )
+    start_mode, source_run, start_error = _optimizer_start_options(request, version)
+    if start_error:
+        return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    return Response(_optimizer_authoritative_coverage_preflight(
+        version, start_mode, source_run,
+    ))
 
 
 def _run_optimizer_response(request, version):
@@ -2277,9 +2518,17 @@ def _run_optimizer_response(request, version):
     max_runtime_seconds, runtime_error = _parse_optimizer_max_runtime_seconds(request)
     if runtime_error:
         return Response(runtime_error, status=status.HTTP_400_BAD_REQUEST)
+    optimization_focus, focus_error = _parse_optimizer_focus(request)
+    if focus_error:
+        return Response(focus_error, status=status.HTTP_400_BAD_REQUEST)
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    preflight_response = _optimizer_preflight_response(
+        version, start_mode, source_run,
+    )
+    if preflight_response is not None:
+        return preflight_response
     # This legacy request-bound path still performs shared-state activation and
     # therefore remains single-flight. Parallel searches use the background
     # endpoint, where every worker runs against an isolated run snapshot.
@@ -2324,6 +2573,7 @@ def _run_optimizer_response(request, version):
             version, created_by=request.user, seed=seed,
             start_mode=start_mode, source_run=source_run,
             max_runtime_seconds=max_runtime_seconds,
+            optimization_focus=optimization_focus,
             adaptive_runtime=control is not None, stop_requested=stop_requested,
         )
     except ValueError as optimizer_error:
@@ -2409,9 +2659,17 @@ def schedule_version_run_optimizer(request, version_id):
     max_runtime_seconds, runtime_error = _parse_optimizer_max_runtime_seconds(request)
     if runtime_error:
         return Response(runtime_error, status=status.HTTP_400_BAD_REQUEST)
+    optimization_focus, focus_error = _parse_optimizer_focus(request)
+    if focus_error:
+        return Response(focus_error, status=status.HTTP_400_BAD_REQUEST)
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    preflight_response = _optimizer_preflight_response(
+        version, start_mode, source_run,
+    )
+    if preflight_response is not None:
+        return preflight_response
     if (
         version.status != ScheduleVersion.Status.BUILD
         or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
@@ -2506,7 +2764,8 @@ def schedule_version_run_optimizer(request, version_id):
                     and source_run is not None
                     else None
                 ),
-                max_runtime_seconds=max_runtime_seconds or 15 * 60,
+                max_runtime_seconds=max_runtime_seconds or 120 * 60,
+                optimization_focus=optimization_focus,
                 run_kind='OPTIMIZER',
                 locked_open_shift_instance_ids=locked_open_ids,
             )
@@ -2553,6 +2812,11 @@ def schedule_version_recalculate_score(request, version_id):
             {'detail': 'Select the viewed active optimizer run to recalculate its score.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    preflight_response = _optimizer_preflight_response(
+        version, OptimizerRun.StartMode.CURRENT_SCHEDULE, optimizer_run,
+    )
+    if preflight_response is not None:
+        return preflight_response
     summary, report = recalculate_schedule_version_score(version, optimizer_run)
     return Response({
         'optimizer_summary': summary,
@@ -2604,6 +2868,7 @@ def optimizer_run_save_copy(request, run_id):
             run_kind='COPY',
             locked_open_shift_instance_ids=locked_open_ids,
             start_mode=source.start_mode,
+            optimization_focus=source.optimization_focus,
         )
         source_assignments = ScheduleShiftAssignment.objects.filter(
             visible_assignment_filter(source),
@@ -2885,9 +3150,14 @@ def optimizer_run_activate(request, run_id):
         return _build_workspace_forbidden_response()
 
     optimizer_run = get_object_or_404(
-        OptimizerRun.objects.select_related('schedule_version'),
+        OptimizerRun.objects.select_related('schedule_version__schedule_block'),
         id=run_id,
     )
+    if optimizer_run.schedule_version.schedule_block.published_at is not None:
+        return Response(
+            {'detail': 'Unpublish this Schedule Block before activating another optimizer run.'},
+            status=status.HTTP_409_CONFLICT,
+        )
     if optimizer_run.status != OptimizerRun.Status.COMPLETED:
         return Response(
             {'detail': 'Only completed optimizer runs can be activated.'},
@@ -2911,6 +3181,57 @@ def optimizer_run_activate(request, run_id):
     return Response(OptimizerRunSerializer(optimizer_run).data)
 
 
+def _published_violation_report(version):
+    """Return publication-time scoring without consulting current rules."""
+    if version.published_violation_report:
+        return version.published_violation_report
+
+    published_run = version.published_optimizer_run
+    breakdown = dict(published_run.score_breakdown or {}) if published_run else {}
+    total_score = float(published_run.final_score or 0) if published_run else 0.0
+    return {
+        'schedule_version': {
+            'id': version.id,
+            'schedule_block': version.schedule_block_id,
+            'domain': version.domain_id,
+            'domain_name': version.domain.name,
+            'version_number': version.version_number,
+            'name': version.name,
+            'status': version.status,
+        },
+        'schedule_block': {
+            'id': version.schedule_block_id,
+            'name': version.schedule_block.generated_name,
+            'start_date': version.schedule_block.start_date.isoformat(),
+            'end_date': version.schedule_block.end_date.isoformat(),
+        },
+        'optimizer_run': (
+            {
+                'id': published_run.id,
+                'schedule_version': published_run.schedule_version_id,
+                'run_number': published_run.run_number,
+                'created_at': published_run.created_at.isoformat(),
+                'status': published_run.status,
+                'initial_score': float(published_run.initial_score) if published_run.initial_score is not None else None,
+                'final_score': float(published_run.final_score) if published_run.final_score is not None else None,
+                'is_active': published_run.is_active,
+                'score_is_stale': False,
+            }
+            if published_run is not None
+            else None
+        ),
+        'total_score': total_score,
+        'score_breakdown': breakdown,
+        'warnings': [
+            'This legacy publication predates detailed scoring snapshots. The stored published score is shown without reevaluating current contracts or requests.'
+        ],
+        'fixed_request_feasibility': {},
+        'score_audit': {},
+        'debug': {'publication_snapshot': True, 'legacy_snapshot': True},
+        'users': [],
+    }
+
+
 @api_view(['GET'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -2919,9 +3240,21 @@ def schedule_version_violation_report(request, version_id):
         return _build_workspace_forbidden_response()
 
     version = get_object_or_404(
-        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        ScheduleVersion.objects.select_related(
+            'schedule_block', 'domain', 'published_optimizer_run',
+        ),
         id=version_id,
     )
+    if version.schedule_block.published_at is not None:
+        requested_run_id = request.query_params.get('optimizer_run_id')
+        if requested_run_id not in (None, '') and str(
+            version.published_optimizer_run_id or ''
+        ) != str(requested_run_id):
+            return Response(
+                {'detail': 'Published schedules can only show the frozen published-run report.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(_published_violation_report(version))
     optimizer_run = _get_optimizer_run_for_version(version, request.query_params.get('optimizer_run_id'))
     report = build_violation_report(version, optimizer_run=optimizer_run)
     report['requests'] = []
@@ -2960,9 +3293,20 @@ def optimizer_run_violations(request, run_id):
         return _build_workspace_forbidden_response()
 
     optimizer_run = get_object_or_404(
-        OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
+        OptimizerRun.objects.select_related(
+            'schedule_version__schedule_block',
+            'schedule_version__domain',
+            'schedule_version__published_optimizer_run',
+        ),
         id=run_id,
     )
+    if optimizer_run.schedule_version.schedule_block.published_at is not None:
+        if optimizer_run.schedule_version.published_optimizer_run_id != optimizer_run.id:
+            return Response(
+                {'detail': 'Published schedules can only show the frozen published-run report.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(_published_violation_report(optimizer_run.schedule_version))
     return Response(build_violation_report(optimizer_run.schedule_version, optimizer_run=optimizer_run))
 
 
@@ -3506,6 +3850,60 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
 @api_view(['POST'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
+def schedule_version_unlock_physician_assignments(request, version_id, physician_id):
+    if not _can_manage_build_workspace(request.user):
+        return _build_workspace_forbidden_response()
+
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block'),
+        id=version_id,
+    )
+    if (
+        version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
+        or version.status != ScheduleVersion.Status.BUILD
+    ):
+        return Response(
+            {'detail': 'Assignments can only be unlocked in a BUILD Schedule Version.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    viewed_run, run_error = _requested_editable_run(request, version)
+    if run_error:
+        return run_error
+
+    physician = get_object_or_404(
+        Physician.objects.select_related('user'),
+        id=physician_id,
+    )
+    with transaction.atomic():
+        locked_assignments = ScheduleShiftAssignment.objects.select_for_update().filter(
+            visible_assignment_filter(viewed_run),
+            shift_instance__schedule_version=version,
+            physician=physician,
+            is_locked=True,
+        )
+        unlocked_count = locked_assignments.update(
+            is_locked=False,
+            updated_at=timezone.now(),
+        )
+        if unlocked_count:
+            _mark_schedule_score_stale(version, viewed_run)
+
+    return Response({
+        'detail': (
+            f'Unlocked {unlocked_count} locked shift'
+            f'{"" if unlocked_count == 1 else "s"} for {_physician_display_name(physician)}.'
+        ),
+        'physician_id': physician.id,
+        'physician_name': _physician_display_name(physician),
+        'unlocked_count': unlocked_count,
+        'optimizer_run_id': viewed_run.id if viewed_run else None,
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
 def schedule_block_generate_shift_instances(request, block_id):
     if not _can_manage_build_workspace(request.user):
         return _build_workspace_forbidden_response()
@@ -3825,9 +4223,36 @@ def schedule_block_publish(request, block_id):
             status=status.HTTP_409_CONFLICT,
         )
 
-    block.published_at = timezone.now()
-    block.build_status = ScheduleBlock.BuildStatus.ARCHIVE
-    block.save(update_fields=['published_at', 'build_status', 'updated_at'])
+    versions = list(
+        ScheduleVersion.objects.filter(schedule_block=block)
+        .select_related('domain', 'schedule_block')
+    )
+    publication_snapshots = []
+    for version in versions:
+        published_run = version.optimizer_runs.filter(
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        ).order_by('-run_number').first()
+        report = build_violation_report(version, optimizer_run=published_run)
+        publication_snapshots.append((
+            version.id,
+            published_run,
+            json.loads(json.dumps(report, cls=DjangoJSONEncoder)),
+        ))
+
+    with transaction.atomic():
+        block = ScheduleBlock.objects.select_for_update().get(id=block.id)
+        block.published_at = timezone.now()
+        block.build_status = ScheduleBlock.BuildStatus.ARCHIVE
+        block.save(update_fields=['published_at', 'build_status', 'updated_at'])
+        for version_id, published_run, report in publication_snapshots:
+            ScheduleVersion.objects.filter(id=version_id).update(
+                published_optimizer_run=published_run,
+                published_violation_report=report,
+                score_is_stale=False,
+            )
+            if published_run is not None:
+                OptimizerRun.objects.filter(id=published_run.id).update(score_is_stale=False)
     return Response(ScheduleBlockSerializer(block).data)
 
 
@@ -3845,9 +4270,20 @@ def schedule_block_unpublish(request, block_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    block.published_at = None
-    block.build_status = ScheduleBlock.BuildStatus.BUILD
-    block.save(update_fields=['published_at', 'build_status', 'updated_at'])
+    with transaction.atomic():
+        block.published_at = None
+        block.build_status = ScheduleBlock.BuildStatus.BUILD
+        block.save(update_fields=['published_at', 'build_status', 'updated_at'])
+        versions = ScheduleVersion.objects.filter(schedule_block=block)
+        version_ids = list(versions.values_list('id', flat=True))
+        versions.update(
+            published_optimizer_run=None,
+            published_violation_report={},
+            score_is_stale=True,
+        )
+        OptimizerRun.objects.filter(schedule_version_id__in=version_ids).update(
+            score_is_stale=True,
+        )
     return Response(ScheduleBlockSerializer(block).data)
 
 

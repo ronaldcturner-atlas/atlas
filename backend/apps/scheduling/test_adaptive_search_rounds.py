@@ -136,6 +136,79 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
         )
         self.assertEqual(action, 'deep_restart')
 
+    def test_standard_focus_does_not_delay_restart_for_distribution_only_gain(self):
+        self.assertFalse(optimizer._pipeline_epoch_is_productive(
+            primary_improvements=0,
+            proportionality_improvements=3,
+            distribution_focus=False,
+        ))
+
+    def test_distribution_focus_renews_epoch_for_distribution_gain(self):
+        self.assertTrue(optimizer._pipeline_epoch_is_productive(
+            primary_improvements=0,
+            proportionality_improvements=1,
+            distribution_focus=True,
+        ))
+
+    def test_official_penalty_gain_is_productive_in_every_focus(self):
+        for distribution_focus in (False, True):
+            with self.subTest(distribution_focus=distribution_focus):
+                self.assertTrue(optimizer._pipeline_epoch_is_productive(
+                    primary_improvements=1,
+                    proportionality_improvements=0,
+                    distribution_focus=distribution_focus,
+                ))
+
+    def test_proportionality_target_accounts_for_whole_shift_rounding(self):
+        measure = optimizer._proportionality_measure(
+            {'A': 1},
+            {'A': 1, 'B': 1},
+            Decimal('50'),
+        )
+        target = optimizer._proportionality_target(
+            measure['score'],
+            measure['theoretical_floor'],
+            measure['neutral_baseline'],
+        )
+
+        self.assertEqual(measure['score'], Decimal('25'))
+        self.assertEqual(measure['theoretical_floor'], Decimal('25'))
+        self.assertEqual(target['target_min'], Decimal('25'))
+        self.assertEqual(target['target_max'], Decimal('25'))
+        self.assertEqual(target['quality_percent'], Decimal('100'))
+        self.assertEqual(target['quality_band'], 'TARGET')
+
+    def test_proportionality_target_reports_avoidable_imbalance(self):
+        balanced = optimizer._proportionality_measure(
+            {'A': 2, 'B': 2},
+            {'A': 1, 'B': 1},
+            Decimal('50'),
+        )
+        clustered = optimizer._proportionality_measure(
+            {'A': 3, 'B': 1},
+            {'A': 1, 'B': 1},
+            Decimal('50'),
+        )
+        balanced_target = optimizer._proportionality_target(
+            balanced['score'],
+            balanced['theoretical_floor'],
+            balanced['neutral_baseline'],
+        )
+        clustered_target = optimizer._proportionality_target(
+            clustered['score'],
+            clustered['theoretical_floor'],
+            clustered['neutral_baseline'],
+        )
+
+        self.assertEqual(balanced['score'], Decimal('0'))
+        self.assertEqual(clustered['score'], Decimal('25'))
+        self.assertEqual(balanced_target['target_max'], Decimal('3.75'))
+        self.assertEqual(balanced_target['quality_percent'], Decimal('100'))
+        self.assertEqual(clustered_target['quality_percent'], Decimal('0'))
+        self.assertEqual(
+            clustered_target['quality_band'], 'IMPROVEMENT_AVAILABLE',
+        )
+
     def test_productive_search_is_not_interrupted_by_a_fixed_epoch_limit(self):
         class Clock:
             value = 0.0

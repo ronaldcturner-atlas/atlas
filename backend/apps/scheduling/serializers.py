@@ -204,6 +204,7 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
 class ScheduleBlockSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
     request_status = serializers.SerializerMethodField()
+    published_runs = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleBlock
@@ -219,6 +220,7 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
             'published_at',
+            'published_runs',
         ]
         read_only_fields = [
             'id',
@@ -228,6 +230,7 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
             'published_at',
+            'published_runs',
         ]
 
     def get_name(self, obj):
@@ -240,6 +243,25 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
         if now <= obj.request_close_datetime:
             return 'Open'
         return 'Closed'
+
+    def get_published_runs(self, obj):
+        if obj.published_at is None:
+            return []
+        return [
+            {
+                'schedule_version_id': version.id,
+                'domain_name': version.domain.name,
+                'run_id': version.published_optimizer_run_id,
+                'run_number': (
+                    version.published_optimizer_run.run_number
+                    if version.published_optimizer_run is not None
+                    else None
+                ),
+            }
+            for version in obj.schedule_versions.select_related(
+                'domain', 'published_optimizer_run',
+            ).order_by('domain__name', 'id')
+        ]
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -296,6 +318,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(source='domain.name', read_only=True)
     shift_instance_count = serializers.SerializerMethodField()
     active_optimizer_run = serializers.SerializerMethodField()
+    published_optimizer_run = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleVersion
@@ -311,6 +334,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'workload_hour_overrides',
             'score_is_stale',
             'active_optimizer_run',
+            'published_optimizer_run',
             'shift_instance_count',
             'created_at',
             'updated_at',
@@ -329,17 +353,29 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             run = obj.optimizer_runs.filter(is_active=True).order_by('-run_number').first()
         return OptimizerRunSerializer(run).data if run else None
 
+    def get_published_optimizer_run(self, obj):
+        run = obj.published_optimizer_run
+        if run is None:
+            return None
+        return {
+            'id': run.id,
+            'run_number': run.run_number,
+            'final_score': run.final_score,
+        }
+
 
 class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
     """Lightweight version metadata for the Build Workspace header and selector."""
     domain_name = serializers.CharField(source='domain.name', read_only=True)
     shift_instance_count = serializers.SerializerMethodField()
+    published_optimizer_run = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleVersion
         fields = [
             'id', 'schedule_block', 'domain', 'domain_name', 'version_number',
             'name', 'status', 'score_is_stale', 'shift_instance_count',
+            'published_optimizer_run',
             'created_at', 'updated_at',
         ]
         read_only_fields = fields
@@ -350,12 +386,23 @@ class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
             date__lte=obj.schedule_block.end_date,
         ).count()
 
+    def get_published_optimizer_run(self, obj):
+        run = obj.published_optimizer_run
+        if run is None:
+            return None
+        return {
+            'id': run.id,
+            'run_number': run.run_number,
+            'final_score': run.final_score,
+        }
+
 
 class OptimizerRunSerializer(serializers.ModelSerializer):
     schedule_version_name = serializers.CharField(source='schedule_version.name', read_only=True)
     copied_from_run_number = serializers.IntegerField(source='copied_from_run.run_number', read_only=True)
     started_at = serializers.SerializerMethodField()
     live_best_score = serializers.SerializerMethodField()
+    is_published = serializers.SerializerMethodField()
 
     def get_started_at(self, obj):
         try:
@@ -370,6 +417,9 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
         except OptimizerControl.DoesNotExist:
             return None
         return control.live_best_score
+
+    def get_is_published(self, obj):
+        return obj.schedule_version.published_optimizer_run_id == obj.id
 
     class Meta:
         model = OptimizerRun
@@ -391,6 +441,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'optimizer_debug',
             'notes',
             'is_active',
+            'is_published',
             'score_is_stale',
             'copied_from_run',
             'copied_from_run_number',
@@ -400,6 +451,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'locked_open_shift_instance_ids',
             'start_mode',
             'max_runtime_seconds',
+            'optimization_focus',
         ]
         read_only_fields = fields
 
@@ -412,6 +464,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
     runtime_seconds = serializers.SerializerMethodField()
     started_at = serializers.SerializerMethodField()
     live_best_score = serializers.SerializerMethodField()
+    is_published = serializers.SerializerMethodField()
 
     def get_started_at(self, obj):
         try:
@@ -427,6 +480,9 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
             return None
         return control.live_best_score
 
+    def get_is_published(self, obj):
+        return obj.schedule_version.published_optimizer_run_id == obj.id
+
     def get_runtime_seconds(self, obj):
         annotated_runtime = getattr(obj, 'runtime_seconds_value', None)
         if annotated_runtime is not None:
@@ -439,11 +495,12 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
         fields = [
             'id', 'schedule_version', 'run_number', 'created_at', 'started_at',
             'live_best_score', 'status', 'seed',
-            'initial_score', 'final_score', 'is_active', 'score_is_stale',
+            'initial_score', 'final_score', 'is_active', 'is_published', 'score_is_stale',
             'copied_from_run', 'copied_from_run_number', 'run_kind',
             'started_from_run', 'started_from_run_number',
             'locked_open_shift_instance_ids', 'start_mode',
             'max_runtime_seconds',
+            'optimization_focus',
             'runtime_seconds',
             'notes',
         ]

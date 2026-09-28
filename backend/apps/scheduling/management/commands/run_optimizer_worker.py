@@ -6,7 +6,7 @@ from time import monotonic
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
-from django.db import close_old_connections, transaction
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 
 from apps.scheduling.models import OptimizerControl, OptimizerRun
@@ -14,6 +14,7 @@ from apps.scheduling.optimizer import optimize_schedule_version
 
 
 DEFAULT_JOB_TIMEOUT_SECONDS = 16 * 60
+_HELD_CONTROL_LOCKS = set()
 
 
 class OptimizerJobTimeout(TimeoutError):
@@ -31,19 +32,58 @@ class Command(BaseCommand):
             default=None,
         )
 
+    @staticmethod
+    def _advisory_lock_key(control_id):
+        # PostgreSQL advisory locks are released automatically when a worker
+        # process or database connection disappears. This makes a started job
+        # reclaimable after a local service restart without tying it to a web
+        # session or browser connection.
+        return control_id.int & ((1 << 63) - 1)
+
+    def _try_control_lock(self, control_id):
+        if control_id in _HELD_CONTROL_LOCKS:
+            return False
+        if connection.vendor == 'postgresql':
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    'SELECT pg_try_advisory_lock(%s)',
+                    [self._advisory_lock_key(control_id)],
+                )
+                acquired = bool(cursor.fetchone()[0])
+        else:
+            acquired = True
+        if acquired:
+            _HELD_CONTROL_LOCKS.add(control_id)
+        return acquired
+
+    def _release_control_lock(self, control_id):
+        if control_id not in _HELD_CONTROL_LOCKS:
+            return
+        try:
+            if connection.vendor == 'postgresql':
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT pg_advisory_unlock(%s)',
+                        [self._advisory_lock_key(control_id)],
+                    )
+        finally:
+            _HELD_CONTROL_LOCKS.discard(control_id)
+
     def _claim_next(self):
         with transaction.atomic():
-            control = (
+            controls = list(
                 OptimizerControl.objects.select_for_update(skip_locked=True)
-                .filter(started_at__isnull=True, optimizer_run__status=OptimizerRun.Status.RUNNING)
-                .order_by('created_at')
-                .first()
+                .filter(optimizer_run__status=OptimizerRun.Status.RUNNING)
+                .order_by('started_at', 'created_at')
             )
-            if control is None:
-                return None
-            control.started_at = timezone.now()
-            control.save(update_fields=['started_at'])
-            return control.pk
+            for control in controls:
+                if not self._try_control_lock(control.pk):
+                    continue
+                if control.started_at is None:
+                    control.started_at = timezone.now()
+                    control.save(update_fields=['started_at'])
+                return control.pk
+            return None
 
     @staticmethod
     def _store_live_best_score(control_id, score):
@@ -125,6 +165,7 @@ class Command(BaseCommand):
                 start_mode=control.optimizer_run.start_mode,
                 source_run=control.source_run,
                 max_runtime_seconds=control.optimizer_run.max_runtime_seconds,
+                optimization_focus=control.optimizer_run.optimization_focus,
                 adaptive_runtime=True,
                 stop_requested=stop_requested,
                 progress_callback=publish_progress,
@@ -158,11 +199,14 @@ class Command(BaseCommand):
         while True:
             control_id = self._claim_next()
             if control_id is not None:
-                self.stdout.write(f'Running optimizer job {control_id}')
-                self._run_control(
-                    control_id,
-                    job_timeout_seconds=options['job_timeout_seconds'],
-                )
+                self.stdout.write(f'Running or resuming optimizer job {control_id}')
+                try:
+                    self._run_control(
+                        control_id,
+                        job_timeout_seconds=options['job_timeout_seconds'],
+                    )
+                finally:
+                    self._release_control_lock(control_id)
                 if options['once']:
                     return
                 continue

@@ -173,6 +173,16 @@ function isDateWithinBlock(value: string, startDate: string, endDate: string) {
   return value >= startDate && value <= endDate
 }
 
+function nextIndividualRequestDate(value: string, blockEndDate: string) {
+  const current = parseIsoDateToUtc(value)
+  if (current.getUTCDate() === endOfMonthUtc(current).getUTCDate()) {
+    return null
+  }
+
+  const next = toIsoDateUtc(addDaysUtc(current, 1))
+  return next <= blockEndDate ? next : null
+}
+
 function getDaysForMonthGrid(monthDate: Date, minDate: Date, maxDate: Date) {
   const monthStart = startOfMonthUtc(monthDate)
   const monthEnd = endOfMonthUtc(monthDate)
@@ -718,6 +728,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     try {
       setIsSaving(true)
       setError(null)
+      const savedDate = selectedDate
 
       const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/requests/upsert/`, {
         method: 'POST',
@@ -745,6 +756,12 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
       // workflow. Once an individual request is saved, those temporary visual
       // selections are complete and must not remain highlighted on later edits.
       setBulkPendingDates([])
+      const nextDate = nextIndividualRequestDate(savedDate, block.end_date)
+      if (nextDate) {
+        // Do not override a date the user selected while the save request was
+        // in flight. This advances only the individual request workflow.
+        setSelectedDate((current) => current === savedDate ? nextDate : current)
+      }
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save request.')
     } finally {

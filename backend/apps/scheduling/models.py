@@ -185,6 +185,14 @@ class ScheduleVersion(models.Model):
     workload_hour_overrides = models.JSONField(default=dict, blank=True)
     shift_template_fingerprint = models.CharField(max_length=64, blank=True, default='')
     score_is_stale = models.BooleanField(default=False)
+    published_optimizer_run = models.ForeignKey(
+        'OptimizerRun',
+        on_delete=models.SET_NULL,
+        related_name='published_schedule_versions',
+        null=True,
+        blank=True,
+    )
+    published_violation_report = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -212,6 +220,10 @@ class OptimizerRun(models.Model):
     class StartMode(models.TextChoices):
         CURRENT_SCHEDULE = 'CURRENT_SCHEDULE', 'Current schedule'
         FRESH_FILL = 'FRESH_FILL', 'Fresh fill'
+
+    class OptimizationFocus(models.TextChoices):
+        STANDARD = 'STANDARD', 'Standard optimization'
+        DISTRIBUTION = 'DISTRIBUTION', 'Facility/Shift distribution focus'
 
     schedule_version = models.ForeignKey(
         ScheduleVersion,
@@ -251,7 +263,12 @@ class OptimizerRun(models.Model):
     start_mode = models.CharField(
         max_length=24, choices=StartMode.choices, default=StartMode.FRESH_FILL,
     )
-    max_runtime_seconds = models.PositiveIntegerField(default=900)
+    max_runtime_seconds = models.PositiveIntegerField(default=120 * 60)
+    optimization_focus = models.CharField(
+        max_length=24,
+        choices=OptimizationFocus.choices,
+        default=OptimizationFocus.STANDARD,
+    )
 
     def __str__(self):
         return f'{self.schedule_version_id}: Run {self.run_number}'

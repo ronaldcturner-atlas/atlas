@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
 from .optimizer import (
@@ -343,11 +343,22 @@ def _fte_adjustment_preview(status, physician_rows, available_hours, aggregate_m
             'proposed_hours': _number(max(proposed, Decimal('0'))),
         })
     applied_total = sum(adjustments.values(), Decimal('0'))
+    required_rate = max(
+        (
+            adjustments[row['physician_id']] / Decimal(str(row['fte']))
+            for row in candidates
+        ),
+        default=base_rate,
+    )
+    recommended_rate = max(
+        Decimal('1'),
+        required_rate.quantize(Decimal('1'), rounding=ROUND_CEILING),
+    )
     return {
         'direction': direction,
         'required_adjustment_hours': _number(required),
         'total_applicable_fte': _number(total_fte),
-        'adjustment_hours_per_fte': _number(base_rate),
+        'adjustment_hours_per_fte': _number(recommended_rate),
         'proposals': proposals,
         'can_preview': abs(applied_total - required) <= Decimal('0.0001'),
         'reason': None,

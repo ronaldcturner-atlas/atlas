@@ -32,6 +32,7 @@ from .models import (
 )
 from .optimizer import (
     _attach_published_weekend_context,
+    _distribution_score,
     _adaptive_repair_order,
     _adaptive_repair_slice_seconds,
     _pipeline_epoch_transition,
@@ -51,6 +52,7 @@ from .optimizer import (
     _workload_schedule_score,
     _workload_rule_delta_from_totals,
     _record_adaptive_repair_productivity,
+    _repair_proportional_distribution_swaps,
     optimize_schedule_version,
 )
 from .run_state import assignments_for_viewed_run
@@ -532,6 +534,79 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.ARCHIVE)
         self.assertIsNotNone(block.published_at)
 
+    def test_publish_captures_run_and_freezes_scoring_until_unpublished(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+        domain = Domain.objects.create(name='Publication Snapshot Domain', active=True)
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=domain,
+            version_number=1,
+            name='Publication Snapshot Version',
+        )
+        published_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=7,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+            final_score=Decimal('321'),
+            score_breakdown={'total_score': 321.0},
+        )
+        contract = Contract.objects.create(
+            domain=domain,
+            name='Publication Snapshot Contract',
+            active=True,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/publish/', data={}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['published_runs'][0]['run_number'], 7)
+        version.refresh_from_db()
+        published_run.refresh_from_db()
+        self.assertEqual(version.published_optimizer_run_id, published_run.id)
+        self.assertTrue(version.published_violation_report)
+        self.assertFalse(version.score_is_stale)
+        self.assertFalse(published_run.score_is_stale)
+
+        api._mark_contract_domain_scores_stale(contract)
+        version.refresh_from_db()
+        published_run.refresh_from_db()
+        self.assertFalse(version.score_is_stale)
+        self.assertFalse(published_run.score_is_stale)
+
+        context = self.client.get(f'/api/schedule-blocks/{block.id}/build/').json()
+        self.assertIsNone(context['workload_feasibility'])
+        self.assertEqual(
+            context['selected_version']['published_optimizer_run']['run_number'],
+            7,
+        )
+        self.assertTrue(
+            next(run for run in context['optimizer_runs'] if run['id'] == published_run.id)[
+                'is_published'
+            ]
+        )
+
+        frozen_report = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/'
+        )
+        self.assertEqual(frozen_report.status_code, 200)
+        self.assertEqual(frozen_report.json(), version.published_violation_report)
+
+        unpublish = self.client.post(
+            f'/api/schedule-blocks/{block.id}/unpublish/', data={}, format='json',
+        )
+        self.assertEqual(unpublish.status_code, 200)
+        version.refresh_from_db()
+        published_run.refresh_from_db()
+        self.assertIsNone(version.published_optimizer_run_id)
+        self.assertEqual(version.published_violation_report, {})
+        self.assertTrue(version.score_is_stale)
+        self.assertTrue(published_run.score_is_stale)
+        context = self.client.get(f'/api/schedule-blocks/{block.id}/build/').json()
+        self.assertIsNotNone(context['workload_feasibility'])
+
     def test_unpublish_returns_archived_block_to_build(self):
         block = self._create_block(
             build_status=ScheduleBlock.BuildStatus.ARCHIVE,
@@ -545,7 +620,7 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.BUILD)
         self.assertIsNone(block.published_at)
 
-    def test_published_schedule_uses_active_optimizer_run_assignments(self):
+    def test_published_schedule_uses_frozen_published_run_assignments(self):
         block = self._create_block(
             build_status=ScheduleBlock.BuildStatus.ARCHIVE,
             published_at=timezone.now(),
@@ -598,6 +673,32 @@ class ScheduleBlockApiTests(TestCase):
             assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
             optimizer_run=active_run,
         )
+        version.published_optimizer_run = active_run
+        version.save(update_fields=['published_optimizer_run'])
+        active_run.is_active = False
+        active_run.save(update_fields=['is_active'])
+        later_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+        later_user = get_user_model().objects.create_user(
+            username='later@example.com',
+            first_name='Later',
+            last_name='Physician',
+        )
+        later_physician = Physician.objects.create(
+            user=later_user,
+            display_name='Later Physician',
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=later_physician,
+            created_by=self.user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=later_run,
+        )
 
         response = self.client.get('/api/published-schedule/')
 
@@ -608,6 +709,7 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(payload[0]['facility_name'], 'Published Hospital')
         self.assertEqual(payload[0]['facility_short_name'], 'PUB')
         self.assertEqual(payload[0]['facility_sort_order'], 7)
+        self.assertNotEqual(payload[0]['physician_name'], 'Later Physician')
 
     def test_preview_block_fields_are_read_only(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
@@ -2005,6 +2107,255 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(report['status'], 'conflict_proven')
         self.assertTrue(any(row['rule'] == 'Combined weekend minimums' for row in report['conflicts']))
 
+    def test_optimizer_preflight_blocks_locked_assignment_request_overstaffing(self):
+        locked_physician = self._create_assignment_physician(
+            'locked-preflight@example.com', 'Locked Preflight', facilities=[self.facility],
+        )
+        requested_physician = self._create_assignment_physician(
+            'requested-preflight@example.com', 'Requested Preflight', facilities=[self.facility],
+        )
+        requested_contract = ContractUserAssignment.objects.get(
+            physician=requested_physician,
+        ).contract
+        requested_contract.manual_assignment_only = True
+        requested_contract.save(update_fields=['manual_assignment_only', 'updated_at'])
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        locked_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=locked_physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        schedule_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=requested_physician,
+            date=self.block.start_date,
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            weight=ScheduleRequest.Weight.FIXED,
+        )
+        schedule_request.shift_templates.add(self.day_template)
+
+        preflight = self.client.post(
+            f'/api/schedule-versions/{version.id}/optimizer-preflight/',
+            data={'start_mode': OptimizerRun.StartMode.FRESH_FILL},
+            format='json',
+        )
+
+        self.assertEqual(preflight.status_code, 200)
+        report = preflight.json()
+        self.assertEqual(report['status'], 'conflict')
+        self.assertEqual(report['conflict_count'], 1)
+        conflict = report['conflicts'][0]
+        self.assertEqual(conflict['shift_instance_id'], instance.id)
+        self.assertEqual(conflict['required_staffing'], 1)
+        self.assertEqual(conflict['mandatory_assignments'], 2)
+        sources = {
+            source['type']
+            for contributor in conflict['contributors']
+            for source in contributor['sources']
+        }
+        self.assertEqual(
+            sources,
+            {'LOCKED_ASSIGNMENT', 'AUTHORITATIVE_SHIFT_ON_REQUEST'},
+        )
+        self.assertTrue(any(
+            source.get('assignment_id') == locked_assignment.id
+            for contributor in conflict['contributors']
+            for source in contributor['sources']
+        ))
+        self.assertTrue(any(
+            source.get('request_id') == schedule_request.id
+            for contributor in conflict['contributors']
+            for source in contributor['sources']
+        ))
+
+        start = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'start_mode': OptimizerRun.StartMode.FRESH_FILL,
+                'max_runtime_minutes': 120,
+            },
+            format='json',
+        )
+        self.assertEqual(start.status_code, 409)
+        self.assertEqual(start.json()['optimizer_preflight']['conflict_count'], 1)
+        self.assertFalse(OptimizerRun.objects.filter(schedule_version=version).exists())
+        self.assertFalse(OptimizerControl.objects.filter(schedule_version=version).exists())
+
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+            final_score=Decimal('100'),
+        )
+        from_previous = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                'source_run_id': source_run.id,
+                'max_runtime_minutes': 120,
+            },
+            format='json',
+        )
+        self.assertEqual(from_previous.status_code, 409)
+        self.assertEqual(
+            from_previous.json()['optimizer_preflight']['conflict_count'], 1,
+        )
+        self.assertEqual(
+            OptimizerRun.objects.filter(schedule_version=version).count(), 1,
+        )
+
+        recalculate = self.client.post(
+            f'/api/schedule-versions/{version.id}/recalculate-score/',
+            data={'optimizer_run_id': source_run.id},
+            format='json',
+        )
+        self.assertEqual(recalculate.status_code, 409)
+        self.assertEqual(
+            recalculate.json()['optimizer_preflight']['conflict_count'], 1,
+        )
+
+    def test_optimizer_preflight_allows_mandatory_assignments_within_capacity(self):
+        locked_physician = self._create_assignment_physician(
+            'capacity-locked@example.com', 'Capacity Locked', facilities=[self.facility],
+        )
+        requested_physician = self._create_assignment_physician(
+            'capacity-requested@example.com', 'Capacity Requested', facilities=[self.facility],
+        )
+        requested_contract = ContractUserAssignment.objects.get(
+            physician=requested_physician,
+        ).contract
+        requested_contract.manual_assignment_only = True
+        requested_contract.save(update_fields=['manual_assignment_only', 'updated_at'])
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        instance.required_staffing = 2
+        instance.save(update_fields=['required_staffing'])
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=locked_physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        schedule_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=requested_physician,
+            date=self.block.start_date,
+            request_scope=ScheduleRequest.RequestScope.ADMIN,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            weight=ScheduleRequest.Weight.FIXED,
+        )
+        schedule_request.shift_templates.add(self.day_template)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/optimizer-preflight/',
+            data={'start_mode': OptimizerRun.StartMode.FRESH_FILL},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'ready')
+        self.assertEqual(response.json()['conflicts'], [])
+
+    def test_previous_run_optimizer_assignment_yields_to_new_authoritative_request(self):
+        previous_owner = self._create_assignment_physician(
+            'previous-owner@example.com', 'Previous Owner', facilities=[self.facility],
+        )
+        requested_physician = self._create_assignment_physician(
+            'new-request@example.com', 'New Request', facilities=[self.facility],
+        )
+        requested_contract = ContractUserAssignment.objects.get(
+            physician=requested_physician,
+        ).contract
+        requested_contract.manual_assignment_only = True
+        requested_contract.save(update_fields=['manual_assignment_only', 'updated_at'])
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            seed=1122,
+            initial_score=0,
+            final_score=0,
+            is_active=True,
+        )
+        previous_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=previous_owner,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=source_run,
+            is_locked=False,
+        )
+        schedule_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=requested_physician,
+            date=self.block.start_date,
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.SHIFT_ON,
+            weight=ScheduleRequest.Weight.FIXED,
+        )
+        schedule_request.shift_templates.add(self.day_template)
+
+        preflight = self.client.post(
+            f'/api/schedule-versions/{version.id}/optimizer-preflight/',
+            data={
+                'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                'source_run_id': source_run.id,
+            },
+            format='json',
+        )
+        self.assertEqual(preflight.status_code, 200)
+        self.assertEqual(preflight.json()['status'], 'ready')
+        self.assertEqual(preflight.json()['conflicts'], [])
+
+        optimized = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/versions/{version.id}/optimize/',
+            data={
+                'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                'source_run_id': source_run.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(optimized.status_code, 200)
+        completed_run = OptimizerRun.objects.get(
+            id=optimized.json()['optimizer_run_id'],
+        )
+        self.assertTrue(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=completed_run,
+                shift_instance=instance,
+                physician=requested_physician,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                is_locked=True,
+            ).exists()
+        )
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=completed_run,
+                shift_instance=instance,
+                physician=previous_owner,
+            ).exists()
+        )
+        self.assertTrue(
+            ScheduleShiftAssignment.objects.filter(id=previous_assignment.id).exists()
+        )
+
     def test_weekend_feasibility_detects_isolated_fixed_minimum_streak(self):
         physician = self._create_assignment_physician(
             'weekend-streak@example.com', 'Weekend Streak', facilities=[self.facility],
@@ -2163,6 +2514,30 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(reset.status_code, 200)
         version.refresh_from_db()
         self.assertEqual(version.workload_hour_overrides, {})
+
+    def test_workload_adjustment_requires_whole_hours_per_fte(self):
+        physician = self._create_assignment_physician('whole-hours@example.com', 'Whole Hours')
+        assignment = ContractUserAssignment.objects.get(physician=physician)
+        assignment.contract.workload_settings = {
+            'period_rules': [{
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '0', 'max_value': '1',
+            }],
+        }
+        assignment.contract.save(update_fields=['workload_settings'])
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(id=generated.json()['schedule_version']['id'])
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/workload-hour-adjustment/',
+            data={'hours_per_fte': '2.31'}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['hours_per_fte'], 'Enter a whole number of hours.')
 
     def test_night_feasibility_subtracts_locked_manual_nights_and_limits(self):
         physician = self._create_assignment_physician(
@@ -3118,6 +3493,75 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(run.max_runtime_seconds, 45 * 60)
         self.assertEqual(response.json()['max_runtime_seconds'], 45 * 60)
 
+    def test_background_optimizer_defaults_runtime_to_120_minutes(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 9878},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 202)
+        run = OptimizerRun.objects.get(id=response.json()['id'])
+        self.assertEqual(run.max_runtime_seconds, 120 * 60)
+        self.assertEqual(response.json()['max_runtime_seconds'], 120 * 60)
+
+    def test_background_optimizer_stores_distribution_focus(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'seed': 9879,
+                'optimization_focus': OptimizerRun.OptimizationFocus.DISTRIBUTION,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 202)
+        run = OptimizerRun.objects.get(id=response.json()['id'])
+        self.assertEqual(
+            run.optimization_focus,
+            OptimizerRun.OptimizationFocus.DISTRIBUTION,
+        )
+        self.assertEqual(
+            response.json()['optimization_focus'],
+            OptimizerRun.OptimizationFocus.DISTRIBUTION,
+        )
+
+    def test_background_optimizer_rejects_unknown_optimization_focus(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'seed': 9880,
+                'optimization_focus': 'PENALTY_ONLY',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('optimization_focus', response.json())
+        self.assertFalse(
+            OptimizerRun.objects.filter(schedule_version=version).exists(),
+        )
+
     @override_settings(OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION=2)
     def test_background_optimizer_accepts_two_independent_runs_and_rejects_third(self):
         self.client.post(
@@ -3157,6 +3601,67 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(
             OptimizerControl.objects.filter(schedule_version=version).count(),
             2,
+        )
+
+    @override_settings(OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION=2)
+    def test_parallel_runs_can_use_two_different_completed_source_runs(self):
+        version = self._create_build_version()
+        first_source = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('1000'),
+            is_active=True,
+        )
+        second_source = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('900'),
+        )
+
+        first = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                'source_run_id': first_source.id,
+                'currently_viewed_run_id': second_source.id,
+                'seed': 2101,
+            },
+            format='json',
+        )
+        second = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'start_mode': OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                'source_run_id': second_source.id,
+                'currently_viewed_run_id': first_source.id,
+                'seed': 2102,
+            },
+            format='json',
+        )
+
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.status_code, 202)
+        first_run = OptimizerRun.objects.get(id=first.json()['id'])
+        second_run = OptimizerRun.objects.get(id=second.json()['id'])
+        self.assertEqual(first_run.started_from_run_id, first_source.id)
+        self.assertEqual(second_run.started_from_run_id, second_source.id)
+        self.assertEqual(first_run.started_from_run_number, first_source.run_number)
+        self.assertEqual(second_run.started_from_run_number, second_source.run_number)
+        self.assertEqual(first_run.initial_score, first_source.final_score)
+        self.assertEqual(second_run.initial_score, second_source.final_score)
+        self.assertEqual(
+            list(
+                OptimizerControl.objects.filter(optimizer_run__in=[first_run, second_run])
+                .order_by('optimizer_run__run_number')
+                .values_list('source_run_id', flat=True)
+            ),
+            [first_source.id, second_source.id],
         )
 
     @override_settings(OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION=2)
@@ -3216,6 +3721,35 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             2,
         )
 
+        Command()._release_control_lock(worker_one_control_id)
+        Command()._release_control_lock(worker_two_control_id)
+
+    def test_worker_reclaims_started_control_after_owner_lock_is_released(self):
+        from apps.scheduling.management.commands.run_optimizer_worker import Command
+
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'seed': 1303}, format='json',
+        )
+        control = OptimizerControl.objects.get(
+            optimizer_run_id=response.json()['id'],
+        )
+        first_worker = Command()
+        claimed_id = first_worker._claim_next()
+        self.assertEqual(claimed_id, control.pk)
+
+        self.assertIsNone(Command()._claim_next())
+        first_worker._release_control_lock(claimed_id)
+
+        reclaimed_id = Command()._claim_next()
+        self.assertEqual(reclaimed_id, control.pk)
+        Command()._release_control_lock(reclaimed_id)
+
     def test_background_optimizer_rejects_runtime_outside_admin_range(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -3243,7 +3777,12 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         version = ScheduleVersion.objects.get(schedule_block=self.block)
         response = self.client.post(
             f'/api/schedule-versions/{version.id}/run-optimizer/',
-            data={'background': True, 'seed': 4321}, format='json',
+            data={
+                'background': True,
+                'seed': 4321,
+                'optimization_focus': OptimizerRun.OptimizationFocus.DISTRIBUTION,
+            },
+            format='json',
         )
         run = OptimizerRun.objects.get(id=response.json()['id'])
 
@@ -3266,7 +3805,11 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertTrue(run.is_active)
         self.assertFalse(OptimizerControl.objects.filter(optimizer_run=run).exists())
         optimize.assert_called_once()
-        self.assertEqual(optimize.call_args.kwargs['max_runtime_seconds'], 900)
+        self.assertEqual(optimize.call_args.kwargs['max_runtime_seconds'], 120 * 60)
+        self.assertEqual(
+            optimize.call_args.kwargs['optimization_focus'],
+            OptimizerRun.OptimizationFocus.DISTRIBUTION,
+        )
 
     @override_settings(OPTIMIZER_ENABLE_PARALLEL_ISOLATION=True)
     def test_background_worker_enables_isolated_optimizer_execution(self):
@@ -3488,6 +4031,87 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             float(optimizer_run.final_score),
             rescore.json()['violation_report']['total_score'],
         )
+
+    def test_unlock_all_physician_assignments_only_unlocks_selected_physician(self):
+        version = self._create_build_version()
+        day_instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        overnight_instance = self._create_shift_instance(
+            version, self.overnight_template, self.block.start_date,
+        )
+        selected_physician = self._create_assignment_physician(
+            'unlock.selected@example.com', 'Unlock Selected', facilities=[self.facility],
+        )
+        other_physician = self._create_assignment_physician(
+            'unlock.other@example.com', 'Unlock Other', facilities=[self.facility],
+        )
+        selected_assignments = [
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=shift_instance,
+                physician=selected_physician,
+                created_by=self.scheduler_user,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                is_locked=True,
+            )
+            for shift_instance in (day_instance, overnight_instance)
+        ]
+        other_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=day_instance,
+            physician=other_physician,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            is_locked=True,
+        )
+        ScheduleVersion.objects.filter(id=version.id).update(score_is_stale=False)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/physicians/{selected_physician.id}/unlock-assignments/',
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['unlocked_count'], 2)
+        self.assertEqual(response.json()['physician_id'], selected_physician.id)
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(
+                id__in=[assignment.id for assignment in selected_assignments],
+                is_locked=True,
+            ).exists()
+        )
+        other_assignment.refresh_from_db()
+        self.assertTrue(other_assignment.is_locked)
+        version.refresh_from_db()
+        self.assertTrue(version.score_is_stale)
+
+    def test_unlock_all_physician_assignments_rejects_non_active_run(self):
+        version = self._create_build_version()
+        physician = self._create_assignment_physician(
+            'unlock.historical@example.com', 'Unlock Historical', facilities=[self.facility],
+        )
+        historical_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+        )
+        OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/physicians/{physician.id}/unlock-assignments/',
+            data={'optimizer_run_id': historical_run.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('active run', response.json()['detail'])
 
     def test_save_copy_isolates_assignments_and_supports_reports_and_rescore(self):
         self.client.post(
@@ -7333,6 +7957,262 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             redistributed_scoring['score'] - scoring['score'],
         )
 
+    def test_default_proportionality_uses_supply_remaining_after_manual_only_assignments(self):
+        regulars = [
+            SimpleNamespace(id=1, display_name='Regular 1'),
+            SimpleNamespace(id=2, display_name='Regular 2'),
+        ]
+        contracts = {
+            1: SimpleNamespace(
+                id=1, name='Regular 1', manual_assignment_only=False,
+                workload_settings={}, shift_settings={}, night_settings={},
+                weekend_settings={},
+            ),
+            2: SimpleNamespace(
+                id=2, name='Regular 2', manual_assignment_only=False,
+                workload_settings={}, shift_settings={}, night_settings={},
+                weekend_settings={},
+            ),
+            3: SimpleNamespace(
+                id=3, name='Nocturnist', manual_assignment_only=True,
+                workload_settings={}, shift_settings={}, night_settings={},
+                weekend_settings={},
+            ),
+        }
+        templates = {
+            10: SimpleNamespace(
+                id=1, start_time=time(14, 0), night_shift=False,
+                weekend_days=[],
+            ),
+            20: SimpleNamespace(
+                id=2, start_time=time(14, 0), night_shift=False,
+                weekend_days=[],
+            ),
+        }
+        instances = []
+        state = defaultdict(list)
+        # Six facility-10 slots and four facility-20 slots exist. The
+        # manual-only clinician occupies two facility-20 slots, leaving a
+        # regular optimizer pool of 6:2, or 3:1 per regular physician.
+        for index, facility_id in enumerate([10] * 6 + [20] * 4, start=1):
+            template = templates[facility_id]
+            start = timezone.make_aware(datetime(2026, 7, index, 14, 0))
+            instance = SimpleNamespace(
+                id=index,
+                date=start.date(),
+                start_datetime=start,
+                end_datetime=start + timedelta(hours=8),
+                required_staffing=1,
+                facility_id=facility_id,
+                shift_template_id=template.id,
+                shift_template=template,
+                is_locked_open=False,
+            )
+            instances.append(instance)
+        state[9] = [3]
+        state[10] = [3]
+        for instance_id in (1, 2, 3, 7):
+            state[instance_id] = [1]
+        for instance_id in (4, 5, 6, 8):
+            state[instance_id] = [2]
+
+        result = _distribution_score(
+            instances,
+            regulars,
+            state,
+            contracts,
+            {1: {10, 20}, 2: {10, 20}, 3: set()},
+        )
+
+        self.assertEqual(result['facility_distribution_score'], Decimal('0'))
+        self.assertEqual(result['time_distribution_score'], Decimal('0'))
+
+    def test_explicit_shift_rules_remove_templates_from_default_proportionality(self):
+        physician = SimpleNamespace(id=1, display_name='Rule Guided')
+        early_template = SimpleNamespace(
+            id=91, start_time=time(7, 0), night_shift=False,
+            weekend_days=[],
+        )
+        late_template = SimpleNamespace(
+            id=92, start_time=time(14, 0), night_shift=False,
+            weekend_days=[],
+        )
+        early_start = timezone.make_aware(datetime(2026, 7, 1, 7, 0))
+        late_start = timezone.make_aware(datetime(2026, 7, 2, 14, 0))
+        early_instance = SimpleNamespace(
+            id=1,
+            date=early_start.date(),
+            start_datetime=early_start,
+            end_datetime=early_start + timedelta(hours=8),
+            required_staffing=1,
+            facility_id=10,
+            shift_template_id=early_template.id,
+            shift_template=early_template,
+        )
+        late_instance = SimpleNamespace(
+            id=2,
+            date=late_start.date(),
+            start_datetime=late_start,
+            end_datetime=late_start + timedelta(hours=8),
+            required_staffing=1,
+            facility_id=20,
+            shift_template_id=late_template.id,
+            shift_template=late_template,
+        )
+        contract = SimpleNamespace(
+            id=1,
+            name='Rule guided',
+            manual_assignment_only=False,
+            workload_settings={},
+            night_settings={},
+            weekend_settings={},
+            shift_settings={'rules': [{
+                'shift_template_ids': [early_template.id, late_template.id],
+                'period_rules': [{
+                    'period_type': 'SCHEDULE_BLOCK',
+                    'units': 'SHIFTS',
+                    'min_value': 1,
+                }],
+            }]},
+        )
+
+        result = _distribution_score(
+            [early_instance, late_instance],
+            [physician],
+            defaultdict(list, {early_instance.id: [physician.id]}),
+            {physician.id: contract},
+            {physician.id: {10, 20}},
+        )
+
+        self.assertEqual(result['facility_distribution_score'], Decimal('0'))
+        self.assertEqual(result['time_distribution_score'], Decimal('0'))
+
+    def test_proportionality_breaks_ties_without_changing_official_score(self):
+        physicians = [
+            SimpleNamespace(id=1, active=True, display_name='Regular 1'),
+            SimpleNamespace(id=2, active=True, display_name='Regular 2'),
+        ]
+        contracts = {
+            physician.id: SimpleNamespace(
+                id=physician.id,
+                name=f'Regular {physician.id}',
+                manual_assignment_only=False,
+                workload_settings={},
+                shift_settings={},
+                night_settings={},
+                weekend_settings={},
+            )
+            for physician in physicians
+        }
+        templates = {
+            (10, 'early'): SimpleNamespace(
+                id=101, start_time=time(7, 0), night_shift=False,
+                weekend_days=[],
+            ),
+            (10, 'late'): SimpleNamespace(
+                id=102, start_time=time(14, 0), night_shift=False,
+                weekend_days=[],
+            ),
+            (20, 'early'): SimpleNamespace(
+                id=201, start_time=time(7, 0), night_shift=False,
+                weekend_days=[],
+            ),
+            (20, 'late'): SimpleNamespace(
+                id=202, start_time=time(14, 0), night_shift=False,
+                weekend_days=[],
+            ),
+        }
+        categories = [
+            (10, 'early'), (10, 'early'), (10, 'early'),
+            (10, 'late'), (10, 'late'), (10, 'late'),
+            (20, 'early'), (20, 'late'),
+        ]
+        instances = []
+        for index, category in enumerate(categories, start=1):
+            template = templates[category]
+            start = timezone.make_aware(datetime.combine(
+                date(2026, 7, index), template.start_time,
+            ))
+            instances.append(SimpleNamespace(
+                id=index,
+                date=start.date(),
+                start_datetime=start,
+                end_datetime=start + timedelta(hours=8),
+                required_staffing=1,
+                facility_id=category[0],
+                shift_template_id=template.id,
+                shift_template=template,
+                is_locked_open=False,
+            ))
+        balanced = defaultdict(list, {
+            1: [1], 2: [1], 4: [1], 8: [1],
+            3: [2], 5: [2], 6: [2], 7: [2],
+        })
+        clustered = defaultdict(list, {
+            1: [1], 2: [1], 3: [1], 7: [1],
+            4: [2], 5: [2], 6: [2], 8: [2],
+        })
+        targets = {
+            physician.id: {
+                'units': 'HOURS',
+                'target': Decimal('32'),
+                'rules': [],
+            }
+            for physician in physicians
+        }
+        scoring_args = (
+            targets,
+            contracts,
+            defaultdict(list),
+            {1: {10, 20}, 2: {10, 20}},
+            {1: Decimal('0'), 2: Decimal('0')},
+        )
+
+        balanced_scoring = _score_schedule(
+            instances, physicians, balanced, *scoring_args,
+        )
+        clustered_scoring = _score_schedule(
+            instances, physicians, clustered, *scoring_args,
+        )
+
+        self.assertEqual(balanced_scoring['score'], clustered_scoring['score'])
+        self.assertEqual(
+            balanced_scoring['breakdown']['facility_distribution_score'],
+            Decimal('0'),
+        )
+        self.assertLess(
+            balanced_scoring['proportionality_score'],
+            clustered_scoring['proportionality_score'],
+        )
+
+        repaired_state, repaired_scoring, debug = (
+            _repair_proportional_distribution_swaps(
+                instances=instances,
+                physicians=physicians,
+                state=clustered,
+                manual_pairs=set(),
+                targets=targets,
+                contract_by_physician=contracts,
+                requests_by_physician_date=defaultdict(list),
+                eligible_facilities_by_physician={1: {10, 20}, 2: {10, 20}},
+                minimum_rest_by_physician={
+                    1: Decimal('0'), 2: Decimal('0'),
+                },
+                candidate_limit=100,
+            )
+        )
+
+        self.assertTrue(debug['accepts'])
+        self.assertEqual(repaired_scoring['score'], clustered_scoring['score'])
+        self.assertLess(
+            repaired_scoring['proportionality_score'],
+            clustered_scoring['proportionality_score'],
+        )
+        self.assertEqual(
+            sum(len(physician_ids) for physician_ids in repaired_state.values()),
+            8,
+        )
+
     def test_schedule_version_violation_report_lists_all_users(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -7359,6 +8239,16 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(payload['schedule_block']['id'], self.block.id)
         self.assertIn('total_score', payload)
         self.assertIn('score_breakdown', payload)
+        self.assertFalse(payload['proportionality']['is_penalty'])
+        for dimension in ('facility', 'time_of_day'):
+            target = payload['proportionality']['targets'][dimension]
+            self.assertLessEqual(target['target_min'], target['target_max'])
+            self.assertGreaterEqual(target['quality_percent'], 0)
+            self.assertLessEqual(target['quality_percent'], 100)
+            self.assertIn(
+                target['quality_band'],
+                ('TARGET', 'REASONABLE', 'IMPROVEMENT_AVAILABLE'),
+            )
         self.assertTrue(payload['debug']['violations_recomputed_from_final_assignments'])
         self.assertIn('stale_violation_rows_dropped', payload['debug'])
         self.assertIn('violation_assignment_validation_errors', payload['debug'])
@@ -7369,6 +8259,15 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             payload['score_breakdown']['workload_score'],
         )
         self.assertEqual(payload['score_audit']['warnings'], [])
+        self.assertTrue(payload['rule_summary'])
+        self.assertAlmostEqual(
+            sum(row['total_penalty'] for row in payload['rule_summary']),
+            payload['total_score'],
+        )
+        self.assertAlmostEqual(
+            payload['score_audit']['rule_summary_total'],
+            payload['total_score'],
+        )
         self.assertEqual(
             [user['display_name'] for user in payload['users']],
             sorted(user['display_name'] for user in payload['users']),
@@ -7499,6 +8398,16 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(len(request_rows), 1)
         self.assertEqual(request_rows[0]['violation_type'], 'REQUEST_DAY_OFF_VIOLATION')
         self.assertEqual(request_rows[0]['penalty_amount'], payload['score_breakdown']['request_score'])
+        request_summary = [
+            row for row in payload['rule_summary']
+            if row['score_component'] == 'request_score'
+            and row['rule_name'] == 'Request Day Off Violation'
+        ]
+        self.assertEqual(len(request_summary), 1)
+        self.assertEqual(
+            request_summary[0]['total_penalty'],
+            payload['score_breakdown']['request_score'],
+        )
         self.assertEqual(payload['score_audit']['warnings'], [])
 
     def test_optimizer_and_context_ignore_out_of_range_shift_instances(self):

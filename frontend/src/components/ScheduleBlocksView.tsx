@@ -14,6 +14,12 @@ type ScheduleBlock = {
   created_at: string
   updated_at: string
   published_at: string | null
+  published_runs: Array<{
+    schedule_version_id: number
+    domain_name: string
+    run_id: number | null
+    run_number: number | null
+  }>
   my_requests?: Array<{
     id: number
     date: string
@@ -677,7 +683,14 @@ export default function ScheduleBlocksView({
                 <td>{formatDateTime(block.request_close_datetime)}</td>
                 <td>{getRequestStatus(block.request_open_datetime, block.request_close_datetime)}</td>
                 <td>{block.build_status}</td>
-                <td>{formatDateTime(block.published_at)}</td>
+                <td>
+                  <div>{formatDateTime(block.published_at)}</div>
+                  {block.published_runs.map((published) => (
+                    <div className="muted" key={published.schedule_version_id}>
+                      {published.run_number === null ? 'Manual schedule' : `Run ${published.run_number}`} · {published.domain_name}
+                    </div>
+                  ))}
+                </td>
                 <td>
                   <div className="facility-actions">
                     <button type="button" onClick={() => onOpenBuild?.(block.id)}>

@@ -344,7 +344,20 @@ select option:checked{
 .optimizer-summary-grid,.optimizer-extra-grid{display:grid;grid-template-columns:repeat(6,minmax(104px,1fr));gap:6px}
 .optimizer-start-control{display:grid;gap:4px;min-width:0}.optimizer-start-control small{color:var(--muted);font-size:11px;line-height:1.3}
 .optimizer-runtime-control small{color:var(--muted);font-size:11px;line-height:1.3}.optimizer-runtime-input{display:grid;grid-template-columns:minmax(70px,1fr) auto;align-items:center;gap:7px}.optimizer-runtime-input input{width:100%;min-width:0}.optimizer-runtime-input span{color:var(--muted);font-size:12px}
+.optimizer-focus-control{display:grid;align-content:start;gap:7px;min-width:230px;margin:0;padding:10px 12px;border:1px solid rgba(255,255,255,.14);border-radius:8px}.optimizer-focus-control legend{padding:0 5px;color:var(--muted);font-size:11px}.optimizer-focus-control label{display:flex;align-items:center;gap:7px;color:var(--sidebar-fg);font-size:12px;cursor:pointer}.optimizer-focus-control input{margin:0}.optimizer-focus-control:disabled{opacity:.55}.optimizer-focus-control:disabled label{cursor:not-allowed}
 .optimizer-action-message{max-width:360px;color:#fde68a;font-size:12px;line-height:1.35}
+.optimizer-preflight-conflicts{display:grid;gap:12px;padding:16px;border:2px solid #ef4444;border-radius:10px;background:rgba(127,29,29,.28);color:#fee2e2}
+.optimizer-preflight-conflicts-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.optimizer-preflight-conflicts-header h3{margin:0 0 4px;color:#fff}
+.optimizer-preflight-conflicts-header p,.optimizer-preflight-block-note{margin:0}
+.optimizer-preflight-conflicts-header>strong{flex:none;padding:5px 9px;border-radius:999px;background:#991b1b;color:#fff}
+.optimizer-preflight-conflict-list{display:grid;gap:8px;max-height:420px;overflow:auto}
+.optimizer-preflight-conflict{display:grid;gap:8px;padding:10px 12px;border:1px solid rgba(254,202,202,.35);border-radius:8px;background:rgba(69,10,10,.38)}
+.optimizer-preflight-conflict>div{display:flex;justify-content:space-between;gap:12px}
+.optimizer-preflight-conflict>div span{color:#fecaca;text-align:right}
+.optimizer-preflight-conflict ul{display:grid;gap:5px;margin:0;padding-left:20px}
+.optimizer-preflight-conflict li span{display:block;color:#fecaca;font-size:12px}
+.optimizer-preflight-block-note{font-weight:700;color:#fff}
 .optimizer-score-stale{justify-self:start;padding:4px 8px;border:1px solid rgba(251,191,36,0.42);border-radius:999px;background:rgba(251,191,36,0.1);color:#fde68a;font-size:11px}
 .optimizer-summary-grid>div,.optimizer-extra-grid>div{display:grid;gap:2px;min-width:0;padding:6px 8px;border:1px solid rgba(255,255,255,0.07);border-radius:6px;background:rgba(255,255,255,0.025)}
 .optimizer-summary-grid span,.optimizer-extra-grid span{color:var(--muted);font-size:10px;line-height:1.2}
@@ -370,6 +383,23 @@ select option:checked{
 .violation-report-warning{border:1px solid rgba(251,191,36,0.45);background:rgba(251,191,36,0.12);color:var(--sidebar-fg);border-radius:8px;padding:12px}
 .violation-report-warning p{margin:0 0 6px}
 .violation-report-warning p:last-child{margin-bottom:0}
+.violation-report-tabs{display:flex;gap:6px;border-bottom:1px solid var(--border)}
+.violation-report-tabs button{margin-bottom:-1px;padding:9px 16px;border:1px solid transparent;border-bottom-color:var(--border);border-radius:8px 8px 0 0;background:transparent;color:var(--muted);font:inherit;font-weight:700;cursor:pointer}
+.violation-report-tabs button:hover{color:var(--sidebar-fg)}
+.violation-report-tabs button.active{border-color:var(--border);border-bottom-color:var(--panel);background:var(--panel);color:var(--sidebar-fg)}
+.violation-summary-view{display:grid;gap:16px}
+.violation-summary-total{display:grid;gap:4px;padding:16px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}
+.violation-summary-total span{color:var(--muted);font-size:13px}
+.violation-summary-total strong{font-size:28px}
+.violation-summary-total p,.proportionality-context-grid p,.proportionality-context-note{margin:0;color:var(--muted);font-size:13px;line-height:1.45}
+.proportionality-context-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.proportionality-context-grid section{display:grid;gap:7px;padding:14px;border:1px solid rgba(96,165,250,.32);border-radius:9px;background:rgba(59,130,246,.08)}
+.proportionality-context-grid h3{margin:0;font-size:15px}
+.proportionality-context-grid strong{font-size:22px;color:#bfdbfe}
+.proportionality-context-note{padding:11px 13px;border-left:3px solid #60a5fa;background:rgba(59,130,246,.06)}
+.violation-summary-table{min-width:860px}
+.violation-summary-table tfoot th{border-top:2px solid var(--border);text-align:right}
+.violation-summary-table tfoot th:last-child{text-align:left}
 .violation-user-list{display:flex;flex-direction:column;gap:16px}
 .violation-user-section{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:14px}
 .violation-user-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
@@ -383,7 +413,7 @@ select option:checked{
 .build-calendar-toolbar button{padding:7px 11px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .build-calendar-toolbar button:disabled{opacity:0.5;cursor:not-allowed}
 .build-calendar-physician-filter{display:grid;gap:3px;margin-left:12px;color:var(--muted);font-size:10px}.build-calendar-physician-filter select{min-width:190px;padding:7px 9px;border:1px solid rgba(255,255,255,.14);border-radius:8px;background:#111c2d;color:var(--sidebar-fg)}
-.build-calendar-filter-summary{display:flex;align-items:center;justify-content:center;gap:12px;min-height:28px;margin-top:8px;color:var(--muted);font-size:11px}.build-calendar-filter-summary button{padding:3px 7px;border:0;background:transparent;color:#93c5fd;cursor:pointer}.build-calendar-filter-error{color:#fecaca}
+.build-calendar-filter-summary{display:flex;align-items:center;justify-content:center;gap:12px;min-height:28px;margin-top:8px;color:var(--muted);font-size:11px}.build-calendar-filter-summary button{padding:3px 7px;border:0;background:transparent;color:#93c5fd;cursor:pointer}.build-calendar-filter-summary .build-calendar-unlock-button{padding:5px 9px;border:1px solid #f59e0b;border-radius:6px;background:#78350f;color:#fef3c7;font-weight:700}.build-calendar-filter-summary button:disabled{cursor:not-allowed;opacity:.45}.build-calendar-filter-error{color:#fecaca}
 .build-calendar{min-width:0;border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:12px;background:rgba(255,255,255,0.01)}
 .build-calendar-weekdays,.build-calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px}
 .build-calendar-weekdays{margin-bottom:8px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:0.04em}
@@ -668,9 +698,12 @@ select option:checked{
   border-left-color: #22c55e;
 }
 
-.workload-feasibility-minimum_infeasible,
-.workload-feasibility-maximum_infeasible {
+.workload-feasibility-minimum_infeasible {
   border-left-color: #f59e0b;
+}
+
+.workload-feasibility-maximum_infeasible {
+  border-left-color: #ef4444;
 }
 
 .workload-feasibility-preview {
@@ -739,7 +772,9 @@ select option:checked{
   background: #111827;
 }
 
-.weekend-feasibility-no_conflict_found { border-left-color: #22c55e; }
+.weekend-feasibility-green { border-left-color: #22c55e; }
+.weekend-feasibility-yellow { border-left-color: #f59e0b; }
+.weekend-feasibility-red { border-left-color: #ef4444; }
 .weekend-feasibility-card small { color: #cbd5e1; }
 .weekend-feasibility-card dl { display: flex; flex-wrap: wrap; gap: 0.8rem 1.5rem; margin: 0; }
 .weekend-feasibility-card dl > div { display: grid; gap: 0.2rem; }
@@ -754,7 +789,9 @@ select option:checked{
   font-weight: 700;
   white-space: nowrap;
 }
-.weekend-feasibility-badge-no_conflict_found { color: #bbf7d0; background: #14532d; }
+.weekend-feasibility-badge-green { color: #bbf7d0; background: #14532d; }
+.weekend-feasibility-badge-yellow { color: #fde68a; background: #78350f; }
+.weekend-feasibility-badge-red { color: #fecaca; background: #991b1b; }
 .weekend-feasibility-conflicts { display: grid; gap: 0.6rem; }
 .weekend-feasibility-conflicts article { padding: 0.7rem; border: 1px solid #475569; border-radius: 0.5rem; }
 .weekend-feasibility-conflicts article span { margin-left: 0.6rem; color: #cbd5e1; }
@@ -762,6 +799,10 @@ select option:checked{
 
 .request-off-feasibility-feasible {
   border-left-color: #22c55e;
+}
+
+.request-off-feasibility-infeasible {
+  border-left-color: #ef4444;
 }
 
 .request-off-feasibility-card small {
@@ -783,6 +824,11 @@ select option:checked{
   color: #bbf7d0;
 }
 
+.request-off-feasibility-badge-infeasible {
+  background: #991b1b;
+  color: #fecaca;
+}
+
 .request-off-feasibility-dates {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -793,13 +839,13 @@ select option:checked{
   display: grid;
   gap: 0.55rem;
   padding: 0.75rem;
-  border: 1px solid #92400e;
+  border: 1px solid #b91c1c;
   border-radius: 0.5rem;
   background: #0f172a;
 }
 
 .request-off-feasibility-dates article > span {
-  color: #fde68a;
+  color: #fecaca;
 }
 
 .request-off-feasibility-dates dl {
@@ -819,9 +865,12 @@ select option:checked{
   font-weight: 700;
 }
 
-.night-feasibility-feasible {
+.night-feasibility-green {
   border-left-color: #22c55e;
 }
+
+.night-feasibility-yellow { border-left-color: #f59e0b; }
+.night-feasibility-red { border-left-color: #ef4444; }
 
 .night-feasibility-heading,
 .night-feasibility-heading > div,
@@ -854,17 +903,26 @@ select option:checked{
   font-weight: 700;
 }
 
-.night-feasibility-badge-feasible,
-.night-period-feasible header span {
+.night-feasibility-badge-green,
+.night-period-green header span {
   color: #bbf7d0;
   background: #14532d;
 }
 
-.night-feasibility-badge-penalty_unavoidable,
-.night-period-penalty_unavoidable header span {
+.night-feasibility-badge-yellow,
+.night-period-yellow header span {
   color: #fde68a;
   background: #78350f;
 }
+
+.night-feasibility-badge-red,
+.night-period-red header span {
+  color: #fecaca;
+  background: #991b1b;
+}
+
+.night-period-yellow { border-color: #b45309; }
+.night-period-red { border-color: #b91c1c; }
 
 .night-feasibility-alert {
   display: grid;
