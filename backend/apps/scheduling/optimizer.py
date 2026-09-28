@@ -72,6 +72,19 @@ SAFE_BASELINE_CANDIDATES_PER_REPAIR = 40
 SAFE_BASELINE_GENERAL_SWAPS = 50
 MAX_RUNTIME_SECONDS = 120 * 60
 ZERO_GAIN_PIPELINE_EPOCHS_BEFORE_DEEP_RESTART = 2
+MAX_DEEP_PIPELINE_EPOCH_RESTARTS = 2
+STRUCTURAL_DEEP_RESTART_MIN_REMAINING_SECONDS = 15 * 60
+STRUCTURAL_DEEP_RESTART_MIN_REMAINING_RATIO = 0.25
+STRUCTURAL_DEEP_RESTART_MIN_REPAIRABLE_PENALTY = Decimal('10000')
+REPAIRABLE_SCORE_COMPONENTS = (
+    'workload_score',
+    'request_score',
+    'same_shift_score',
+    'shift_rule_score',
+    'night_score',
+    'weekend_score',
+    'consecutive_days_score',
+)
 NIGHT_BLOCK_BUILDER_ENABLED = False
 NIGHT_BLOCK_BUILDER_DISABLED_REASON = 'Disabled after runtime regression'
 # Keep the inexpensive structural guidance even while the exhaustive block
@@ -117,7 +130,7 @@ def _pipeline_epoch_transition(current_count, *, productive, epoch_kind):
     )
     if productive:
         return exhausted_count, 'soft_restart'
-    if epoch_kind == 'deep':
+    if epoch_kind in ('deep', 'structural_deep'):
         return exhausted_count, 'stop'
     if exhausted_count >= ZERO_GAIN_PIPELINE_EPOCHS_BEFORE_DEEP_RESTART:
         return exhausted_count, 'deep_restart'
@@ -137,6 +150,68 @@ def _pipeline_epoch_is_productive(
     )
 
 
+def _repairable_official_penalty(scoring):
+    """Return configured rule penalties that the search can still rearrange."""
+    breakdown = scoring.get('breakdown') or {}
+    return sum(
+        (
+            Decimal(str(breakdown.get(component, 0) or 0))
+            for component in REPAIRABLE_SCORE_COMPONENTS
+        ),
+        Decimal('0'),
+    )
+
+
+def _structural_deep_restart_decision(
+    *, search_budget, best_scoring, deep_restart_count,
+    primary_improvements, proportionality_improvements,
+    distribution_focus, now,
+):
+    """Explain whether one final, materially different restart is warranted."""
+    total_seconds = max(float(search_budget.total_seconds), 0.0)
+    elapsed_seconds = max(float(now - search_budget.started_at), 0.0)
+    remaining_seconds = max(total_seconds - elapsed_seconds, 0.0)
+    required_remaining_seconds = max(
+        float(STRUCTURAL_DEEP_RESTART_MIN_REMAINING_SECONDS),
+        total_seconds * STRUCTURAL_DEEP_RESTART_MIN_REMAINING_RATIO,
+    )
+    best_score = Decimal(str(best_scoring.get('score', 0) or 0))
+    score_floor = Decimal(str(search_budget.score_floor or 0))
+    score_gap = max(best_score - score_floor, Decimal('0'))
+    repairable_penalty = _repairable_official_penalty(best_scoring)
+    actionable_penalty = min(score_gap, repairable_penalty)
+    relevant_improvements = int(primary_improvements or 0)
+    if distribution_focus:
+        relevant_improvements += int(proportionality_improvements or 0)
+
+    blockers = []
+    if int(deep_restart_count) != MAX_DEEP_PIPELINE_EPOCH_RESTARTS - 1:
+        blockers.append('requires_exactly_one_prior_deep_restart')
+    if remaining_seconds < required_remaining_seconds:
+        blockers.append('insufficient_remaining_runtime')
+    if score_gap <= 0:
+        blockers.append('reached_proven_score_floor')
+    if actionable_penalty < STRUCTURAL_DEEP_RESTART_MIN_REPAIRABLE_PENALTY:
+        blockers.append('insufficient_repairable_penalty')
+    if relevant_improvements <= 0:
+        blockers.append('no_prior_relevant_improvement')
+
+    return {
+        'allowed': not blockers,
+        'blockers': blockers,
+        'remaining_seconds': remaining_seconds,
+        'required_remaining_seconds': required_remaining_seconds,
+        'best_score': float(best_score),
+        'proven_score_floor': float(score_floor),
+        'score_gap': float(score_gap),
+        'repairable_penalty': float(repairable_penalty),
+        'actionable_penalty': float(actionable_penalty),
+        'relevant_improvements': relevant_improvements,
+        'deep_restart_count': int(deep_restart_count),
+        'distribution_focus': bool(distribution_focus),
+    }
+
+
 def _reset_adaptive_repair_epoch_state(repair_stats, cycle):
     """Reset epoch-local ROI without forgetting repeatedly failed tactics.
 
@@ -152,6 +227,21 @@ def _reset_adaptive_repair_epoch_state(repair_stats, cycle):
         stats['recent_score_improvement'] = 0.0
         stats['cooldown_until_cycle'] = cycle
         stats['deep_epoch_resets'] = int(stats.get('deep_epoch_resets', 0)) + 1
+
+
+def _reset_adaptive_repair_structural_state(repair_stats, cycle):
+    """Fully reopen the repair portfolio for the final structural restart."""
+    for stats in repair_stats.values():
+        stats['epoch_calls'] = 0
+        stats['recent_runtime_seconds'] = 0.0
+        stats['recent_score_improvement'] = 0.0
+        stats['score_improvement_per_second'] = 0.0
+        stats['consecutive_empty_calls'] = 0
+        stats['consecutive_no_gain_calls'] = 0
+        stats['cooldown_until_cycle'] = cycle
+        stats['structural_epoch_resets'] = int(
+            stats.get('structural_epoch_resets', 0)
+        ) + 1
 
 
 def _physician_display_name(physician):
@@ -7489,6 +7579,9 @@ def _run_adaptive_search_rounds(
     debug.setdefault('consecutive_exhausted_pipeline_epochs', 0)
     debug.setdefault('deep_pipeline_epoch_restarts', 0)
     debug.setdefault('deep_pipeline_epoch_details', [])
+    debug.setdefault('structural_deep_pipeline_epoch_restarts', 0)
+    debug.setdefault('structural_deep_restart_decisions', [])
+    debug.setdefault('structural_focus_cursor', 0)
     debug.setdefault('coupled_weekend_repair_activations', 0)
     cycles_without_global_improvement = 0
     best_generation = 0
@@ -7549,8 +7642,10 @@ def _run_adaptive_search_rounds(
         # on multi-month blocks because every candidate is fully rescored.
         # Without this shared deadline a single restart could run far beyond
         # the optimizer's absolute SearchBudget deadline.
+        structural_restart = pipeline_epoch_kind == 'structural_deep'
+        diversification_slice_seconds = 8 if structural_restart else 4
         diversification_deadline = min(
-            budget_clock() + 4,
+            budget_clock() + diversification_slice_seconds,
             search_budget.started_at + search_budget.total_seconds,
         )
 
@@ -7570,12 +7665,26 @@ def _run_adaptive_search_rounds(
         )
         focus = None
         if focuses:
-            # Select among several expensive violations rather than repeatedly
-            # rebuilding the same highest-scoring physician cohort.
-            focus = rng.choice(focuses[:min(12, len(focuses))])
+            if structural_restart:
+                # The one permitted structural restart works through the
+                # dominant remaining rule families instead of repeating the
+                # ordinary random top-twelve selection with a different seed.
+                focus_pool = focuses[:min(3, len(focuses))]
+                focus = focus_pool[
+                    int(debug['structural_focus_cursor']) % len(focus_pool)
+                ]
+                debug['structural_focus_cursor'] += 1
+            else:
+                # Select among several expensive violations rather than repeatedly
+                # rebuilding the same highest-scoring physician cohort.
+                focus = rng.choice(focuses[:min(12, len(focuses))])
         schedule_start = min(instance.date for instance in instances)
         schedule_end = max(instance.date for instance in instances)
-        window_days = rng.choice((14, 21, 28, 42))
+        window_days = rng.choice(
+            (42, 56, 70, 84)
+            if structural_restart
+            else (14, 21, 28, 42)
+        )
         focus_dates = focus['dates'] if focus else []
         anchor = rng.choice(focus_dates) if focus_dates else rng.choice(instances).date
         core_start = max(
@@ -7604,7 +7713,9 @@ def _run_adaptive_search_rounds(
         maximum_score_increase = max(
             Decimal('5000'), best_scoring['score'] * temperature_ratio,
         )
-        cohort_size = rng.choice((8, 10, 12))
+        cohort_size = rng.choice(
+            (14, 16, 18) if structural_restart else (8, 10, 12)
+        )
         solver_state, solver_scoring, solver_debug = (
             _solve_bounded_multi_physician_neighborhood(
                 instances=instances, physicians=physicians,
@@ -7623,7 +7734,7 @@ def _run_adaptive_search_rounds(
                 diversification_bias=True,
                 should_stop=diversification_should_stop,
                 time_limit_seconds=min(
-                    4,
+                    diversification_slice_seconds,
                     max(
                         diversification_deadline - budget_clock(),
                         0.1,
@@ -7666,7 +7777,11 @@ def _run_adaptive_search_rounds(
                     best_state, exploration,
                 ),
             }
-        target_kicks = min(8, max(3, len(pairs) // 250))
+        target_kicks = (
+            min(12, max(6, len(pairs) // 180))
+            if structural_restart
+            else min(8, max(3, len(pairs) // 250))
+        )
         total_attempts = 0
         applied = []
         for kick_index in range(target_kicks):
@@ -7674,7 +7789,10 @@ def _run_adaptive_search_rounds(
                 break
             pairs = _optimizer_pairs(exploration, manual_pairs)
             candidates = []
-            attempt_limit = min(80, len(pairs) * 2)
+            attempt_limit = min(
+                140 if structural_restart else 80,
+                len(pairs) * 2,
+            )
             for _ in range(attempt_limit):
                 if diversification_should_stop():
                     break
@@ -7731,6 +7849,7 @@ def _run_adaptive_search_rounds(
             'core_focus_end': core_end.isoformat(),
             'boundary_padding_days': boundary_padding,
             'cohort_size': cohort_size,
+            'structural_restart': structural_restart,
             'maximum_score_increase': float(maximum_score_increase),
             'kicks_applied': len(applied),
             'kick_details': applied,
@@ -7861,11 +7980,42 @@ def _run_adaptive_search_rounds(
         debug['consecutive_exhausted_pipeline_epochs'] = (
             consecutive_exhausted_pipeline_epochs
         )
+        structural_restart = False
+        should_consider_structural_restart = (
+            transition == 'stop' and pipeline_epoch_kind == 'deep'
+        ) or (
+            transition == 'deep_restart'
+            and int(debug['deep_pipeline_epoch_restarts']) >= 1
+        )
+        if should_consider_structural_restart:
+            structural_decision = _structural_deep_restart_decision(
+                search_budget=search_budget,
+                best_scoring=best_scoring,
+                deep_restart_count=debug['deep_pipeline_epoch_restarts'],
+                primary_improvements=debug.get('primary_improvements', 0),
+                proportionality_improvements=debug.get(
+                    'proportionality_improvements', 0,
+                ),
+                distribution_focus=distribution_focus,
+                now=budget_clock(),
+            )
+            structural_decision.update({
+                'after_epoch': pipeline_epoch_number,
+                'after_restart_mode': pipeline_epoch_kind,
+                'trigger': trigger,
+            })
+            debug['structural_deep_restart_decisions'].append(
+                structural_decision,
+            )
+            if structural_decision['allowed']:
+                transition = 'structural_deep_restart'
+                structural_restart = True
+            else:
+                transition = 'stop'
         if transition == 'stop':
-            # A deep epoch has already reset all seed-local portfolio evidence
-            # and rerun the bounded portfolio from the retained global best.
-            # If it is also empty, further identical retries are not a useful
-            # way to consume the scheduler's remaining runtime ceiling.
+            # The permitted deep portfolios have exhausted their useful
+            # evidence, or too little time/actionable penalty remains to
+            # justify the one larger structural restart.
             debug['productivity_exhausted'] = True
             debug['restart_exhausted'] = True
             return False
@@ -7887,7 +8037,9 @@ def _run_adaptive_search_rounds(
                 {'candidate_limit': 250},
             ))
             debug['coupled_weekend_repair_activations'] += 1
-        deep_restart = transition == 'deep_restart'
+        deep_restart = transition in (
+            'deep_restart', 'structural_deep_restart',
+        )
         pipeline_epoch_seed = rng.getrandbits(63)
         rng = random.Random(pipeline_epoch_seed)
         pipeline_epoch_number += 1
@@ -7900,7 +8052,11 @@ def _run_adaptive_search_rounds(
         pipeline_epoch_start_proportionality_improvements = int(
             debug.get('proportionality_improvements', 0)
         )
-        pipeline_epoch_kind = 'deep' if deep_restart else 'soft'
+        pipeline_epoch_kind = (
+            'structural_deep'
+            if structural_restart
+            else ('deep' if deep_restart else 'soft')
+        )
         pipeline_epoch_open = True
         exploration_state = _copy_state(best_state)
         active_repairs = list(repairs)
@@ -7910,12 +8066,25 @@ def _run_adaptive_search_rounds(
         # repairs, but the cleared cooldown still lets a strategy discover
         # newly available moves.
         if deep_restart:
-            _reset_adaptive_repair_epoch_state(repair_stats, debug['cycles'])
+            if structural_restart:
+                _reset_adaptive_repair_structural_state(
+                    repair_stats, debug['cycles'],
+                )
+                debug['structural_deep_pipeline_epoch_restarts'] += 1
+            else:
+                _reset_adaptive_repair_epoch_state(
+                    repair_stats, debug['cycles'],
+                )
             debug['deep_pipeline_epoch_restarts'] += 1
             debug['deep_pipeline_epoch_details'].append({
                 'epoch': pipeline_epoch_number,
                 'seed': pipeline_epoch_seed,
-                'trigger': 'two_consecutive_zero_gain_epochs',
+                'trigger': (
+                    'conditional_structural_restart'
+                    if structural_restart
+                    else 'two_consecutive_zero_gain_epochs'
+                ),
+                'restart_mode': pipeline_epoch_kind,
                 'starting_score': float(best_scoring['score']),
             })
         else:
@@ -7929,6 +8098,11 @@ def _run_adaptive_search_rounds(
         debug['pipeline_epoch_restarts'] += 1
         debug['seed_epochs'] += 1
         last_diversification_at = budget_clock()
+        if structural_restart:
+            # Enter a demonstrably different basin immediately. Merely
+            # changing the seed and replaying the same repairs was the failure
+            # mode that caused the original early stop.
+            launch_diversification('structural_deep')
         return True
 
     while True:

@@ -136,6 +136,90 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
         )
         self.assertEqual(action, 'deep_restart')
 
+    def test_structural_deep_epoch_stops_after_zero_gain(self):
+        exhausted_count, action = optimizer._pipeline_epoch_transition(
+            3, productive=False, epoch_kind='structural_deep',
+        )
+
+        self.assertEqual(exhausted_count, 4)
+        self.assertEqual(action, 'stop')
+
+    def structural_restart_decision(
+        self, *, total_seconds=7200, now=3600, deep_restart_count=1,
+        primary_improvements=2, proportionality_improvements=0,
+        distribution_focus=False, score=Decimal('693100'),
+        score_floor=Decimal('0'), repairable_penalty=Decimal('693100'),
+    ):
+        budget = SimpleNamespace(
+            total_seconds=total_seconds,
+            started_at=0,
+            score_floor=score_floor,
+        )
+        return optimizer._structural_deep_restart_decision(
+            search_budget=budget,
+            best_scoring={
+                'score': score,
+                'breakdown': {'workload_score': repairable_penalty},
+            },
+            deep_restart_count=deep_restart_count,
+            primary_improvements=primary_improvements,
+            proportionality_improvements=proportionality_improvements,
+            distribution_focus=distribution_focus,
+            now=now,
+        )
+
+    def test_structural_deep_restart_allows_run_85_shape(self):
+        decision = self.structural_restart_decision(now=3486)
+
+        self.assertTrue(decision['allowed'])
+        self.assertEqual(decision['blockers'], [])
+        self.assertEqual(decision['required_remaining_seconds'], 1800)
+        self.assertEqual(decision['deep_restart_count'], 1)
+
+    def test_structural_deep_restart_requires_enough_remaining_runtime(self):
+        decision = self.structural_restart_decision(now=5500)
+
+        self.assertFalse(decision['allowed'])
+        self.assertIn('insufficient_remaining_runtime', decision['blockers'])
+
+    def test_structural_deep_restart_requires_meaningful_score_gap(self):
+        decision = self.structural_restart_decision(
+            score=Decimal('108000'),
+            score_floor=Decimal('100000'),
+            repairable_penalty=Decimal('50000'),
+        )
+
+        self.assertFalse(decision['allowed'])
+        self.assertEqual(decision['actionable_penalty'], 8000)
+        self.assertIn('insufficient_repairable_penalty', decision['blockers'])
+
+    def test_standard_structural_restart_ignores_proportionality_only_gain(self):
+        decision = self.structural_restart_decision(
+            primary_improvements=0,
+            proportionality_improvements=4,
+            distribution_focus=False,
+        )
+
+        self.assertFalse(decision['allowed'])
+        self.assertIn('no_prior_relevant_improvement', decision['blockers'])
+
+    def test_distribution_structural_restart_accepts_proportionality_gain(self):
+        decision = self.structural_restart_decision(
+            primary_improvements=0,
+            proportionality_improvements=4,
+            distribution_focus=True,
+        )
+
+        self.assertTrue(decision['allowed'])
+
+    def test_structural_deep_restart_is_permitted_only_once(self):
+        decision = self.structural_restart_decision(deep_restart_count=2)
+
+        self.assertFalse(decision['allowed'])
+        self.assertIn(
+            'requires_exactly_one_prior_deep_restart', decision['blockers'],
+        )
+
     def test_standard_focus_does_not_delay_restart_for_distribution_only_gain(self):
         self.assertFalse(optimizer._pipeline_epoch_is_productive(
             primary_improvements=0,
@@ -430,6 +514,31 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
         self.assertEqual(stats['cooldown_until_cycle'], 20)
         self.assertEqual(stats['deep_epoch_resets'], 1)
         self.assertEqual(optimizer._adaptive_repair_slice_seconds(stats), 1.0)
+
+    def test_structural_epoch_reset_reopens_failed_tactics(self):
+        repair_stats = {
+            'general_swaps': {
+                'epoch_calls': 5,
+                'recent_runtime_seconds': 12,
+                'recent_score_improvement': 0,
+                'score_improvement_per_second': 0,
+                'consecutive_empty_calls': 3,
+                'consecutive_no_gain_calls': 4,
+                'cooldown_until_cycle': 99,
+            },
+        }
+
+        optimizer._reset_adaptive_repair_structural_state(
+            repair_stats, cycle=20,
+        )
+
+        stats = repair_stats['general_swaps']
+        self.assertEqual(stats['epoch_calls'], 0)
+        self.assertEqual(stats['consecutive_empty_calls'], 0)
+        self.assertEqual(stats['consecutive_no_gain_calls'], 0)
+        self.assertEqual(stats['cooldown_until_cycle'], 20)
+        self.assertEqual(stats['structural_epoch_resets'], 1)
+        self.assertEqual(optimizer._adaptive_repair_slice_seconds(stats), 4.0)
 
     def test_reconstruction_window_padding_uses_configured_temporal_rules(self):
         contracts = {
