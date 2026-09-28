@@ -55,6 +55,9 @@ DEFAULT_WORKLOAD_RULE_PENALTY = Decimal('100')
 DEFAULT_WEEKEND_BALANCE_PENALTY = Decimal('100')
 DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT = Decimal('50')
 DEFAULT_TIME_PROPORTIONALITY_WEIGHT = Decimal('50')
+BENCHMARK_FACILITY_WEIGHT = Decimal('0.40')
+BENCHMARK_TIME_WEIGHT = Decimal('0.60')
+BENCHMARK_MATERIAL_IMPROVEMENT_PERCENT = Decimal('5')
 PROPORTIONALITY_TARGET_QUALITY = Decimal('0.85')
 PROPORTIONALITY_REASONABLE_QUALITY = Decimal('0.70')
 ZERO_SHIFT_UNDERUTILIZATION_PENALTY = Decimal('5000')
@@ -4022,6 +4025,171 @@ def _proportionality_target_payload(scoring):
         for dimension, values in scoring.get(
             'proportionality_targets', {},
         ).items()
+    }
+
+
+def _weighted_distribution_index(
+    *, facility, time_of_day, baseline_facility, baseline_time_of_day,
+):
+    """Compare two feasible schedules with time weighted slightly higher.
+
+    Each dimension is normalized to the viewed schedule before applying the
+    40/60 weights. This prevents the numerically larger facility score from
+    overpowering the scheduler's stated preference for time-of-day balance.
+    The viewed schedule therefore has an index of 100; lower is better.
+    """
+    rows = (
+        (
+            BENCHMARK_FACILITY_WEIGHT,
+            Decimal(str(facility or 0)),
+            Decimal(str(baseline_facility or 0)),
+        ),
+        (
+            BENCHMARK_TIME_WEIGHT,
+            Decimal(str(time_of_day or 0)),
+            Decimal(str(baseline_time_of_day or 0)),
+        ),
+    )
+    usable = [row for row in rows if row[2] > 0]
+    if not usable:
+        return Decimal('0')
+    usable_weight = sum((row[0] for row in usable), Decimal('0'))
+    return Decimal('100') * sum(
+        (
+            weight / usable_weight * value / baseline
+            for weight, value, baseline in usable
+        ),
+        Decimal('0'),
+    )
+
+
+def _distribution_benchmark_payload(version, optimizer_run, scoring):
+    """Return the best actually demonstrated constrained distribution.
+
+    Completed run snapshots are feasible schedules, so this comparison never
+    presents an unconstrained mathematical floor as an attainable target.
+    Candidates with stale scoring or a higher official penalty than the viewed
+    schedule are excluded. The benchmark is informational and never changes
+    assignments or activates another run.
+    """
+    facility = Decimal(str(
+        scoring.get('proportionality_breakdown', {}).get('facility', 0) or 0
+    ))
+    time_of_day = Decimal(str(
+        scoring.get('proportionality_breakdown', {}).get('time_of_day', 0) or 0
+    ))
+    official_penalty = Decimal(str(scoring.get('score', 0) or 0))
+    current = {
+        'source': 'VIEWED_SCHEDULE',
+        'run_id': optimizer_run.id if optimizer_run else None,
+        'run_number': optimizer_run.run_number if optimizer_run else None,
+        'official_penalty': float(official_penalty),
+        'facility': float(facility),
+        'time_of_day': float(time_of_day),
+        'weighted_index': 100.0 if facility > 0 or time_of_day > 0 else 0.0,
+    }
+    if (
+        Decimal(str(scoring.get('breakdown', {}).get('coverage_score', 0) or 0)) > 0
+        or _has_hard_invalids(scoring)
+    ):
+        return {
+            'available': False,
+            'reason': 'VIEWED_SCHEDULE_NOT_FEASIBLE',
+            'facility_weight_percent': 40,
+            'time_weight_percent': 60,
+            'current': current,
+        }
+    if optimizer_run is not None and optimizer_run.score_is_stale:
+        return {
+            'available': False,
+            'reason': 'CURRENT_RULES_CHANGED',
+            'facility_weight_percent': 40,
+            'time_weight_percent': 60,
+            'current': current,
+        }
+
+    candidates = [current]
+    searched_run_count = 0
+    completed_runs = (
+        version.optimizer_runs
+        .filter(
+            status=OptimizerRun.Status.COMPLETED,
+            score_is_stale=False,
+            final_score__isnull=False,
+        )
+        .order_by('run_number', 'id')
+    )
+    for candidate_run in completed_runs:
+        if optimizer_run is not None and candidate_run.id == optimizer_run.id:
+            continue
+        candidate_summary = candidate_run.optimizer_summary or {}
+        if any(
+            int(candidate_summary.get(key, 0) or 0) > 0
+            for key in (
+                'unfilled_shift_count',
+                'final_overlap_violations',
+                'final_rest_violations',
+                'final_duplicate_violations',
+                'final_overstaffed_violations',
+                'final_inactive_physician_violations',
+                'final_facility_ineligible_violations',
+            )
+        ):
+            continue
+        proportionality = candidate_summary.get('proportionality') or {}
+        if not all(
+            key in proportionality for key in ('facility', 'time_of_day')
+        ):
+            continue
+        candidate_penalty = Decimal(str(candidate_run.final_score))
+        if candidate_penalty > official_penalty:
+            continue
+        searched_run_count += 1
+        candidate_facility = Decimal(str(proportionality['facility']))
+        candidate_time = Decimal(str(proportionality['time_of_day']))
+        weighted_index = _weighted_distribution_index(
+            facility=candidate_facility,
+            time_of_day=candidate_time,
+            baseline_facility=facility,
+            baseline_time_of_day=time_of_day,
+        )
+        candidates.append({
+            'source': 'OPTIMIZER_RUN',
+            'run_id': candidate_run.id,
+            'run_number': candidate_run.run_number,
+            'official_penalty': float(candidate_penalty),
+            'facility': float(candidate_facility),
+            'time_of_day': float(candidate_time),
+            'weighted_index': float(weighted_index),
+        })
+
+    best = min(
+        candidates,
+        key=lambda row: (
+            row['weighted_index'], row['official_penalty'],
+            -(row['run_number'] or 0),
+        ),
+    )
+    improvement_percent = max(
+        Decimal('100') - Decimal(str(best['weighted_index'])),
+        Decimal('0'),
+    )
+    return {
+        'available': True,
+        'method': 'BEST_COMPLETED_FEASIBLE_RUN',
+        'facility_weight_percent': 40,
+        'time_weight_percent': 60,
+        'current': current,
+        'best_feasible_found': best,
+        'improvement_percent': float(improvement_percent),
+        'material_improvement_available': (
+            improvement_percent >= BENCHMARK_MATERIAL_IMPROVEMENT_PERCENT
+        ),
+        'material_improvement_threshold_percent': float(
+            BENCHMARK_MATERIAL_IMPROVEMENT_PERCENT
+        ),
+        'eligible_completed_run_count': searched_run_count,
+        'proven_optimal': False,
     }
 
 
@@ -9078,26 +9246,9 @@ def build_violation_report(schedule_version, optimizer_run=None):
             )
             break
 
-    reporting_distribution = _distribution_score(
-        instances,
-        scoring_physicians,
-        state,
-        contract_by_physician,
-        eligible_facilities_by_physician,
-        include_proportionality_targets=True,
+    distribution_benchmark = _distribution_benchmark_payload(
+        version, optimizer_run, scoring,
     )
-    scoring['proportionality_targets'] = {
-        'facility': _proportionality_target(
-            scoring['proportionality_breakdown']['facility'],
-            reporting_distribution['facility_distribution_floor'],
-            reporting_distribution['facility_neutral_baseline'],
-        ),
-        'time_of_day': _proportionality_target(
-            scoring['proportionality_breakdown']['time_of_day'],
-            reporting_distribution['time_distribution_floor'],
-            reporting_distribution['time_neutral_baseline'],
-        ),
-    }
 
     return {
         'schedule_version': {
@@ -9141,7 +9292,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
                 key: float(value)
                 for key, value in scoring['proportionality_breakdown'].items()
             },
-            'targets': _proportionality_target_payload(scoring),
+            'benchmark': distribution_benchmark,
             'is_penalty': False,
         },
         'rule_summary': rule_summary,

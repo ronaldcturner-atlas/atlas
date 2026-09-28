@@ -99,13 +99,29 @@ type ViolationUser = {
   workload_score?: WorkloadScoreRow | null
 }
 
-type ProportionalityTarget = {
-  target_min: number
-  target_max: number
-  theoretical_floor: number
-  neutral_baseline: number
-  quality_percent: number
-  quality_band: 'TARGET' | 'REASONABLE' | 'IMPROVEMENT_AVAILABLE'
+type DistributionBenchmarkSchedule = {
+  source: 'VIEWED_SCHEDULE' | 'OPTIMIZER_RUN'
+  run_id: number | null
+  run_number: number | null
+  official_penalty: number
+  facility: number
+  time_of_day: number
+  weighted_index: number
+}
+
+type DistributionBenchmark = {
+  available: boolean
+  reason?: string
+  method?: 'BEST_COMPLETED_FEASIBLE_RUN'
+  facility_weight_percent: number
+  time_weight_percent: number
+  current: DistributionBenchmarkSchedule
+  best_feasible_found?: DistributionBenchmarkSchedule
+  improvement_percent?: number
+  material_improvement_available?: boolean
+  material_improvement_threshold_percent?: number
+  eligible_completed_run_count?: number
+  proven_optimal?: boolean
 }
 
 type ViolationReport = {
@@ -124,10 +140,7 @@ type ViolationReport = {
     total: number
     facility: number
     time_of_day: number
-    targets?: {
-      facility?: ProportionalityTarget
-      time_of_day?: ProportionalityTarget
-    }
+    benchmark?: DistributionBenchmark
     is_penalty: false
   }
   rule_summary: Array<{
@@ -188,24 +201,6 @@ function prettyType(value: string) {
     .split('_')
     .map((part) => part.charAt(0) + part.slice(1).toLowerCase())
     .join(' ')
-}
-
-function proportionalityBandLabel(value: ProportionalityTarget['quality_band']) {
-  if (value === 'TARGET') return 'Target range'
-  if (value === 'REASONABLE') return 'Reasonable'
-  return 'Improvement available'
-}
-
-function ProportionalityTargetContext({ target }: { target?: ProportionalityTarget }) {
-  if (!target) {
-    return <b>Lower is better.</b>
-  }
-  return (
-    <b>
-      Calculated target: {target.target_min.toFixed(1)}–{target.target_max.toFixed(1)}.{' '}
-      Distribution quality: {target.quality_percent.toFixed(0)}% — {proportionalityBandLabel(target.quality_band)}.
-    </b>
-  )
 }
 
 function assignmentLabel(detail: AssignmentDetail) {
@@ -394,16 +389,50 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             <section>
               <h3>Facility proportionality</h3>
               <strong>{(report.proportionality?.facility ?? 0).toFixed(1)}</strong>
-              <p><ProportionalityTargetContext target={report.proportionality?.targets?.facility} /> This measures how closely each eligible non-nocturnist physician's facility mix follows the available optimizer-controlled shift supply.</p>
+              <p><b>Lower is better.</b> This measures how closely each eligible non-nocturnist physician's facility mix follows the available optimizer-controlled shift supply.</p>
             </section>
             <section>
               <h3>Time proportionality</h3>
               <strong>{(report.proportionality?.time_of_day ?? 0).toFixed(1)}</strong>
-              <p><ProportionalityTargetContext target={report.proportionality?.targets?.time_of_day} /> This measures how closely each eligible non-nocturnist physician's early, midday, and late shift mix follows the available optimizer-controlled shift supply.</p>
+              <p><b>Lower is better.</b> This measures how closely each eligible non-nocturnist physician's early, midday, and late shift mix follows the available optimizer-controlled shift supply.</p>
             </section>
           </div>
+          {report.proportionality?.benchmark?.available ? (
+            <div className="distribution-benchmark-panel">
+              <div>
+                <span>Best constrained result found</span>
+                <strong>
+                  {report.proportionality.benchmark.best_feasible_found?.run_number
+                    ? `Run ${report.proportionality.benchmark.best_feasible_found.run_number}`
+                    : 'Viewed schedule'}
+                </strong>
+                <p>
+                  Facility {(report.proportionality.benchmark.best_feasible_found?.facility ?? report.proportionality.facility).toFixed(1)} · Time {(report.proportionality.benchmark.best_feasible_found?.time_of_day ?? report.proportionality.time_of_day).toFixed(1)} · Official penalty {(report.proportionality.benchmark.best_feasible_found?.official_penalty ?? report.total_score).toFixed(1)}
+                </p>
+              </div>
+              <div>
+                <span>Demonstrated improvement available</span>
+                <strong>{(report.proportionality.benchmark.improvement_percent ?? 0).toFixed(1)}%</strong>
+                <p>
+                  {(report.proportionality.benchmark.eligible_completed_run_count ?? 0) === 0
+                    ? 'No other completed schedule is available for comparison at this official penalty or lower.'
+                    : report.proportionality.benchmark.material_improvement_available
+                    ? 'A meaningfully better constrained distribution has been demonstrated.'
+                    : 'The viewed schedule is near the best constrained distribution demonstrated so far.'}
+                </p>
+              </div>
+            </div>
+          ) : report.proportionality?.benchmark ? (
+            <p className="proportionality-context-note">
+              A constrained comparison is unavailable because the viewed schedule is stale or not fully valid. Recalculate or run the optimizer again first.
+            </p>
+          ) : (
+            <p className="proportionality-context-note">
+              No constrained comparison was saved with this report snapshot.
+            </p>
+          )}
           <p className="proportionality-context-note">
-            These proportionality values are not penalties and are not included in the total score. Each target is specific to this block: its lower edge accounts for unavoidable whole-shift rounding, and its upper edge represents removing at least 85% of the imbalance expected from an opportunity-weighted neutral allocation. Date-level rules can make the lower edge unattainable. The values remain tie-breakers used only when the official penalty does not increase.
+            The constrained comparison uses completed schedules that actually satisfied Atlas validity requirements and did not exceed this schedule's official penalty. Time of day contributes 60% and facility contributes 40% after normalizing the two measures. It is the best feasible result demonstrated so far, not a theoretical target or a claim of mathematical optimality.
           </p>
 
           <div className="violation-table-wrap">
@@ -487,7 +516,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
         <div><span>Invalid assignment score</span><strong>{(report.score_breakdown.invalid_assignment_score ?? 0).toFixed(1)}</strong></div>
       </div>
       <p className="proportionality-context-note">
-        Lower facility and time proportionality values are better. Their block-specific calculated target ranges appear on the Summary tab. They are not penalties and are not included in Total score; the optimizer uses them only to prefer a more even distribution when the official penalty does not increase.
+        Lower facility and time proportionality values are better. The Summary tab compares this schedule with the best constrained result demonstrated by completed schedules without increasing the official penalty. These values are not penalties and are not included in Total score.
       </p>
 
       <div className="violation-user-list">

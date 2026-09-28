@@ -8240,15 +8240,14 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertIn('total_score', payload)
         self.assertIn('score_breakdown', payload)
         self.assertFalse(payload['proportionality']['is_penalty'])
-        for dimension in ('facility', 'time_of_day'):
-            target = payload['proportionality']['targets'][dimension]
-            self.assertLessEqual(target['target_min'], target['target_max'])
-            self.assertGreaterEqual(target['quality_percent'], 0)
-            self.assertLessEqual(target['quality_percent'], 100)
-            self.assertIn(
-                target['quality_band'],
-                ('TARGET', 'REASONABLE', 'IMPROVEMENT_AVAILABLE'),
-            )
+        self.assertNotIn('targets', payload['proportionality'])
+        benchmark = payload['proportionality']['benchmark']
+        self.assertTrue(benchmark['available'])
+        self.assertEqual(benchmark['facility_weight_percent'], 40)
+        self.assertEqual(benchmark['time_weight_percent'], 60)
+        self.assertEqual(benchmark['best_feasible_found']['source'], 'VIEWED_SCHEDULE')
+        self.assertEqual(benchmark['improvement_percent'], 0)
+        self.assertFalse(benchmark['proven_optimal'])
         self.assertTrue(payload['debug']['violations_recomputed_from_final_assignments'])
         self.assertIn('stale_violation_rows_dropped', payload['debug'])
         self.assertIn('violation_assignment_validation_errors', payload['debug'])
