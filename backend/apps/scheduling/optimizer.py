@@ -55,6 +55,8 @@ DEFAULT_WORKLOAD_RULE_PENALTY = Decimal('100')
 DEFAULT_WEEKEND_BALANCE_PENALTY = Decimal('100')
 DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT = Decimal('50')
 DEFAULT_TIME_PROPORTIONALITY_WEIGHT = Decimal('50')
+FACILITY_PROPORTIONALITY_PRIORITY_WEIGHT = Decimal('0.40')
+TIME_PROPORTIONALITY_PRIORITY_WEIGHT = Decimal('0.60')
 PROPORTIONALITY_TARGET_QUALITY = Decimal('0.85')
 PROPORTIONALITY_REASONABLE_QUALITY = Decimal('0.70')
 ZERO_SHIFT_UNDERUTILIZATION_PENALTY = Decimal('5000')
@@ -3877,14 +3879,14 @@ def _same_shift_candidate_delta_from_indexes(
 def _proportionality_measure(
     actual_counts, opportunity_counts, weight, *, include_context=True,
 ):
-    """Return the raw score and scalable, block-specific comparison points.
+    """Return the raw score and block-specific normalization context.
 
     The floor is the best distribution possible with the physician's whole
     number of assignments, ignoring date-level scheduling constraints. The
     neutral baseline is the expected score if those assignments followed the
-    eligible opportunity shares independently. Together they let the UI
-    express how much avoidable imbalance has been removed without changing
-    the optimizer's lexicographic objective.
+    eligible opportunity shares independently. The optimizer uses that
+    baseline to compare facility and time-of-day imbalance on compatible
+    scales while leaving both raw scores unchanged for reporting.
     """
     assigned_total_int = int(sum(actual_counts.values()))
     opportunity_total_int = int(sum(opportunity_counts.values()))
@@ -3907,10 +3909,20 @@ def _proportionality_measure(
             )
             deviation = Decimal(actual_counts.get(category, 0)) - expected
             squared_deviation += deviation * deviation
+        opportunity_shares = (
+            Decimal(count) / opportunity_total
+            for count in opportunity_counts.values()
+            if int(count) > 0
+        )
         return {
             'score': weight * squared_deviation / assigned_total,
             'theoretical_floor': Decimal('0'),
-            'neutral_baseline': Decimal('0'),
+            'neutral_baseline': weight * (
+                Decimal('1') - sum(
+                    (share * share for share in opportunity_shares),
+                    Decimal('0'),
+                )
+            ),
         }
 
     categories = [
@@ -4023,6 +4035,41 @@ def _proportionality_target_payload(scoring):
             'proportionality_targets', {},
         ).items()
     }
+
+
+def _weighted_proportionality_priority(breakdown, neutral_baselines):
+    """Normalize each dimension, then favor time of day by 60% to 40%."""
+    rows = (
+        (
+            FACILITY_PROPORTIONALITY_PRIORITY_WEIGHT,
+            Decimal(str(breakdown.get('facility', 0))),
+            Decimal(str(neutral_baselines.get('facility', 0))),
+        ),
+        (
+            TIME_PROPORTIONALITY_PRIORITY_WEIGHT,
+            Decimal(str(breakdown.get('time_of_day', 0))),
+            Decimal(str(neutral_baselines.get('time_of_day', 0))),
+        ),
+    )
+    usable = [row for row in rows if row[2] > 0]
+    if not usable:
+        return Decimal('0')
+    usable_weight = sum((weight for weight, _score, _baseline in usable), Decimal('0'))
+    return sum(
+        (
+            weight / usable_weight * score / baseline
+            for weight, score, baseline in usable
+        ),
+        Decimal('0'),
+    )
+
+
+def _proportionality_priority_value(scoring):
+    """Read the normalized objective, with compatibility for test fixtures."""
+    return scoring.get(
+        'proportionality_priority_score',
+        scoring.get('proportionality_score', Decimal('0')),
+    )
 
 
 def _distribution_score(
@@ -4477,6 +4524,13 @@ def _score_schedule(
     time_baseline = distribution_scores.pop(
         'time_neutral_baseline', Decimal('0'),
     )
+    proportionality_priority_score = _weighted_proportionality_priority(
+        proportionality_breakdown,
+        {
+            'facility': facility_baseline,
+            'time_of_day': time_baseline,
+        },
+    )
     proportionality_targets = (
         {
             'facility': _proportionality_target(
@@ -4540,6 +4594,7 @@ def _score_schedule(
         # breakdown.  It is a lexicographic tie-breaker only: optimizer moves
         # may lower it when, and only when, the official score does not rise.
         'proportionality_score': proportionality_score,
+        'proportionality_priority_score': proportionality_priority_score,
         'proportionality_breakdown': proportionality_breakdown,
         'proportionality_targets': proportionality_targets,
     }
@@ -6097,10 +6152,10 @@ def _repair_proportional_distribution_swaps(
                         'official_score_before': float(current_scoring['score']),
                         'official_score_after': float(trial_scoring['score']),
                         'proportionality_before': float(
-                            current_scoring['proportionality_score']
+                            _proportionality_priority_value(current_scoring)
                         ),
                         'proportionality_after': float(
-                            trial_scoring['proportionality_score']
+                            _proportionality_priority_value(trial_scoring)
                         ),
                     })
                     current = result['state']
@@ -8184,7 +8239,8 @@ def _run_adaptive_search_rounds(
             slice_end = repair_started + allocated_slice_seconds
             score_before_repair = best_scoring['score']
             proportionality_before_repair = best_scoring.get(
-                'proportionality_score', Decimal('0'),
+                'proportionality_priority_score',
+                best_scoring.get('proportionality_score', Decimal('0')),
             )
             priority_before_repair = _state_result_priority(
                 instances, best_state, best_scoring,
@@ -8243,7 +8299,7 @@ def _run_adaptive_search_rounds(
             ):
                 strategy_gain = max(
                     proportionality_before_repair
-                    - best_scoring.get('proportionality_score', Decimal('0')),
+                    - _proportionality_priority_value(best_scoring),
                     Decimal('0'),
                 )
             _record_adaptive_repair_productivity(
@@ -9211,7 +9267,7 @@ def _result_priority(scoring, unfilled_shift_count):
         0 if complete_valid else 1,
         scoring.get('fixed_request_on_unmet', 0),
         scoring['score'],
-        scoring.get('proportionality_score', Decimal('0')),
+        _proportionality_priority_value(scoring),
     )
 
 
@@ -9220,7 +9276,7 @@ def _optimization_priority(scoring):
     return (
         scoring.get('fixed_request_on_unmet', 0),
         scoring['score'],
-        scoring.get('proportionality_score', Decimal('0')),
+        _proportionality_priority_value(scoring),
     )
 
 
@@ -9405,8 +9461,8 @@ def evaluate_plateau_pairwise_swap(
             minimum_rest_by_physician,
         )
         proportionality_delta = (
-            trial_scoring['proportionality_score']
-            - current_scoring['proportionality_score']
+            _proportionality_priority_value(trial_scoring)
+            - _proportionality_priority_value(current_scoring)
         )
         proportionality_improved = proportionality_delta < 0
     return {

@@ -293,6 +293,62 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
             clustered_target['quality_band'], 'IMPROVEMENT_AVAILABLE',
         )
 
+    def test_proportionality_priority_normalizes_dimensions_before_weighting(self):
+        priority = optimizer._weighted_proportionality_priority(
+            {'facility': Decimal('40'), 'time_of_day': Decimal('10')},
+            {'facility': Decimal('200'), 'time_of_day': Decimal('50')},
+        )
+
+        self.assertEqual(priority, Decimal('0.20'))
+
+    def test_proportionality_priority_favors_equal_time_improvement(self):
+        facility_improvement = optimizer._weighted_proportionality_priority(
+            {'facility': Decimal('90'), 'time_of_day': Decimal('100')},
+            {'facility': Decimal('100'), 'time_of_day': Decimal('100')},
+        )
+        time_improvement = optimizer._weighted_proportionality_priority(
+            {'facility': Decimal('100'), 'time_of_day': Decimal('90')},
+            {'facility': Decimal('100'), 'time_of_day': Decimal('100')},
+        )
+
+        self.assertEqual(facility_improvement, Decimal('0.96'))
+        self.assertEqual(time_improvement, Decimal('0.94'))
+        self.assertLess(time_improvement, facility_improvement)
+
+    def test_fast_proportionality_measure_retains_normalization_baseline(self):
+        fast = optimizer._proportionality_measure(
+            {'A': 3, 'B': 1},
+            {'A': 3, 'B': 1},
+            Decimal('50'),
+            include_context=False,
+        )
+        detailed = optimizer._proportionality_measure(
+            {'A': 3, 'B': 1},
+            {'A': 3, 'B': 1},
+            Decimal('50'),
+            include_context=True,
+        )
+
+        self.assertEqual(fast['score'], detailed['score'])
+        self.assertEqual(fast['neutral_baseline'], detailed['neutral_baseline'])
+
+    def test_official_penalty_remains_ahead_of_proportionality_priority(self):
+        lower_penalty = {
+            'fixed_request_on_unmet': 0,
+            'score': Decimal('90'),
+            'proportionality_priority_score': Decimal('10'),
+        }
+        better_distribution = {
+            'fixed_request_on_unmet': 0,
+            'score': Decimal('100'),
+            'proportionality_priority_score': Decimal('0'),
+        }
+
+        self.assertLess(
+            optimizer._optimization_priority(lower_penalty),
+            optimizer._optimization_priority(better_distribution),
+        )
+
     def test_productive_search_is_not_interrupted_by_a_fixed_epoch_limit(self):
         class Clock:
             value = 0.0

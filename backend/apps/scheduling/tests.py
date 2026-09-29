@@ -8184,6 +8184,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             balanced_scoring['proportionality_score'],
             clustered_scoring['proportionality_score'],
         )
+        self.assertLess(
+            balanced_scoring['proportionality_priority_score'],
+            clustered_scoring['proportionality_priority_score'],
+        )
 
         repaired_state, repaired_scoring, debug = (
             _repair_proportional_distribution_swaps(
@@ -8207,6 +8211,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertLess(
             repaired_scoring['proportionality_score'],
             clustered_scoring['proportionality_score'],
+        )
+        self.assertLess(
+            repaired_scoring['proportionality_priority_score'],
+            clustered_scoring['proportionality_priority_score'],
         )
         self.assertEqual(
             sum(len(physician_ids) for physician_ids in repaired_state.values()),
