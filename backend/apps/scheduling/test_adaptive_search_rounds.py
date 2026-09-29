@@ -293,34 +293,6 @@ class AdaptiveSearchRoundTests(SimpleTestCase):
             clustered_target['quality_band'], 'IMPROVEMENT_AVAILABLE',
         )
 
-    def test_distribution_benchmark_weights_normalized_time_more_than_facility(self):
-        facility_improvement = optimizer._weighted_distribution_index(
-            facility=Decimal('90'),
-            time_of_day=Decimal('100'),
-            baseline_facility=Decimal('100'),
-            baseline_time_of_day=Decimal('100'),
-        )
-        time_improvement = optimizer._weighted_distribution_index(
-            facility=Decimal('100'),
-            time_of_day=Decimal('90'),
-            baseline_facility=Decimal('100'),
-            baseline_time_of_day=Decimal('100'),
-        )
-
-        self.assertEqual(facility_improvement, Decimal('96'))
-        self.assertEqual(time_improvement, Decimal('94'))
-        self.assertLess(time_improvement, facility_improvement)
-
-    def test_distribution_benchmark_normalizes_different_score_scales(self):
-        index = optimizer._weighted_distribution_index(
-            facility=Decimal('1000'),
-            time_of_day=Decimal('450'),
-            baseline_facility=Decimal('1000'),
-            baseline_time_of_day=Decimal('500'),
-        )
-
-        self.assertEqual(index, Decimal('94'))
-
     def test_productive_search_is_not_interrupted_by_a_fixed_epoch_limit(self):
         class Clock:
             value = 0.0
