@@ -47,6 +47,7 @@ from .optimizer import (
     optimize_schedule_version,
     recalculate_schedule_version_score,
 )
+from .optimizer_v2_runner import V2_RUN_KIND
 from .run_state import (
     assignments_for_viewed_run,
     get_active_optimizer_run,
@@ -262,7 +263,7 @@ def published_schedule(request):
             continue
         active_run = active_runs.get(version_id)
         if active_run is not None and active_run.run_kind in (
-            'COPY', 'BENCHMARK', 'OPTIMIZER_V2_TEST',
+            'COPY', 'BENCHMARK', 'OPTIMIZER_V2', 'OPTIMIZER_V2_TEST',
         ):
             if assignment['optimizer_run_id'] != active_run.id:
                 continue
@@ -2098,8 +2099,12 @@ def schedule_block_build_context(request, block_id):
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
             'can_manage_build_workspace': can_manage,
+            'atlas_v2_enabled': bool(
+                getattr(settings, 'ATLAS_V2_ENABLED', False)
+            ),
+            # Compatibility response field for older open browser sessions.
             'atlas_v2_test_enabled': bool(
-                getattr(settings, 'ATLAS_V2_TEST_ENABLED', False)
+                getattr(settings, 'ATLAS_V2_ENABLED', False)
             ),
             'domains': [
                 {'id': domain.id, 'name': domain.name}
@@ -2282,8 +2287,10 @@ def _parse_optimizer_focus(request):
 
 def _parse_optimizer_engine(request):
     value = request.data.get('optimizer_engine', 'V1')
-    if value not in ('V1', 'V2_TEST'):
-        return None, {'optimizer_engine': 'Use V1 or V2_TEST.'}
+    if value == 'V2_TEST':
+        value = 'V2'
+    if value not in ('V1', 'V2'):
+        return None, {'optimizer_engine': 'Use V1 or V2.'}
     return value, None
 
 
@@ -2540,15 +2547,15 @@ def _run_optimizer_response(request, version):
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
     if (
-        optimizer_engine == 'V2_TEST'
-        and not getattr(settings, 'ATLAS_V2_TEST_ENABLED', False)
+        optimizer_engine == 'V2'
+        and not getattr(settings, 'ATLAS_V2_ENABLED', False)
     ):
         return Response({
-            'optimizer_engine': 'Atlas v2 test is not available yet.',
+            'optimizer_engine': 'Atlas V2 is not available.',
         }, status=status.HTTP_409_CONFLICT)
-    if optimizer_engine == 'V2_TEST':
+    if optimizer_engine == 'V2':
         return Response({
-            'optimizer_engine': 'Atlas v2 test must run in the background.',
+            'optimizer_engine': 'Atlas V2 must run in the background.',
         }, status=status.HTTP_400_BAD_REQUEST)
     preflight_response = _optimizer_preflight_response(
         version, start_mode, source_run,
@@ -2695,11 +2702,11 @@ def schedule_version_run_optimizer(request, version_id):
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
     if (
-        optimizer_engine == 'V2_TEST'
-        and not getattr(settings, 'ATLAS_V2_TEST_ENABLED', False)
+        optimizer_engine == 'V2'
+        and not getattr(settings, 'ATLAS_V2_ENABLED', False)
     ):
         return Response({
-            'optimizer_engine': 'Atlas v2 test is not available yet.',
+            'optimizer_engine': 'Atlas V2 is not available.',
         }, status=status.HTTP_409_CONFLICT)
     preflight_response = _optimizer_preflight_response(
         version, start_mode, source_run,
@@ -2803,8 +2810,8 @@ def schedule_version_run_optimizer(request, version_id):
                 max_runtime_seconds=max_runtime_seconds or 120 * 60,
                 optimization_focus=optimization_focus,
                 run_kind=(
-                    'OPTIMIZER_V2_TEST'
-                    if optimizer_engine == 'V2_TEST'
+                    V2_RUN_KIND
+                    if optimizer_engine == 'V2'
                     else 'OPTIMIZER'
                 ),
                 locked_open_shift_instance_ids=locked_open_ids,

@@ -175,7 +175,7 @@ type OptimizerRun = {
   copied_from_run_number: number | null
   started_from_run: number | null
   started_from_run_number: number | null
-  run_kind: 'OPTIMIZER' | 'OPTIMIZER_V2_TEST' | 'COPY' | 'BENCHMARK'
+  run_kind: 'OPTIMIZER' | 'OPTIMIZER_V2' | 'OPTIMIZER_V2_TEST' | 'COPY' | 'BENCHMARK'
   locked_open_shift_instance_ids: number[]
   start_mode: 'CURRENT_SCHEDULE' | 'FRESH_FILL'
   max_runtime_seconds: number
@@ -266,7 +266,8 @@ type OptimizerPreflight = {
 type BuildContext = {
   schedule_block: ScheduleBlock
   can_manage_build_workspace: boolean
-  atlas_v2_test_enabled: boolean
+  atlas_v2_enabled: boolean
+  atlas_v2_test_enabled?: boolean
   domains: DomainOption[]
   versions: ScheduleVersion[]
   selected_version: ScheduleVersion | null
@@ -637,7 +638,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [stoppingOptimizerRunIds, setStoppingOptimizerRunIds] = useState<number[]>([])
   const [optimizerClockMs, setOptimizerClockMs] = useState(() => Date.now())
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
-  const [optimizerEngine, setOptimizerEngine] = useState<'V1' | 'V2_TEST'>('V1')
+  const [optimizerEngine, setOptimizerEngine] = useState<'V1' | 'V2'>('V1')
+  const optimizerEngineDefaultedRef = useRef(false)
   const [optimizerSourceRunId, setOptimizerSourceRunId] = useState<number | null>(null)
   const [optimizerPreflight, setOptimizerPreflight] = useState<OptimizerPreflight | null>(null)
   const [isOptimizerPreflightLoading, setIsOptimizerPreflightLoading] = useState(false)
@@ -874,6 +876,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       const nextContext = data as BuildContext
       setContext(nextContext)
+      if (!optimizerEngineDefaultedRef.current) {
+        setOptimizerEngine(
+          nextContext.atlas_v2_enabled || nextContext.atlas_v2_test_enabled
+            ? 'V2'
+            : 'V1',
+        )
+        optimizerEngineDefaultedRef.current = true
+      }
       setOptimizerSummary(nextContext.optimizer_summary ?? null)
       const completedRuns = (nextContext.optimizer_runs ?? []).filter(isCompletedOptimizerRun)
       setOptimizerSourceRunId((current) => (
@@ -2170,18 +2180,18 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               />
               Atlas v1
             </label>
-            {context.atlas_v2_test_enabled && (
+            {(context.atlas_v2_enabled || context.atlas_v2_test_enabled) && (
               <label>
                 <input
                   type="radio"
                   name="optimizer-engine"
-                  value="V2_TEST"
-                  checked={optimizerEngine === 'V2_TEST'}
+                  value="V2"
+                  checked={optimizerEngine === 'V2'}
                   onChange={() => {
-                    setOptimizerEngine('V2_TEST')
+                    setOptimizerEngine('V2')
                   }}
                 />
-                Atlas v2 (test)
+                Atlas V2
               </label>
             )}
           </fieldset>
@@ -2248,11 +2258,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             )}
             <small>
               {optimizerStartMode === 'CURRENT_SCHEDULE'
-                ? optimizerEngine === 'V2_TEST'
-                  ? 'Atlas v2 test improves an independent copy of the selected completed run. The source and active schedules are not changed.'
+                ? optimizerEngine === 'V2'
+                  ? 'Atlas V2 improves an independent copy of the selected completed run. The source and active schedules are not changed.'
                   : 'Uses the selected completed run as an independent starting snapshot. It does not need to be viewed or active.'
-                : optimizerEngine === 'V2_TEST'
-                  ? 'Builds a new unanchored schedule, then improves it with Atlas v2. Locked edits are still preserved.'
+                : optimizerEngine === 'V2'
+                  ? 'Builds a new unanchored schedule, then improves it with Atlas V2. Locked edits are still preserved.'
                   : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
             </small>
           </div>
@@ -2319,11 +2329,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 : optimizerCapacity.available_slots < 1
                   ? `${optimizerCapacity.limit} Optimizers Running`
                   : optimizerStartMode === 'CURRENT_SCHEDULE'
-                    ? optimizerEngine === 'V2_TEST'
-                      ? `Run Atlas v2 Test from Run ${optimizerSourceRun?.run_number ?? '—'}`
+                    ? optimizerEngine === 'V2'
+                      ? `Run Atlas V2 from Run ${optimizerSourceRun?.run_number ?? '—'}`
                       : `Run Optimizer from Run ${optimizerSourceRun?.run_number ?? '—'}`
-                    : optimizerEngine === 'V2_TEST'
-                      ? 'Run Atlas v2 Test from Fresh Fill'
+                    : optimizerEngine === 'V2'
+                      ? 'Run Atlas V2 from Fresh Fill'
                       : 'Run Optimizer from Fresh Fill'}
             </button>
             <span className="optimizer-capacity-label">
@@ -2353,7 +2363,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   <div>
                     <strong>Run {run.run_number}</strong>
                     <span>{run.start_mode === 'FRESH_FILL' ? 'Fresh Fill' : `From Run ${run.started_from_run_number ?? '—'}`}</span>
-                    {run.run_kind === 'OPTIMIZER_V2_TEST' && <span>Atlas v2 test</span>}
+                    {(run.run_kind === 'OPTIMIZER_V2' || run.run_kind === 'OPTIMIZER_V2_TEST') && <span>Atlas V2</span>}
                     {run.optimization_focus === 'DISTRIBUTION' && <span>Facility/Shift distribution focus</span>}
                   </div>
                   <div>
@@ -2362,7 +2372,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     </span>
                     <span className="optimizer-live-best-score">
                       Current best penalty: {run.live_best_score === null || run.live_best_score === undefined
-                        ? run.run_kind === 'OPTIMIZER_V2_TEST'
+                        ? run.run_kind === 'OPTIMIZER_V2' || run.run_kind === 'OPTIMIZER_V2_TEST'
                           ? run.start_mode === 'FRESH_FILL'
                             ? 'Building first complete schedule…'
                             : `Searching from ${formatScore(run.initial_score)}…`
@@ -2885,7 +2895,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     <span>Starting penalty {formatScore(run.initial_score)}</span>
                     <span>{optimizerRunScoreLabel(run)}</span>
                     <span>{run.optimization_focus === 'DISTRIBUTION' ? 'Facility/Shift distribution focus' : 'Standard optimization'}</span>
-                    {run.run_kind === 'OPTIMIZER_V2_TEST' && <span>Atlas v2 test</span>}
+                    {(run.run_kind === 'OPTIMIZER_V2' || run.run_kind === 'OPTIMIZER_V2_TEST') && <span>Atlas V2</span>}
                     {run.score_is_stale && <span>Stored under prior schedule/rules</span>}
                     <span>{formatTimestamp(run.created_at)}</span>
                     {run.runtime_seconds != null && <span>Total time {formatRuntimeMinutes(run.runtime_seconds)}</span>}

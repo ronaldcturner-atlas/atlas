@@ -16,8 +16,8 @@ from apps.scheduling.models import (
 )
 from apps.scheduling.optimizer import optimize_schedule_version
 from apps.scheduling.optimizer_v2_runner import (
-    V2_TEST_RUN_KIND,
-    optimize_schedule_version_v2_test,
+    V2_RUN_KINDS,
+    optimize_schedule_version_v2,
 )
 
 
@@ -165,8 +165,8 @@ class Command(BaseCommand):
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.setitimer(signal.ITIMER_REAL, effective_job_timeout_seconds)
         try:
-            if control.optimizer_run.run_kind == V2_TEST_RUN_KIND:
-                optimize_schedule_version_v2_test(
+            if control.optimizer_run.run_kind in V2_RUN_KINDS:
+                optimize_schedule_version_v2(
                     control.schedule_version,
                     created_by=control.optimizer_run.created_by,
                     optimizer_run=control.optimizer_run,
@@ -194,7 +194,7 @@ class Command(BaseCommand):
         except Exception as exc:
             traceback.print_exc()
             if (
-                control.optimizer_run.run_kind == V2_TEST_RUN_KIND
+                control.optimizer_run.run_kind in V2_RUN_KINDS
                 and control.optimizer_run.start_mode
                 == OptimizerRun.StartMode.FRESH_FILL
             ):

@@ -8,12 +8,12 @@ from time import monotonic
 from django.core.management import call_command
 from django.db import transaction
 
+from .initial_schedule import construct_complete_initial_schedule
 from .models import OptimizerRun, ScheduleShiftAssignment
 from .optimizer import (
     _state_from_assignments,
     _version_shift_instances_queryset,
     build_violation_report,
-    optimize_schedule_version,
 )
 from .optimizer_v2 import (
     reassign_assignment,
@@ -23,7 +23,11 @@ from .optimizer_v2 import (
 from .run_state import assignments_for_viewed_run
 
 
-V2_TEST_RUN_KIND = 'OPTIMIZER_V2_TEST'
+V2_RUN_KIND = 'OPTIMIZER_V2'
+LEGACY_V2_TEST_RUN_KIND = 'OPTIMIZER_V2_TEST'
+V2_RUN_KINDS = frozenset({V2_RUN_KIND, LEGACY_V2_TEST_RUN_KIND})
+# Compatibility import for older code and completed-run tests.
+V2_TEST_RUN_KIND = LEGACY_V2_TEST_RUN_KIND
 
 
 def _apply_search_operations(state, operations):
@@ -80,7 +84,7 @@ def _require_matching_final_score(final_score, search_result):
         )
 
 
-def optimize_schedule_version_v2_test(
+def optimize_schedule_version_v2(
     schedule_version,
     *,
     optimizer_run,
@@ -90,8 +94,8 @@ def optimize_schedule_version_v2_test(
     progress_callback=None,
 ):
     """Build or copy an isolated start, run v2, and save one result."""
-    if optimizer_run.run_kind != V2_TEST_RUN_KIND:
-        raise ValueError('Atlas v2 test requires an Atlas v2 test run record.')
+    if optimizer_run.run_kind not in V2_RUN_KINDS:
+        raise ValueError('Atlas V2 requires an Atlas V2 run record.')
     fresh_fill = optimizer_run.start_mode == OptimizerRun.StartMode.FRESH_FILL
     if not fresh_fill:
         if source_run is None or source_run.status != OptimizerRun.Status.COMPLETED:
@@ -102,44 +106,13 @@ def optimize_schedule_version_v2_test(
     overall_started = monotonic()
     bootstrap_summary = None
     if fresh_fill:
-        complete_schedule_seen = [False]
-
-        def bootstrap_progress(score, force=False):
-            complete_schedule_seen[0] = True
-            if progress_callback is not None:
-                progress_callback(score, force=force)
-
-        def bootstrap_stop_requested():
-            return complete_schedule_seen[0] or bool(
-                stop_requested is not None and stop_requested()
-            )
-
-        bootstrap_summary = optimize_schedule_version(
+        bootstrap_summary = construct_complete_initial_schedule(
             schedule_version,
             created_by=created_by,
             optimizer_run=optimizer_run,
-            seed=optimizer_run.seed,
-            start_mode=OptimizerRun.StartMode.FRESH_FILL,
-            source_run=source_run,
-            max_runtime_seconds=optimizer_run.max_runtime_seconds,
-            optimization_focus=optimizer_run.optimization_focus,
-            adaptive_runtime=True,
-            stop_requested=bootstrap_stop_requested,
-            progress_callback=bootstrap_progress,
-            isolated_run=True,
-            finalize_run=False,
+            stop_requested=stop_requested,
+            progress_callback=progress_callback,
         )
-        if int(bootstrap_summary.get('unfilled_shift_count') or 0) > 0:
-            raise ValueError(
-                'Atlas v2 Fresh Fill could not construct a complete starting '
-                'schedule within the selected runtime.'
-            )
-        if int(bootstrap_summary.get('final_overlap_violations') or 0) > 0:
-            raise ValueError(
-                'Atlas v2 Fresh Fill produced a time-overlap conflict during '
-                'construction; no result was saved.'
-            )
-        optimizer_run.refresh_from_db()
         source_run = optimizer_run
 
     source_report = build_violation_report(
@@ -272,8 +245,8 @@ def optimize_schedule_version_v2_test(
             for instance_id, required in instance_required.items()
         )
         summary = {
-            'message': 'Atlas v2 test run completed.',
-            'optimizer_engine': 'V2_TEST',
+            'message': 'Atlas V2 run completed.',
+            'optimizer_engine': 'V2',
             'optimizer_run_id': optimizer_run.id,
             'optimizer_run_number': optimizer_run.run_number,
             'start_mode': optimizer_run.start_mode,
@@ -303,7 +276,7 @@ def optimize_schedule_version_v2_test(
         optimizer_run.score_breakdown = report['score_breakdown']
         optimizer_run.optimizer_summary = summary
         optimizer_run.optimizer_debug = {
-            'optimizer_engine': 'V2_TEST',
+            'optimizer_engine': 'V2',
             'search': search_result,
             'score_audit': report.get('score_audit'),
         }
@@ -312,7 +285,7 @@ def optimize_schedule_version_v2_test(
         optimizer_run.notes = (
             'Atlas v2 Fresh Fill result; historical and active schedules were preserved.'
             if fresh_fill
-            else 'Atlas v2 test result; source and active schedules were preserved.'
+                else 'Atlas V2 result; source and active schedules were preserved.'
         )
         optimizer_run.save(update_fields=[
             'status', 'initial_score', 'final_score', 'score_breakdown',
@@ -322,3 +295,7 @@ def optimize_schedule_version_v2_test(
     if progress_callback is not None:
         progress_callback(final_score, force=True)
     return summary
+
+
+# Existing imports remain valid while callers migrate to the product name.
+optimize_schedule_version_v2_test = optimize_schedule_version_v2

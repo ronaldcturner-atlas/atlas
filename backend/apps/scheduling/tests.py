@@ -3817,7 +3817,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             OptimizerRun.OptimizationFocus.DISTRIBUTION,
         )
 
-    @override_settings(ATLAS_V2_TEST_ENABLED=True)
+    @override_settings(ATLAS_V2_ENABLED=True)
     def test_background_atlas_v2_test_supports_fresh_fill_and_previous_run(self):
         version = self._create_build_version()
         source_run = OptimizerRun.objects.create(
@@ -3832,7 +3832,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             f'/api/schedule-versions/{version.id}/run-optimizer/',
             data={
                 'background': True,
-                'optimizer_engine': 'V2_TEST',
+                'optimizer_engine': 'V2',
                 'start_mode': 'FRESH_FILL',
             },
             format='json',
@@ -3860,7 +3860,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(response.status_code, 202)
         queued_run = OptimizerRun.objects.get(id=response.json()['id'])
-        self.assertEqual(queued_run.run_kind, 'OPTIMIZER_V2_TEST')
+        self.assertEqual(queued_run.run_kind, 'OPTIMIZER_V2')
         self.assertEqual(queued_run.started_from_run_id, source_run.id)
         self.assertEqual(queued_run.initial_score, source_run.final_score)
 
@@ -3914,7 +3914,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             }))
 
         with patch(
-            'apps.scheduling.optimizer_v2_runner.optimize_schedule_version',
+            'apps.scheduling.initial_schedule.optimize_schedule_version',
             side_effect=bootstrap,
         ) as build_start, patch(
             'apps.scheduling.optimizer_v2_runner.call_command',
@@ -4001,7 +4001,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             [(instance.id, physician.id)],
         )
 
-    @override_settings(ATLAS_V2_TEST_ENABLED=False)
+    @override_settings(ATLAS_V2_ENABLED=False)
     def test_background_atlas_v2_test_is_gated_until_workers_restart(self):
         version = self._create_build_version()
         source_run = OptimizerRun.objects.create(
@@ -4016,7 +4016,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             f'/api/schedule-versions/{version.id}/run-optimizer/',
             data={
                 'background': True,
-                'optimizer_engine': 'V2_TEST',
+                'optimizer_engine': 'V2',
                 'start_mode': 'CURRENT_SCHEDULE',
                 'source_run_id': source_run.id,
             },
@@ -4027,11 +4027,11 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertFalse(
             OptimizerRun.objects.filter(
                 schedule_version=version,
-                run_kind='OPTIMIZER_V2_TEST',
+                run_kind='OPTIMIZER_V2',
             ).exists()
         )
 
-    @override_settings(ATLAS_V2_TEST_ENABLED=True)
+    @override_settings(ATLAS_V2_ENABLED=True)
     def test_background_worker_routes_atlas_v2_test_to_v2_runner(self):
         version = self._create_build_version()
         source_run = OptimizerRun.objects.create(
@@ -4045,7 +4045,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             f'/api/schedule-versions/{version.id}/run-optimizer/',
             data={
                 'background': True,
-                'optimizer_engine': 'V2_TEST',
+                'optimizer_engine': 'V2',
                 'start_mode': 'CURRENT_SCHEDULE',
                 'source_run_id': source_run.id,
             },
@@ -4062,7 +4062,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         with patch(
             'apps.scheduling.management.commands.run_optimizer_worker.'
-            'optimize_schedule_version_v2_test',
+            'optimize_schedule_version_v2',
             side_effect=complete_v2,
         ) as optimize_v2, patch(
             'apps.scheduling.management.commands.run_optimizer_worker.'
@@ -4141,7 +4141,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(source_assignment.optimizer_run_id, source_run.id)
         self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
         self.assertFalse(v2_run.is_active)
-        self.assertEqual(summary['optimizer_engine'], 'V2_TEST')
+        self.assertEqual(summary['optimizer_engine'], 'V2')
         self.assertEqual(benchmark.call_args.kwargs['validate_sample'], 0)
         self.assertEqual(benchmark.call_args.kwargs['checkpoint_interval'], 20)
         self.assertEqual(benchmark.call_args.kwargs['starting_score'], 0.0)

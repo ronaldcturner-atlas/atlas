@@ -10000,6 +10000,7 @@ def optimize_schedule_version(
     progress_callback=None,
     isolated_run=False,
     finalize_run=True,
+    construction_only=False,
 ):
     _FULL_SCORE_EVALUATIONS.set(0)
     _SCORE_CACHE.set(OrderedDict())
@@ -10014,6 +10015,12 @@ def optimize_schedule_version(
         raise ValueError('Maximum optimizer runtime cannot exceed 240 minutes.')
     if optimization_focus not in OptimizerRun.OptimizationFocus.values:
         raise ValueError('Invalid optimizer focus.')
+    if construction_only and start_mode != OptimizerRun.StartMode.FRESH_FILL:
+        raise ValueError('Construction-only mode requires a Fresh Fill start.')
+    if construction_only and finalize_run:
+        raise ValueError(
+            'Construction-only mode must leave the optimizer run open.'
+        )
     if schedule_version.status != ScheduleVersion.Status.BUILD:
         raise ValueError('Optimizer can only run on a BUILD Schedule Version.')
     allowed_schedule_block_statuses = (ScheduleBlock.BuildStatus.BUILD,)
@@ -10639,6 +10646,15 @@ def optimize_schedule_version(
         nonnight_assignments_allowed_despite_recovery = 0
         open_slots_available = _unfilled_slot_count(instances, state)
         optimizer_search_started_at = monotonic()
+        progress_ready = False
+        construction_complete = False
+
+        def effective_stop_requested():
+            return bool(
+                (construction_only and construction_complete)
+                or (stop_requested is not None and stop_requested())
+            )
+
         search_budget_kwargs = dict(
             # The advertised maximum applies to the entire optimizer
             # invocation, including setup. Starting the absolute budget only
@@ -10646,7 +10662,7 @@ def optimize_schedule_version(
             # cause a valid best state to be rolled back by the safety alarm.
             started_at=invocation_started_at,
             score_floor=proven_score_floor,
-            stop_requested=stop_requested or (lambda: False),
+            stop_requested=effective_stop_requested,
         )
         # Keep the constructor's default overridable by benchmark/test budget
         # hooks for direct calls. API-selected and queued-run limits are
@@ -10656,7 +10672,6 @@ def optimize_schedule_version(
         search_budget = SearchBudget(**search_budget_kwargs)
         adaptive_best_state = _copy_state(source_state_snapshot)
         adaptive_best_scoring = source_state_reported_scoring
-        progress_ready = False
         progress_marker = None
         adaptive_debug = {'enabled': adaptive_runtime, 'cycles': 0, 'improvements': 0,
                           'attempts': 0, 'stall_seconds': search_budget.stall_seconds,
@@ -10678,6 +10693,7 @@ def optimize_schedule_version(
 
         def observe_best(candidate_state, candidate_scoring):
             nonlocal adaptive_best_state, adaptive_best_scoring
+            nonlocal construction_complete
             candidate_priority = _state_result_priority(
                 instances, candidate_state, candidate_scoring,
             )
@@ -10685,6 +10701,8 @@ def optimize_schedule_version(
                      and candidate_scoring.get('fixed_request_on_unmet', 0) == 0
                      and all(pid in candidate_state[sid] for sid, pid in manual_pairs))
             search_budget.observe(candidate_scoring['score'], valid=valid)
+            if valid:
+                construction_complete = True
             if (
                 valid
                 and progress_callback is not None

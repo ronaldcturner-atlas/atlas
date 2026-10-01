@@ -17,9 +17,14 @@ OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION = int(
 OPTIMIZER_ENABLE_PARALLEL_ISOLATION = (
     os.environ.get("OPTIMIZER_ENABLE_PARALLEL_ISOLATION", "False") == "True"
 )
-ATLAS_V2_TEST_ENABLED = (
-    os.environ.get("ATLAS_V2_TEST_ENABLED", "False") == "True"
+ATLAS_V2_ENABLED = (
+    os.environ.get(
+        "ATLAS_V2_ENABLED",
+        os.environ.get("ATLAS_V2_TEST_ENABLED", "False"),
+    ) == "True"
 )
+# Compatibility setting for older deployments during the product transition.
+ATLAS_V2_TEST_ENABLED = ATLAS_V2_ENABLED
 
 ALLOWED_HOSTS = ["*"]
 
