@@ -34,6 +34,7 @@ from .optimizer_assignment_snapshot import (
 )
 from .optimizer_run_context import prepare_optimizer_run
 from .optimizer_v1_constructor import (
+    build_night_blocks as build_night_blocks_v1,
     fill_open_instances as fill_open_instances_v1,
 )
 
@@ -10626,225 +10627,6 @@ def optimize_schedule_version(
                     previous = next_instance
             return windows
 
-        def build_night_blocks():
-            nonlocal assignments_made
-            nonlocal rest_violations_blocked
-            nonlocal night_block_assignment_attempts
-            nonlocal night_block_assignment_successes
-            nonlocal night_block_builder_candidates_created
-            nonlocal night_block_builder_score_before
-            nonlocal night_block_builder_score_after
-            nonlocal physicians_below_night_min_before_night_build
-            nonlocal physicians_below_night_min_after_night_build
-            nonlocal night_recovery_conflicts_after_night_build
-            nonlocal night_distribution_by_physician_after_build
-
-            before_scoring = _score_schedule(
-                instances,
-                physicians,
-                state,
-                targets,
-                contract_by_physician,
-                requests_by_physician_date,
-                eligible_facilities_by_physician,
-                minimum_rest_by_physician,
-                include_internal_night_heuristics=True,
-            )
-            night_block_builder_score_before = float(before_scoring['score'])
-            before_status = _night_minimum_status(
-                instances,
-                physicians,
-                state,
-                contract_by_physician,
-            )
-            physicians_below_night_min_before_night_build = before_status['physicians_under_night_minimum']
-
-            while True:
-                if runtime_exceeded():
-                    mark_timeout('night_block_builder')
-                    break
-                unfilled_nights = [
-                    instance for instance in night_instances
-                    if len(state[instance.id]) < instance.required_staffing
-                ]
-                if not unfilled_nights:
-                    break
-
-                minimum_status = _night_minimum_status(
-                    instances,
-                    physicians,
-                    state,
-                    contract_by_physician,
-                )
-                under_minimum_ids = {
-                    row['physician_id']
-                    for row in minimum_status['physicians_under_night_minimum']
-                }
-                current_under_deficit = night_rule_window_deficit(
-                    minimum_status['physicians_under_night_minimum']
-                )
-                candidates = []
-                windows = shuffle(consecutive_night_windows(unfilled_nights))
-                for physician in shuffle(physicians):
-                    if runtime_exceeded():
-                        mark_timeout('night_block_builder')
-                        break
-                    physician_windows = shuffle(windows)
-                    for window in physician_windows:
-                        if runtime_exceeded():
-                            mark_timeout('night_block_builder')
-                            break
-                        for length in block_candidate_lengths(physician.id, window):
-                            if runtime_exceeded():
-                                mark_timeout('night_block_builder')
-                                break
-                            block = window[:length]
-                            if not block:
-                                continue
-                            night_block_assignment_attempts += 1
-                            trial_state = _copy_state(state)
-                            rejected = None
-                            for instance in block:
-                                if len(trial_state[instance.id]) >= instance.required_staffing:
-                                    rejected = 'filled'
-                                    break
-                                if physician.id in trial_state[instance.id]:
-                                    rejected = 'duplicate'
-                                    break
-                                if instance.facility_id not in eligible_facilities_by_physician.get(physician.id, set()):
-                                    rejected = 'facility_ineligible'
-                                    break
-                                if not _can_assign_in_state(
-                                    trial_state,
-                                    instances_by_id,
-                                    instance,
-                                    physician.id,
-                                    eligible_facilities_by_physician,
-                                    minimum_rest_by_physician,
-                                ):
-                                    rejected = 'rest_or_overlap'
-                                    rest_violations_blocked += 1
-                                    break
-                                _add_to_state(trial_state, instance.id, physician.id)
-                            if rejected is not None:
-                                night_block_builder_rejections_by_reason[rejected] += 1
-                                continue
-
-                            night_block_builder_candidates_created += 1
-                            trial_scoring = _score_schedule(
-                                instances,
-                                physicians,
-                                trial_state,
-                                targets,
-                                contract_by_physician,
-                                requests_by_physician_date,
-                                eligible_facilities_by_physician,
-                                minimum_rest_by_physician,
-                                include_internal_night_heuristics=True,
-                            )
-                            trial_status = _night_minimum_status(
-                                instances,
-                                physicians,
-                                trial_state,
-                                contract_by_physician,
-                            )
-                            trial_report = _night_violation_report(
-                                instances,
-                                physicians,
-                                trial_state,
-                                contract_by_physician,
-                            )
-                            trial_under_deficit = night_rule_window_deficit(
-                                trial_status['physicians_under_night_minimum']
-                            )
-                            candidates.append(
-                                (
-                                    0 if physician.id in under_minimum_ids else 1,
-                                    trial_under_deficit,
-                                    night_recovery_conflict_count(trial_report),
-                                    -len(block),
-                                    trial_scoring['score'],
-                                    rng.random(),
-                                    physician,
-                                    block,
-                                    trial_state,
-                                )
-                            )
-
-                if not candidates:
-                    break
-
-                under_candidates = [
-                    candidate for candidate in candidates
-                    if candidate[0] == 0
-                ]
-                candidate_pool = under_candidates or candidates
-                improving_minimum_candidates = [
-                    candidate for candidate in candidate_pool
-                    if candidate[1] < current_under_deficit
-                ]
-                if improving_minimum_candidates:
-                    candidate_pool = improving_minimum_candidates
-
-                (
-                    _under_priority,
-                    _trial_under_deficit,
-                    _recovery_conflicts,
-                    _negative_length,
-                    _trial_score,
-                    _tie_breaker,
-                    selected_physician,
-                    selected_block,
-                    selected_state,
-                ) = min(candidate_pool)
-                state.clear()
-                state.update(selected_state)
-                assignments_made += len(selected_block)
-                night_block_assignment_successes += len(selected_block)
-                night_block_builder_lengths_assigned.append(len(selected_block))
-                night_block_builder_assigned_blocks.append(
-                    {
-                        'physician_id': selected_physician.id,
-                        'physician': _physician_display_name(selected_physician),
-                        **_contract_rule_identity(contract_by_physician.get(selected_physician.id)),
-                        'length': len(selected_block),
-                        'dates': _block_dates(selected_block),
-                        'shift_instance_ids': [instance.id for instance in selected_block],
-                        'facilities': sorted({
-                            instance.facility.short_name or instance.facility.name
-                            for instance in selected_block
-                        }),
-                    }
-                )
-
-            after_scoring = _score_schedule(
-                instances,
-                physicians,
-                state,
-                targets,
-                contract_by_physician,
-                requests_by_physician_date,
-                eligible_facilities_by_physician,
-                minimum_rest_by_physician,
-                include_internal_night_heuristics=True,
-            )
-            night_block_builder_score_after = float(after_scoring['score'])
-            after_status = _night_minimum_status(
-                instances,
-                physicians,
-                state,
-                contract_by_physician,
-            )
-            physicians_below_night_min_after_night_build = after_status['physicians_under_night_minimum']
-            after_report = _night_violation_report(
-                instances,
-                physicians,
-                state,
-                contract_by_physician,
-            )
-            night_recovery_conflicts_after_night_build = night_recovery_conflict_count(after_report)
-            night_distribution_by_physician_after_build = night_distribution_rows(after_report)
-
         initial_fill_hours = defaultdict(lambda: Decimal('0'))
         initial_fill_shifts = defaultdict(int)
         initial_fill_template_indexes = defaultdict(list)
@@ -10921,7 +10703,113 @@ def optimize_schedule_version(
                         initial_fill_template_indexes[(physician_id, template_id)].append(occurrence_index)
 
         if NIGHT_BLOCK_BUILDER_ENABLED:
-            build_night_blocks()
+            night_block_diagnostics = {
+                'assignments_made': assignments_made,
+                'rest_violations_blocked': rest_violations_blocked,
+                'night_block_assignment_attempts': (
+                    night_block_assignment_attempts
+                ),
+                'night_block_assignment_successes': (
+                    night_block_assignment_successes
+                ),
+                'night_block_builder_candidates_created': (
+                    night_block_builder_candidates_created
+                ),
+                'night_block_builder_score_before': (
+                    night_block_builder_score_before
+                ),
+                'night_block_builder_score_after': (
+                    night_block_builder_score_after
+                ),
+                'physicians_below_night_min_before_night_build': (
+                    physicians_below_night_min_before_night_build
+                ),
+                'physicians_below_night_min_after_night_build': (
+                    physicians_below_night_min_after_night_build
+                ),
+                'night_recovery_conflicts_after_night_build': (
+                    night_recovery_conflicts_after_night_build
+                ),
+                'night_distribution_by_physician_after_build': (
+                    night_distribution_by_physician_after_build
+                ),
+                'night_block_builder_rejections_by_reason': (
+                    night_block_builder_rejections_by_reason
+                ),
+                'night_block_builder_lengths_assigned': (
+                    night_block_builder_lengths_assigned
+                ),
+                'night_block_builder_assigned_blocks': (
+                    night_block_builder_assigned_blocks
+                ),
+            }
+            build_night_blocks_v1({
+                'state': state,
+                'diagnostics': night_block_diagnostics,
+                'instances': instances,
+                'physicians': physicians,
+                'targets': targets,
+                'contract_by_physician': contract_by_physician,
+                'requests_by_physician_date': requests_by_physician_date,
+                'eligible_facilities_by_physician': (
+                    eligible_facilities_by_physician
+                ),
+                'minimum_rest_by_physician': minimum_rest_by_physician,
+                'night_instances': night_instances,
+                'instances_by_id': instances_by_id,
+                'runtime_exceeded': runtime_exceeded,
+                'mark_timeout': mark_timeout,
+                'night_rule_window_deficit': night_rule_window_deficit,
+                'consecutive_night_windows': consecutive_night_windows,
+                'shuffle': shuffle,
+                'block_candidate_lengths': block_candidate_lengths,
+                'night_recovery_conflict_count': (
+                    night_recovery_conflict_count
+                ),
+                'night_distribution_rows': night_distribution_rows,
+                'rng': rng,
+            })
+            assignments_made = night_block_diagnostics[
+                'assignments_made'
+            ]
+            rest_violations_blocked = night_block_diagnostics[
+                'rest_violations_blocked'
+            ]
+            night_block_assignment_attempts = night_block_diagnostics[
+                'night_block_assignment_attempts'
+            ]
+            night_block_assignment_successes = night_block_diagnostics[
+                'night_block_assignment_successes'
+            ]
+            night_block_builder_candidates_created = night_block_diagnostics[
+                'night_block_builder_candidates_created'
+            ]
+            night_block_builder_score_before = night_block_diagnostics[
+                'night_block_builder_score_before'
+            ]
+            night_block_builder_score_after = night_block_diagnostics[
+                'night_block_builder_score_after'
+            ]
+            physicians_below_night_min_before_night_build = (
+                night_block_diagnostics[
+                    'physicians_below_night_min_before_night_build'
+                ]
+            )
+            physicians_below_night_min_after_night_build = (
+                night_block_diagnostics[
+                    'physicians_below_night_min_after_night_build'
+                ]
+            )
+            night_recovery_conflicts_after_night_build = (
+                night_block_diagnostics[
+                    'night_recovery_conflicts_after_night_build'
+                ]
+            )
+            night_distribution_by_physician_after_build = (
+                night_block_diagnostics[
+                    'night_distribution_by_physician_after_build'
+                ]
+            )
         sync_initial_fill_counters()
         # Chronological construction is essential for the extension bonus to
         # see yesterday's assignment when choosing today's physician.  Keep

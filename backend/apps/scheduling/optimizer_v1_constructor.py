@@ -510,3 +510,248 @@ def fill_open_instances(context, ordered_instances, phase):
             diagnostics['assignments_made'] += 1
             if phase == 'night':
                 diagnostics['night_block_assignment_successes'] += 1
+
+
+def build_night_blocks(context):
+    """Apply the proven V1 night-block construction phase."""
+    from . import optimizer as legacy
+
+    state = context['state']
+    diagnostics = context['diagnostics']
+    before_scoring = legacy._score_schedule(
+        context['instances'],
+        context['physicians'],
+        state,
+        context['targets'],
+        context['contract_by_physician'],
+        context['requests_by_physician_date'],
+        context['eligible_facilities_by_physician'],
+        context['minimum_rest_by_physician'],
+        include_internal_night_heuristics=True,
+    )
+    diagnostics['night_block_builder_score_before'] = float(
+        before_scoring['score']
+    )
+    before_status = legacy._night_minimum_status(
+        context['instances'],
+        context['physicians'],
+        state,
+        context['contract_by_physician'],
+    )
+    diagnostics['physicians_below_night_min_before_night_build'] = (
+        before_status['physicians_under_night_minimum']
+    )
+
+    while True:
+        if context['runtime_exceeded']():
+            context['mark_timeout']('night_block_builder')
+            break
+        unfilled_nights = [
+            instance for instance in context['night_instances']
+            if len(state[instance.id]) < instance.required_staffing
+        ]
+        if not unfilled_nights:
+            break
+
+        minimum_status = legacy._night_minimum_status(
+            context['instances'],
+            context['physicians'],
+            state,
+            context['contract_by_physician'],
+        )
+        under_minimum_ids = {
+            row['physician_id']
+            for row in minimum_status['physicians_under_night_minimum']
+        }
+        current_under_deficit = context['night_rule_window_deficit'](
+            minimum_status['physicians_under_night_minimum']
+        )
+        candidates = []
+        windows = context['shuffle'](
+            context['consecutive_night_windows'](unfilled_nights)
+        )
+        for physician in context['shuffle'](context['physicians']):
+            if context['runtime_exceeded']():
+                context['mark_timeout']('night_block_builder')
+                break
+            physician_windows = context['shuffle'](windows)
+            for window in physician_windows:
+                if context['runtime_exceeded']():
+                    context['mark_timeout']('night_block_builder')
+                    break
+                for length in context['block_candidate_lengths'](
+                    physician.id, window,
+                ):
+                    if context['runtime_exceeded']():
+                        context['mark_timeout']('night_block_builder')
+                        break
+                    block = window[:length]
+                    if not block:
+                        continue
+                    diagnostics['night_block_assignment_attempts'] += 1
+                    trial_state = legacy._copy_state(state)
+                    rejected = None
+                    for instance in block:
+                        if (
+                            len(trial_state[instance.id])
+                            >= instance.required_staffing
+                        ):
+                            rejected = 'filled'
+                            break
+                        if physician.id in trial_state[instance.id]:
+                            rejected = 'duplicate'
+                            break
+                        if instance.facility_id not in context[
+                            'eligible_facilities_by_physician'
+                        ].get(physician.id, set()):
+                            rejected = 'facility_ineligible'
+                            break
+                        if not legacy._can_assign_in_state(
+                            trial_state,
+                            context['instances_by_id'],
+                            instance,
+                            physician.id,
+                            context['eligible_facilities_by_physician'],
+                            context['minimum_rest_by_physician'],
+                        ):
+                            rejected = 'rest_or_overlap'
+                            diagnostics['rest_violations_blocked'] += 1
+                            break
+                        legacy._add_to_state(
+                            trial_state, instance.id, physician.id,
+                        )
+                    if rejected is not None:
+                        diagnostics[
+                            'night_block_builder_rejections_by_reason'
+                        ][rejected] += 1
+                        continue
+
+                    diagnostics['night_block_builder_candidates_created'] += 1
+                    trial_scoring = legacy._score_schedule(
+                        context['instances'],
+                        context['physicians'],
+                        trial_state,
+                        context['targets'],
+                        context['contract_by_physician'],
+                        context['requests_by_physician_date'],
+                        context['eligible_facilities_by_physician'],
+                        context['minimum_rest_by_physician'],
+                        include_internal_night_heuristics=True,
+                    )
+                    trial_status = legacy._night_minimum_status(
+                        context['instances'],
+                        context['physicians'],
+                        trial_state,
+                        context['contract_by_physician'],
+                    )
+                    trial_report = legacy._night_violation_report(
+                        context['instances'],
+                        context['physicians'],
+                        trial_state,
+                        context['contract_by_physician'],
+                    )
+                    trial_under_deficit = context[
+                        'night_rule_window_deficit'
+                    ](trial_status['physicians_under_night_minimum'])
+                    candidates.append((
+                        0 if physician.id in under_minimum_ids else 1,
+                        trial_under_deficit,
+                        context['night_recovery_conflict_count'](
+                            trial_report
+                        ),
+                        -len(block),
+                        trial_scoring['score'],
+                        context['rng'].random(),
+                        physician,
+                        block,
+                        trial_state,
+                    ))
+
+        if not candidates:
+            break
+
+        under_candidates = [
+            candidate for candidate in candidates if candidate[0] == 0
+        ]
+        candidate_pool = under_candidates or candidates
+        improving_minimum_candidates = [
+            candidate for candidate in candidate_pool
+            if candidate[1] < current_under_deficit
+        ]
+        if improving_minimum_candidates:
+            candidate_pool = improving_minimum_candidates
+
+        (
+            _under_priority,
+            _trial_under_deficit,
+            _recovery_conflicts,
+            _negative_length,
+            _trial_score,
+            _tie_breaker,
+            selected_physician,
+            selected_block,
+            selected_state,
+        ) = min(candidate_pool)
+        state.clear()
+        state.update(selected_state)
+        diagnostics['assignments_made'] += len(selected_block)
+        diagnostics['night_block_assignment_successes'] += len(
+            selected_block
+        )
+        diagnostics['night_block_builder_lengths_assigned'].append(
+            len(selected_block)
+        )
+        diagnostics['night_block_builder_assigned_blocks'].append({
+            'physician_id': selected_physician.id,
+            'physician': legacy._physician_display_name(
+                selected_physician
+            ),
+            **legacy._contract_rule_identity(
+                context['contract_by_physician'].get(selected_physician.id)
+            ),
+            'length': len(selected_block),
+            'dates': legacy._block_dates(selected_block),
+            'shift_instance_ids': [
+                instance.id for instance in selected_block
+            ],
+            'facilities': sorted({
+                instance.facility.short_name or instance.facility.name
+                for instance in selected_block
+            }),
+        })
+
+    after_scoring = legacy._score_schedule(
+        context['instances'],
+        context['physicians'],
+        state,
+        context['targets'],
+        context['contract_by_physician'],
+        context['requests_by_physician_date'],
+        context['eligible_facilities_by_physician'],
+        context['minimum_rest_by_physician'],
+        include_internal_night_heuristics=True,
+    )
+    diagnostics['night_block_builder_score_after'] = float(
+        after_scoring['score']
+    )
+    after_status = legacy._night_minimum_status(
+        context['instances'],
+        context['physicians'],
+        state,
+        context['contract_by_physician'],
+    )
+    diagnostics['physicians_below_night_min_after_night_build'] = (
+        after_status['physicians_under_night_minimum']
+    )
+    after_report = legacy._night_violation_report(
+        context['instances'],
+        context['physicians'],
+        state,
+        context['contract_by_physician'],
+    )
+    diagnostics['night_recovery_conflicts_after_night_build'] = context[
+        'night_recovery_conflict_count'
+    ](after_report)
+    diagnostics['night_distribution_by_physician_after_build'] = context[
+        'night_distribution_rows'
+    ](after_report)
