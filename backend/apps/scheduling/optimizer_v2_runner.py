@@ -10,10 +10,10 @@ from django.db import transaction
 
 from .initial_schedule import construct_complete_initial_schedule
 from .models import OptimizerRun, ScheduleShiftAssignment
-from .optimizer import (
-    _state_from_assignments,
-    _version_shift_instances_queryset,
-    build_violation_report,
+from .optimizer import build_violation_report
+from .optimizer_assignment_snapshot import (
+    state_from_assignments,
+    version_shift_instances_queryset,
 )
 from .optimizer_v2 import (
     reassign_assignment,
@@ -181,7 +181,7 @@ def optimize_schedule_version_v2(
         .select_related('shift_instance', 'physician')
         .order_by('shift_instance_id', 'physician_id', 'id')
     )
-    state, _locked_manual_pairs = _state_from_assignments(source_assignments)
+    state, _locked_manual_pairs = state_from_assignments(source_assignments)
     state = _apply_search_operations(state, search_result['swaps'])
 
     source_by_pair = {}
@@ -236,7 +236,7 @@ def optimize_schedule_version_v2(
                 'the isolated result was not saved.'
             )
         instance_required = dict(
-            _version_shift_instances_queryset(schedule_version).values_list(
+            version_shift_instances_queryset(schedule_version).values_list(
                 'id', 'required_staffing',
             )
         )

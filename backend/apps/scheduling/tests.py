@@ -3914,7 +3914,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             }))
 
         with patch(
-            'apps.scheduling.initial_schedule.optimize_schedule_version',
+            'apps.scheduling.initial_schedule.construct_complete_fresh_fill_schedule',
             side_effect=bootstrap,
         ) as build_start, patch(
             'apps.scheduling.optimizer_v2_runner.call_command',
@@ -3933,9 +3933,10 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertIsNone(v2_run.started_from_run_id)
         self.assertEqual(summary['start_mode'], OptimizerRun.StartMode.FRESH_FILL)
         self.assertIsNotNone(summary['fresh_fill_bootstrap'])
-        self.assertEqual(build_start.call_args.kwargs['start_mode'], 'FRESH_FILL')
-        self.assertTrue(build_start.call_args.kwargs['isolated_run'])
-        self.assertFalse(build_start.call_args.kwargs['finalize_run'])
+        self.assertEqual(
+            build_start.call_args.kwargs['optimizer_run'].id,
+            v2_run.id,
+        )
         self.assertEqual(search.call_args.kwargs['run_id'], v2_run.id)
         self.assertEqual(
             list(

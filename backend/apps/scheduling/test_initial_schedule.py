@@ -1,13 +1,23 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from io import StringIO
 
 from django.test import SimpleTestCase
+from django.core.management import call_command
+from django.core.management.base import CommandError
 
 from apps.scheduling.initial_schedule import (
     construct_complete_initial_schedule,
 )
+from apps.scheduling.management.commands.verify_initial_schedule_equivalence import (
+    _snapshot_differences,
+    _snapshot_hash,
+)
 from apps.scheduling.models import OptimizerRun
 from apps.scheduling.optimizer import optimize_schedule_version
+from apps.scheduling.optimizer_v1_constructor import (
+    construct_complete_fresh_fill_schedule,
+)
 
 
 class InitialScheduleConstructorTests(SimpleTestCase):
@@ -32,7 +42,7 @@ class InitialScheduleConstructorTests(SimpleTestCase):
             }
 
         with patch(
-            'apps.scheduling.initial_schedule.optimize_schedule_version',
+            'apps.scheduling.initial_schedule.construct_complete_fresh_fill_schedule',
             side_effect=proven_constructor,
         ) as constructor:
             summary = construct_complete_initial_schedule(
@@ -59,18 +69,43 @@ class InitialScheduleConstructorTests(SimpleTestCase):
             {
                 'created_by': 'scheduler',
                 'optimizer_run': run,
-                'seed': 9183,
-                'start_mode': OptimizerRun.StartMode.FRESH_FILL,
-                'source_run': None,
-                'max_runtime_seconds': 7200,
-                'optimization_focus': (
-                    OptimizerRun.OptimizationFocus.STANDARD
-                ),
-                'adaptive_runtime': True,
-                'isolated_run': True,
-                'finalize_run': False,
-                'construction_only': True,
             },
+        )
+
+    def test_proven_constructor_adapter_pins_safe_fresh_fill_options(self):
+        run = self._run()
+        stopped = lambda: False
+        progress = Mock()
+        expected = {'final_score': 2923000}
+
+        with patch(
+            'apps.scheduling.optimizer.optimize_schedule_version',
+            return_value=expected,
+        ) as optimizer:
+            result = construct_complete_fresh_fill_schedule(
+                'schedule-version',
+                optimizer_run=run,
+                created_by='scheduler',
+                stop_requested=stopped,
+                progress_callback=progress,
+            )
+
+        self.assertIs(result, expected)
+        optimizer.assert_called_once_with(
+            'schedule-version',
+            created_by='scheduler',
+            optimizer_run=run,
+            seed=9183,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            source_run=None,
+            max_runtime_seconds=7200,
+            optimization_focus=OptimizerRun.OptimizationFocus.STANDARD,
+            adaptive_runtime=True,
+            stop_requested=stopped,
+            progress_callback=progress,
+            isolated_run=True,
+            finalize_run=False,
+            construction_only=True,
         )
 
     def test_user_stop_is_visible_before_construction_completes(self):
@@ -84,7 +119,7 @@ class InitialScheduleConstructorTests(SimpleTestCase):
             }
 
         with patch(
-            'apps.scheduling.initial_schedule.optimize_schedule_version',
+            'apps.scheduling.initial_schedule.construct_complete_fresh_fill_schedule',
             side_effect=proven_constructor,
         ):
             construct_complete_initial_schedule(
@@ -122,10 +157,45 @@ class InitialScheduleConstructorTests(SimpleTestCase):
         )
         for summary, message in cases:
             with self.subTest(summary=summary), patch(
-                'apps.scheduling.initial_schedule.optimize_schedule_version',
+                'apps.scheduling.initial_schedule.construct_complete_fresh_fill_schedule',
                 return_value=summary,
             ):
                 with self.assertRaisesMessage(ValueError, message):
                     construct_complete_initial_schedule(
                         'schedule-version', optimizer_run=self._run(),
                     )
+
+    def test_equivalence_snapshot_detects_assignment_and_score_drift(self):
+        baseline = {
+            'assignments': [(1, 10, 'OPTIMIZER', False)],
+            'final_score': 100,
+            'score_breakdown': {'request_score': 100},
+            'validity': {'unfilled_shift_count': 0},
+        }
+        self.assertEqual(_snapshot_differences(baseline, dict(baseline)), [])
+        self.assertEqual(_snapshot_hash(baseline), _snapshot_hash(dict(baseline)))
+
+        changed = {
+            **baseline,
+            'assignments': [(1, 11, 'OPTIMIZER', False)],
+            'final_score': 200,
+        }
+        self.assertEqual(
+            [row['field'] for row in _snapshot_differences(baseline, changed)],
+            ['assignments', 'final_score'],
+        )
+        self.assertNotEqual(_snapshot_hash(baseline), _snapshot_hash(changed))
+
+    @patch(
+        'apps.scheduling.management.commands.'
+        'verify_initial_schedule_equivalence.OptimizerRun.objects.filter'
+    )
+    def test_equivalence_command_rejects_active_optimizer(self, filter_runs):
+        filter_runs.return_value.exists.return_value = True
+        with self.assertRaisesMessage(CommandError, 'slots to be idle'):
+            call_command(
+                'verify_initial_schedule_equivalence',
+                1,
+                expected_hash='reference',
+                stdout=StringIO(),
+            )

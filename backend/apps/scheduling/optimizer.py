@@ -7,13 +7,12 @@ from itertools import islice
 from heapq import nsmallest
 from functools import lru_cache
 import random
-import secrets
 from time import monotonic
 from ortools.sat.python import cp_model
 from .search_budget import SearchBudget
 
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Q
 from django.utils import timezone
 
 from .models import (
@@ -26,6 +25,14 @@ from .models import (
     ScheduleVersion,
 )
 from .run_state import assignments_for_viewed_run
+from .optimizer_assignment_snapshot import (
+    canonical_assignment_snapshot,
+    prepare_assignment_snapshot,
+    prepare_authoritative_requests,
+    state_from_assignments as _state_from_assignments,
+    version_shift_instances_queryset as _version_shift_instances_queryset,
+)
+from .optimizer_run_context import prepare_optimizer_run
 
 
 _FULL_SCORE_EVALUATIONS = ContextVar('optimizer_full_score_evaluations', default=0)
@@ -1025,88 +1032,11 @@ def _build_workload_summary(physicians, physician_hours, physician_shifts, physi
     return summary
 
 
-def _version_shift_instances_queryset(version):
-    return ScheduleShiftInstance.objects.filter(
-        schedule_version=version,
-        date__gte=version.schedule_block.start_date,
-        date__lte=version.schedule_block.end_date,
-    )
-
-
 def _unfilled_slot_count(instances, assigned_instance_physicians):
     return sum(
         max(instance.required_staffing - len(assigned_instance_physicians[instance.id]), 0)
         for instance in instances
     )
-
-
-def _state_from_assignments(assignments):
-    state = defaultdict(list)
-    manual_pairs = set()
-    for assignment in assignments:
-        if assignment.physician_id not in state[assignment.shift_instance_id]:
-            state[assignment.shift_instance_id].append(assignment.physician_id)
-        if (
-            assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
-            and assignment.is_locked
-        ):
-            manual_pairs.add((assignment.shift_instance_id, assignment.physician_id))
-    return state, manual_pairs
-
-
-def canonical_assignment_snapshot(
-    assignments, instances, selected_run=None, preserve_physician_ids=None,
-):
-    """Deduplicate and cap an assignment snapshot without mutating source rows."""
-    preserve_physician_ids = set(preserve_physician_ids or ())
-    required_by_instance = {
-        instance.id: instance.required_staffing for instance in instances
-    }
-    selected_run_id = getattr(selected_run, 'id', None)
-
-    def priority(assignment):
-        locked_manual = (
-            assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
-            and assignment.is_locked
-        )
-        return (
-            0 if locked_manual else 1,
-            0 if assignment.optimizer_run_id == selected_run_id else 1,
-            0 if assignment.optimizer_run_id is not None else 1,
-            assignment.id or 0,
-        )
-
-    kept = []
-    seen_pairs = set()
-    counts_by_instance = defaultdict(int)
-    duplicate_rows = []
-    excess_rows = []
-    for assignment in sorted(assignments, key=priority):
-        pair = (assignment.shift_instance_id, assignment.physician_id)
-        if pair in seen_pairs:
-            duplicate_rows.append(assignment)
-            continue
-        required = required_by_instance.get(assignment.shift_instance_id)
-        if (
-            required is None
-            or (
-                counts_by_instance[assignment.shift_instance_id] >= required
-                and assignment.physician_id not in preserve_physician_ids
-            )
-        ):
-            excess_rows.append(assignment)
-            continue
-        seen_pairs.add(pair)
-        counts_by_instance[assignment.shift_instance_id] += 1
-        kept.append(assignment)
-    return kept, {
-        'duplicate_rows_discarded': len(duplicate_rows),
-        'excess_rows_discarded': len(excess_rows),
-        'discarded_assignment_ids': [
-            assignment.id for assignment in [*duplicate_rows, *excess_rows]
-            if assignment.id is not None
-        ],
-    }
 
 
 def _invalid_state_assignment_capacity(instances, state, allowed_overstaff_physician_ids=None):
@@ -10038,124 +9968,26 @@ def optimize_schedule_version(
         )
 
     with transaction.atomic():
-        version_queryset = ScheduleVersion.objects.select_related(
-            'schedule_block', 'domain',
+        prepared_run = prepare_optimizer_run(
+            schedule_version,
+            created_by=created_by,
+            optimizer_run=optimizer_run,
+            seed=seed,
+            start_mode=start_mode,
+            source_run=source_run,
+            run_kind=run_kind,
+            isolated_run=isolated_run,
+            runtime_limit_seconds=runtime_limit_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            optimization_focus=optimization_focus,
         )
-        if not isolated_run:
-            version_queryset = version_queryset.select_for_update()
-        version = version_queryset.get(id=schedule_version.id)
-        if start_mode not in OptimizerRun.StartMode.values:
-            raise ValueError('Invalid optimizer start mode.')
-        if source_run is not None:
-            source_run_queryset = OptimizerRun.objects
-            if not isolated_run:
-                source_run_queryset = source_run_queryset.select_for_update()
-            source_run = source_run_queryset.get(
-                id=source_run.id,
-                schedule_version=version,
-                status=OptimizerRun.Status.COMPLETED,
-            )
-        source_locked_open_ids = (
-            list(source_run.locked_open_shift_instance_ids or [])
-            if source_run is not None
-            else list(
-                ScheduleShiftInstance.objects.filter(
-                    schedule_version=version, is_locked_open=True,
-                ).values_list('id', flat=True)
-            )
-        )
-        if optimizer_run is None:
-            latest_run_number = (
-                OptimizerRun.objects.filter(schedule_version=version)
-                .order_by('-run_number')
-                .values_list('run_number', flat=True)
-                .first()
-                or 0
-            )
-            if seed is None:
-                seed = secrets.randbits(63)
-            optimizer_run = OptimizerRun.objects.create(
-                schedule_version=version,
-                run_number=latest_run_number + 1,
-                created_by=created_by,
-                status=OptimizerRun.Status.RUNNING,
-                seed=seed,
-                start_mode=start_mode,
-                started_from_run=(
-                    source_run
-                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                    else None
-                ),
-                started_from_run_number=(
-                    source_run.run_number
-                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                    and source_run is not None
-                    else None
-                ),
-                initial_score=(
-                    source_run.final_score
-                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                    and source_run is not None
-                    else None
-                ),
-                max_runtime_seconds=runtime_limit_seconds,
-                optimization_focus=optimization_focus,
-                run_kind=run_kind,
-                locked_open_shift_instance_ids=source_locked_open_ids,
-            )
-        else:
-            optimizer_run_queryset = OptimizerRun.objects
-            if not isolated_run:
-                optimizer_run_queryset = optimizer_run_queryset.select_for_update()
-            optimizer_run = optimizer_run_queryset.get(
-                id=optimizer_run.id,
-                schedule_version=version,
-            )
-            expected_started_from_run = (
-                source_run
-                if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                else None
-            )
-            expected_started_from_number = (
-                source_run.run_number
-                if expected_started_from_run is not None
-                else None
-            )
-            lineage_updates = []
-            if optimizer_run.started_from_run_id != (
-                expected_started_from_run.id if expected_started_from_run else None
-            ):
-                optimizer_run.started_from_run = expected_started_from_run
-                lineage_updates.append('started_from_run')
-            if optimizer_run.started_from_run_number != expected_started_from_number:
-                optimizer_run.started_from_run_number = expected_started_from_number
-                lineage_updates.append('started_from_run_number')
-            if (
-                expected_started_from_run is not None
-                and optimizer_run.initial_score != expected_started_from_run.final_score
-            ):
-                optimizer_run.initial_score = expected_started_from_run.final_score
-                lineage_updates.append('initial_score')
-            if lineage_updates:
-                optimizer_run.save(update_fields=lineage_updates)
-            runtime_limit_seconds = int(
-                max_runtime_seconds
-                if max_runtime_seconds is not None
-                else optimizer_run.max_runtime_seconds
-            )
-            if not 0 <= runtime_limit_seconds <= 4 * 60 * 60:
-                raise ValueError('Maximum optimizer runtime cannot exceed 240 minutes.')
-            if optimizer_run.max_runtime_seconds != runtime_limit_seconds:
-                optimizer_run.max_runtime_seconds = runtime_limit_seconds
-                optimizer_run.save(update_fields=['max_runtime_seconds'])
-            optimization_focus = optimizer_run.optimization_focus
-            if seed is not None and optimizer_run.seed != seed:
-                optimizer_run.seed = seed
-                optimizer_run.save(update_fields=['seed'])
-        if optimizer_run.seed is None:
-            optimizer_run.seed = seed if seed is not None else secrets.randbits(63)
-            optimizer_run.save(update_fields=['seed'])
-        seed = optimizer_run.seed
+        version = prepared_run.version
+        source_run = prepared_run.source_run
+        optimizer_run = prepared_run.optimizer_run
+        source_locked_open_ids = prepared_run.source_locked_open_ids
+        runtime_limit_seconds = prepared_run.runtime_limit_seconds
+        optimization_focus = prepared_run.optimization_focus
+        seed = prepared_run.seed
         rng = random.Random(seed)
 
         def random_tie_sorted(items, key):
@@ -10171,154 +10003,62 @@ def optimize_schedule_version(
             rng.shuffle(values)
             return values
 
-        assignment_rows_before = ScheduleShiftAssignment.objects.filter(
-            shift_instance__schedule_version=version,
-            shift_instance__date__gte=version.schedule_block.start_date,
-            shift_instance__date__lte=version.schedule_block.end_date,
-        ).count()
-        optimizer_assignments_deleted = 0
-        if not isolated_run:
-            ScheduleShiftInstance.objects.filter(schedule_version=version).update(
-                is_locked_open=False,
-            )
-            ScheduleShiftInstance.objects.filter(
-                schedule_version=version,
-                id__in=source_locked_open_ids,
-            ).update(is_locked_open=True)
-        instances_queryset = _version_shift_instances_queryset(version)
-        if not isolated_run:
-            instances_queryset = instances_queryset.select_for_update()
-        instances = list(
-            instances_queryset
-            .select_related('facility', 'shift_template')
-            .order_by('date', 'facility__name', 'start_datetime', 'id')
+        prepared_assignments = prepare_assignment_snapshot(
+            version,
+            source_run=source_run,
+            optimizer_run=optimizer_run,
+            start_mode=start_mode,
+            source_locked_open_ids=source_locked_open_ids,
+            isolated_run=isolated_run,
+            created_by=created_by,
         )
-        if isolated_run:
-            source_locked_open_id_set = set(source_locked_open_ids)
-            for instance in instances:
-                instance.is_locked_open = instance.id in source_locked_open_id_set
-        if source_run is not None:
-            raw_source_assignments = list(
-                assignments_for_viewed_run(version, source_run)
-                .select_related('shift_instance', 'physician__user')
-            )
-        else:
-            raw_source_assignments = list(
-                assignments_for_viewed_run(version, None)
-                .select_related('shift_instance', 'physician__user')
-            )
-        manual_assignment_only_physician_ids = set(
-            ContractUserAssignment.objects.filter(
-                domain=version.domain,
-                contract__active=True,
-                contract__manual_assignment_only=True,
-                physician__active=True,
-            ).values_list('physician_id', flat=True)
+        assignment_rows_before = prepared_assignments.assignment_rows_before
+        optimizer_assignments_deleted = (
+            prepared_assignments.optimizer_assignments_deleted
         )
-        source_assignments, source_assignment_normalization = canonical_assignment_snapshot(
-            raw_source_assignments,
-            instances,
-            selected_run=source_run,
-            preserve_physician_ids=manual_assignment_only_physician_ids,
+        instances = prepared_assignments.instances
+        source_assignments = prepared_assignments.source_assignments
+        source_assignment_normalization = (
+            prepared_assignments.source_assignment_normalization
         )
-        # A physician can be switched to a manual-only contract after an older
-        # optimizer run assigned them shifts.  Those optimizer-owned rows must
-        # not become frozen placeholder assignments in every later run.  Only
-        # assignments explicitly made by a scheduler are authoritative for a
-        # manual-only physician.
-        manual_only_optimizer_source_rows_dropped = sum(
-            1
-            for row in source_assignments
-            if (
-                row.physician_id in manual_assignment_only_physician_ids
-                and row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
-            )
+        manual_assignment_only_physician_ids = (
+            prepared_assignments.manual_assignment_only_physician_ids
         )
-        source_assignments = [
-            row
-            for row in source_assignments
-            if not (
-                row.physician_id in manual_assignment_only_physician_ids
-                and row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
-            )
-        ]
-        source_assignment_count_raw = len(raw_source_assignments)
-
-        if source_assignments:
-            source_assignment_count = len(source_assignments)
-            # Self-contained runs cannot rely on the runless manual overlay:
-            # their authoritative view includes only rows owned by this run.
-            if source_run is None and optimizer_run.run_kind not in ('COPY', 'BENCHMARK'):
-                assignments = [
-                    row for row in source_assignments
-                    if (
-                        start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                        or row.is_locked
-                        or row.physician_id in manual_assignment_only_physician_ids
-                    )
-                ]
-            else:
-                manual_seed_rows_by_pair = {}
-                manual_overlay_rows = []
-                for row in source_assignments:
-                    if (
-                        row.assignment_source != ScheduleShiftAssignment.AssignmentSource.MANUAL
-                        or not (
-                            start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                            or row.is_locked
-                        )
-                    ):
-                        continue
-                    if row.optimizer_run_id is None and optimizer_run.run_kind not in ('COPY', 'BENCHMARK'):
-                        # Normal runs already display runless manual assignments.
-                        # Copying them would show the same locked slot twice.
-                        manual_overlay_rows.append(row)
-                        continue
-                    pair = (row.shift_instance_id, row.physician_id)
-                    manual_seed_rows_by_pair[pair] = ScheduleShiftAssignment(
-                        shift_instance_id=row.shift_instance_id,
-                        physician_id=row.physician_id,
-                        created_by=created_by,
-                        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-                        optimizer_run=optimizer_run,
-                        is_locked=row.is_locked,
-                    )
-                manual_seed_rows = list(manual_seed_rows_by_pair.values())
-                ScheduleShiftAssignment.objects.bulk_create(manual_seed_rows)
-                assignments = (
-                    [
-                        row for row in source_assignments
-                        if (
-                            row.assignment_source == ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
-                            and (
-                                start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                                or row.physician_id in manual_assignment_only_physician_ids
-                            )
-                        )
-                    ]
-                    if source_assignments
-                    else []
-                ) + manual_overlay_rows + list(
-                    ScheduleShiftAssignment.objects.filter(
-                        optimizer_run=optimizer_run,
-                        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-                    ).select_related('shift_instance', 'physician__user')
-                )
-        else:
-            source_assignment_count = 0
-            assignments = []
-        manual_assignments_preserved = sum(
-            1
-            for assignment in assignments
-            if assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
-            and assignment.is_locked
+        manual_only_optimizer_source_rows_dropped = (
+            prepared_assignments.manual_only_optimizer_source_rows_dropped
         )
-        duplicate_shift_instances = list(
-            _version_shift_instances_queryset(version)
-            .values('date', 'shift_template_id')
-            .annotate(row_count=Count('id'))
-            .filter(row_count__gt=1)
+        source_assignment_count_raw = (
+            prepared_assignments.source_assignment_count_raw
         )
+        source_assignment_count = prepared_assignments.source_assignment_count
+        assignments = prepared_assignments.assignments
+        manual_assignments_preserved = (
+            prepared_assignments.manual_assignments_preserved
+        )
+        duplicate_shift_instances = (
+            prepared_assignments.duplicate_shift_instances
+        )
+        state = prepared_assignments.state
+        manual_pairs = prepared_assignments.manual_pairs
+        runless_manual_overlay_pairs = (
+            prepared_assignments.runless_manual_overlay_pairs
+        )
+        source_visible_assignment_pairs = (
+            prepared_assignments.source_visible_assignment_pairs
+        )
+        loaded_start_assignment_pairs = (
+            prepared_assignments.loaded_start_assignment_pairs
+        )
+        assignments_same_at_start = (
+            prepared_assignments.assignments_same_at_start
+        )
+        source_pairs_missing_at_start = (
+            prepared_assignments.source_pairs_missing_at_start
+        )
+        source_pairs_extra_at_start = (
+            prepared_assignments.source_pairs_extra_at_start
+        )
+        instances_by_id = prepared_assignments.instances_by_id
 
         active_contract_assignments = list(
             ContractUserAssignment.objects.filter(
@@ -10364,138 +10104,36 @@ def optimize_schedule_version(
         for physician_id in manual_assignment_only_physician_ids:
             eligible_facilities_by_physician[physician_id] = set()
 
-        state, manual_pairs = _state_from_assignments(assignments)
-        runless_manual_overlay_pairs = {
-            (assignment.shift_instance_id, assignment.physician_id)
-            for assignment in assignments
-            if (
-                assignment.assignment_source == ScheduleShiftAssignment.AssignmentSource.MANUAL
-                and assignment.optimizer_run_id is None
-            )
-        }
-        manual_pairs.update(
-            (instance_id, physician_id)
-            for instance_id, physician_ids in state.items()
-            for physician_id in physician_ids
-            if physician_id in manual_assignment_only_physician_ids
+        prepared_requests = prepare_authoritative_requests(
+            version,
+            instances=instances,
+            state=state,
+            manual_pairs=manual_pairs,
+            assignments=assignments,
+            manual_assignment_only_physician_ids=(
+                manual_assignment_only_physician_ids
+            ),
+            optimizer_run=optimizer_run,
+            created_by=created_by,
         )
-        source_visible_assignment_pairs = {
-            (assignment.shift_instance_id, assignment.physician_id)
-            for assignment in source_assignments
-        }
-        loaded_start_assignment_pairs = {
-            (instance_id, physician_id)
-            for instance_id, physician_ids in state.items()
-            for physician_id in physician_ids
-        }
-        assignments_same_at_start = (
-            loaded_start_assignment_pairs == source_visible_assignment_pairs
+        requests_by_physician_date = (
+            prepared_requests.requests_by_physician_date
         )
-        source_pairs_missing_at_start = sorted(
-            source_visible_assignment_pairs - loaded_start_assignment_pairs
+        manual_only_request_assignment_rows = (
+            prepared_requests.manual_only_request_assignment_rows
         )
-        source_pairs_extra_at_start = sorted(
-            loaded_start_assignment_pairs - source_visible_assignment_pairs
+        manual_only_request_assignments_seeded = (
+            prepared_requests.manual_only_request_assignments_seeded
         )
-        instances_by_id = {instance.id: instance for instance in instances}
-
-        requests = (
-            ScheduleRequest.objects.filter(
-                schedule_block=version.schedule_block,
-                date__gte=version.schedule_block.start_date,
-                date__lte=version.schedule_block.end_date,
-            )
-            .prefetch_related('shift_templates')
+        manual_only_request_assignments_already_present = (
+            prepared_requests.manual_only_request_assignments_already_present
         )
-        requests_by_physician_date = defaultdict(list)
-        for schedule_request in requests:
-            requests_by_physician_date[
-                (schedule_request.physician_id, schedule_request.date)
-            ].append(schedule_request)
-
-        # For a manual-only physician, a Shift On request is the scheduler's
-        # authoritative assignment instruction regardless of scope or weight.
-        # Seed it before any workload accounting or search, lock it like a
-        # manual assignment, and remove only replaceable optimizer occupants.
-        instances_by_date_template = defaultdict(list)
-        for instance in instances:
-            instances_by_date_template[
-                (instance.date, instance.shift_template_id)
-            ].append(instance)
-        manual_only_request_assignment_rows = []
-        manual_only_request_assignments_seeded = 0
-        manual_only_request_assignments_already_present = 0
-        manual_only_request_optimizer_owners_displaced = 0
-        manual_only_request_conflicts = []
-        for (physician_id, request_date), schedule_requests in requests_by_physician_date.items():
-            if physician_id not in manual_assignment_only_physician_ids:
-                continue
-            for schedule_request in schedule_requests:
-                if schedule_request.request_type != ScheduleRequest.RequestType.SHIFT_ON:
-                    continue
-                matching_instances = []
-                for template in schedule_request.shift_templates.all():
-                    matching_instances.extend(
-                        instances_by_date_template.get((request_date, template.id), ())
-                    )
-                matching_instances.sort(
-                    key=lambda item: (item.start_datetime, item.end_datetime, item.id)
-                )
-                if not matching_instances:
-                    manual_only_request_conflicts.append({
-                        'request_id': schedule_request.id,
-                        'physician_id': physician_id,
-                        'date': request_date.isoformat(),
-                        'reason': 'no_matching_shift_instance',
-                    })
-                    continue
-                instance = matching_instances[0]
-                pair = (instance.id, physician_id)
-                if physician_id in state[instance.id]:
-                    manual_pairs.add(pair)
-                    manual_only_request_assignments_already_present += 1
-                    continue
-
-                replaceable_owner_ids = [
-                    owner_id
-                    for owner_id in state[instance.id]
-                    if (instance.id, owner_id) not in manual_pairs
-                ]
-                while (
-                    len(state[instance.id]) >= instance.required_staffing
-                    and replaceable_owner_ids
-                ):
-                    owner_id = replaceable_owner_ids.pop()
-                    state[instance.id].remove(owner_id)
-                    manual_only_request_optimizer_owners_displaced += 1
-                if len(state[instance.id]) >= instance.required_staffing:
-                    manual_only_request_conflicts.append({
-                        'request_id': schedule_request.id,
-                        'physician_id': physician_id,
-                        'date': request_date.isoformat(),
-                        'shift_instance_id': instance.id,
-                        'reason': 'conflicts_with_existing_fixed_assignment',
-                    })
-
-                _add_to_state(state, instance.id, physician_id)
-                manual_pairs.add(pair)
-                manual_only_request_assignment_rows.append(
-                    ScheduleShiftAssignment(
-                        shift_instance=instance,
-                        physician_id=physician_id,
-                        created_by=created_by,
-                        assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
-                        optimizer_run=optimizer_run,
-                        is_locked=True,
-                    )
-                )
-                manual_only_request_assignments_seeded += 1
-        if manual_only_request_assignment_rows:
-            ScheduleShiftAssignment.objects.bulk_create(
-                manual_only_request_assignment_rows,
-                batch_size=500,
-            )
-            assignments.extend(manual_only_request_assignment_rows)
+        manual_only_request_optimizer_owners_displaced = (
+            prepared_requests.manual_only_request_optimizer_owners_displaced
+        )
+        manual_only_request_conflicts = (
+            prepared_requests.manual_only_request_conflicts
+        )
 
         total_required_hours = sum(
             _shift_hours(instance) * instance.required_staffing
