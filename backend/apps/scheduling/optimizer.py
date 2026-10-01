@@ -33,6 +33,9 @@ from .optimizer_assignment_snapshot import (
     version_shift_instances_queryset as _version_shift_instances_queryset,
 )
 from .optimizer_run_context import prepare_optimizer_run
+from .optimizer_v1_constructor import (
+    fill_open_instances as fill_open_instances_v1,
+)
 
 
 _FULL_SCORE_EVALUATIONS = ContextVar('optimizer_full_score_evaluations', default=0)
@@ -10917,454 +10920,6 @@ def optimize_schedule_version(
                         template_id, occurrence_index = position
                         initial_fill_template_indexes[(physician_id, template_id)].append(occurrence_index)
 
-        def fill_open_instances(ordered_instances, phase):
-            nonlocal assignments_made
-            nonlocal rest_violations_blocked
-            nonlocal night_block_assignment_attempts
-            nonlocal night_block_assignment_successes
-            nonlocal nonnight_assignments_blocked_by_recovery
-            nonlocal nonnight_assignments_allowed_despite_recovery
-            nonlocal candidates_considered_before_timeout
-            nonlocal initial_fill_workload_guard_candidates_above_max
-            nonlocal initial_fill_workload_guard_candidates_deprioritized
-
-            for instance in ordered_instances:
-                if runtime_exceeded():
-                    mark_timeout(phase)
-                    break
-                while len(state[instance.id]) < instance.required_staffing:
-                    if runtime_exceeded():
-                        mark_timeout(phase)
-                        break
-                    if phase == 'night':
-                        night_block_assignment_attempts += 1
-                    candidates = []
-                    recovery_conflict_candidates = 0
-                    for physician in shuffle(physicians):
-                        candidates_considered_before_timeout += 1
-                        if runtime_exceeded():
-                            mark_timeout(phase)
-                            break
-                        if physician.id in state[instance.id]:
-                            continue
-                        if instance.facility_id not in eligible_facilities_by_physician.get(physician.id, set()):
-                            continue
-                        if not _can_assign_in_state(
-                            state,
-                            instances_by_id,
-                            instance,
-                            physician.id,
-                            eligible_facilities_by_physician,
-                            minimum_rest_by_physician,
-                            assigned_intervals=initial_fill_intervals[physician.id],
-                        ):
-                            rest_violations_blocked += 1
-                            continue
-
-                        contract = contract_by_physician[physician.id]
-                        target = targets[physician.id]
-                        shift_hours = _shift_hours(instance)
-                        next_hours = initial_fill_hours[physician.id] + shift_hours
-                        next_shifts = initial_fill_shifts[physician.id] + 1
-                        workload_score = _workload_candidate_score(target, next_hours, next_shifts)
-                        workload_rule_delta = _workload_rule_delta_from_totals(
-                            workload_ranges_by_physician[physician.id],
-                            workload_totals_by_physician[physician.id],
-                            instance.date,
-                            shift_hours,
-                        )
-                        workload_settings = (
-                            contract.workload_settings
-                            if isinstance(contract.workload_settings, dict)
-                            else {}
-                        )
-                        max_days_in_row = _configured_positive_int(
-                            workload_settings,
-                            'max_days_in_row',
-                        )
-                        max_days_penalty = _configured_positive_penalty(
-                            workload_settings,
-                            'max_days_in_row_penalty_weight',
-                            Decimal('0'),
-                        )
-                        assigned_dates = initial_fill_assigned_dates[physician.id]
-                        consecutive_days_delta = Decimal('0')
-                        if (
-                            instance.date not in assigned_dates
-                            and max_days_in_row is not None
-                            and max_days_penalty > 0
-                        ):
-                            left_length = 0
-                            prior_date = instance.date - timedelta(days=1)
-                            while prior_date in assigned_dates:
-                                left_length += 1
-                                prior_date -= timedelta(days=1)
-                            right_length = 0
-                            next_date = instance.date + timedelta(days=1)
-                            while next_date in assigned_dates:
-                                right_length += 1
-                                next_date += timedelta(days=1)
-                            before_excess = (
-                                max(left_length - max_days_in_row, 0)
-                                + max(right_length - max_days_in_row, 0)
-                            )
-                            after_excess = max(
-                                left_length + 1 + right_length - max_days_in_row,
-                                0,
-                            )
-                            consecutive_days_delta = (
-                                Decimal(after_excess - before_excess)
-                                * max_days_penalty
-                            )
-                        same_shift_delta = _same_shift_candidate_delta_from_indexes(
-                            contract,
-                            initial_fill_template_positions,
-                            initial_fill_template_indexes,
-                            physician.id,
-                            instance,
-                        )
-                        if phase == 'night':
-                            night_delta = _night_volume_delta_from_totals(
-                                night_ranges_by_physician[physician.id],
-                                night_totals_by_physician[physician.id],
-                                instance.date,
-                            )
-                            night_pressure = _night_volume_pressure_from_totals(
-                                night_ranges_by_physician[physician.id],
-                                night_totals_by_physician[physician.id],
-                                instance.date,
-                            )
-                        else:
-                            night_delta = Decimal('0')
-                            night_pressure = Decimal('0')
-                        if NIGHT_CONSTRUCTION_HEURISTICS_ENABLED:
-                            # These two terms are inexpensive and give the
-                            # constructor enough structure to form consecutive
-                            # night blocks and protect their recovery days.
-                            night_block_bonus = _night_block_extension_bonus(
-                                instances_by_id,
-                                state,
-                                contract_by_physician,
-                                physician.id,
-                                instance,
-                            )
-                            recovery_penalty = _night_recovery_candidate_penalty(
-                                instances,
-                                physicians,
-                                state,
-                                contract_by_physician,
-                                physician.id,
-                                instance,
-                            )
-                            if phase == 'night':
-                                settings = _night_settings(contract)
-                                min_consecutive = _configured_positive_int(
-                                    settings,
-                                    'min_consecutive_night_shifts',
-                                )
-                                max_consecutive = _configured_positive_int(
-                                    settings,
-                                    'max_consecutive_night_shifts',
-                                )
-                                prior_dates = initial_fill_night_dates[physician.id]
-                                previous_date = instance.date - timedelta(days=1)
-                                previous_run_length = 0
-                                while previous_date in prior_dates:
-                                    previous_run_length += 1
-                                    previous_date -= timedelta(days=1)
-                                if previous_run_length:
-                                    projected_run_length = previous_run_length + 1
-                                    if (
-                                        max_consecutive is not None
-                                        and projected_run_length > max_consecutive
-                                    ):
-                                        night_block_priority = 3
-                                        night_block_deficit = projected_run_length - max_consecutive
-                                    elif (
-                                        min_consecutive is not None
-                                        and min_consecutive > 1
-                                        and projected_run_length <= min_consecutive
-                                    ):
-                                        night_block_priority = 0
-                                        night_block_deficit = max(
-                                            min_consecutive - projected_run_length,
-                                            0,
-                                        )
-                                    else:
-                                        night_block_priority = 1
-                                        night_block_deficit = 0
-                                elif min_consecutive is not None and min_consecutive > 1:
-                                    # Starting a block must remain neutral
-                                    # across contracts.  Giving it a worse
-                                    # rank than a contract with min=1 caused
-                                    # the latter physicians to absorb nearly
-                                    # every open night before workload limits
-                                    # could participate in the comparison.
-                                    night_block_priority = 1
-                                    night_block_deficit = 0
-                                else:
-                                    night_block_priority = 1
-                                    night_block_deficit = 0
-                            else:
-                                night_block_priority = 1
-                                night_block_deficit = 0
-                            # The exhaustive delta repeatedly builds a complete
-                            # night report for every candidate.  Retain it only
-                            # with the opt-in block builder that owns that cost.
-                            if NIGHT_BLOCK_BUILDER_ENABLED:
-                                night_delta += _night_candidate_delta(
-                                    instances,
-                                    physicians,
-                                    state,
-                                    contract_by_physician,
-                                    physician.id,
-                                    instance,
-                                )
-                                night_minimum_bonus = _night_minimum_candidate_bonus(
-                                    instances,
-                                    state,
-                                    contract_by_physician,
-                                    physician.id,
-                                    instance,
-                                )
-                            else:
-                                night_minimum_bonus = Decimal('0')
-                        else:
-                            night_block_bonus = Decimal('0')
-                            night_minimum_bonus = Decimal('0')
-                            recovery_penalty = Decimal('0')
-                            night_block_priority = 1
-                            night_block_deficit = 0
-                        if _is_weekend_designated(instance):
-                            weekend_settings = (
-                                contract.weekend_settings
-                                if isinstance(contract.weekend_settings, dict)
-                                else {}
-                            )
-                            min_consecutive_weekend = _configured_positive_int(
-                                weekend_settings,
-                                'min_consecutive_weekend_shifts',
-                            )
-                            max_consecutive_weekend = _configured_positive_int(
-                                weekend_settings,
-                                'max_consecutive_weekend_shifts',
-                            )
-                            min_consecutive_weekends = _configured_positive_int(
-                                weekend_settings,
-                                'min_consecutive_weekends',
-                            )
-                            max_consecutive_weekends = _configured_positive_int(
-                                weekend_settings,
-                                'max_consecutive_weekends',
-                            )
-                            prior_weekend_dates = initial_fill_weekend_dates[physician.id]
-                            previous_weekend_date = instance.date - timedelta(days=1)
-                            previous_weekend_run_length = 0
-                            while previous_weekend_date in prior_weekend_dates:
-                                previous_weekend_run_length += 1
-                                previous_weekend_date -= timedelta(days=1)
-                            projected_weekend_run_length = (
-                                previous_weekend_run_length + 1
-                            )
-                            weekend_start = (
-                                instance.date
-                                - timedelta(days=instance.date.weekday())
-                            )
-                            prior_weekend_weeks = initial_fill_weekend_weeks[physician.id]
-                            opens_new_weekend = weekend_start not in prior_weekend_weeks
-                            previous_week = weekend_start - timedelta(days=7)
-                            previous_week_run_length = 0
-                            while previous_week in prior_weekend_weeks:
-                                previous_week_run_length += 1
-                                previous_week -= timedelta(days=7)
-                            projected_week_run_length = previous_week_run_length + 1
-                            if (
-                                previous_weekend_run_length
-                                and max_consecutive_weekend is not None
-                                and projected_weekend_run_length > max_consecutive_weekend
-                            ) or (
-                                opens_new_weekend
-                                and previous_week_run_length
-                                and max_consecutive_weekends is not None
-                                and projected_week_run_length > max_consecutive_weekends
-                            ):
-                                weekend_block_priority = 3
-                            elif (
-                                (
-                                    previous_weekend_run_length
-                                    and min_consecutive_weekend is not None
-                                    and min_consecutive_weekend > 1
-                                    and projected_weekend_run_length <= min_consecutive_weekend
-                                )
-                                or (
-                                    opens_new_weekend
-                                    and previous_week_run_length
-                                    and min_consecutive_weekends is not None
-                                    and min_consecutive_weekends > 1
-                                    and projected_week_run_length <= min_consecutive_weekends
-                                )
-                            ):
-                                weekend_block_priority = 0
-                            else:
-                                # New blocks and already-complete blocks stay
-                                # neutral so weekend construction does not
-                                # overpower workload or other contract rules.
-                                weekend_block_priority = 1
-                        else:
-                            weekend_block_priority = 1
-                        if recovery_penalty > 0:
-                            recovery_conflict_candidates += 1
-
-                        matching_requests = _requests_for_shift(
-                            requests_by_physician_date,
-                            physician.id,
-                            instance,
-                        )
-                        request_score = _request_candidate_rank(
-                            matching_requests,
-                            contract,
-                        )
-                        workload_rank, workload_debug = _initial_fill_workload_guard(
-                            workload_ranges_by_physician[physician.id],
-                            {
-                                'date': instance.date,
-                                'values': workload_totals_by_physician[physician.id],
-                            },
-                            shift_hours,
-                        )
-                        workload_scarcity = (
-                            _initial_fill_workload_scarcity(
-                                workload_ranges_by_physician[physician.id],
-                                workload_totals_by_physician[physician.id],
-                                {
-                                    index: sum(
-                                        initial_fill_open_capacity[facility_id][(
-                                            row['window_start'], row['window_end'], row['units'],
-                                        )]
-                                        for facility_id in eligible_facilities_by_physician[physician.id]
-                                    )
-                                    for index, row in enumerate(workload_ranges_by_physician[physician.id])
-                                    if row['min_value'] is not None
-                                    and row['window_start'] <= instance.date <= row['window_end']
-                                },
-                                instance.date,
-                            )
-                            if start_mode == OptimizerRun.StartMode.FRESH_FILL
-                            and workload_rank == 0
-                            else Decimal('0')
-                        )
-                        if workload_rank == 2:
-                            initial_fill_workload_guard_candidates_above_max += 1
-                            initial_fill_workload_guard_candidates_deprioritized += 1
-                            if len(initial_fill_workload_guard_examples) < 10:
-                                initial_fill_workload_guard_examples.append({
-                                    'physician_id': physician.id,
-                                    'physician': _physician_display_name(physician),
-                                    **_contract_rule_identity(contract),
-                                    **workload_debug,
-                                })
-                        candidates.append(
-                            (
-                                recovery_penalty > 0,
-                                request_score,
-                                consecutive_days_delta > 0,
-                                consecutive_days_delta,
-                                night_block_priority,
-                                weekend_block_priority,
-                                (
-                                    workload_rank
-                                    if start_mode == OptimizerRun.StartMode.FRESH_FILL
-                                    else 1
-                                ),
-                                -workload_scarcity,
-                                night_block_deficit,
-                                night_delta,
-                                night_pressure,
-                                workload_rank,
-                                workload_rule_delta,
-                                workload_score
-                                + same_shift_delta
-                                + night_delta
-                                + night_block_bonus
-                                + night_minimum_bonus
-                                + (recovery_penalty * RECOVERY_CONFLICT_AVOIDANCE_MULTIPLIER),
-                                rng.random(),
-                                physician,
-                            )
-                        )
-
-                    if timed_out or not candidates:
-                        break
-
-                    clean_candidates = [
-                        candidate for candidate in candidates
-                        if not candidate[0]
-                    ]
-                    candidate_pool = clean_candidates or candidates
-                    if phase == 'non_night' and recovery_conflict_candidates:
-                        if clean_candidates:
-                            nonnight_assignments_blocked_by_recovery += recovery_conflict_candidates
-                        else:
-                            nonnight_assignments_allowed_despite_recovery += 1
-
-                    (
-                        _has_recovery_conflict,
-                        _request_score_value,
-                        _has_consecutive_days_penalty,
-                        _consecutive_days_delta,
-                        _night_block_priority,
-                        _weekend_block_priority,
-                        _fresh_fill_workload_rank,
-                        _workload_scarcity,
-                        _night_block_deficit,
-                        _night_delta_value,
-                        _night_pressure_value,
-                        _workload_rank,
-                        _workload_rule_delta,
-                        _candidate_score,
-                        _tie_breaker,
-                        selected_physician,
-                    ) = min(candidate_pool)
-                    _add_to_state(state, instance.id, selected_physician.id)
-                    if initial_fill_opportunity_windows:
-                        for window_start, window_end, units in initial_fill_opportunity_windows:
-                            if window_start <= instance.date <= window_end:
-                                key = (window_start, window_end, units)
-                                slot_units = Decimal('1') if units == 'SHIFTS' else _shift_hours(instance)
-                                initial_fill_open_capacity[instance.facility_id][key] -= slot_units
-                    initial_fill_intervals[selected_physician.id].append((
-                        instance.start_datetime, instance.end_datetime,
-                    ))
-                    initial_fill_hours[selected_physician.id] += _shift_hours(instance)
-                    initial_fill_shifts[selected_physician.id] += 1
-                    initial_fill_assigned_dates[selected_physician.id].add(instance.date)
-                    selected_position = initial_fill_template_positions.get(instance.id)
-                    if selected_position is not None:
-                        template_id, occurrence_index = selected_position
-                        initial_fill_template_indexes[(selected_physician.id, template_id)].append(
-                            occurrence_index
-                        )
-                    for row in workload_ranges_by_physician[selected_physician.id]:
-                        if row['window_start'] <= instance.date <= row['window_end']:
-                            key = (row['window_start'], row['window_end'], row['units'])
-                            workload_totals_by_physician[selected_physician.id][key] += (
-                                Decimal('1') if row['units'] == 'SHIFTS' else _shift_hours(instance)
-                            )
-                    if phase == 'night':
-                        initial_fill_night_dates[selected_physician.id].add(instance.date)
-                        for row in night_ranges_by_physician[selected_physician.id]:
-                            if row['window_start'] <= instance.date <= row['window_end']:
-                                key = (row['window_start'], row['window_end'])
-                                night_totals_by_physician[selected_physician.id][key] += Decimal('1')
-                    if _is_weekend_designated(instance):
-                        initial_fill_weekend_dates[selected_physician.id].add(instance.date)
-                        initial_fill_weekend_weeks[selected_physician.id].add(
-                            instance.date - timedelta(days=instance.date.weekday())
-                        )
-                    assignments_made += 1
-                    if phase == 'night':
-                        night_block_assignment_successes += 1
-
         if NIGHT_BLOCK_BUILDER_ENABLED:
             build_night_blocks()
         sync_initial_fill_counters()
@@ -11383,10 +10938,103 @@ def optimize_schedule_version(
             non_night_instances,
             key=lambda item: (item.date, item.start_datetime),
         )
+        placement_diagnostics = {
+            'assignments_made': assignments_made,
+            'rest_violations_blocked': rest_violations_blocked,
+            'night_block_assignment_attempts': night_block_assignment_attempts,
+            'night_block_assignment_successes': night_block_assignment_successes,
+            'nonnight_assignments_blocked_by_recovery': (
+                nonnight_assignments_blocked_by_recovery
+            ),
+            'nonnight_assignments_allowed_despite_recovery': (
+                nonnight_assignments_allowed_despite_recovery
+            ),
+            'candidates_considered_before_timeout': (
+                candidates_considered_before_timeout
+            ),
+            'initial_fill_workload_guard_candidates_above_max': (
+                initial_fill_workload_guard_candidates_above_max
+            ),
+            'initial_fill_workload_guard_candidates_deprioritized': (
+                initial_fill_workload_guard_candidates_deprioritized
+            ),
+            'initial_fill_workload_guard_examples': (
+                initial_fill_workload_guard_examples
+            ),
+        }
+        placement_context = {
+            'state': state,
+            'diagnostics': placement_diagnostics,
+            'runtime_exceeded': runtime_exceeded,
+            'mark_timeout': mark_timeout,
+            'is_timed_out': lambda: timed_out,
+            'shuffle': shuffle,
+            'rng': rng,
+            'physicians': physicians,
+            'instances': instances,
+            'instances_by_id': instances_by_id,
+            'targets': targets,
+            'contract_by_physician': contract_by_physician,
+            'requests_by_physician_date': requests_by_physician_date,
+            'eligible_facilities_by_physician': (
+                eligible_facilities_by_physician
+            ),
+            'minimum_rest_by_physician': minimum_rest_by_physician,
+            'workload_ranges_by_physician': workload_ranges_by_physician,
+            'workload_totals_by_physician': workload_totals_by_physician,
+            'night_ranges_by_physician': night_ranges_by_physician,
+            'night_totals_by_physician': night_totals_by_physician,
+            'initial_fill_hours': initial_fill_hours,
+            'initial_fill_shifts': initial_fill_shifts,
+            'initial_fill_template_indexes': initial_fill_template_indexes,
+            'initial_fill_intervals': initial_fill_intervals,
+            'initial_fill_night_dates': initial_fill_night_dates,
+            'initial_fill_weekend_dates': initial_fill_weekend_dates,
+            'initial_fill_weekend_weeks': initial_fill_weekend_weeks,
+            'initial_fill_assigned_dates': initial_fill_assigned_dates,
+            'initial_fill_template_positions': initial_fill_template_positions,
+            'initial_fill_open_capacity': initial_fill_open_capacity,
+            'initial_fill_opportunity_windows': initial_fill_opportunity_windows,
+            'start_mode': start_mode,
+        }
         if not timed_out:
-            fill_open_instances(night_instances, 'night')
+            fill_open_instances_v1(
+                placement_context, night_instances, 'night',
+            )
+            assignments_made = placement_diagnostics['assignments_made']
         if not timed_out:
-            fill_open_instances(non_night_instances, 'non_night')
+            fill_open_instances_v1(
+                placement_context, non_night_instances, 'non_night',
+            )
+        assignments_made = placement_diagnostics['assignments_made']
+        rest_violations_blocked = placement_diagnostics[
+            'rest_violations_blocked'
+        ]
+        night_block_assignment_attempts = placement_diagnostics[
+            'night_block_assignment_attempts'
+        ]
+        night_block_assignment_successes = placement_diagnostics[
+            'night_block_assignment_successes'
+        ]
+        nonnight_assignments_blocked_by_recovery = placement_diagnostics[
+            'nonnight_assignments_blocked_by_recovery'
+        ]
+        nonnight_assignments_allowed_despite_recovery = placement_diagnostics[
+            'nonnight_assignments_allowed_despite_recovery'
+        ]
+        candidates_considered_before_timeout = placement_diagnostics[
+            'candidates_considered_before_timeout'
+        ]
+        initial_fill_workload_guard_candidates_above_max = (
+            placement_diagnostics[
+                'initial_fill_workload_guard_candidates_above_max'
+            ]
+        )
+        initial_fill_workload_guard_candidates_deprioritized = (
+            placement_diagnostics[
+                'initial_fill_workload_guard_candidates_deprioritized'
+            ]
+        )
 
         assignment_pairs_at_first_score = {
             (instance_id, physician_id)
