@@ -261,7 +261,9 @@ def published_schedule(request):
         if authoritative_block_by_date.get(assignment_date) != block_id:
             continue
         active_run = active_runs.get(version_id)
-        if active_run is not None and active_run.run_kind in ('COPY', 'BENCHMARK'):
+        if active_run is not None and active_run.run_kind in (
+            'COPY', 'BENCHMARK', 'OPTIMIZER_V2_TEST',
+        ):
             if assignment['optimizer_run_id'] != active_run.id:
                 continue
         else:
@@ -2096,6 +2098,9 @@ def schedule_block_build_context(request, block_id):
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
             'can_manage_build_workspace': can_manage,
+            'atlas_v2_test_enabled': bool(
+                getattr(settings, 'ATLAS_V2_TEST_ENABLED', False)
+            ),
             'domains': [
                 {'id': domain.id, 'name': domain.name}
                 for domain in Domain.objects.filter(active=True).order_by('name')
@@ -2272,6 +2277,13 @@ def _parse_optimizer_focus(request):
         return None, {
             'optimization_focus': 'Use STANDARD or DISTRIBUTION.'
         }
+    return value, None
+
+
+def _parse_optimizer_engine(request):
+    value = request.data.get('optimizer_engine', 'V1')
+    if value not in ('V1', 'V2_TEST'):
+        return None, {'optimizer_engine': 'Use V1 or V2_TEST.'}
     return value, None
 
 
@@ -2521,9 +2533,23 @@ def _run_optimizer_response(request, version):
     optimization_focus, focus_error = _parse_optimizer_focus(request)
     if focus_error:
         return Response(focus_error, status=status.HTTP_400_BAD_REQUEST)
+    optimizer_engine, engine_error = _parse_optimizer_engine(request)
+    if engine_error:
+        return Response(engine_error, status=status.HTTP_400_BAD_REQUEST)
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    if (
+        optimizer_engine == 'V2_TEST'
+        and not getattr(settings, 'ATLAS_V2_TEST_ENABLED', False)
+    ):
+        return Response({
+            'optimizer_engine': 'Atlas v2 test is not available yet.',
+        }, status=status.HTTP_409_CONFLICT)
+    if optimizer_engine == 'V2_TEST':
+        return Response({
+            'optimizer_engine': 'Atlas v2 test must run in the background.',
+        }, status=status.HTTP_400_BAD_REQUEST)
     preflight_response = _optimizer_preflight_response(
         version, start_mode, source_run,
     )
@@ -2662,9 +2688,19 @@ def schedule_version_run_optimizer(request, version_id):
     optimization_focus, focus_error = _parse_optimizer_focus(request)
     if focus_error:
         return Response(focus_error, status=status.HTTP_400_BAD_REQUEST)
+    optimizer_engine, engine_error = _parse_optimizer_engine(request)
+    if engine_error:
+        return Response(engine_error, status=status.HTTP_400_BAD_REQUEST)
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
+    if (
+        optimizer_engine == 'V2_TEST'
+        and not getattr(settings, 'ATLAS_V2_TEST_ENABLED', False)
+    ):
+        return Response({
+            'optimizer_engine': 'Atlas v2 test is not available yet.',
+        }, status=status.HTTP_409_CONFLICT)
     preflight_response = _optimizer_preflight_response(
         version, start_mode, source_run,
     )
@@ -2766,7 +2802,11 @@ def schedule_version_run_optimizer(request, version_id):
                 ),
                 max_runtime_seconds=max_runtime_seconds or 120 * 60,
                 optimization_focus=optimization_focus,
-                run_kind='OPTIMIZER',
+                run_kind=(
+                    'OPTIMIZER_V2_TEST'
+                    if optimizer_engine == 'V2_TEST'
+                    else 'OPTIMIZER'
+                ),
                 locked_open_shift_instance_ids=locked_open_ids,
             )
             OptimizerControl.objects.create(

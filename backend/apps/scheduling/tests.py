@@ -1,4 +1,5 @@
 from collections import defaultdict
+import json
 import time as time_module
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -60,7 +61,7 @@ from .serializers import ScheduleBlockSerializer
 
 
 class SchedulingTests(TestCase):
-    def test_pipeline_epochs_escalate_to_one_deep_restart_then_stop(self):
+    def test_pipeline_epochs_require_two_deep_restarts_before_stop(self):
         count, action = _pipeline_epoch_transition(
             0, productive=False, epoch_kind='initial',
         )
@@ -74,7 +75,12 @@ class SchedulingTests(TestCase):
         count, action = _pipeline_epoch_transition(
             count, productive=False, epoch_kind='deep',
         )
-        self.assertEqual((count, action), (3, 'stop'))
+        self.assertEqual((count, action), (3, 'deep_restart'))
+
+        count, action = _pipeline_epoch_transition(
+            count, productive=False, epoch_kind='deep',
+        )
+        self.assertEqual((count, action), (4, 'stop'))
 
         count, action = _pipeline_epoch_transition(
             2, productive=True, epoch_kind='deep',
@@ -3810,6 +3816,417 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             optimize.call_args.kwargs['optimization_focus'],
             OptimizerRun.OptimizationFocus.DISTRIBUTION,
         )
+
+    @override_settings(ATLAS_V2_TEST_ENABLED=True)
+    def test_background_atlas_v2_test_supports_fresh_fill_and_previous_run(self):
+        version = self._create_build_version()
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=100,
+        )
+
+        fresh_fill_response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'optimizer_engine': 'V2_TEST',
+                'start_mode': 'FRESH_FILL',
+            },
+            format='json',
+        )
+        self.assertEqual(fresh_fill_response.status_code, 202)
+        fresh_fill_run = OptimizerRun.objects.get(
+            id=fresh_fill_response.json()['id'],
+        )
+        self.assertEqual(
+            fresh_fill_run.start_mode, OptimizerRun.StartMode.FRESH_FILL,
+        )
+        self.assertIsNone(fresh_fill_run.started_from_run_id)
+        self.assertIsNone(fresh_fill_run.initial_score)
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'optimizer_engine': 'V2_TEST',
+                'start_mode': 'CURRENT_SCHEDULE',
+                'source_run_id': source_run.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 202)
+        queued_run = OptimizerRun.objects.get(id=response.json()['id'])
+        self.assertEqual(queued_run.run_kind, 'OPTIMIZER_V2_TEST')
+        self.assertEqual(queued_run.started_from_run_id, source_run.id)
+        self.assertEqual(queued_run.initial_score, source_run.final_score)
+
+    def test_atlas_v2_fresh_fill_bootstraps_same_isolated_run(self):
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        physician = self._create_assignment_physician(
+            'v2.fresh@example.com', 'V2 Fresh', facilities=[self.facility],
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            max_runtime_seconds=60,
+            seed=9182,
+        )
+
+        def bootstrap(_version, **kwargs):
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=(
+                    ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                ),
+                optimizer_run=kwargs['optimizer_run'],
+            )
+            return {
+                'unfilled_shift_count': 0,
+                'final_overlap_violations': 0,
+                'final_score': 0,
+            }
+
+        def return_search(_command_name, **kwargs):
+            kwargs['stdout'].write(json.dumps({
+                'swaps': [],
+                'wall_seconds': 0.25,
+                'stopped_reason': 'local_optimum',
+                'total_evaluations': 1,
+                'accepted_transitions': 0,
+                'predicted_final_score': 0,
+            }))
+
+        with patch(
+            'apps.scheduling.optimizer_v2_runner.optimize_schedule_version',
+            side_effect=bootstrap,
+        ) as build_start, patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+            side_effect=return_search,
+        ) as search:
+            summary = optimize_schedule_version_v2_test(
+                version,
+                optimizer_run=v2_run,
+                source_run=None,
+                created_by=self.scheduler_user,
+            )
+
+        v2_run.refresh_from_db()
+        self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
+        self.assertEqual(v2_run.start_mode, OptimizerRun.StartMode.FRESH_FILL)
+        self.assertIsNone(v2_run.started_from_run_id)
+        self.assertEqual(summary['start_mode'], OptimizerRun.StartMode.FRESH_FILL)
+        self.assertIsNotNone(summary['fresh_fill_bootstrap'])
+        self.assertEqual(build_start.call_args.kwargs['start_mode'], 'FRESH_FILL')
+        self.assertTrue(build_start.call_args.kwargs['isolated_run'])
+        self.assertFalse(build_start.call_args.kwargs['finalize_run'])
+        self.assertEqual(search.call_args.kwargs['run_id'], v2_run.id)
+        self.assertEqual(
+            list(
+                ScheduleShiftAssignment.objects.filter(optimizer_run=v2_run)
+                .values_list('shift_instance_id', 'physician_id')
+            ),
+            [(instance.id, physician.id)],
+        )
+
+    def test_atlas_v2_fresh_fill_real_constructor_handoff(self):
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        physician = self._create_assignment_physician(
+            'v2.real.fresh@example.com', 'V2 Real Fresh',
+            facilities=[self.facility],
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            max_runtime_seconds=60,
+            seed=9183,
+        )
+
+        def return_search(_command_name, **kwargs):
+            kwargs['stdout'].write(json.dumps({
+                'swaps': [],
+                'wall_seconds': 0.25,
+                'stopped_reason': 'local_optimum',
+                'total_evaluations': 1,
+                'accepted_transitions': 0,
+                'predicted_final_score': 0,
+            }))
+
+        with patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+            side_effect=return_search,
+        ):
+            summary = optimize_schedule_version_v2_test(
+                version,
+                optimizer_run=v2_run,
+                source_run=None,
+                created_by=self.scheduler_user,
+            )
+
+        v2_run.refresh_from_db()
+        self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
+        self.assertEqual(summary['unfilled_shift_count'], 0)
+        self.assertEqual(
+            list(
+                ScheduleShiftAssignment.objects.filter(optimizer_run=v2_run)
+                .values_list('shift_instance_id', 'physician_id')
+            ),
+            [(instance.id, physician.id)],
+        )
+
+    @override_settings(ATLAS_V2_TEST_ENABLED=False)
+    def test_background_atlas_v2_test_is_gated_until_workers_restart(self):
+        version = self._create_build_version()
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=100,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'optimizer_engine': 'V2_TEST',
+                'start_mode': 'CURRENT_SCHEDULE',
+                'source_run_id': source_run.id,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(
+            OptimizerRun.objects.filter(
+                schedule_version=version,
+                run_kind='OPTIMIZER_V2_TEST',
+            ).exists()
+        )
+
+    @override_settings(ATLAS_V2_TEST_ENABLED=True)
+    def test_background_worker_routes_atlas_v2_test_to_v2_runner(self):
+        version = self._create_build_version()
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=100,
+        )
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={
+                'background': True,
+                'optimizer_engine': 'V2_TEST',
+                'start_mode': 'CURRENT_SCHEDULE',
+                'source_run_id': source_run.id,
+            },
+            format='json',
+        )
+        queued_run = OptimizerRun.objects.get(id=response.json()['id'])
+
+        def complete_v2(_version, **kwargs):
+            run = kwargs['optimizer_run']
+            run.status = OptimizerRun.Status.COMPLETED
+            run.final_score = 90
+            run.save(update_fields=['status', 'final_score'])
+            return {'optimizer_run_id': run.id, 'final_score': 90}
+
+        with patch(
+            'apps.scheduling.management.commands.run_optimizer_worker.'
+            'optimize_schedule_version_v2_test',
+            side_effect=complete_v2,
+        ) as optimize_v2, patch(
+            'apps.scheduling.management.commands.run_optimizer_worker.'
+            'optimize_schedule_version',
+        ) as optimize_v1:
+            call_command('run_optimizer_worker', '--once')
+
+        queued_run.refresh_from_db()
+        self.assertEqual(queued_run.status, OptimizerRun.Status.COMPLETED)
+        optimize_v2.assert_called_once()
+        optimize_v1.assert_not_called()
+
+    def test_atlas_v2_test_runner_saves_isolated_self_contained_result(self):
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        physician = self._create_assignment_physician(
+            'v2.runner@example.com', 'V2 Runner', facilities=[self.facility],
+        )
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=0,
+            is_active=True,
+        )
+        source_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=physician,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=source_run,
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            started_from_run=source_run,
+            run_kind='OPTIMIZER_V2_TEST',
+            max_runtime_seconds=60,
+        )
+
+        def return_search(_command_name, **kwargs):
+            kwargs['stdout'].write(json.dumps({
+                'swaps': [],
+                'wall_seconds': 0.25,
+                'stopped_reason': 'local_optimum',
+                'total_evaluations': 1,
+                'accepted_transitions': 0,
+                'predicted_final_score': 0,
+            }))
+
+        with patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+            side_effect=return_search,
+        ) as benchmark:
+            summary = optimize_schedule_version_v2_test(
+                version,
+                optimizer_run=v2_run,
+                source_run=source_run,
+                created_by=self.scheduler_user,
+            )
+
+        source_run.refresh_from_db()
+        source_assignment.refresh_from_db()
+        v2_run.refresh_from_db()
+        self.assertTrue(source_run.is_active)
+        self.assertEqual(source_assignment.optimizer_run_id, source_run.id)
+        self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
+        self.assertFalse(v2_run.is_active)
+        self.assertEqual(summary['optimizer_engine'], 'V2_TEST')
+        self.assertEqual(benchmark.call_args.kwargs['validate_sample'], 0)
+        self.assertEqual(benchmark.call_args.kwargs['checkpoint_interval'], 20)
+        self.assertEqual(benchmark.call_args.kwargs['starting_score'], 0.0)
+        self.assertEqual(
+            list(
+                ScheduleShiftAssignment.objects.filter(optimizer_run=v2_run)
+                .values_list('shift_instance_id', 'physician_id')
+            ),
+            [(instance.id, physician.id)],
+        )
+
+    def test_atlas_v2_test_runner_rejects_and_rolls_back_overlap_result(self):
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        physician = self._create_assignment_physician(
+            'v2.overlap@example.com', 'V2 Overlap',
+            facilities=[self.facility],
+        )
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=100,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=physician,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=source_run,
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            started_from_run=source_run,
+            run_kind='OPTIMIZER_V2_TEST',
+            max_runtime_seconds=60,
+        )
+
+        def return_search(_command_name, **kwargs):
+            kwargs['stdout'].write(json.dumps({
+                'swaps': [],
+                'wall_seconds': 0.25,
+                'stopped_reason': 'local_optimum',
+                'total_evaluations': 1,
+                'accepted_transitions': 0,
+                'predicted_final_score': 90,
+            }))
+
+        reports = [
+            {'total_score': 100, 'score_breakdown': {'overlap_score': 0}},
+            {'total_score': 90, 'score_breakdown': {'overlap_score': 10000}},
+        ]
+        with patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+            side_effect=return_search,
+        ), patch(
+            'apps.scheduling.optimizer_v2_runner.build_violation_report',
+            side_effect=reports,
+        ):
+            with self.assertRaisesMessage(
+                ValueError, 'Atlas v2 produced a time-overlap conflict',
+            ):
+                optimize_schedule_version_v2_test(
+                    version,
+                    optimizer_run=v2_run,
+                    source_run=source_run,
+                    created_by=self.scheduler_user,
+                )
+
+        self.assertFalse(
+            ScheduleShiftAssignment.objects.filter(optimizer_run=v2_run).exists()
+        )
+        v2_run.refresh_from_db()
+        self.assertEqual(v2_run.status, OptimizerRun.Status.RUNNING)
 
     @override_settings(OPTIMIZER_ENABLE_PARALLEL_ISOLATION=True)
     def test_background_worker_enables_isolated_optimizer_execution(self):

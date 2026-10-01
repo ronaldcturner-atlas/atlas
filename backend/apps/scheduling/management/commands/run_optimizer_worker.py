@@ -9,8 +9,16 @@ from django.core.management.base import BaseCommand
 from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 
-from apps.scheduling.models import OptimizerControl, OptimizerRun
+from apps.scheduling.models import (
+    OptimizerControl,
+    OptimizerRun,
+    ScheduleShiftAssignment,
+)
 from apps.scheduling.optimizer import optimize_schedule_version
+from apps.scheduling.optimizer_v2_runner import (
+    V2_TEST_RUN_KIND,
+    optimize_schedule_version_v2_test,
+)
 
 
 DEFAULT_JOB_TIMEOUT_SECONDS = 16 * 60
@@ -157,24 +165,42 @@ class Command(BaseCommand):
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.setitimer(signal.ITIMER_REAL, effective_job_timeout_seconds)
         try:
-            optimize_schedule_version(
-                control.schedule_version,
-                created_by=control.optimizer_run.created_by,
-                optimizer_run=control.optimizer_run,
-                seed=control.optimizer_run.seed,
-                start_mode=control.optimizer_run.start_mode,
-                source_run=control.source_run,
-                max_runtime_seconds=control.optimizer_run.max_runtime_seconds,
-                optimization_focus=control.optimizer_run.optimization_focus,
-                adaptive_runtime=True,
-                stop_requested=stop_requested,
-                progress_callback=publish_progress,
-                isolated_run=bool(
-                    getattr(settings, 'OPTIMIZER_ENABLE_PARALLEL_ISOLATION', False)
-                ),
-            )
+            if control.optimizer_run.run_kind == V2_TEST_RUN_KIND:
+                optimize_schedule_version_v2_test(
+                    control.schedule_version,
+                    created_by=control.optimizer_run.created_by,
+                    optimizer_run=control.optimizer_run,
+                    source_run=control.source_run,
+                    stop_requested=stop_requested,
+                    progress_callback=publish_progress,
+                )
+            else:
+                optimize_schedule_version(
+                    control.schedule_version,
+                    created_by=control.optimizer_run.created_by,
+                    optimizer_run=control.optimizer_run,
+                    seed=control.optimizer_run.seed,
+                    start_mode=control.optimizer_run.start_mode,
+                    source_run=control.source_run,
+                    max_runtime_seconds=control.optimizer_run.max_runtime_seconds,
+                    optimization_focus=control.optimizer_run.optimization_focus,
+                    adaptive_runtime=True,
+                    stop_requested=stop_requested,
+                    progress_callback=publish_progress,
+                    isolated_run=bool(
+                        getattr(settings, 'OPTIMIZER_ENABLE_PARALLEL_ISOLATION', False)
+                    ),
+                )
         except Exception as exc:
             traceback.print_exc()
+            if (
+                control.optimizer_run.run_kind == V2_TEST_RUN_KIND
+                and control.optimizer_run.start_mode
+                == OptimizerRun.StartMode.FRESH_FILL
+            ):
+                ScheduleShiftAssignment.objects.filter(
+                    optimizer_run_id=control.optimizer_run_id,
+                ).delete()
             OptimizerRun.objects.filter(
                 id=control.optimizer_run_id,
                 status=OptimizerRun.Status.RUNNING,

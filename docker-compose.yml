@@ -32,6 +32,7 @@ services:
       DEBUG: ${DEBUG}
       SECRET_KEY: ${SECRET_KEY}
       OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION: 2
+      ATLAS_V2_TEST_ENABLED: "True"
     ports:
       - "8000:8000"
     volumes:
@@ -57,6 +58,7 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION: 2
       OPTIMIZER_ENABLE_PARALLEL_ISOLATION: "True"
+      ATLAS_V2_TEST_ENABLED: "True"
     volumes:
       - ./backend:/app
     depends_on:
@@ -80,6 +82,7 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION: 2
       OPTIMIZER_ENABLE_PARALLEL_ISOLATION: "True"
+      ATLAS_V2_TEST_ENABLED: "True"
     volumes:
       - ./backend:/app
     depends_on:
