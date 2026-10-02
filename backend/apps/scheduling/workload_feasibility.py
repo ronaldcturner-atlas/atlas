@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_CEILING
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
 from .optimizer import (
     _version_contract_target,
+    _workload_adjustment_context,
     _decimal_or_none,
     _effective_workload_rule,
     _is_weekend_designated,
@@ -1387,6 +1388,9 @@ def build_workload_feasibility(
                 if detailed_run and rule_rows else None
             ),
             'workload_score_contribution': _number(score_contribution),
+            'workload_hour_adjustment': _workload_adjustment_context(
+                instances, target,
+            ),
         }
         deficit_total = Decimal(str(physician_row['deficit_hours'] or 0))
         if detailed_run is not None and deficit_total > 0:
@@ -1475,6 +1479,37 @@ def build_workload_feasibility(
             }
             for fte, group in sorted(groups.items(), reverse=True)
         ]
+    contract_adjustment_groups = {}
+    for row in physician_rows:
+        adjustment = row.get('workload_hour_adjustment')
+        if adjustment is None:
+            continue
+        key = (
+            row['contract'], row['fte'],
+            tuple(
+                (
+                    rule['period_type'], rule['units'],
+                    rule['minimum'], rule['maximum'],
+                )
+                for rule in adjustment['contract_rules']
+            ),
+            adjustment['original_block_minimum_hours'],
+            adjustment['original_block_maximum_hours'],
+            adjustment['effective_block_minimum_hours'],
+            adjustment['effective_block_maximum_hours'],
+        )
+        if key not in contract_adjustment_groups:
+            contract_adjustment_groups[key] = {
+                'contract': row['contract'],
+                'fte': row['fte'],
+                'user_count': 0,
+                **adjustment,
+            }
+        contract_adjustment_groups[key]['user_count'] += 1
+    workload_contract_adjustments = sorted(
+        contract_adjustment_groups.values(),
+        key=lambda row: (row['contract'].lower(), -row['fte']),
+    )
     return {
         'schedule_block': {
             'schedule_block_id': block.id,
@@ -1535,6 +1570,7 @@ def build_workload_feasibility(
             'physicians_without_hour_ranges': physicians_without_hour_ranges,
             'fte_adjustment_preview': adjustment_preview,
             'has_workload_hour_overrides': bool(version.workload_hour_overrides),
+            'workload_contract_adjustments': workload_contract_adjustments,
         },
         'night_feasibility': night_feasibility,
         'request_off_feasibility': request_off_feasibility,

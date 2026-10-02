@@ -75,6 +75,24 @@ type AssignmentContext = {
   eligible_physicians: EligiblePhysician[]
 }
 
+type WorkloadContractAdjustment = {
+  fte: number
+  contract: string
+  user_count: number
+  contract_rules: Array<{
+    period_type: string
+    units: string
+    minimum: number | null
+    maximum: number | null
+  }>
+  original_block_minimum_hours: number | null
+  original_block_maximum_hours: number | null
+  effective_block_minimum_hours: number | null
+  effective_block_maximum_hours: number | null
+  minimum_adjustment_hours: number | null
+  maximum_adjustment_hours: number | null
+}
+
 type OptimizerSummary = {
   message?: string
   optimizer_run_id?: number
@@ -306,6 +324,7 @@ type BuildContext = {
     physicians_without_hour_ranges: string[]
     total_generated_shift_instances: number
     has_workload_hour_overrides: boolean
+    workload_contract_adjustments: WorkloadContractAdjustment[]
     night_feasibility: {
       status: 'feasible' | 'penalty_unavoidable'
       fixed_manual_night_shifts: number
@@ -517,6 +536,88 @@ function formatRuntimeMinutes(runtimeSeconds: number) {
   const minutes = runtimeSeconds / 60
   const displayed = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1)
   return `${displayed} ${minutes === 1 ? 'minute' : 'minutes'}`
+}
+
+function hourRangeLabel(minimum: number | null, maximum: number | null) {
+  const value = (hours: number | null) => hours === null ? 'No limit' : `${hours.toFixed(1)}h`
+  return `${value(minimum)}–${value(maximum)}`
+}
+
+function signedHourAdjustment(value: number | null) {
+  if (value === null || Math.abs(value) < 0.0001) return 'No change'
+  return `${value > 0 ? '+' : '−'}${Math.abs(value).toFixed(1)}h`
+}
+
+function signedWorkloadRate(
+  direction: 'increase_maximum' | 'decrease_minimum',
+  value: string | number | null,
+) {
+  if (value === null || value === '') return ''
+  const magnitude = Math.abs(Number(value))
+  return direction === 'decrease_minimum' ? `-${magnitude}` : String(magnitude)
+}
+
+function contractWorkloadRuleLabel(adjustment: WorkloadContractAdjustment) {
+  return adjustment.contract_rules.map((rule) => {
+    const minimum = rule.minimum === null ? 'No min' : rule.minimum.toFixed(1)
+    const maximum = rule.maximum === null ? 'No max' : rule.maximum.toFixed(1)
+    return `${minimum}–${maximum} ${rule.units.toLowerCase()}/${rule.period_type.replaceAll('_', ' ').toLowerCase()}`
+  }).join('; ') || 'No contract hour rule'
+}
+
+function WorkloadAdjustmentHover({
+  adjustments,
+  isResetting,
+  resetDisabled,
+  onReset,
+}: {
+  adjustments: WorkloadContractAdjustment[]
+  isResetting: boolean
+  resetDisabled: boolean
+  onReset: () => void
+}) {
+  const hasAdjustments = adjustments.length > 0
+  return (
+    <div className="feasibility-compact-item workload-adjustment-compact-item">
+      <strong
+        className={hasAdjustments ? 'feasibility-adjustment-active' : ''}
+        tabIndex={0}
+      >
+        Workload adjustments{hasAdjustments ? ` · ${adjustments.length}` : ''}
+      </strong>
+      <div
+        className={`feasibility-hover-panel workload-adjustment-hover-panel${hasAdjustments ? ' workload-adjustment-hover-panel-active' : ''}`}
+        role="dialog"
+        aria-label="Block-specific Contract workload adjustments"
+      >
+        <h3>Block-specific Contract workload adjustments</h3>
+        {hasAdjustments ? (
+          <div className="workload-adjustment-hover-list">
+            {adjustments.map((adjustment) => (
+              <article key={`${adjustment.contract}-${adjustment.fte}-${adjustment.effective_block_minimum_hours}-${adjustment.effective_block_maximum_hours}`}>
+                <h4>{adjustment.contract}</h4>
+                <small>{adjustment.user_count} user{adjustment.user_count === 1 ? '' : 's'} · {adjustment.fte.toFixed(2)} FTE</small>
+                <dl>
+                  <div><dt>Permanent rule</dt><dd>{contractWorkloadRuleLabel(adjustment)}</dd></div>
+                  <div><dt>Original block range</dt><dd>{hourRangeLabel(adjustment.original_block_minimum_hours, adjustment.original_block_maximum_hours)}</dd></div>
+                  <div><dt>Block adjustment</dt><dd>Min {signedHourAdjustment(adjustment.minimum_adjustment_hours)} · Max {signedHourAdjustment(adjustment.maximum_adjustment_hours)}</dd></div>
+                  <div><dt>Effective block range</dt><dd>{hourRangeLabel(adjustment.effective_block_minimum_hours, adjustment.effective_block_maximum_hours)}</dd></div>
+                </dl>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p>No block-specific workload adjustment is active. Permanent Contract workload rules apply unchanged.</p>
+        )}
+        <small>Only Contracts whose effective limits differ for this Schedule Version are shown.</small>
+        {hasAdjustments && (
+          <button type="button" className="secondary" disabled={resetDisabled} onClick={onReset}>
+            {isResetting ? 'Resetting...' : 'Reset Block Adjustments'}
+          </button>
+        )}
+      </div>
+    </div>
+  )
 }
 
 function formatElapsedTime(totalSeconds: number) {
@@ -2481,6 +2582,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <small>Manual-only users count only through their exact fixed assignments. This aggregate check does not account for eligibility, nights, rest, or requests.</small>
               </div>
             </div>
+            <WorkloadAdjustmentHover
+              adjustments={context.workload_feasibility.workload_contract_adjustments}
+              isResetting={isApplyingWorkloadAdjustment}
+              resetDisabled={isMutatingBuild}
+              onReset={() => void changeWorkloadAdjustment(true)}
+            />
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Night-shift feasibility</strong>
               <div className="feasibility-hover-panel night-feasibility-hover-panel" role="tooltip">
@@ -2540,6 +2647,12 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           <div>
             <strong>Workload feasibility</strong>
             <span>{context.workload_feasibility.interpretation}</span>
+            <WorkloadAdjustmentHover
+              adjustments={context.workload_feasibility.workload_contract_adjustments}
+              isResetting={isApplyingWorkloadAdjustment}
+              resetDisabled={isMutatingBuild}
+              onReset={() => void changeWorkloadAdjustment(true)}
+            />
           </div>
           <dl>
             <div>
@@ -2610,7 +2723,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     {context.workload_feasibility.fte_adjustment_preview.total_applicable_fte.toFixed(2)} FTE
                     {context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte === null
                       ? ''
-                      : ` (${context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte.toFixed(0)} hours per FTE)`}.
+                      : ` (${signedWorkloadRate(
+                        context.workload_feasibility.fte_adjustment_preview.direction,
+                        context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte.toFixed(0),
+                      )} hours per FTE)`}.
                   </p>
                   <div className="workload-feasibility-preview-table-wrap">
                     <table>
@@ -2639,11 +2755,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     <span>Hours per FTE</span>
                     <input
                       type="number"
-                      min="1"
-                      max="1000"
+                      min={context.workload_feasibility.fte_adjustment_preview.direction === 'decrease_minimum' ? '-1000' : '1'}
+                      max={context.workload_feasibility.fte_adjustment_preview.direction === 'decrease_minimum' ? '-1' : '1000'}
                       step="1"
-                      value={workloadHoursPerFte || String(context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte ?? '')}
-                      onChange={(event) => setWorkloadHoursPerFte(event.target.value)}
+                      value={signedWorkloadRate(
+                        context.workload_feasibility.fte_adjustment_preview.direction,
+                        workloadHoursPerFte || context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte,
+                      )}
+                      onChange={(event) => setWorkloadHoursPerFte(
+                        event.target.value === '' ? '' : String(Math.abs(Number(event.target.value))),
+                      )}
                     />
                   </label>
                   <button
@@ -2658,11 +2779,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 </div>
               )}
             </div>
-          )}
-          {context.workload_feasibility.has_workload_hour_overrides && (
-            <button type="button" className="secondary" disabled={isMutatingBuild} onClick={() => void changeWorkloadAdjustment(true)}>
-              Reset Schedule Block Hour Adjustments
-            </button>
           )}
         </section>
         <section
@@ -2842,7 +2958,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   </button>
                 ) : (
                   <Link
-                    className="secondary build-workspace-link-button"
+                    className="secondary build-workspace-link-button build-violations-link"
                     to={`/schedule-versions/${selectedRunForActions.schedule_version}/violations?optimizer_run_id=${selectedRunForActions.id}`}
                   >
                     Violations
@@ -2954,7 +3070,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     </button>
                     {isCompletedOptimizerRun(run) && (!context.schedule_block.published_at || run.is_published) ? (
                       <Link
-                        className="secondary build-workspace-link-button"
+                        className="secondary build-workspace-link-button build-violations-link"
                         to={`/schedule-versions/${run.schedule_version}/violations?optimizer_run_id=${run.id}`}
                       >
                         Violations

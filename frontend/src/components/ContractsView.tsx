@@ -525,6 +525,8 @@ export default function ContractsView() {
 
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
+  const [duplicatingContractId, setDuplicatingContractId] = useState<number | null>(null)
+  const [deletingContractId, setDeletingContractId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
 
@@ -729,7 +731,9 @@ export default function ContractsView() {
 
   const duplicateContract = async (contract: ContractRecord) => {
     try {
+      setDuplicatingContractId(contract.id)
       setError(null)
+      setSaveNotice(null)
       const response = await fetch(`${API_BASE}/contracts/${contract.id}/duplicate/`, {
         method: 'POST',
         credentials: 'include',
@@ -740,10 +744,15 @@ export default function ContractsView() {
         throw new Error(message ?? 'Unable to duplicate contract')
       }
 
+      const duplicatedContract = await response.json() as ContractRecord
       await loadContracts(showInactive, domainFilter)
+      openEditModal(duplicatedContract)
+      setSaveNotice(`Duplicated from ${contract.name}. The new Contract is active and ready to edit.`)
     } catch (duplicateError) {
       console.error(duplicateError)
       setError(duplicateError instanceof Error ? duplicateError.message : 'Unable to duplicate contract.')
+    } finally {
+      setDuplicatingContractId(null)
     }
   }
 
@@ -765,6 +774,35 @@ export default function ContractsView() {
     } catch (toggleError) {
       console.error(toggleError)
       setError(toggleError instanceof Error ? toggleError.message : 'Unable to update contract status.')
+    }
+  }
+
+  const deleteContract = async (contract: ContractRecord) => {
+    if (contract.assigned_users_count > 0) return
+    const confirmed = window.confirm(`Delete "${contract.name}"? This is permanent.`)
+    if (!confirmed) return
+
+    try {
+      setDeletingContractId(contract.id)
+      setError(null)
+      setSaveNotice(null)
+      const response = await fetch(`${API_BASE}/contracts/${contract.id}/`, {
+        method: 'DELETE',
+        credentials: 'include',
+      })
+
+      if (!response.ok) {
+        const message = await getApiErrorMessage(response)
+        throw new Error(message ?? 'Unable to delete contract')
+      }
+
+      await loadContracts(showInactive, domainFilter)
+      setSaveNotice(`Deleted ${contract.name}.`)
+    } catch (deleteError) {
+      console.error(deleteError)
+      setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete contract.')
+    } finally {
+      setDeletingContractId(null)
     }
   }
 
@@ -832,6 +870,7 @@ export default function ContractsView() {
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
+      {saveNotice && !isModalOpen && <div className="contract-saved-banner">{saveNotice}</div>}
 
       <div className="scheduler-table-wrap">
         <table className="scheduler-table">
@@ -856,16 +895,26 @@ export default function ContractsView() {
                 <td>
                   <div className="facility-actions">
                     <button type="button" onClick={() => openEditModal(contract)}>
-                      Open
-                    </button>
-                    <button type="button" onClick={() => openEditModal(contract)}>
                       Edit
                     </button>
-                    <button type="button" onClick={() => duplicateContract(contract)}>
-                      Duplicate
+                    <button
+                      type="button"
+                      disabled={duplicatingContractId !== null}
+                      onClick={() => duplicateContract(contract)}
+                    >
+                      {duplicatingContractId === contract.id ? 'Duplicating...' : 'Duplicate'}
                     </button>
                     <button type="button" onClick={() => toggleActive(contract)}>
                       {contract.active ? 'Deactivate' : 'Reactivate'}
+                    </button>
+                    <button
+                      type="button"
+                      className="danger"
+                      disabled={contract.assigned_users_count > 0 || deletingContractId !== null}
+                      title={contract.assigned_users_count > 0 ? 'Remove all assigned users before deleting this Contract.' : `Delete ${contract.name}`}
+                      onClick={() => deleteContract(contract)}
+                    >
+                      {deletingContractId === contract.id ? 'Deleting...' : 'Delete'}
                     </button>
                   </div>
                 </td>
@@ -878,7 +927,7 @@ export default function ContractsView() {
       {!visibleContracts.length && <div className="empty-state">No contracts found</div>}
 
       {isModalOpen && (
-        <div className="shift-modal-overlay">
+        <div className="shift-modal-overlay contract-modal-overlay">
           <div className="shift-modal schedule-block-modal contract-modal" onClick={(event) => event.stopPropagation()}>
             <div className="shift-modal-header">
               <h2>{editingContractId ? 'Edit Contract' : 'Create Contract'}</h2>

@@ -31,6 +31,8 @@ type ViolationRow = {
   period_start?: string | null
   period_end?: string | null
   violation_type: string
+  score_component: string
+  shift_rule_label?: string | null
   dates_involved: string[]
   night_block_dates?: string[]
   prior_night_block_dates?: string[]
@@ -86,6 +88,20 @@ type WorkloadScoreRow = {
   shift_deviation: number | null
   hour_deviation: number | null
   score_contribution: number
+  workload_hour_adjustment?: {
+    contract_rules: Array<{
+      period_type: string
+      units: string
+      minimum: number | null
+      maximum: number | null
+    }>
+    original_block_minimum_hours: number | null
+    original_block_maximum_hours: number | null
+    effective_block_minimum_hours: number | null
+    effective_block_maximum_hours: number | null
+    minimum_adjustment_hours: number | null
+    maximum_adjustment_hours: number | null
+  } | null
 }
 
 type ViolationUser = {
@@ -141,6 +157,33 @@ type Props = {
   versionId: number
 }
 
+type PenaltyFilter =
+  | 'total_score'
+  | 'workload_score'
+  | 'night_score'
+  | 'request_score'
+  | 'rest_score'
+  | 'same_shift_score'
+  | 'shift_rule_score'
+  | 'weekend_score'
+  | 'consecutive_days_score'
+  | 'underutilization_score'
+  | 'invalid_assignment_score'
+
+const PENALTY_FILTERS: Array<{ key: PenaltyFilter; label: string }> = [
+  { key: 'total_score', label: 'Total score' },
+  { key: 'workload_score', label: 'Workload score' },
+  { key: 'night_score', label: 'Night score' },
+  { key: 'request_score', label: 'Request score' },
+  { key: 'rest_score', label: 'Rest score' },
+  { key: 'same_shift_score', label: 'Same shift score' },
+  { key: 'shift_rule_score', label: 'Shift rule score' },
+  { key: 'weekend_score', label: 'Weekend score' },
+  { key: 'consecutive_days_score', label: 'Consecutive days score' },
+  { key: 'underutilization_score', label: 'Underutilization score' },
+  { key: 'invalid_assignment_score', label: 'Invalid assignment score' },
+]
+
 const API_BASE = 'http://localhost:8000/api'
 
 function formatDate(value: string) {
@@ -175,6 +218,17 @@ function prettyType(value: string) {
     .split('_')
     .map((part) => part.charAt(0) + part.slice(1).toLowerCase())
     .join(' ')
+}
+
+function violationLabel(violation: ViolationRow) {
+  const typeLabel = prettyType(violation.violation_type)
+  if (
+    violation.violation_type.startsWith('SHIFT_GROUP_')
+    && violation.shift_rule_label
+  ) {
+    return `${typeLabel} (${violation.shift_rule_label})`
+  }
+  return typeLabel
 }
 
 function assignmentLabel(detail: AssignmentDetail) {
@@ -252,6 +306,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<'details' | 'summary'>('details')
+  const [activePenaltyFilter, setActivePenaltyFilter] = useState<PenaltyFilter>('total_score')
 
   useEffect(() => {
     let cancelled = false
@@ -269,6 +324,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
         }
         if (!cancelled) {
           setReport(data as ViolationReport)
+          setActivePenaltyFilter('total_score')
         }
       } catch (fetchError) {
         if (!cancelled) {
@@ -294,6 +350,43 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
     return <div className="facilities-error">{error ?? 'Unable to load violation report.'}</div>
   }
 
+  const filteredUsers = report.users.map((user) => {
+    const violations = user.violations.filter((violation) => (
+      violation.penalty_amount > 0
+      && (
+        activePenaltyFilter === 'total_score'
+        || violation.score_component === activePenaltyFilter
+      )
+    ))
+    const workloadScore = (
+      (activePenaltyFilter === 'total_score' || activePenaltyFilter === 'workload_score')
+      && (user.workload_score?.score_contribution ?? 0) > 0
+    ) ? user.workload_score ?? null : null
+    const workloadRuleRows = (workloadScore?.rule_rows ?? []).filter(
+      (row) => row.score_contribution > 0,
+    )
+    const filteredScore = violations.reduce(
+      (sum, violation) => sum + violation.penalty_amount,
+      0,
+    ) + (workloadScore?.score_contribution ?? 0)
+    return {
+      ...user,
+      violations,
+      workload_score: workloadScore ? {
+        ...workloadScore,
+        rule_rows: workloadRuleRows,
+      } : null,
+      filtered_score: filteredScore,
+    }
+  }).filter((user) => user.violations.length > 0 || user.workload_score !== null)
+
+  const activePenaltyLabel = PENALTY_FILTERS.find(
+    (filter) => filter.key === activePenaltyFilter,
+  )?.label ?? 'Total score'
+  const visibleRuleSummary = report.rule_summary.filter((row) => (
+    row.score_component !== 'coverage_score'
+    && row.score_component !== 'overlap_score'
+  ))
   return (
     <div className="violation-report-page">
       <div className="build-workspace-header">
@@ -389,7 +482,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {report.rule_summary.map((row, index) => (
+                {visibleRuleSummary.map((row, index) => (
                   <tr key={`${row.score_component}-${row.contract_name}-${row.rule_name}-${index}`}>
                     <td>{row.area}</td>
                     <td>{row.contract_name ?? 'All contracts'}</td>
@@ -404,7 +497,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
               <tfoot>
                 <tr>
                   <th colSpan={6}>Total schedule-block penalty</th>
-                  <th>{report.rule_summary.reduce((sum, row) => sum + row.total_penalty, 0).toFixed(1)}</th>
+                  <th>{visibleRuleSummary.reduce((sum, row) => sum + row.total_penalty, 0).toFixed(1)}</th>
                 </tr>
               </tfoot>
             </table>
@@ -414,69 +507,53 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
 
       <div hidden={activeTab !== 'details'} role="tabpanel">
 
-      <div className="optimizer-summary-panel">
-        <div>
-          <span>Total score</span>
-          <strong>{report.total_score.toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Workload score</span>
-          <strong>{(report.score_breakdown.workload_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Night score</span>
-          <strong>{(report.score_breakdown.night_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Request score</span>
-          <strong>{(report.score_breakdown.request_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Coverage score</span>
-          <strong>{(report.score_breakdown.coverage_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Rest score</span>
-          <strong>{(report.score_breakdown.rest_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Overlap score</span>
-          <strong>{(report.score_breakdown.overlap_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div>
-          <span>Same shift score</span>
-          <strong>{(report.score_breakdown.same_shift_score ?? 0).toFixed(1)}</strong>
-        </div>
-        <div><span>Shift rule score</span><strong>{(report.score_breakdown.shift_rule_score ?? 0).toFixed(1)}</strong></div>
-        <div><span>Weekend score</span><strong>{(report.score_breakdown.weekend_score ?? 0).toFixed(1)}</strong></div>
-        <div><span>Consecutive days score</span><strong>{(report.score_breakdown.consecutive_days_score ?? 0).toFixed(1)}</strong></div>
+      <div className="optimizer-summary-panel violation-score-filters" aria-label="Penalty detail filters">
+        {PENALTY_FILTERS.map((filter) => (
+          <button
+            type="button"
+            key={filter.key}
+            className={activePenaltyFilter === filter.key ? 'active' : ''}
+            aria-pressed={activePenaltyFilter === filter.key}
+            onClick={() => setActivePenaltyFilter(filter.key)}
+          >
+            <span>{filter.label}</span>
+            <strong>{(
+              filter.key === 'total_score'
+                ? report.total_score
+                : report.score_breakdown[filter.key] ?? 0
+            ).toFixed(1)}</strong>
+          </button>
+        ))}
+      </div>
+      <div className="violation-proportionality-scores" aria-label="Distribution measures">
         <div><span>Facility proportionality</span><strong>{(report.proportionality?.facility ?? 0).toFixed(1)}</strong></div>
         <div><span>Time proportionality</span><strong>{(report.proportionality?.time_of_day ?? 0).toFixed(1)}</strong></div>
-        <div><span>Underutilization score</span><strong>{(report.score_breakdown.underutilization_score ?? 0).toFixed(1)}</strong></div>
-        <div><span>Invalid assignment score</span><strong>{(report.score_breakdown.invalid_assignment_score ?? 0).toFixed(1)}</strong></div>
       </div>
       <p className="proportionality-context-note">
         Lower facility and time proportionality values are better. They are not penalties and are not included in Total score; the optimizer uses them only to prefer a more even distribution when the official penalty does not increase.
       </p>
 
+      <p className="violation-filter-status">
+        Showing nonzero penalties contributing to {activePenaltyLabel}.
+      </p>
+
       <div className="violation-user-list">
-        {report.users.map((user) => (
+        {filteredUsers.length === 0 && (
+          <p className="violation-empty">No nonzero individual penalties contribute to {activePenaltyLabel}.</p>
+        )}
+        {filteredUsers.map((user) => (
           <section className="violation-user-section" key={user.user_id}>
             <div className="violation-user-heading">
               <h3>{user.display_name}</h3>
               <div className="violation-user-metrics">
-                <span>Score: {user.total_score.toFixed(1)}</span>
+                <span>{activePenaltyFilter === 'total_score' ? 'Score' : 'Selected penalty'}: {user.filtered_score.toFixed(1)}</span>
                 <span>{user.shifts} shifts</span>
                 <span>{user.hours.toFixed(1)}h</span>
                 <span>{user.night_shifts} night</span>
               </div>
             </div>
 
-            {user.violations.length === 0 ? (
-              <p className="violation-empty">{(user.workload_score?.score_contribution ?? 0) > 0
-                ? 'Workload violations are shown below. No other listed violations.'
-                : 'No listed violations'}</p>
-            ) : (
+            {user.violations.length > 0 && (
               <div className="violation-table-wrap">
                 <table className="scheduler-table violation-table">
                   <thead>
@@ -495,7 +572,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                   <tbody>
                     {user.violations.map((violation, index) => (
                       <tr key={`${violation.violation_type}-${index}`}>
-                        <td>{prettyType(violation.violation_type)}</td>
+                        <td>{violationLabel(violation)}</td>
                         <td>{violation.contract_name ?? '-'}</td>
                         <td>{violation.period_start && violation.period_end
                           ? `${formatDate(violation.period_start)} – ${formatDate(violation.period_end)}`

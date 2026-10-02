@@ -59,6 +59,77 @@ class ConstraintAwareNeighborhoodTests(SimpleTestCase):
         self.assertTrue(debug['stopped'])
         self.assertEqual(debug['stopped_stage'], 'before_model_build')
 
+    def test_manual_assignment_only_physician_cannot_receive_reconstructed_assignment(self):
+        template = SimpleNamespace(
+            id=100, night_shift=False, weekend_days=[],
+        )
+        instances = []
+        for offset in range(3):
+            day = date(2027, 2, 1) + timedelta(days=offset)
+            instances.append(SimpleNamespace(
+                id=offset + 1,
+                date=day,
+                facility_id=10,
+                shift_template_id=template.id,
+                shift_template=template,
+                start_datetime=datetime.combine(
+                    day, time(8), tzinfo=timezone.utc,
+                ),
+                end_datetime=datetime.combine(
+                    day, time(16), tzinfo=timezone.utc,
+                ),
+            ))
+        physicians = [
+            SimpleNamespace(id=1),
+            SimpleNamespace(id=3),
+            SimpleNamespace(id=2),
+        ]
+        contracts = {
+            physician_id: SimpleNamespace(
+                id=physician_id,
+                name='Manual only' if physician_id == 3 else 'Optimizer',
+                manual_assignment_only=physician_id == 3,
+                request_settings={}, night_settings={}, workload_settings={},
+                weekend_settings={}, shift_settings={},
+            )
+            for physician_id in (1, 2, 3)
+        }
+        initial = {1: [1], 2: [3], 3: [2]}
+
+        def authoritative_score(_instances, _physicians, state, *_args, **_kwargs):
+            return scoring(0 if state.get(1) == [3] else 100)
+
+        with patch.object(
+            optimizer, '_night_violation_report',
+            return_value={'night_violations': []},
+        ), patch.object(
+            optimizer, '_request_scoring_rows', return_value=[],
+        ), patch.object(
+            optimizer, '_score_schedule', side_effect=authoritative_score,
+        ):
+            state, result, debug = optimizer._solve_bounded_multi_physician_neighborhood(
+                instances=instances,
+                physicians=physicians,
+                state=initial,
+                scoring=scoring(100),
+                manual_pairs={(2, 3)},
+                targets={1: {'rules': []}, 2: {'rules': []}, 3: {'rules': []}},
+                contract_by_physician=contracts,
+                requests_by_physician_date={},
+                eligible_facilities_by_physician={1: {10}, 2: {10}, 3: {10}},
+                minimum_rest_by_physician={1: 0, 2: 0, 3: 0},
+                rng=Random(7),
+                focus_physician_ids={1},
+                focus_start=date(2027, 2, 1),
+                focus_end=date(2027, 2, 3),
+                cohort_size=2,
+            )
+
+        self.assertNotIn(3, debug['physician_ids'])
+        self.assertEqual(state[2], [3])
+        self.assertNotEqual(state[1], [3])
+        self.assertEqual(result['score'], Decimal('100'))
+
     def test_weekend_rule_guides_atomic_exchange_before_full_score_acceptance(self):
         facility = SimpleNamespace(id=10)
         weekend_template = SimpleNamespace(

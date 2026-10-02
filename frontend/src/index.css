@@ -178,9 +178,10 @@ select option:checked{
 .facility-row-dragging{opacity:0.45;background:rgba(79,70,229,0.12)}
 .facility-actions{display:flex;gap:8px}
 .facility-actions button{padding:6px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.16);background:transparent;color:var(--sidebar-fg);cursor:pointer}
-.facility-actions button:hover{background:rgba(255,255,255,0.06)}
+.facility-actions button:hover:not(:disabled){background:rgba(255,255,255,0.06)}
+.facility-actions button:disabled{opacity:0.45;cursor:not-allowed}
 .facility-actions button.danger{border-color:rgba(248,113,113,0.55);color:#fca5a5}
-.facility-actions button.danger:hover{background:rgba(239,68,68,0.12)}
+.facility-actions button.danger:hover:not(:disabled){background:rgba(239,68,68,0.12)}
 .facility-color-cell{display:inline-flex;align-items:center;gap:8px}
 .facility-color-swatch{width:12px;height:12px;border-radius:50%;border:1px solid rgba(255,255,255,0.35);display:inline-block}
 .facility-field{display:grid;gap:6px}
@@ -376,10 +377,21 @@ select option:checked{
 .optimizer-debug-details{max-height:260px;overflow:auto;margin:0;padding:10px;border-radius:8px;background:rgba(0,0,0,0.18);font-size:11px;color:var(--sidebar-fg);white-space:pre-wrap}
 .danger-action{border-color:rgba(248,113,113,0.45)!important;color:#fecaca!important;background:rgba(127,29,29,0.16)!important}
 .build-workspace-link-button{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;min-height:38px}
+.build-violations-link{border:1px solid #fbbf24!important;background:rgba(245,158,11,.22)!important;color:#fef3c7!important;font-weight:800;box-shadow:0 0 0 1px rgba(251,191,36,.14),0 3px 10px rgba(0,0,0,.2);transition:background .15s ease,border-color .15s ease,box-shadow .15s ease,color .15s ease}
+.build-violations-link:hover{border-color:#fde68a!important;background:rgba(245,158,11,.36)!important;color:#fff!important;box-shadow:0 0 0 2px rgba(251,191,36,.2),0 4px 12px rgba(0,0,0,.28)}
+.build-violations-link:focus-visible{outline:3px solid rgba(253,230,138,.7);outline-offset:2px}
 .violation-report-page{display:flex;flex-direction:column;gap:18px}
 .violation-report-page .optimizer-summary-panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
-.violation-report-page .optimizer-summary-panel>div{display:flex;flex-direction:column;gap:5px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)}
+.violation-report-page .optimizer-summary-panel>div,.violation-report-page .optimizer-summary-panel>button{display:flex;flex-direction:column;gap:5px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--panel)}
 .violation-report-page .optimizer-summary-panel span{color:var(--muted);font-size:13px}
+.violation-score-filters>button{color:var(--sidebar-fg);font:inherit;text-align:left;cursor:pointer;transition:border-color .15s ease,background .15s ease,box-shadow .15s ease}
+.violation-score-filters>button:hover{border-color:rgba(96,165,250,.65);background:rgba(59,130,246,.08)}
+.violation-score-filters>button.active{border-color:#60a5fa;background:rgba(59,130,246,.16);box-shadow:0 0 0 1px rgba(96,165,250,.22)}
+.violation-score-filters>button.active span{color:#bfdbfe}
+.violation-proportionality-scores{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.violation-proportionality-scores>div{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;border:1px solid rgba(96,165,250,.24);border-radius:8px;background:rgba(59,130,246,.05)}
+.violation-proportionality-scores span,.violation-filter-status{color:var(--muted);font-size:13px}
+.violation-filter-status{margin:0}
 .violation-report-warning{border:1px solid rgba(251,191,36,0.45);background:rgba(251,191,36,0.12);color:var(--sidebar-fg);border-radius:8px;padding:12px}
 .violation-report-warning p{margin:0 0 6px}
 .violation-report-warning p:last-child{margin-bottom:0}
@@ -473,6 +485,8 @@ select option:checked{
 .contracts-domain-filter{min-width:240px}
 
 .contract-modal{max-width:min(1400px,96vw)}
+.sidebar + .main-area .contract-modal-overlay{left:250px}
+.sidebar.sidebar-collapsed + .main-area .contract-modal-overlay{left:76px}
 .contract-header-grid{display:grid;grid-template-columns:2fr 1.5fr 0.8fr;gap:12px;margin-bottom:14px}
 .contract-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
 .contract-section-stack{display:grid;gap:12px}
@@ -523,6 +537,7 @@ select option:checked{
 }
 
 .workload-feasibility-card {
+  position: relative;
   display: grid;
   gap: 0.75rem;
   margin: 0.85rem 0;
@@ -562,6 +577,15 @@ select option:checked{
 .feasibility-compact-item > strong:focus-visible {
   outline: 2px solid #86efac;
   outline-offset: 2px;
+}
+
+.feasibility-compact-item > strong.feasibility-adjustment-active {
+  color: #fef3c7;
+  background: #92400e;
+}
+
+.feasibility-compact-item > strong.feasibility-adjustment-active:focus-visible {
+  outline-color: #fcd34d;
 }
 
 .feasibility-hover-panel {
@@ -644,6 +668,30 @@ select option:checked{
   margin-top: 0.7rem;
   color: #cbd5e1;
   line-height: 1.35;
+}
+
+.workload-adjustment-hover-panel-active {
+  border-left-color: #f59e0b;
+}
+
+.workload-adjustment-hover-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.workload-adjustment-hover-list article {
+  padding: 0.65rem;
+  border: 1px solid #475569;
+  border-radius: 0.5rem;
+  background: #111827;
+}
+
+.workload-adjustment-hover-list article > small {
+  margin: -0.25rem 0 0.55rem;
+}
+
+.workload-adjustment-hover-panel > button {
+  margin-top: 0.75rem;
 }
 
 .feasibility-hover-periods {

@@ -2519,7 +2519,6 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
                 }],
             }
             assignment.contract.save(update_fields=['workload_settings'])
-
         generated = self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
             data={'domain_id': self.domain.id}, format='json',
@@ -2538,6 +2537,56 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             ContractUserAssignment.objects.get(physician=full_time).contract.workload_settings['period_rules'][0]['max_value'],
             '10',
         )
+        context = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        ).json()
+        adjustments = {
+            row['fte']: row
+            for row in context['workload_feasibility']['workload_contract_adjustments']
+        }
+        self.assertEqual(set(adjustments), {1.0, 0.5})
+        self.assertEqual(adjustments[1.0]['user_count'], 1)
+        self.assertEqual(adjustments[1.0]['original_block_maximum_hours'], 10.0)
+        self.assertEqual(adjustments[1.0]['effective_block_maximum_hours'], 15.0)
+        self.assertEqual(adjustments[1.0]['maximum_adjustment_hours'], 5.0)
+        self.assertEqual(adjustments[0.5]['effective_block_maximum_hours'], 12.5)
+
+        violation_report = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/',
+        ).json()
+        half_time_row = next(
+            row for row in violation_report['workload_contract_adjustments']
+            if row['fte'] == 0.5
+        )
+        self.assertEqual(half_time_row['user_count'], 1)
+        self.assertEqual(half_time_row['original_block_maximum_hours'], 10.0)
+        self.assertEqual(half_time_row['effective_block_maximum_hours'], 12.5)
+        self.assertEqual(half_time_row['maximum_adjustment_hours'], 2.5)
+
+        full_time_assignment = ContractUserAssignment.objects.get(physician=full_time)
+        full_time_assignment.contract.workload_settings['period_rules'].insert(0, {
+            'period_type': 'MONTH', 'units': 'HOURS',
+            'min_value': '0', 'max_value': '4',
+        })
+        full_time_assignment.contract.save(update_fields=['workload_settings'])
+        version.workload_hour_overrides[str(full_time.id)] = {
+            'minimum_hours': '0',
+            'maximum_hours': '10',
+        }
+        version.save(update_fields=['workload_hour_overrides'])
+        context = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version.id}',
+        ).json()
+        remaining_adjustments = context['workload_feasibility']['workload_contract_adjustments']
+        self.assertEqual(len(remaining_adjustments), 1)
+        self.assertEqual(remaining_adjustments[0]['fte'], 0.5)
+
+        violation_report = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/',
+        ).json()
+        self.assertEqual(len(violation_report['workload_contract_adjustments']), 1)
+        self.assertEqual(violation_report['workload_contract_adjustments'][0]['fte'], 0.5)
+
         reset = self.client.post(
             f'/api/schedule-versions/{version.id}/workload-hour-adjustment/',
             data={'reset': True}, format='json',
@@ -8841,6 +8890,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         ]
         self.assertEqual(len(request_rows), 1)
         self.assertEqual(request_rows[0]['violation_type'], 'REQUEST_DAY_OFF_VIOLATION')
+        self.assertEqual(request_rows[0]['score_component'], 'request_score')
         self.assertEqual(request_rows[0]['penalty_amount'], payload['score_breakdown']['request_score'])
         request_summary = [
             row for row in payload['rule_summary']
@@ -8851,6 +8901,181 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(
             request_summary[0]['total_penalty'],
             payload['score_breakdown']['request_score'],
+        )
+        self.assertEqual(payload['score_audit']['warnings'], [])
+
+    def test_violation_report_lists_consecutive_day_penalties_by_physician(self):
+        version = self._create_build_version(
+            date(2026, 7, 6),
+            date(2026, 7, 8),
+        )
+        physician = self._create_assignment_physician(
+            'consecutive.report@example.com',
+            'Consecutive Report',
+            facilities=[self.facility],
+        )
+        contract = Contract.objects.get(user_assignments__physician=physician)
+        contract.workload_settings = {
+            'max_days_in_row': '1',
+            'max_days_in_row_penalty_weight': '5000',
+        }
+        contract.save(update_fields=['workload_settings', 'updated_at'])
+
+        instances = [
+            self._create_shift_instance(version, self.day_template, target_date)
+            for target_date in (
+                date(2026, 7, 6),
+                date(2026, 7, 7),
+                date(2026, 7, 8),
+            )
+        ]
+        for instance in instances:
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            )
+
+        response = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        user = next(
+            row for row in payload['users']
+            if row['user_id'] == physician.id
+        )
+        violations = [
+            row for row in user['violations']
+            if row['violation_type'] == 'MAX_CONSECUTIVE_DAYS'
+        ]
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0]['score_component'], 'consecutive_days_score')
+        self.assertEqual(violations[0]['configured_limit'], 1)
+        self.assertEqual(violations[0]['actual_value'], 3)
+        self.assertEqual(violations[0]['penalty_weight'], 5000.0)
+        self.assertEqual(violations[0]['penalty_amount'], 10000.0)
+        self.assertEqual(
+            violations[0]['dates_involved'],
+            ['2026-07-06', '2026-07-07', '2026-07-08'],
+        )
+        self.assertEqual(
+            payload['score_audit']['consecutive_days_rows_total'],
+            payload['score_breakdown']['consecutive_days_score'],
+        )
+        self.assertEqual(payload['score_audit']['warnings'], [])
+
+    def test_violation_report_lists_rest_penalty_with_physician_and_shifts(self):
+        version = self._create_build_version(
+            date(2026, 7, 6),
+            date(2026, 7, 6),
+        )
+        evening_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(18, 0),
+            end_time=time(23, 0),
+            active_days_of_week=[],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        physician = self._create_assignment_physician(
+            'rest.report@example.com',
+            'Rest Report',
+            facilities=[self.facility],
+        )
+        instances = [
+            self._create_shift_instance(
+                version, template, date(2026, 7, 6),
+            )
+            for template in (self.day_template, evening_template)
+        ]
+        for instance in instances:
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            )
+
+        response = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        user = next(
+            row for row in payload['users']
+            if row['user_id'] == physician.id
+        )
+        violations = [
+            row for row in user['violations']
+            if row['score_component'] == 'rest_score'
+        ]
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0]['violation_type'], 'INSUFFICIENT_REST')
+        self.assertEqual(violations[0]['dates_involved'], ['2026-07-06'])
+        self.assertEqual(len(violations[0]['assignment_details']), 2)
+        self.assertEqual(violations[0]['configured_limit'], 10.0)
+        self.assertEqual(violations[0]['actual_value'], 2.0)
+        self.assertEqual(violations[0]['penalty_amount'], 10000.0)
+        self.assertEqual(
+            payload['score_audit']['rest_rows_total'],
+            payload['score_breakdown']['rest_score'],
+        )
+        self.assertEqual(payload['score_audit']['warnings'], [])
+
+    def test_violation_report_lists_invalid_assignment_by_physician_and_date(self):
+        version = self._create_build_version(
+            date(2026, 7, 6),
+            date(2026, 7, 6),
+        )
+        physician = self._create_assignment_physician(
+            'ineligible.report@example.com',
+            'Ineligible Report',
+            facilities=[],
+        )
+        instance = self._create_shift_instance(
+            version, self.day_template, date(2026, 7, 6),
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=physician,
+            created_by=self.scheduler_user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+        )
+
+        response = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        user = next(
+            row for row in payload['users']
+            if row['user_id'] == physician.id
+        )
+        violations = [
+            row for row in user['violations']
+            if row['score_component'] == 'invalid_assignment_score'
+        ]
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(
+            violations[0]['violation_type'],
+            'FACILITY_INELIGIBLE_ASSIGNMENT',
+        )
+        self.assertEqual(violations[0]['dates_involved'], ['2026-07-06'])
+        self.assertEqual(len(violations[0]['assignment_details']), 1)
+        self.assertEqual(
+            violations[0]['penalty_amount'],
+            payload['score_breakdown']['invalid_assignment_score'],
+        )
+        self.assertEqual(
+            payload['score_audit']['invalid_assignment_rows_total'],
+            payload['score_breakdown']['invalid_assignment_score'],
         )
         self.assertEqual(payload['score_audit']['warnings'], [])
 
@@ -9294,7 +9519,7 @@ class ContractApiTests(TestCase):
         self.assertEqual(reactivate_response.status_code, 200)
         self.assertTrue(reactivate_response.json()['active'])
 
-    def test_duplicate_contract_creates_inactive_copy(self):
+    def test_duplicate_contract_creates_active_copy(self):
         payload = self._build_payload()
         payload['manual_assignment_only'] = True
         create_response = self.client.post('/api/contracts/', data=payload, format='json')
@@ -9304,10 +9529,34 @@ class ContractApiTests(TestCase):
 
         self.assertEqual(duplicate_response.status_code, 201)
         duplicate_payload = duplicate_response.json()
-        self.assertFalse(duplicate_payload['active'])
+        self.assertTrue(duplicate_payload['active'])
         self.assertTrue(duplicate_payload['manual_assignment_only'])
         self.assertIn('(Copy)', duplicate_payload['name'])
         self.assertEqual(duplicate_payload['domain'], self.domain.id)
+
+    def test_delete_contract_without_assigned_users(self):
+        payload = self._build_payload()
+        payload['assigned_user_ids'] = []
+        create_response = self.client.post('/api/contracts/', data=payload, format='json')
+        contract_id = create_response.json()['id']
+
+        delete_response = self.client.delete(f'/api/contracts/{contract_id}/')
+
+        self.assertEqual(delete_response.status_code, 204)
+        self.assertFalse(Contract.objects.filter(id=contract_id).exists())
+
+    def test_delete_contract_with_assigned_users_is_rejected(self):
+        create_response = self.client.post('/api/contracts/', data=self._build_payload(), format='json')
+        contract_id = create_response.json()['id']
+
+        delete_response = self.client.delete(f'/api/contracts/{contract_id}/')
+
+        self.assertEqual(delete_response.status_code, 400)
+        self.assertEqual(
+            delete_response.json()['detail'],
+            'Remove all assigned users before deleting this Contract.',
+        )
+        self.assertTrue(Contract.objects.filter(id=contract_id).exists())
 
     def test_inactive_contract_cannot_be_assigned(self):
         payload = self._build_payload()

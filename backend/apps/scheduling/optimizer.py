@@ -431,13 +431,105 @@ def _with_workload_hour_override(target, override):
     }
     rules = [rule for rule in target.get('rules') or [] if rule['units'] != 'HOURS'] + [rule]
     values = [value for value in (minimum, maximum) if value is not None]
-    return {**target, 'units': 'HOURS', 'target': sum(values) / Decimal(len(values)), 'rules': rules}
+    return {
+        **target,
+        'units': 'HOURS',
+        'target': sum(values) / Decimal(len(values)),
+        'rules': rules,
+        'workload_hour_adjustment': {
+            'minimum_hours': minimum,
+            'maximum_hours': maximum,
+            'original_hour_rules': hour_rules,
+        },
+    }
 
 
 def _version_contract_target(version, physician_id, contract, default_hours_target, default_shift_target):
     target = _contract_target(contract, default_hours_target, default_shift_target)
     overrides = version.workload_hour_overrides if isinstance(version.workload_hour_overrides, dict) else {}
     return _with_workload_hour_override(target, overrides.get(str(physician_id)))
+
+
+def _hour_rule_block_bounds(instances, rules):
+    minimum = Decimal('0')
+    maximum = Decimal('0')
+    has_hour_rule = False
+    maximum_unbounded = False
+    for rule in rules or []:
+        if rule.get('units') != 'HOURS':
+            continue
+        for window_start, window_end in _period_windows(instances, rule['period_type']):
+            effective = _effective_workload_rule(rule, window_start, window_end)
+            has_hour_rule = True
+            minimum += effective['min_value'] or Decimal('0')
+            if effective['max_value'] is None:
+                maximum_unbounded = True
+            else:
+                maximum += effective['max_value']
+    if not has_hour_rule:
+        return None, None
+    return minimum, None if maximum_unbounded else maximum
+
+
+def _workload_adjustment_context(instances, target):
+    adjustment = (target or {}).get('workload_hour_adjustment')
+    if not adjustment:
+        return None
+    original_rules = adjustment.get('original_hour_rules') or []
+    reference_rules = [
+        rule for rule in original_rules
+        if rule.get('period_type') == 'SCHEDULE_BLOCK'
+    ] or original_rules
+    original_minimum, original_maximum = _hour_rule_block_bounds(
+        instances, reference_rules,
+    )
+    effective_minimum, effective_maximum = _hour_rule_block_bounds(
+        instances, (target or {}).get('rules') or [],
+    )
+    if (
+        original_minimum == effective_minimum
+        and original_maximum == effective_maximum
+    ):
+        return None
+    return {
+        'contract_rules': [
+            {
+                'period_type': rule['period_type'],
+                'units': rule['units'],
+                'minimum': (
+                    float(rule['min_value'])
+                    if rule['min_value'] is not None else None
+                ),
+                'maximum': (
+                    float(rule['max_value'])
+                    if rule['max_value'] is not None else None
+                ),
+            }
+            for rule in original_rules
+        ],
+        'original_block_minimum_hours': (
+            float(original_minimum) if original_minimum is not None else None
+        ),
+        'original_block_maximum_hours': (
+            float(original_maximum) if original_maximum is not None else None
+        ),
+        'effective_block_minimum_hours': (
+            float(effective_minimum) if effective_minimum is not None else None
+        ),
+        'effective_block_maximum_hours': (
+            float(effective_maximum) if effective_maximum is not None else None
+        ),
+        'minimum_adjustment_hours': (
+            float(effective_minimum - original_minimum)
+            if effective_minimum is not None and original_minimum is not None
+            else None
+        ),
+        'maximum_adjustment_hours': (
+            float(effective_maximum - original_maximum)
+            if effective_maximum is not None and original_maximum is not None
+            else None
+        ),
+    }
 
 
 def _request_weight(contract, weight):
@@ -944,6 +1036,7 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
             {
                 'physician_id': physician.id,
                 'physician': _physician_display_name(physician),
+                'fte': float(getattr(physician, 'fte', 1)),
                 'contract_id': target.get('contract_id') if target else None,
                 'contract_name': target.get('contract_name') if target else None,
                 'assigned_shifts': assigned_shifts,
@@ -979,9 +1072,47 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
                 'score_contribution': float(score),
                 'score_contribution_exact': str(score),
                 'rule_rows': rule_rows,
+                'workload_hour_adjustment': _workload_adjustment_context(
+                    instances, target,
+                ),
             }
         )
     return rows
+
+
+def _workload_contract_adjustment_rows(workload_rows):
+    groups = {}
+    for row in workload_rows:
+        adjustment = row.get('workload_hour_adjustment')
+        if adjustment is None:
+            continue
+        key = (
+            row.get('contract_id'), row.get('contract_name'), row.get('fte'),
+            tuple(
+                (
+                    rule['period_type'], rule['units'],
+                    rule['minimum'], rule['maximum'],
+                )
+                for rule in adjustment['contract_rules']
+            ),
+            adjustment['original_block_minimum_hours'],
+            adjustment['original_block_maximum_hours'],
+            adjustment['effective_block_minimum_hours'],
+            adjustment['effective_block_maximum_hours'],
+        )
+        if key not in groups:
+            groups[key] = {
+                'contract_id': row.get('contract_id'),
+                'contract': row.get('contract_name'),
+                'fte': row.get('fte'),
+                'user_count': 0,
+                **adjustment,
+            }
+        groups[key]['user_count'] += 1
+    return sorted(
+        groups.values(),
+        key=lambda row: ((row['contract'] or '').lower(), -(row['fte'] or 0)),
+    )
 
 
 def _workload_range_from_rule(rule):
@@ -1153,6 +1284,7 @@ def _validate_schedule(
     eligible_facilities_by_physician,
     minimum_rest_by_physician,
     manual_assignment_only_physician_ids=None,
+    details=False,
 ):
     manual_assignment_only_physician_ids = set(manual_assignment_only_physician_ids or ())
     active_physician_ids = {physician.id for physician in physicians if physician.active}
@@ -1162,19 +1294,90 @@ def _validate_schedule(
     overstaffed_violations = 0
     inactive_physician_violations = 0
     facility_ineligible_violations = 0
+    violations = []
+
+    def add_violation(
+        violation_type, physician_id, involved_instances, penalty,
+        configured_limit=None, actual_value=None, units=None, explanation=None,
+    ):
+        if not details:
+            return
+        ordered_instances = sorted(
+            involved_instances,
+            key=lambda instance: (
+                instance.start_datetime, instance.end_datetime, instance.id,
+            ),
+        )
+        violations.append({
+            'physician_id': physician_id,
+            'violation_type': violation_type,
+            'dates_involved': list(dict.fromkeys(
+                instance.date.isoformat() for instance in ordered_instances
+            )),
+            'assignment_details': [
+                _assignment_debug_payload(instance)
+                for instance in ordered_instances
+            ],
+            'shift_instance_ids': [
+                instance.id for instance in ordered_instances
+            ],
+            'configured_limit': configured_limit,
+            'actual_value': actual_value,
+            'units': units,
+            'penalty_weight': float(penalty),
+            'penalty': float(penalty),
+            'explanation': explanation,
+        })
 
     for instance in instances:
         physician_ids = list(state[instance.id])
-        duplicate_violations += len(physician_ids) - len(set(physician_ids))
-        overstaffed_violations += max(len(physician_ids) - instance.required_staffing, 0)
+        seen_physician_ids = set()
+        for physician_id in physician_ids:
+            if physician_id in seen_physician_ids:
+                duplicate_violations += 1
+                add_violation(
+                    'DUPLICATE_ASSIGNMENT', physician_id, [instance],
+                    Decimal(OVERLAP_VIOLATION_PENALTY),
+                    configured_limit='One assignment per physician per shift',
+                    actual_value=physician_ids.count(physician_id),
+                    explanation='Physician is assigned more than once to the same shift.',
+                )
+            seen_physician_ids.add(physician_id)
+        excess_physician_ids = physician_ids[instance.required_staffing:]
+        overstaffed_violations += len(excess_physician_ids)
+        for physician_id in excess_physician_ids:
+            add_violation(
+                'OVERSTAFFED_SHIFT', physician_id, [instance],
+                Decimal(COVERAGE_PENALTY),
+                configured_limit=instance.required_staffing,
+                actual_value=len(physician_ids),
+                units='ASSIGNMENTS',
+                explanation='This assignment exceeds the shift\'s required staffing.',
+            )
         for physician_id in physician_ids:
             if physician_id not in active_physician_ids:
                 inactive_physician_violations += 1
+                add_violation(
+                    'INACTIVE_PHYSICIAN_ASSIGNMENT', physician_id, [instance],
+                    Decimal(INACTIVE_PHYSICIAN_PENALTY),
+                    configured_limit='Active physician',
+                    actual_value='Inactive or unavailable physician',
+                    explanation='Shift is assigned to a physician who is not active in this scheduling domain.',
+                )
             if (
                 physician_id not in manual_assignment_only_physician_ids
                 and instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set())
             ):
                 facility_ineligible_violations += 1
+                add_violation(
+                    'FACILITY_INELIGIBLE_ASSIGNMENT', physician_id, [instance],
+                    Decimal(FACILITY_ELIGIBILITY_PENALTY),
+                    configured_limit='Eligible facility',
+                    actual_value=(
+                        instance.facility.short_name or instance.facility.name
+                    ),
+                    explanation='Physician is assigned at a facility not permitted by the Contract.',
+                )
             intervals_by_physician[physician_id].append(instance.id)
 
     overlap_violations = 0
@@ -1198,6 +1401,13 @@ def _validate_schedule(
             for right in physician_instances[index + 1:]:
                 if right.start_datetime < left.end_datetime and right.end_datetime > left.start_datetime:
                     overlap_violations += 1
+                    add_violation(
+                        'OVERLAPPING_ASSIGNMENTS', physician_id, [left, right],
+                        Decimal(OVERLAP_VIOLATION_PENALTY),
+                        configured_limit='No overlapping assignments',
+                        actual_value='Overlapping times',
+                        explanation='Physician is assigned to shifts whose times overlap.',
+                    )
                     continue
                 if left.end_datetime <= right.start_datetime:
                     rest_gap = right.start_datetime - left.end_datetime
@@ -1205,6 +1415,16 @@ def _validate_schedule(
                     rest_gap = left.start_datetime - right.end_datetime
                 if rest_gap < minimum_rest:
                     rest_violations += 1
+                    add_violation(
+                        'INSUFFICIENT_REST', physician_id, [left, right],
+                        Decimal(REST_VIOLATION_PENALTY),
+                        configured_limit=float(
+                            minimum_rest.total_seconds() / 3600
+                        ),
+                        actual_value=float(rest_gap.total_seconds() / 3600),
+                        units='HOURS',
+                        explanation='Physician has less time off between these assignments than configured.',
+                    )
 
         # The prior schedule is immutable context.  Only conflicts involving
         # a current-block assignment are charged to this schedule.
@@ -1215,6 +1435,14 @@ def _validate_schedule(
                     and current.end_datetime > prior.start_datetime
                 ):
                     overlap_violations += 1
+                    add_violation(
+                        'OVERLAPPING_ASSIGNMENTS', physician_id,
+                        [prior, current],
+                        Decimal(OVERLAP_VIOLATION_PENALTY),
+                        configured_limit='No overlapping assignments',
+                        actual_value='Overlapping times',
+                        explanation='Current assignment overlaps an assignment in the preceding published block.',
+                    )
                     continue
                 if prior.end_datetime <= current.start_datetime:
                     rest_gap = current.start_datetime - prior.end_datetime
@@ -1222,6 +1450,16 @@ def _validate_schedule(
                     rest_gap = prior.start_datetime - current.end_datetime
                 if rest_gap < minimum_rest:
                     rest_violations += 1
+                    add_violation(
+                        'INSUFFICIENT_REST', physician_id, [prior, current],
+                        Decimal(REST_VIOLATION_PENALTY),
+                        configured_limit=float(
+                            minimum_rest.total_seconds() / 3600
+                        ),
+                        actual_value=float(rest_gap.total_seconds() / 3600),
+                        units='HOURS',
+                        explanation='Current assignment provides less recovery time after the preceding published block than configured.',
+                    )
 
     return {
         'final_overlap_violations': overlap_violations,
@@ -1230,6 +1468,7 @@ def _validate_schedule(
         'final_overstaffed_violations': overstaffed_violations,
         'final_inactive_physician_violations': inactive_physician_violations,
         'final_facility_ineligible_violations': facility_ineligible_violations,
+        'violations': violations,
     }
 
 
@@ -6373,6 +6612,14 @@ def _solve_bounded_multi_physician_neighborhood(
 
     if deadline_reached('before_model_build'):
         return _copy_state(state), scoring, debug
+    optimizer_managed_physicians = [
+        physician for physician in physicians
+        if not getattr(
+            contract_by_physician.get(physician.id),
+            'manual_assignment_only',
+            False,
+        )
+    ]
     penalty_by_physician = defaultdict(lambda: Decimal('0'))
     for row in scoring.get('workload_score_rows', []):
         penalty_by_physician[row['physician_id']] += Decimal(
@@ -6416,7 +6663,7 @@ def _solve_bounded_multi_physician_neighborhood(
         row['physician_id']: row for row in scoring.get('workload_score_rows', [])
     }
     ranked = sorted(
-        physicians,
+        optimizer_managed_physicians,
         key=lambda physician: (
             penalty_by_physician[physician.id],
             Decimal(str(workload_rows.get(physician.id, {}).get('assigned_hours', 0))),
@@ -6469,7 +6716,7 @@ def _solve_bounded_multi_physician_neighborhood(
     }
     receiver_pool = sorted(
         (
-            p for p in physicians
+            p for p in optimizer_managed_physicians
             if p.id not in source_ids
             and eligible_facilities_by_physician.get(p.id)
         ),
@@ -8555,6 +8802,13 @@ def _night_fix_sources(instances_by_id, physicians, state, manual_pairs, contrac
 def _violation_explanation(violation_type):
     explanations = {
         'SAME_SHIFT_STREAK': 'Physician is assigned to too many consecutive occurrences of the same shift template.',
+        'MAX_CONSECUTIVE_DAYS': 'Physician is assigned to more consecutive workdays than configured.',
+        'INSUFFICIENT_REST': 'Physician has less time off between assignments than configured.',
+        'OVERLAPPING_ASSIGNMENTS': 'Physician is assigned to shifts whose times overlap.',
+        'DUPLICATE_ASSIGNMENT': 'Physician is assigned more than once to the same shift.',
+        'OVERSTAFFED_SHIFT': 'This assignment exceeds the shift\'s required staffing.',
+        'INACTIVE_PHYSICIAN_ASSIGNMENT': 'Shift is assigned to an inactive physician.',
+        'FACILITY_INELIGIBLE_ASSIGNMENT': 'Physician is assigned at an ineligible facility.',
         'NIGHT_UNDER_MINIMUM': 'Physician is below the configured minimum night-shift count for the period.',
         'NIGHT_OVER_MAXIMUM': 'Physician is above the configured maximum night-shift count for the period.',
         'MIN_CONSECUTIVE_NIGHTS': 'Physician is assigned to fewer consecutive night shifts than configured.',
@@ -8572,11 +8826,158 @@ def _violation_explanation(violation_type):
     return explanations.get(violation_type, 'Optimizer v0 scoring assigned this penalty.')
 
 
+def _violation_score_component(violation_type):
+    violation_type = violation_type or ''
+    if violation_type == 'SAME_SHIFT_STREAK':
+        return 'same_shift_score'
+    if violation_type == 'MAX_CONSECUTIVE_DAYS':
+        return 'consecutive_days_score'
+    if violation_type == 'INSUFFICIENT_REST':
+        return 'rest_score'
+    if violation_type == 'OVERLAPPING_ASSIGNMENTS':
+        return 'overlap_score'
+    if violation_type in {
+        'DUPLICATE_ASSIGNMENT',
+        'OVERSTAFFED_SHIFT',
+        'INACTIVE_PHYSICIAN_ASSIGNMENT',
+        'FACILITY_INELIGIBLE_ASSIGNMENT',
+    }:
+        return 'invalid_assignment_score'
+    if violation_type.startswith('SHIFT_GROUP_'):
+        return 'shift_rule_score'
+    if violation_type.startswith('REQUEST_'):
+        return 'request_score'
+    if 'WEEKEND' in violation_type or violation_type == 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF':
+        return 'weekend_score'
+    return 'night_score'
+
+
+def _consecutive_day_violation_rows(
+    instances, physicians, state, contract_by_physician,
+):
+    """Describe the exact per-physician rows behind consecutive-days score."""
+    instances_by_id = {instance.id: instance for instance in instances}
+    current_by_physician = defaultdict(list)
+    for instance_id, physician_ids in state.items():
+        instance = instances_by_id.get(instance_id)
+        if instance is None:
+            continue
+        for physician_id in physician_ids:
+            current_by_physician[physician_id].append(instance)
+
+    boundary_context = _published_boundary_context(instances)
+    rows = []
+    for physician in physicians:
+        contract = contract_by_physician.get(physician.id)
+        if contract is None:
+            continue
+        settings = (
+            contract.workload_settings
+            if isinstance(contract.workload_settings, dict)
+            else {}
+        )
+        configured_limit = _decimal_or_none(settings.get('max_days_in_row'))
+        penalty_weight = _decimal_or_none(
+            settings.get('max_days_in_row_penalty_weight')
+        )
+        if (
+            configured_limit is None or configured_limit <= 0
+            or penalty_weight is None or penalty_weight <= 0
+        ):
+            continue
+
+        limit = max(int(configured_limit), 1)
+        current_instances = current_by_physician.get(physician.id, [])
+        current_dates = {instance.date for instance in current_instances}
+        prior_instances = list(boundary_context.get(physician.id, ()))
+        prior_dates = {instance.date for instance in prior_instances}
+        combined_dates = sorted(current_dates | prior_dates)
+        if not combined_dates:
+            continue
+
+        streaks = []
+        streak = []
+        for assigned_date in combined_dates:
+            if streak and assigned_date != streak[-1] + timedelta(days=1):
+                streaks.append(streak)
+                streak = []
+            streak.append(assigned_date)
+        if streak:
+            streaks.append(streak)
+
+        instances_by_date = defaultdict(list)
+        for instance in [*prior_instances, *current_instances]:
+            instances_by_date[instance.date].append(instance)
+
+        for streak_dates in streaks:
+            combined_excess = max(len(streak_dates) - limit, 0)
+            streak_prior_dates = sorted(
+                assigned_date
+                for assigned_date in streak_dates
+                if assigned_date in prior_dates
+            )
+            prior_excess = int(
+                _streak_excess_score(
+                    streak_prior_dates,
+                    limit,
+                    Decimal('1'),
+                )
+            )
+            charged_excess = combined_excess - prior_excess
+            if charged_excess <= 0:
+                continue
+
+            involved_instances = sorted(
+                (
+                    instance
+                    for assigned_date in streak_dates
+                    for instance in instances_by_date[assigned_date]
+                ),
+                key=lambda instance: (
+                    instance.date, instance.start_datetime, instance.id,
+                ),
+            )
+            penalty = Decimal(charged_excess) * penalty_weight
+            rows.append({
+                'physician_id': physician.id,
+                'physician': _physician_display_name(physician),
+                **_contract_rule_identity(contract),
+                'violation_type': 'MAX_CONSECUTIVE_DAYS',
+                'period_type': 'SCHEDULE_BLOCK',
+                'period_start': instances[0].schedule_block.start_date.isoformat()
+                if instances else None,
+                'period_end': instances[0].schedule_block.end_date.isoformat()
+                if instances else None,
+                'dates_involved': [
+                    assigned_date.isoformat() for assigned_date in streak_dates
+                ],
+                'assignment_details': [
+                    _assignment_debug_payload(instance)
+                    for instance in involved_instances
+                ],
+                'shift_instance_ids': [
+                    instance.id for instance in involved_instances
+                ],
+                'configured_limit': limit,
+                'actual_value': len(streak_dates),
+                'units': 'DAYS',
+                'penalty_weight': float(penalty_weight),
+                'penalty': float(penalty),
+                'explanation': (
+                    f'Physician worked {len(streak_dates)} consecutive days, '
+                    f'exceeding the configured maximum of {limit} by '
+                    f'{charged_excess} day(s).'
+                ),
+            })
+    return rows
+
+
 def _report_violation_row(violation, violation_type=None):
     row_type = violation_type or violation.get('violation_type')
     penalty_amount = violation.get('penalty_amount', violation.get('penalty', 0))
     return {
         'violation_type': row_type,
+        'score_component': _violation_score_component(row_type),
         'dates_involved': violation.get('dates_involved', []),
         'night_block_dates': violation.get('night_block_dates', []),
         'prior_night_block_dates': violation.get('prior_night_block_dates', []),
@@ -8605,8 +9006,10 @@ def _report_violation_row(violation, violation_type=None):
         'actual_value': violation.get('actual_value'),
         'penalty_weight': violation.get('penalty_weight'),
         'penalty_amount': penalty_amount,
-        'explanation': (violation.get('explanation') or _violation_explanation(row_type))
-        if (row_type or '').startswith('WEEKEND') else _violation_explanation(row_type),
+        'explanation': (
+            violation.get('explanation')
+            or _violation_explanation(row_type)
+        ),
     }
 
 
@@ -8768,17 +9171,6 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
         rows[key]['violation_count'] += violation_count
         rows[key]['total_penalty'] += float(penalty or 0)
 
-    def violation_component(violation_type):
-        if violation_type == 'SAME_SHIFT_STREAK':
-            return 'same_shift_score'
-        if violation_type.startswith('SHIFT_GROUP_'):
-            return 'shift_rule_score'
-        if violation_type.startswith('REQUEST_'):
-            return 'request_score'
-        if 'WEEKEND' in violation_type or violation_type == 'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF':
-            return 'weekend_score'
-        return 'night_score'
-
     # Seed every configured Shifts- and Night-tab scoring rule, including
     # rules with a zero penalty in the viewed schedule block.
     for contract in contracts:
@@ -8901,7 +9293,7 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
 
         for violation in user.get('violations') or []:
             violation_type = violation.get('violation_type') or 'UNSPECIFIED_RULE'
-            component = violation_component(violation_type)
+            component = _violation_score_component(violation_type)
             area, _fallback_name = component_details[component]
             rule_name = violation.get('shift_rule_label') or violation_type.replace('_', ' ').title()
             violation_contract_name = violation.get('contract_name') or contract_name
@@ -8923,6 +9315,8 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
     detailed_components = {
         'workload_score', 'same_shift_score', 'shift_rule_score',
         'night_score', 'weekend_score', 'request_score',
+        'consecutive_days_score', 'rest_score', 'overlap_score',
+        'invalid_assignment_score',
     }
     for component, (area, rule_name) in component_details.items():
         expected = float(score_breakdown.get(component, 0) or 0)
@@ -9160,6 +9554,38 @@ def build_violation_report(schedule_version, optimizer_run=None):
         }
         for physician in physicians
     }
+    assigned_instances_by_physician = defaultdict(list)
+    physician_by_assignment_id = {}
+    for assignment in assignments:
+        physician_by_assignment_id[assignment.physician_id] = assignment.physician
+    for instance in instances:
+        for physician_id in state.get(instance.id, ()):
+            assigned_instances_by_physician[physician_id].append(instance)
+    for physician_id, physician_instances in assigned_instances_by_physician.items():
+        if physician_id in users:
+            continue
+        physician = physician_by_assignment_id.get(physician_id)
+        users[physician_id] = {
+            'user_id': physician_id,
+            'display_name': (
+                _physician_display_name(physician)
+                if physician is not None
+                else f'Physician {physician_id}'
+            ),
+            'total_score': 0,
+            'shifts': len(physician_instances),
+            'hours': float(sum(
+                (_shift_hours(instance) for instance in physician_instances),
+                Decimal('0'),
+            )),
+            'night_shifts': sum(
+                1
+                for instance in physician_instances
+                if instance.shift_template.night_shift
+            ),
+            'violations': [],
+            'workload_score': None,
+        }
 
     for row in scoring['workload_score_rows']:
         physician_id = row['physician_id']
@@ -9236,6 +9662,77 @@ def build_violation_report(schedule_version, optimizer_run=None):
         score_audit['warnings'].append(
             'Score/report mismatch detected: shift_rule_score does not equal listed shift-rule penalty rows.'
         )
+
+    consecutive_day_rows = _consecutive_day_violation_rows(
+        instances,
+        scoring_physicians,
+        state,
+        scoring_contract_by_physician,
+    )
+    for violation in consecutive_day_rows:
+        row = _report_violation_row(violation)
+        users[violation['physician_id']]['violations'].append(row)
+        users[violation['physician_id']]['total_score'] += row['penalty_amount'] or 0
+    consecutive_day_rows_total = sum(
+        (Decimal(str(row['penalty'])) for row in consecutive_day_rows),
+        Decimal('0'),
+    )
+    score_audit['consecutive_days_rows_total'] = float(
+        consecutive_day_rows_total
+    )
+    score_audit['consecutive_days_score'] = float(
+        scoring['breakdown']['consecutive_days_score']
+    )
+    if (
+        abs(
+            consecutive_day_rows_total
+            - scoring['breakdown']['consecutive_days_score']
+        )
+        > Decimal('0.0001')
+    ):
+        score_audit['warnings'].append(
+            'Score/report mismatch detected: consecutive_days_score does not '
+            'equal listed consecutive-day penalty rows.'
+        )
+
+    validation_report = _validate_schedule(
+        instances,
+        physicians,
+        state,
+        eligible_facilities_by_physician,
+        minimum_rest_by_physician,
+        manual_assignment_only_physician_ids,
+        details=True,
+    )
+    for violation in validation_report['violations']:
+        physician_id = violation['physician_id']
+        if physician_id not in users:
+            continue
+        row = _report_violation_row(violation)
+        users[physician_id]['violations'].append(row)
+        users[physician_id]['total_score'] += row['penalty_amount'] or 0
+
+    validation_row_totals = defaultdict(lambda: Decimal('0'))
+    for violation in validation_report['violations']:
+        component = _violation_score_component(
+            violation.get('violation_type')
+        )
+        validation_row_totals[component] += Decimal(str(
+            violation.get('penalty', 0)
+        ))
+    for component in (
+        'rest_score', 'overlap_score', 'invalid_assignment_score',
+    ):
+        rows_total = validation_row_totals[component]
+        score_audit[f'{component.removesuffix("_score")}_rows_total'] = float(
+            rows_total
+        )
+        score_audit[component] = float(scoring['breakdown'][component])
+        if abs(rows_total - scoring['breakdown'][component]) > Decimal('0.0001'):
+            score_audit['warnings'].append(
+                f'Score/report mismatch detected: {component} does not equal '
+                'listed physician penalty rows.'
+            )
 
     for user in users.values():
         user['violations'] = sorted(user['violations'], key=_report_sort_key)
@@ -9340,6 +9837,9 @@ def build_violation_report(schedule_version, optimizer_run=None):
             'is_penalty': False,
         },
         'rule_summary': rule_summary,
+        'workload_contract_adjustments': _workload_contract_adjustment_rows(
+            scoring['workload_score_rows'],
+        ),
         'warnings': list(dict.fromkeys(warnings)),
         'fixed_request_feasibility': fixed_request_diagnostic,
         'score_audit': score_audit,

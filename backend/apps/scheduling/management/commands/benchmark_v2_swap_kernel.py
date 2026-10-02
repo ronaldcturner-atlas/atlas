@@ -4518,6 +4518,17 @@ class Command(BaseCommand):
                 })
         if (
             transition_validation is not None
+            and transition_validation.get('operation') == 'patch'
+            and any(
+                physician_id not in physician_index
+                for _instance_id, old_physician_id, new_physician_id
+                in transition_validation.get('reassignments', ())
+                for physician_id in (old_physician_id, new_physician_id)
+            )
+        ):
+            transition_validation = None
+        if (
+            transition_validation is not None
             and transition_validation.get('authoritative_legal')
             and (
                 transition_validation.get('authoritative_improving')

@@ -4384,10 +4384,24 @@ def contracts_list_create(request):
     return Response(ContractSerializer(contract).data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['GET', 'PUT', 'PATCH'])
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_detail(request, contract_id):
+    if request.method == 'DELETE':
+        with transaction.atomic():
+            contract = get_object_or_404(
+                Contract.objects.select_for_update(),
+                id=contract_id,
+            )
+            if contract.user_assignments.exists():
+                return Response(
+                    {'detail': 'Remove all assigned users before deleting this Contract.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            contract.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     contract = get_object_or_404(
         Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments__physician__user'),
         id=contract_id,
@@ -4437,7 +4451,7 @@ def contract_duplicate(request, contract_id):
         duplicate = Contract.objects.create(
             domain=source_contract.domain,
             name=_build_duplicate_contract_name(source_contract),
-            active=False,
+            active=True,
             manual_assignment_only=source_contract.manual_assignment_only,
             workload_settings=_copy_json_dict(source_contract.workload_settings),
             shift_settings=_copy_json_dict(source_contract.shift_settings),
