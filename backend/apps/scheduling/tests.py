@@ -1943,6 +1943,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(second_response.status_code, 200)
         self.assertEqual(second_response.json()['created_count'], 0)
         self.assertEqual(second_response.json()['updated_count'], 0)
+        self.assertNotIn('optimizer_summary', second_response.json()['schedule_version'])
         self.assertEqual(ScheduleVersion.objects.filter(schedule_block=self.block).count(), 1)
         self.assertEqual(ScheduleShiftInstance.objects.filter(schedule_block=self.block).count(), 2)
 
@@ -1993,6 +1994,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(context_response.status_code, 200)
         self.assertEqual(context_response.json()['selected_version']['id'], version_id)
+        self.assertFalse(context_response.json()['shift_generation_required'])
         self.assertEqual(len(context_response.json()['shift_instances']), 2)
         feasibility = context_response.json()['workload_feasibility']
         self.assertEqual(
@@ -2009,6 +2011,29 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(shifts_response.status_code, 200)
         self.assertEqual(len(shifts_response.json()), 2)
         self.assertEqual(shifts_response.json()[0]['assigned_count'], 0)
+
+    def test_context_marks_shift_generation_required_when_templates_change(self):
+        generated = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version_id = generated.json()['schedule_version']['id']
+
+        current_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version_id}',
+        )
+        self.assertEqual(current_response.status_code, 200)
+        self.assertFalse(current_response.json()['shift_generation_required'])
+
+        self.day_template.default_staffing_count = 3
+        self.day_template.save(update_fields=['default_staffing_count'])
+
+        changed_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/?version_id={version_id}',
+        )
+        self.assertEqual(changed_response.status_code, 200)
+        self.assertTrue(changed_response.json()['shift_generation_required'])
 
     def test_request_off_feasibility_lists_dates_with_unavoidable_shortages(self):
         physicians = [

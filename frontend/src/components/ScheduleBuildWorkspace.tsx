@@ -268,6 +268,7 @@ type BuildContext = {
   can_manage_build_workspace: boolean
   atlas_v2_enabled: boolean
   atlas_v2_test_enabled?: boolean
+  shift_generation_required: boolean
   domains: DomainOption[]
   versions: ScheduleVersion[]
   selected_version: ScheduleVersion | null
@@ -602,6 +603,34 @@ function apiError(data: unknown, fallback: string) {
   return messages.join(' ') || fallback
 }
 
+const workspaceContextRequests = new Map<string, Promise<BuildContext>>()
+
+function loadWorkspaceContext(url: string) {
+  const existingRequest = workspaceContextRequests.get(url)
+  if (existingRequest) {
+    return existingRequest
+  }
+
+  const request = fetch(url, {
+    credentials: 'include',
+    cache: 'no-store',
+  }).then(async (response) => {
+    const data = await response.json().catch(() => null)
+    if (!response.ok) {
+      throw new Error(apiError(data, 'Unable to load the Schedule Build Workspace.'))
+    }
+    return data as BuildContext
+  })
+  workspaceContextRequests.set(url, request)
+  const clearRequest = () => {
+    if (workspaceContextRequests.get(url) === request) {
+      workspaceContextRequests.delete(url)
+    }
+  }
+  void request.then(clearRequest, clearRequest)
+  return request
+}
+
 function sortedPhysicianMatches(
   physicians: EligiblePhysician[],
   query: string,
@@ -865,16 +894,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       }
       const query = params.toString() ? `?${params.toString()}` : ''
       console.info('Fetching workspace for optimizer_run_id', requestedOptimizerRunId ?? 'active/default')
-      const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/${query}`, {
-        credentials: 'include',
-        cache: 'no-store',
-      })
-      const data = await response.json().catch(() => null)
-      if (!response.ok) {
-        throw new Error(apiError(data, 'Unable to load the Schedule Build Workspace.'))
-      }
-
-      const nextContext = data as BuildContext
+      const nextContext = await loadWorkspaceContext(
+        `${API_BASE}/schedule-blocks/${blockId}/build/${query}`,
+      )
       setContext(nextContext)
       if (!optimizerEngineDefaultedRef.current) {
         setOptimizerEngine(
@@ -995,34 +1017,37 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       ? optimizerSourceRunId
       : context.selected_optimizer_run?.id ?? null
     setIsOptimizerPreflightLoading(true)
-    void fetch(`${API_BASE}/schedule-versions/${versionId}/optimizer-preflight/`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        start_mode: optimizerStartMode,
-        source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE' ? sourceRunId : null,
-        currently_viewed_run_id: optimizerStartMode === 'FRESH_FILL' ? sourceRunId : null,
-      }),
-    })
-      .then(async (response) => {
-        const data = await response.json().catch(() => null)
-        if (!response.ok) throw new Error(apiError(data, 'Unable to check mandatory assignment conflicts.'))
-        if (!cancelled) setOptimizerPreflight(data as OptimizerPreflight)
+    const timer = window.setTimeout(() => {
+      void fetch(`${API_BASE}/schedule-versions/${versionId}/optimizer-preflight/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          start_mode: optimizerStartMode,
+          source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE' ? sourceRunId : null,
+          currently_viewed_run_id: optimizerStartMode === 'FRESH_FILL' ? sourceRunId : null,
+        }),
       })
-      .catch((preflightError) => {
-        if (!cancelled) {
-          setOptimizerPreflight(null)
-          setError(preflightError instanceof Error
-            ? preflightError.message
-            : 'Unable to check mandatory assignment conflicts.')
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setIsOptimizerPreflightLoading(false)
-      })
+        .then(async (response) => {
+          const data = await response.json().catch(() => null)
+          if (!response.ok) throw new Error(apiError(data, 'Unable to check mandatory assignment conflicts.'))
+          if (!cancelled) setOptimizerPreflight(data as OptimizerPreflight)
+        })
+        .catch((preflightError) => {
+          if (!cancelled) {
+            setOptimizerPreflight(null)
+            setError(preflightError instanceof Error
+              ? preflightError.message
+              : 'Unable to check mandatory assignment conflicts.')
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setIsOptimizerPreflightLoading(false)
+        })
+    }, 75)
     return () => {
       cancelled = true
+      window.clearTimeout(timer)
     }
   }, [
     context?.selected_version?.id,
@@ -1500,6 +1525,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       if (!options.quiet && (data.created_count || data.updated_count)) {
         setNotice('Schedule shifts are ready.')
       }
+      if (!data.created_count && !data.updated_count) {
+        setContext((current) => current ? {
+          ...current,
+          shift_generation_required: false,
+        } : current)
+        return
+      }
       setSelectedOptimizerRunId(null)
       updateOptimizerRunUrl(null)
       await fetchContext(data.schedule_version.id, { optimizerRunId: null })
@@ -1517,6 +1549,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       || isGenerating
       || !context.can_manage_build_workspace
       || !['PRE_BUILD', 'BUILD'].includes(context.schedule_block.build_status)
+      || !context.shift_generation_required
     ) {
       return
     }

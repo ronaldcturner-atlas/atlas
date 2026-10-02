@@ -2021,6 +2021,23 @@ def _shift_instance_queryset(version, optimizer_run=None):
     )
 
 
+def _shift_generation_required(block, version):
+    if version is None:
+        return True
+    templates = list(
+        ShiftTemplate.objects.filter(active=True, facility__active=True)
+        .select_related('facility')
+        .order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
+    )
+    current_fingerprint = _shift_template_fingerprint(block, templates)
+    if version.shift_template_fingerprint != current_fingerprint:
+        return True
+    return not version.shift_instances.filter(
+        date__gte=block.start_date,
+        date__lte=block.end_date,
+    ).exists()
+
+
 def _facility_timezone(facility):
     try:
         return ZoneInfo(facility.timezone)
@@ -2115,6 +2132,9 @@ def schedule_block_build_context(request, block_id):
                 ScheduleVersionWorkspaceSerializer(selected_version).data
                 if selected_version
                 else None
+            ),
+            'shift_generation_required': _shift_generation_required(
+                block, selected_version,
             ),
             'optimizer_summary': (
                 optimizer_summary
@@ -4015,7 +4035,7 @@ def schedule_block_generate_shift_instances(request, block_id):
                 'updated_count': 0,
                 'total_count': total_count,
                 'schedule_block': ScheduleBlockSerializer(block).data,
-                'schedule_version': ScheduleVersionSerializer(version).data,
+                'schedule_version': ScheduleVersionWorkspaceSerializer(version).data,
             })
         created_count = 0
         updated_count = 0
@@ -4099,7 +4119,7 @@ def schedule_block_generate_shift_instances(request, block_id):
             'updated_count': updated_count,
             'total_count': total_count,
             'schedule_block': ScheduleBlockSerializer(block).data,
-            'schedule_version': ScheduleVersionSerializer(version).data,
+            'schedule_version': ScheduleVersionWorkspaceSerializer(version).data,
         }
     )
 
