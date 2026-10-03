@@ -1218,6 +1218,22 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     return Boolean(run && !runDeleteProtectionReason(run))
   })
 
+  const removeOptimizerRunsFromLocalHistory = (runIds: number[]) => {
+    const deletedRunIds = new Set(runIds)
+    const remainingRuns = optimizerRuns.filter((run) => !deletedRunIds.has(run.id))
+    setContext((current) => current ? {
+      ...current,
+      optimizer_runs: (current.optimizer_runs ?? []).filter(
+        (run) => !deletedRunIds.has(run.id),
+      ),
+    } : current)
+    setOptimizerSourceRunId((current) => (
+      current !== null && deletedRunIds.has(current)
+        ? remainingRuns.find(isCompletedOptimizerRun)?.id ?? null
+        : current
+    ))
+  }
+
   const updateRunDeleteSelection = (runId: number, checked: boolean, shiftKey: boolean) => {
     const anchorRunId = lastRunDeleteSelectionRef.current
     const currentIndex = optimizerRuns.findIndex((run) => run.id === runId)
@@ -1316,10 +1332,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       setSelectedRunIdsForDelete((current) => current.filter((id) => id !== run.id))
       setSelectedOptimizerRunId(nextRunId)
       updateOptimizerRunUrl(nextRunId)
-      await fetchContext(versionId, {
-        optimizerRunId: nextRunId,
-        quiet: true,
-      })
+      removeOptimizerRunsFromLocalHistory([run.id])
       setNotice(data?.message ?? `Run ${run.run_number} deleted.`)
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : 'Unable to delete optimizer run.')
@@ -1358,11 +1371,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(apiError(data, 'Unable to delete selected optimizer runs.'))
       const nextRunId = data?.next_viewed_run_id ?? viewedOptimizerRunId ?? null
+      const deletedRunIds = Array.isArray(data?.deleted_run_ids)
+        ? data.deleted_run_ids as number[]
+        : []
       setSelectedRunIdsForDelete([])
       setSelectedOptimizerRunId(nextRunId)
       updateOptimizerRunUrl(nextRunId)
-      await fetchContext(versionId, { optimizerRunId: nextRunId, quiet: true })
-      const deletedCount = Array.isArray(data?.deleted_run_ids) ? data.deleted_run_ids.length : 0
+      removeOptimizerRunsFromLocalHistory(deletedRunIds)
+      const deletedCount = deletedRunIds.length
       const skippedRows = Array.isArray(data?.skipped_run_ids) ? data.skipped_run_ids : []
       const skippedDetails = skippedRows.map((row: { id: number, reason: string }) => (
         `Run ${row.id}: ${row.reason.replaceAll('_', ' ')}`

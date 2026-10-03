@@ -27,6 +27,8 @@ from apps.scheduling.optimizer_v2 import (
 )
 from apps.scheduling.optimizer_v2_runner import (
     _apply_search_operations,
+    _authoritative_search_initial_score,
+    _require_hard_valid_final_report,
     _require_matching_final_score,
 )
 
@@ -64,6 +66,17 @@ class V2SwapKernelCommandTests(SimpleTestCase):
 
 
 class V2FinalScoreGuardTests(SimpleTestCase):
+    def test_opening_checkpoint_replaces_stale_bootstrap_score(self):
+        self.assertEqual(
+            _authoritative_search_initial_score({
+                'score_checkpoints': [{
+                    'accepted_transitions': 0,
+                    'score': 2656000,
+                }],
+            }, Decimal('2500000')),
+            Decimal('2656000'),
+        )
+
     def test_operation_replay_preserves_order_across_move_types(self):
         state = _apply_search_operations(
             {10: [1], 20: [2], 30: [3]},
@@ -93,6 +106,28 @@ class V2FinalScoreGuardTests(SimpleTestCase):
                     _require_matching_final_score(
                         Decimal('791000'), search_result,
                     )
+
+    def test_hard_invalid_final_reports_are_rejected(self):
+        cases = (
+            ('overlap_score', 'time-overlap conflict'),
+            ('invalid_assignment_score', 'optimizer-ineligible assignment'),
+            ('coverage_score', 'incomplete schedule'),
+        )
+        for score_name, message in cases:
+            with self.subTest(score_name=score_name):
+                with self.assertRaisesMessage(ValueError, message):
+                    _require_hard_valid_final_report({
+                        'score_breakdown': {score_name: 1},
+                    })
+
+    def test_zero_hard_scores_are_accepted(self):
+        _require_hard_valid_final_report({
+            'score_breakdown': {
+                'overlap_score': 0,
+                'invalid_assignment_score': 0,
+                'coverage_score': 0,
+            },
+        })
 
 
 class PublishedBoundaryOverlapMatrixTests(SimpleTestCase):

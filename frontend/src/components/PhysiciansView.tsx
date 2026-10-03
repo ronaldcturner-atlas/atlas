@@ -94,6 +94,9 @@ export default function PhysiciansView() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingPhysicianId, setEditingPhysicianId] = useState<number | null>(null)
   const [formState, setFormState] = useState<PhysicianFormState>(defaultFormState)
+  const activePhysicianCount = physicians.filter(
+    (physician) => physician.active === true,
+  ).length
 
   const fetchData = async () => {
     try {
@@ -235,7 +238,13 @@ export default function PhysiciansView() {
   return (
     <div className="facilities-view-card">
       <div className="facilities-header">
-        <h2>Physician Management</h2>
+        <div className="physician-management-heading">
+          <h2>Physician Management</h2>
+          <div className="physician-active-count" aria-label={`${activePhysicianCount} active users`}>
+            <span>Total Users</span>
+            <strong>{activePhysicianCount}</strong>
+          </div>
+        </div>
         <button type="button" className="primary-action" onClick={openCreateModal}>
           Add New Physician
         </button>

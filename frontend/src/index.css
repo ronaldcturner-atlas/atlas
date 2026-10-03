@@ -170,6 +170,10 @@ select option:checked{
 .facilities-view-card{background:var(--surface);border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:16px}
 .facilities-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .facilities-header h2{margin:0;font-size:16px}
+.physician-management-heading{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.physician-active-count{display:flex;align-items:center;gap:7px;padding:5px 9px;border:1px solid rgba(129,140,248,.45);border-radius:7px;background:rgba(79,70,229,.14)}
+.physician-active-count span{color:var(--muted);font-size:12px}
+.physician-active-count strong{font-size:14px;line-height:1}
 .primary-action{padding:8px 12px;border-radius:8px;border:0;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
 .facilities-error{padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.16);color:#fecaca;font-size:13px}
 .facility-order-help{margin-top:-6px;color:var(--muted);font-size:12px}

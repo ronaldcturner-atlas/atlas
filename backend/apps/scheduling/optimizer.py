@@ -3808,8 +3808,16 @@ def _weekend_support_cycle_candidates(
         if _is_weekend_designated(instances_by_id[pair[0]]):
             weekend_pairs_by_date[instances_by_id[pair[0]].date].append(pair)
 
-    candidates = []
-    for anchor_instance_id, anchor_physician_id, violation_type in anchors[:16]:
+    # Build a small candidate group for every reported anchor, then interleave
+    # the groups.  The previous depth-first enumeration could consume the
+    # entire global budget on the first isolated weekend assignment.  In a
+    # schedule with many weekend violations, later physicians therefore never
+    # received the targeted Sat/Sun pairing repair at all.
+    candidates_by_anchor = []
+    per_anchor_limit = min(max(int(candidate_limit), 0), 16)
+    for anchor_instance_id, anchor_physician_id, violation_type in anchors[
+        :max(int(candidate_limit), 0)
+    ]:
         anchor_instance = instances_by_id[anchor_instance_id]
         offsets = (
             (-1, 1)
@@ -3849,6 +3857,7 @@ def _weekend_support_cycle_candidates(
                 pair[0],
             ),
         )
+        anchor_candidates = []
         for adjacent_pair in adjacent_pairs:
             adjacent_owner = adjacent_pair[1]
             for support_pair in support_pairs:
@@ -3878,7 +3887,7 @@ def _weekend_support_cycle_candidates(
                     ),
                 )
                 for bridge_pair in bridge_pairs:
-                    candidates.append({
+                    anchor_candidates.append({
                         'source': 'weekend_cycle',
                         'anchor_instance_id': anchor_instance_id,
                         'violation_type': violation_type,
@@ -3891,8 +3900,29 @@ def _weekend_support_cycle_candidates(
                             adjacent_owner,
                         ),
                     })
-                    if len(candidates) >= max(int(candidate_limit), 0):
-                        return candidates
+                    if len(anchor_candidates) >= per_anchor_limit:
+                        break
+                if len(anchor_candidates) >= per_anchor_limit:
+                    break
+            if len(anchor_candidates) >= per_anchor_limit:
+                break
+        if anchor_candidates:
+            candidates_by_anchor.append(anchor_candidates)
+
+    candidates = []
+    depth = 0
+    while len(candidates) < max(int(candidate_limit), 0):
+        added = False
+        for anchor_candidates in candidates_by_anchor:
+            if depth >= len(anchor_candidates):
+                continue
+            candidates.append(anchor_candidates[depth])
+            added = True
+            if len(candidates) >= max(int(candidate_limit), 0):
+                return candidates
+        if not added:
+            break
+        depth += 1
     return candidates
 
 

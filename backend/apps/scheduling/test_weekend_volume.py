@@ -1,7 +1,8 @@
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.test import SimpleTestCase, TestCase
 
@@ -108,6 +109,73 @@ class WeekendVolumeTests(SimpleTestCase):
                 instances, [physician], state, {(1, 11)}, {11: contract},
             ),
             [],
+        )
+
+    def test_weekend_cycle_budget_reaches_each_isolated_weekend_anchor(self):
+        block = SimpleNamespace(
+            start_date=date(2027, 1, 1), end_date=date(2027, 4, 30),
+        )
+        weekend_template = SimpleNamespace(
+            weekend_days=['Saturday', 'Sunday'],
+        )
+        weekday_template = SimpleNamespace(weekend_days=[])
+        instances = []
+        state = {}
+        violations = []
+        base_sunday = date(2027, 1, 3)
+        for index in range(8):
+            sunday = base_sunday + timedelta(days=index * 14)
+            anchor_id = 100 + index
+            adjacent_id = 200 + index
+            support_id = 300 + index
+            bridge_id = 400 + index
+            anchor_physician_id = 10 + index
+            adjacent_owner_id = 110 + index
+            bridge_owner_id = 210 + index
+            for instance_id, day, template in (
+                (anchor_id, sunday, weekend_template),
+                (adjacent_id, sunday - timedelta(days=1), weekend_template),
+                (support_id, sunday + timedelta(days=3), weekday_template),
+                (bridge_id, sunday + timedelta(days=4), weekday_template),
+            ):
+                start = datetime.combine(day, datetime.min.time())
+                instances.append(SimpleNamespace(
+                    id=instance_id,
+                    date=day,
+                    schedule_block=block,
+                    shift_template=template,
+                    start_datetime=start,
+                    end_datetime=start + timedelta(hours=8),
+                ))
+            state[anchor_id] = [anchor_physician_id]
+            state[adjacent_id] = [adjacent_owner_id]
+            state[support_id] = [anchor_physician_id]
+            state[bridge_id] = [bridge_owner_id]
+            violations.append({
+                'physician_id': anchor_physician_id,
+                'violation_type': 'MIN_CONSECUTIVE_WEEKEND_SHIFTS',
+                'shift_instance_ids': [anchor_id],
+                'penalty': 2000,
+            })
+
+        with patch.object(
+            o,
+            '_weekend_volume_report',
+            return_value={'score': 16000, 'violations': violations},
+        ):
+            candidates = o._weekend_support_cycle_candidates(
+                instances,
+                [SimpleNamespace(id=10 + index) for index in range(8)],
+                state,
+                set(),
+                {},
+                candidate_limit=8,
+            )
+
+        self.assertEqual(len(candidates), 8)
+        self.assertEqual(
+            {candidate['anchor_instance_id'] for candidate in candidates},
+            {100 + index for index in range(8)},
         )
 
     def test_missing_weekend_rule_has_no_implicit_penalty(self):

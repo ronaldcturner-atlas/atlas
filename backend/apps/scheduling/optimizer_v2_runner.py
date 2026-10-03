@@ -84,6 +84,35 @@ def _require_matching_final_score(final_score, search_result):
         )
 
 
+def _require_hard_valid_final_report(report):
+    breakdown = report['score_breakdown']
+    if Decimal(str(breakdown.get('overlap_score', 0))) > 0:
+        raise ValueError(
+            'Atlas v2 produced a time-overlap conflict; the isolated '
+            'result was not saved.'
+        )
+    if Decimal(str(breakdown.get('invalid_assignment_score', 0))) > 0:
+        raise ValueError(
+            'Atlas v2 produced an optimizer-ineligible assignment; the '
+            'isolated result was not saved.'
+        )
+    if Decimal(str(breakdown.get('coverage_score', 0))) > 0:
+        raise ValueError(
+            'Atlas v2 produced an incomplete schedule; the isolated '
+            'result was not saved.'
+        )
+
+
+def _authoritative_search_initial_score(search_result, fallback):
+    score_checkpoints = search_result.get('score_checkpoints') or []
+    if (
+        score_checkpoints
+        and int(score_checkpoints[0].get('accepted_transitions', -1)) == 0
+    ):
+        return Decimal(str(score_checkpoints[0]['score']))
+    return Decimal(str(fallback))
+
+
 def optimize_schedule_version_v2(
     schedule_version,
     *,
@@ -175,6 +204,9 @@ def optimize_schedule_version_v2(
         if not lines:
             raise ValueError('Atlas v2 test did not return a search result.')
         search_result = json.loads(lines[-1])
+        initial_score = _authoritative_search_initial_score(
+            search_result, initial_score,
+        )
 
     source_assignments = list(
         assignments_for_viewed_run(schedule_version, source_run)
@@ -225,11 +257,7 @@ def optimize_schedule_version_v2(
         )
         final_score = Decimal(str(report['total_score']))
         _require_matching_final_score(final_score, search_result)
-        if Decimal(str(report['score_breakdown']['overlap_score'])) > 0:
-            raise ValueError(
-                'Atlas v2 produced a time-overlap conflict; the isolated '
-                'result was not saved.'
-            )
+        _require_hard_valid_final_report(report)
         if final_score > initial_score + Decimal('0.0001'):
             raise ValueError(
                 'Atlas v2 test result worsened the authoritative penalty; '

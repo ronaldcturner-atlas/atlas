@@ -327,7 +327,7 @@ class Command(BaseCommand):
             )
             output = io.StringIO()
             checkpoint_score = (
-                current_score is None
+                accepted_transition_count == 0
                 or selection_mode == 'diversify'
                 or (
                     generation_accepted_transition_count > 0
@@ -421,10 +421,19 @@ class Command(BaseCommand):
                 if current_score is not None and abs(
                     authoritative_current - current_score
                 ) > 0.0001:
-                    raise CommandError(
-                        'The compiled v2 score diverged from the authoritative '
-                        'checkpoint.'
-                    )
+                    if accepted_transition_count == 0:
+                        # The bootstrap score can become stale before V2 starts
+                        # when contracts or requests change while the fresh-fill
+                        # phase is completing. Establish the actual V2 baseline
+                        # before accepting any compiled transition. Once search
+                        # has begun, any divergence remains a hard failure.
+                        best_score = authoritative_current
+                        best_swaps = list(current_swaps)
+                    else:
+                        raise CommandError(
+                            'The compiled v2 score diverged from the '
+                            'authoritative checkpoint.'
+                        )
                 current_score = authoritative_current
                 if best_score is None:
                     best_score = current_score

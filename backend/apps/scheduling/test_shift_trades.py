@@ -85,6 +85,54 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(self.assignment.physician, self.requester)
         self.assertEqual(accepted.json()['status'], 'APPROVED')
 
+    def test_published_pickup_is_allowed_at_contract_excluded_facility(self):
+        excluded_facility = Facility.objects.create(
+            name='Excluded Hospital', short_name='EX',
+        )
+        excluded_template = ShiftTemplate.objects.create(
+            facility=excluded_facility, name='Excluded Day',
+            start_time=time(7), end_time=time(16),
+            active_days_of_week=['Wednesday'], weekend_days=[],
+            default_staffing_count=1,
+        )
+        excluded_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2026, 9, 2), shift_template=excluded_template,
+            facility=excluded_facility,
+            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        excluded_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=excluded_instance, physician=self.owner,
+            assignment_source=(
+                ScheduleShiftAssignment.AssignmentSource.MANUAL
+            ),
+            optimizer_run=self.run,
+        )
+        ShiftPosting.objects.create(
+            assignment=excluded_assignment, posted_by=self.owner_user,
+            mode=ShiftPosting.Mode.PICKUP,
+        )
+        ShiftTradePolicy.objects.create(
+            pk=1, require_scheduler_approval=False,
+        )
+
+        self.client.force_authenticate(self.requester_user)
+        created = self.client.post('/api/shift-trades/', {
+            'target_assignment_id': excluded_assignment.id,
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+
+        self.client.force_authenticate(self.owner_user)
+        accepted = self.client.post(
+            f"/api/shift-trades/{created.json()['id']}/accept/", {},
+            format='json',
+        )
+        self.assertEqual(accepted.status_code, 200)
+        excluded_assignment.refresh_from_db()
+        self.assertEqual(excluded_assignment.physician, self.requester)
+
     def test_only_scheduler_can_change_approval_policy(self):
         self.client.force_authenticate(self.owner_user)
         denied = self.client.patch('/api/shift-trade-policy/', {'require_scheduler_approval': False}, format='json')
@@ -117,6 +165,40 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(proposed.status_code, 201)
         self.assertEqual(proposed.json()['trade_type'], 'TRADE')
         self.assertEqual(proposed.json()['requested_assignment']['id'], self.assignment.id)
+
+    def test_trade_options_include_contract_excluded_facilities(self):
+        excluded_facility = Facility.objects.create(
+            name='Excluded Hospital', short_name='EX',
+        )
+        excluded_template = ShiftTemplate.objects.create(
+            facility=excluded_facility, name='Excluded Day',
+            start_time=time(7), end_time=time(16),
+            active_days_of_week=['Wednesday'], weekend_days=[],
+            default_staffing_count=1,
+        )
+        target_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2026, 9, 2), shift_template=excluded_template,
+            facility=excluded_facility,
+            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        target = ScheduleShiftAssignment.objects.create(
+            shift_instance=target_instance, physician=self.requester,
+            assignment_source=(
+                ScheduleShiftAssignment.AssignmentSource.MANUAL
+            ),
+            optimizer_run=self.run,
+        )
+
+        self.client.force_authenticate(self.owner_user)
+        options = self.client.get(
+            f'/api/schedule-assignments/{self.assignment.id}/trade-options/'
+        )
+
+        self.assertEqual(options.status_code, 200)
+        self.assertEqual([option['id'] for option in options.json()], [target.id])
 
     def test_accepting_trade_cancels_competing_offers_for_same_shift(self):
         User = get_user_model()

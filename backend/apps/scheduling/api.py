@@ -684,14 +684,6 @@ def shift_trades(request):
     return Response(_trade_payload(_trade_queryset().get(id=trade.id), request.user), status=status.HTTP_201_CREATED)
 
 
-def _physician_is_eligible_for_facility(physician, assignment):
-    instance = assignment.shift_instance
-    return physician.active and ContractUserAssignment.objects.filter(
-        physician=physician, domain=instance.schedule_version.domain,
-        contract__active=True, contract__facilities=instance.facility,
-    ).exists()
-
-
 def _trade_options_for_assignment(offered):
     proposer = offered.physician
     run = offered.optimizer_run
@@ -699,6 +691,7 @@ def _trade_options_for_assignment(offered):
     cohort = ScheduleShiftAssignment.objects.filter(
         shift_instance__schedule_block=block,
         optimizer_run=run,
+        physician__active=True,
     )
     cohort_rows = list(cohort.order_by(
         'physician__display_name', 'shift_instance__date',
@@ -716,18 +709,6 @@ def _trade_options_for_assignment(offered):
     physician_dates = {}
     for row in cohort_rows:
         physician_dates.setdefault(row['physician_id'], set()).add(row['shift_instance__date'])
-    physician_ids = set(physician_dates)
-    eligible_facilities = {}
-    for physician_id, facility_id in ContractUserAssignment.objects.filter(
-        physician_id__in=physician_ids,
-        domain=offered.shift_instance.schedule_version.domain,
-        physician__active=True,
-        contract__active=True,
-    ).values_list('physician_id', 'contract__facilities'):
-        if facility_id is not None:
-            eligible_facilities.setdefault(physician_id, set()).add(facility_id)
-    proposer_facilities = eligible_facilities.get(proposer.id, set())
-    offered_facility_id = offered.shift_instance.facility_id
     options = []
     for target in cohort_rows:
         if target['physician_id'] == proposer.id:
@@ -736,10 +717,6 @@ def _trade_options_for_assignment(offered):
         if target_date in proposer_work_dates:
             continue
         if offered.shift_instance.date in physician_dates.get(target['physician_id'], set()):
-            continue
-        if target['shift_instance__facility_id'] not in proposer_facilities:
-            continue
-        if offered_facility_id not in eligible_facilities.get(target['physician_id'], set()):
             continue
         start_time = target['shift_instance__segment_start_time'] or target['shift_instance__shift_template__start_time']
         end_time = target['shift_instance__segment_end_time'] or target['shift_instance__shift_template__end_time']
@@ -772,12 +749,8 @@ def schedule_assignment_trade_options(request, assignment_id):
 
 def _trade_assignment_is_valid(physician, assignment, excluded_ids):
     instance = assignment.shift_instance
-    contract_assignment = ContractUserAssignment.objects.filter(
-        physician=physician, domain=instance.schedule_version.domain, contract__active=True,
-        contract__facilities=instance.facility,
-    ).exists()
-    if not physician.active or not contract_assignment:
-        return False, f'{physician} is not eligible for {instance.facility.name}.'
+    if not physician.active:
+        return False, f'{physician} is not an active physician.'
     overlap = ScheduleShiftAssignment.objects.filter(
         physician=physician,
         shift_instance__start_datetime__lt=instance.end_datetime,
@@ -3147,6 +3120,7 @@ def optimizer_runs_bulk_delete(request, version_id):
                 schedule_version=version, id__in=eligible_ids,
             )
         }
+        deletable_ids = []
         for run_id in requested_ids:
             run = candidate_runs_by_id.get(run_id)
             reason = None
@@ -3173,13 +3147,16 @@ def optimizer_runs_bulk_delete(request, version_id):
                     'reason': 'active_run' if run.is_active else 'running',
                 })
                 continue
-            assignment_count = ScheduleShiftAssignment.objects.filter(
-                optimizer_run=run,
-            ).count()
-            ScheduleShiftAssignment.objects.filter(optimizer_run=run).delete()
-            run.delete()
-            assignments_deleted += assignment_count
-            deleted_ids.append(run_id)
+            deletable_ids.append(run_id)
+
+        if deletable_ids:
+            assignments = ScheduleShiftAssignment.objects.filter(
+                optimizer_run_id__in=deletable_ids,
+            )
+            assignments_deleted = assignments.count()
+            assignments.delete()
+            OptimizerRun.objects.filter(id__in=deletable_ids).delete()
+            deleted_ids.extend(deletable_ids)
 
     next_viewed_run_id = viewed_run_id
     if not (
