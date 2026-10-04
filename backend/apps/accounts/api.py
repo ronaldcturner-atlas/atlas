@@ -23,7 +23,7 @@ def login_view(request):
     """
     Login endpoint. Expects username and password in request body.
     """
-    username = request.data.get('username')
+    username = str(request.data.get('username', '')).strip().lower()
     password = request.data.get('password')
     
     if not username or not password:
@@ -32,7 +32,13 @@ def login_view(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    user = authenticate(request, username=username, password=password)
+    account = User.objects.filter(email__iexact=username).first()
+    authentication_username = account.username if account else username
+    user = authenticate(
+        request,
+        username=authentication_username,
+        password=password,
+    )
     if user is not None:
         login(request, user)
         serializer = UserSerializer(user)
@@ -73,7 +79,9 @@ def me_view(request):
 @permission_classes([IsAuthenticated])
 def physicians_list_create(request):
     if request.method == 'GET':
-        physicians = Physician.objects.select_related('user', 'primary_facility').all()
+        physicians = Physician.objects.select_related('user', 'primary_facility').prefetch_related(
+            'contract_assignments__contract__domain',
+        ).all()
         serializer = PhysicianSerializer(physicians, many=True)
         return Response(serializer.data)
 
@@ -88,7 +96,9 @@ def physicians_list_create(request):
 @permission_classes([IsAuthenticated])
 def physician_detail(request, physician_id):
     physician = get_object_or_404(
-        Physician.objects.select_related('user', 'primary_facility'),
+        Physician.objects.select_related('user', 'primary_facility').prefetch_related(
+            'contract_assignments__contract__domain',
+        ),
         id=physician_id,
     )
 

@@ -274,6 +274,8 @@ A Physician profile is linked one-to-one with an authentication user. Its settle
 
 - first and last name;
 - unique email, also used as the username;
+- optional phone number;
+- optional profile role label (currently descriptive only and does not grant permissions);
 - optional display name;
 - optional primary Facility;
 - clinician type: Physician, PA, or NP;

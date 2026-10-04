@@ -101,10 +101,10 @@ export default function Sidebar({ activeView, onSelectView, userView }: SidebarP
           type="button"
           className={activeView === 'physicians' ? 'active' : ''}
           onClick={() => onSelectView('physicians')}
-          title="Physicians"
+          title="Users"
         >
           <span className="nav-icon" aria-hidden="true">●</span>
-          <span className="nav-label">Physicians</span>
+          <span className="nav-label">Users</span>
         </button>
           </>
         )}

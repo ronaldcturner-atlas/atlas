@@ -10,9 +10,19 @@ class Physician(models.Model):
         ('pa', 'PA'),
         ('np', 'NP'),
     ]
+    ROLE_CHOICES = [
+        ('org_admin', 'Org Admin'),
+        ('medical_director', 'Medical Director'),
+        ('admin', 'Admin'),
+        ('staff_physician', 'Staff Physician'),
+        ('app', 'APP'),
+        ('scheduler', 'Scheduler'),
+    ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='physician')
     display_name = models.CharField(max_length=255, blank=True)
+    phone_number = models.CharField(max_length=30, blank=True)
+    role = models.CharField(max_length=30, choices=ROLE_CHOICES, blank=True)
     primary_facility = models.ForeignKey(
         Facility,
         on_delete=models.SET_NULL,

@@ -175,6 +175,7 @@ select option:checked{
 .calendar-comment-modal .shift-modal-body{gap:9px;margin-bottom:12px}.calendar-comment-modal .shift-modal-body label{display:grid;gap:4px;color:var(--muted);font-size:12px}.calendar-comment-modal input,.calendar-comment-modal textarea{width:100%;padding:8px;border:1px solid var(--border);border-radius:7px;background:#fff;color:#111;font:inherit}.calendar-comment-modal textarea{min-height:110px;resize:vertical}
 .calendar-comment-modal select{width:100%}.calendar-comment-end-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,.72fr);gap:8px;align-items:end}
 .calendar-comment-actions{gap:7px}.calendar-comment-actions .danger{margin-right:auto;border:1px solid #ef4444;background:rgba(239,68,68,.14);color:#fecaca}
+.physician-profile-modal{width:min(540px,calc(100vw - 24px));max-width:540px;max-height:calc(100vh - 32px);padding:18px;display:flex;flex-direction:column;overflow:hidden}.physician-profile-modal .shift-modal-body{min-height:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}.physician-profile-modal .shift-modal-actions{flex:0 0 auto;gap:8px;padding-top:2px}
 
 @media (max-width: 980px){
   .calendar-header{align-items:flex-start;gap:12px;flex-direction:column}
@@ -197,6 +198,16 @@ select option:checked{
 .facilities-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .facilities-header h2{margin:0;font-size:16px}
 .physician-management-heading{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.user-directory{column-width:170px;column-gap:28px;margin-top:16px;max-width:1000px}
+.user-name-button{display:block;width:max-content;max-width:100%;padding:3px 0;border:0;background:transparent;color:#dbeafe;font:inherit;font-size:14px;font-weight:700;cursor:pointer;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;break-inside:avoid}
+.user-name-button:hover{color:#93c5fd;text-decoration:underline;text-underline-offset:3px}
+.user-name-button-disabled{opacity:.58}
+.user-profile-form{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 12px;margin-bottom:14px}
+.user-profile-form .facility-field{min-width:0}
+.user-profile-form .facility-field input,.user-profile-form .facility-field select{width:100%;min-width:0}
+.user-profile-form input[readonly]{background:rgba(148,163,184,.12);color:#dbeafe;cursor:default}
+.user-profile-form .physician-active-field{grid-column:1/-1;margin-top:1px}
+@media (max-width:560px){.user-profile-form{grid-template-columns:1fr}}
 .physician-active-count{display:flex;align-items:center;gap:7px;padding:5px 9px;border:1px solid rgba(129,140,248,.45);border-radius:7px;background:rgba(79,70,229,.14)}
 .physician-active-count span{color:var(--muted);font-size:12px}
 .physician-active-count strong{font-size:14px;line-height:1}

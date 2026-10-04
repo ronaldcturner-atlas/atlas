@@ -3,7 +3,7 @@ import { useAuth } from '../contexts/AuthContext'
 import './Login.css'
 
 export default function Login() {
-  const [username, setUsername] = useState('')
+  const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
@@ -15,7 +15,7 @@ export default function Login() {
     setIsLoading(true)
 
     try {
-      await login(username, password)
+      await login(email.trim().toLowerCase(), password)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed')
     } finally {
@@ -39,16 +39,16 @@ export default function Login() {
           {error && <div className="login-error">{error}</div>}
 
           <div className="form-group">
-            <label htmlFor="username" className="form-label">
-              Username
+            <label htmlFor="email" className="form-label">
+              Email
             </label>
             <input
-              type="text"
-              id="username"
+              type="email"
+              id="email"
               className="form-input"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="Enter your username"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="Enter your email"
               disabled={isLoading}
               autoFocus
             />
@@ -72,7 +72,7 @@ export default function Login() {
           <button
             type="submit"
             className="login-button"
-            disabled={isLoading || !username || !password}
+            disabled={isLoading || !email || !password}
           >
             {isLoading ? 'Logging in...' : 'Login'}
           </button>
@@ -80,7 +80,7 @@ export default function Login() {
 
         <div className="demo-credentials">
           <p>Demo Credentials:</p>
-          <p>Username: <code>ron</code></p>
+          <p>Email: <code>ron@atlas.local</code></p>
           <p>Password: <code>atlas</code></p>
         </div>
       </div>

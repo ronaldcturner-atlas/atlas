@@ -110,7 +110,7 @@ export default function Dashboard() {
           ? 'Contracts'
         : activeView === 'facilities'
           ? 'Facilities'
-          : 'Physicians'
+          : 'Users'
 
   React.useEffect(() => {
     if (viewFromPath(location.pathname) === null) {

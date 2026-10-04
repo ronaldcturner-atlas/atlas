@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
+from django.db.models import Q
 
 from apps.facilities.models import Facility
 
@@ -25,8 +26,9 @@ class UserSerializer(serializers.ModelSerializer):
 class PhysicianSerializer(serializers.ModelSerializer):
     first_name = serializers.CharField(source='user.first_name')
     last_name = serializers.CharField(source='user.last_name')
-    email = serializers.EmailField(source='user.email')
+    email = serializers.EmailField(source='user.email', required=True, allow_blank=False)
     primary_facility_name = serializers.CharField(source='primary_facility.name', read_only=True)
+    current_contracts = serializers.SerializerMethodField()
 
     class Meta:
         model = Physician
@@ -36,25 +38,41 @@ class PhysicianSerializer(serializers.ModelSerializer):
             'last_name',
             'display_name',
             'email',
+            'phone_number',
+            'current_contracts',
+            'role',
             'primary_facility',
             'primary_facility_name',
             'clinician_type',
             'fte',
             'active',
         ]
-        read_only_fields = ['id', 'primary_facility_name']
+        read_only_fields = ['id', 'current_contracts', 'primary_facility_name']
+
+    def get_current_contracts(self, obj):
+        assignments = obj.contract_assignments.all()
+        return [
+            {
+                'id': assignment.contract_id,
+                'name': assignment.contract.name,
+                'domain': assignment.contract.domain.name,
+            }
+            for assignment in assignments
+        ]
 
     def validate_email(self, value):
         normalized = value.strip().lower()
-        existing_user = User.objects.filter(email__iexact=normalized).first()
+        existing_users = User.objects.filter(
+            Q(email__iexact=normalized) | Q(username__iexact=normalized),
+        )
+        if self.instance:
+            existing_users = existing_users.exclude(id=self.instance.user_id)
+        if existing_users.exists():
+            raise serializers.ValidationError('A user with this email already exists.')
+        return normalized
 
-        if not existing_user:
-            return normalized
-
-        if self.instance and self.instance.user_id == existing_user.id:
-            return normalized
-
-        raise serializers.ValidationError('A user with this email already exists.')
+    def validate_phone_number(self, value):
+        return value.strip()
 
     def validate_primary_facility(self, value):
         if value is None:

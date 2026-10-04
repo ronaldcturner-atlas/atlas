@@ -6,6 +6,13 @@ type Physician = {
   last_name: string
   display_name: string
   email: string
+  phone_number: string
+  current_contracts: Array<{
+    id: number
+    name: string
+    domain: string
+  }>
+  role: string
   primary_facility: number | null
   primary_facility_name: string | null
   clinician_type: 'physician' | 'pa' | 'np'
@@ -24,6 +31,8 @@ type PhysicianFormState = {
   last_name: string
   display_name: string
   email: string
+  phone_number: string
+  role: string
   primary_facility: string
   clinician_type: 'physician' | 'pa' | 'np'
   fte: string
@@ -37,6 +46,8 @@ const defaultFormState: PhysicianFormState = {
   last_name: '',
   display_name: '',
   email: '',
+  phone_number: '',
+  role: '',
   primary_facility: '',
   clinician_type: 'physician',
   fte: '1.00',
@@ -97,6 +108,13 @@ export default function PhysiciansView() {
   const activePhysicianCount = physicians.filter(
     (physician) => physician.active === true,
   ).length
+  const sortedUsers = [...physicians].sort((left, right) => {
+    const lastNameComparison = left.last_name.localeCompare(right.last_name, undefined, { sensitivity: 'base' })
+    if (lastNameComparison !== 0) {
+      return lastNameComparison
+    }
+    return left.first_name.localeCompare(right.first_name, undefined, { sensitivity: 'base' })
+  })
 
   const fetchData = async () => {
     try {
@@ -110,7 +128,7 @@ export default function PhysiciansView() {
 
       if (!physiciansResponse.ok) {
         const errorMessage = await getApiErrorMessage(physiciansResponse)
-        throw new Error(errorMessage ?? 'Unable to load physicians')
+        throw new Error(errorMessage ?? 'Unable to load users')
       }
 
       if (!facilitiesResponse.ok) {
@@ -125,7 +143,7 @@ export default function PhysiciansView() {
       setFacilities(facilitiesData)
     } catch (fetchError) {
       console.error(fetchError)
-      setError(fetchError instanceof Error ? fetchError.message : 'Unable to load physician data right now.')
+      setError(fetchError instanceof Error ? fetchError.message : 'Unable to load user data right now.')
     } finally {
       setIsLoading(false)
     }
@@ -148,6 +166,8 @@ export default function PhysiciansView() {
       last_name: physician.last_name,
       display_name: physician.display_name,
       email: physician.email,
+      phone_number: physician.phone_number,
+      role: physician.role,
       primary_facility: physician.primary_facility ? String(physician.primary_facility) : '',
       clinician_type: physician.clinician_type,
       fte: physician.fte,
@@ -156,6 +176,14 @@ export default function PhysiciansView() {
     setIsModalOpen(true)
   }
 
+  const editingUser = editingPhysicianId === null
+    ? null
+    : physicians.find((physician) => physician.id === editingPhysicianId) ?? null
+  const currentContractLabel = editingUser?.current_contracts.length
+    ? editingUser.current_contracts.map((contract) => (
+      editingUser.current_contracts.length === 1 ? contract.name : `${contract.domain}: ${contract.name}`
+    )).join(', ')
+    : 'Not assigned'
   const closeModal = () => {
     setIsModalOpen(false)
     setEditingPhysicianId(null)
@@ -189,6 +217,8 @@ export default function PhysiciansView() {
           last_name: formState.last_name.trim(),
           display_name: formState.display_name.trim(),
           email: formState.email.trim(),
+          phone_number: formState.phone_number.trim(),
+          role: formState.role,
           primary_facility: formState.primary_facility ? Number(formState.primary_facility) : null,
           clinician_type: formState.clinician_type,
           fte: formState.fte,
@@ -198,113 +228,62 @@ export default function PhysiciansView() {
 
       if (!response.ok) {
         const errorMessage = await getApiErrorMessage(response)
-        throw new Error(errorMessage ?? 'Unable to save physician')
+        throw new Error(errorMessage ?? 'Unable to save user')
       }
 
       await fetchData()
       closeModal()
     } catch (saveError) {
       console.error(saveError)
-      setError(saveError instanceof Error ? saveError.message : 'Unable to save physician changes.')
+      setError(saveError instanceof Error ? saveError.message : 'Unable to save user profile changes.')
     } finally {
       setIsSaving(false)
     }
   }
 
-  const disablePhysician = async (physician: Physician) => {
-    try {
-      setError(null)
-      const response = await fetch(`${API_BASE}/physicians/${physician.id}/disable/`, {
-        method: 'POST',
-        credentials: 'include',
-      })
-
-      if (!response.ok) {
-        const errorMessage = await getApiErrorMessage(response)
-        throw new Error(errorMessage ?? 'Unable to disable physician')
-      }
-
-      await fetchData()
-    } catch (disableError) {
-      console.error(disableError)
-      setError(disableError instanceof Error ? disableError.message : `Unable to disable ${physician.display_name || physician.first_name}.`)
-    }
-  }
-
   if (isLoading) {
-    return <div className="scheduler-loading">Loading physicians...</div>
+    return <div className="scheduler-loading">Loading users...</div>
   }
 
   return (
     <div className="facilities-view-card">
       <div className="facilities-header">
         <div className="physician-management-heading">
-          <h2>Physician Management</h2>
+          <h2>User Management</h2>
           <div className="physician-active-count" aria-label={`${activePhysicianCount} active users`}>
             <span>Total Users</span>
             <strong>{activePhysicianCount}</strong>
           </div>
         </div>
         <button type="button" className="primary-action" onClick={openCreateModal}>
-          Add New Physician
+          Add New User
         </button>
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
 
-      <div className="scheduler-table-wrap">
-        <table className="scheduler-table">
-          <thead>
-            <tr>
-              <th>First Name</th>
-              <th>Last Name</th>
-              <th>Display Name</th>
-              <th>Email</th>
-              <th>Primary Facility</th>
-              <th>Type</th>
-              <th>FTE</th>
-              <th>Status</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {physicians.map((physician) => (
-              <tr key={physician.id}>
-                <td>{physician.first_name}</td>
-                <td>{physician.last_name}</td>
-                <td>{physician.display_name || '-'}</td>
-                <td>{physician.email}</td>
-                <td>{physician.primary_facility_name || '-'}</td>
-                <td>{physician.clinician_type.toUpperCase()}</td>
-                <td>{physician.fte}</td>
-                <td>{physician.active ? 'Active' : 'Disabled'}</td>
-                <td>
-                  <div className="facility-actions">
-                    <button type="button" onClick={() => openEditModal(physician)}>
-                      Edit
-                    </button>
-                    {physician.active && (
-                      <button type="button" onClick={() => disablePhysician(physician)}>
-                        Disable
-                      </button>
-                    )}
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="user-directory" aria-label="Users">
+        {sortedUsers.map((physician) => (
+          <button
+            type="button"
+            className={`user-name-button${physician.active ? '' : ' user-name-button-disabled'}`}
+            key={physician.id}
+            onClick={() => openEditModal(physician)}
+          >
+            {physician.first_name} {physician.last_name}
+          </button>
+        ))}
       </div>
 
-      {!physicians.length && <div className="empty-state">No physicians found</div>}
+      {!physicians.length && <div className="empty-state">No users found</div>}
 
       {isModalOpen && (
         <div className="shift-modal-overlay" onClick={closeModal}>
-          <div className="shift-modal" onClick={(event) => event.stopPropagation()}>
+          <div className="shift-modal physician-profile-modal" onClick={(event) => event.stopPropagation()}>
             <div className="shift-modal-header">
-              <h2>{editingPhysicianId ? 'Edit Physician' : 'Add New Physician'}</h2>
+              <h2>{editingPhysicianId ? 'User Profile' : 'Add New User'}</h2>
             </div>
-            <div className="shift-modal-body">
+            <div className="shift-modal-body user-profile-form">
               <label className="facility-field">
                 <span>First Name</span>
                 <input
@@ -339,15 +318,48 @@ export default function PhysiciansView() {
                 />
               </label>
               <label className="facility-field">
-                <span>Email</span>
+                <span>Email (required)</span>
                 <input
                   type="email"
+                  required
                   value={formState.email}
                   onChange={(event) =>
                     setFormState((current) => ({ ...current, email: event.target.value }))
                   }
                   placeholder="ava.patel@example.com"
                 />
+              </label>
+              <label className="facility-field">
+                <span>Phone (optional)</span>
+                <input
+                  type="tel"
+                  value={formState.phone_number}
+                  onChange={(event) =>
+                    setFormState((current) => ({ ...current, phone_number: event.target.value }))
+                  }
+                  placeholder="(555) 555-0123"
+                />
+              </label>
+              <label className="facility-field">
+                <span>Current Contract</span>
+                <input type="text" value={currentContractLabel} readOnly />
+              </label>
+              <label className="facility-field">
+                <span>Role</span>
+                <select
+                  value={formState.role}
+                  onChange={(event) =>
+                    setFormState((current) => ({ ...current, role: event.target.value }))
+                  }
+                >
+                  <option value="">Not assigned</option>
+                  <option value="org_admin">Org Admin</option>
+                  <option value="medical_director">Medical Director</option>
+                  <option value="admin">Admin</option>
+                  <option value="staff_physician">Staff Physician</option>
+                  <option value="app">APP</option>
+                  <option value="scheduler">Scheduler</option>
+                </select>
               </label>
               <label className="facility-field">
                 <span>Primary Facility</span>
