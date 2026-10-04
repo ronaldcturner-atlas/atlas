@@ -72,6 +72,23 @@ type TradeOption = {
   end_time: string
 }
 
+type ScheduleDateComment = {
+  id: number | string
+  source: 'ONE_TIME' | 'RECURRING'
+  series_id: number | null
+  date: string
+  title: string
+  details: string
+  schedule_block: number | null
+  updated_at: string
+  recurrence_type?: 'WEEKLY' | 'MONTHLY'
+  interval?: number
+  monthly_ordinal?: number | null
+  end_type?: 'NEVER' | 'ON_DATE' | 'AFTER_COUNT'
+  end_date?: string | null
+  occurrence_count?: number | null
+}
+
 const SHIFT_TONE_CLASS: Record<string, string> = {
   '7a-7p': 'shift-tone-day',
   '7p-7a': 'shift-tone-night',
@@ -131,6 +148,19 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const [tradeNote, setTradeNote] = useState('')
   const [offeredAssignmentId, setOfferedAssignmentId] = useState<number | ''>('')
   const [reassignPhysicianId, setReassignPhysicianId] = useState<number | ''>('')
+  const [unsplitPhysicianId, setUnsplitPhysicianId] = useState<number | ''>('')
+  const [adminSwapAssignmentId, setAdminSwapAssignmentId] = useState<number | ''>('')
+  const [openShiftPhysicianId, setOpenShiftPhysicianId] = useState<number | ''>('')
+  const [dateComments, setDateComments] = useState<ScheduleDateComment[]>([])
+  const [commentDate, setCommentDate] = useState<string | null>(null)
+  const [commentTitle, setCommentTitle] = useState('')
+  const [commentDetails, setCommentDetails] = useState('')
+  const [commentRepeat, setCommentRepeat] = useState('NONE')
+  const [commentEndType, setCommentEndType] = useState<'NEVER' | 'ON_DATE' | 'AFTER_COUNT'>('NEVER')
+  const [commentEndDate, setCommentEndDate] = useState('')
+  const [commentOccurrenceCount, setCommentOccurrenceCount] = useState(10)
+  const [commentEditScope, setCommentEditScope] = useState<'THIS' | 'FUTURE' | 'ALL'>('THIS')
+  const [isSavingComment, setIsSavingComment] = useState(false)
   const [actualStartTime, setActualStartTime] = useState('')
   const [actualEndTime, setActualEndTime] = useState('')
   const [isMutating, setIsMutating] = useState(false)
@@ -141,25 +171,28 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const fetchShifts = async () => {
       try {
         setLoadError(null)
-        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse] = await Promise.all([
+        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse] = await Promise.all([
           fetch('http://localhost:8000/api/published-schedule/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/physicians/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/shift-trades/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/shift-trade-policy/', { credentials: 'include' }),
+          fetch('http://localhost:8000/api/published-schedule-comments/', { credentials: 'include' }),
         ])
         if (!shiftsResponse.ok || !physiciansResponse.ok) {
           throw new Error('Unable to load the schedule filters')
         }
-        const [shiftsData, physiciansData, tradesData, policyData] = await Promise.all([
+        const [shiftsData, physiciansData, tradesData, policyData, commentsData] = await Promise.all([
           shiftsResponse.json(),
           physiciansResponse.json(),
           tradesResponse.ok ? tradesResponse.json() : [],
           policyResponse.ok ? policyResponse.json() : tradePolicy,
+          commentsResponse.ok ? commentsResponse.json() : [],
         ])
         setAllShifts(shiftsData)
         setPhysicians(physiciansData)
         setTrades(tradesData)
         setTradePolicy(policyData)
+        setDateComments(commentsData)
       } catch (error) {
         console.error('Error fetching shifts:', error)
         setLoadError(error instanceof Error ? error.message : 'Unable to load the schedule')
@@ -205,13 +238,17 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const myPhysicianId = user?.physician_id
     ?? exactNamePhysician?.id
     ?? (lastNameMatches.length === 1 ? lastNameMatches[0].id : null)
+  const canManage = !forceUserView && Boolean(user?.is_staff || user?.is_superuser || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())))
 
   useEffect(() => {
     setTradeOptions([])
     setTradePartnerId('')
     setTradeTargetId('')
+    setAdminSwapAssignmentId('')
+    setOpenShiftPhysicianId('')
+    setUnsplitPhysicianId('')
     setTradeNote('')
-    if (!selectedShift || selectedShift.physicianId !== myPhysicianId) return
+    if (!selectedShift?.assignmentId || (selectedShift.physicianId !== myPhysicianId && !canManage)) return
     fetch(`http://localhost:8000/api/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include' })
       .then(async (response) => {
         const data = await response.json()
@@ -219,7 +256,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         setTradeOptions(data)
       })
       .catch((error) => setLoadError(error instanceof Error ? error.message : 'Unable to load trade options.'))
-  }, [selectedShift?.assignmentId, selectedShift?.physicianId, myPhysicianId])
+  }, [selectedShift?.assignmentId, selectedShift?.physicianId, myPhysicianId, canManage])
 
   const selectedPhysicianSet = new Set(selectedPhysicianIds)
   const isGroupSchedule = selectedPhysicianIds.length === 0
@@ -251,9 +288,23 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const totalCells = startingDayOfWeek + daysInMonth
   const rows = Math.ceil(totalCells / 7)
   const cells = rows * 7
+  const calendarStart = new Date(year, month, 1 - startingDayOfWeek)
+  const dateKey = (date: Date) => (
+    `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  )
+  const days = Array.from({ length: cells }, (_, index) => {
+    const date = new Date(calendarStart.getFullYear(), calendarStart.getMonth(), calendarStart.getDate() + index)
+    return {
+      date,
+      key: dateKey(date),
+      isCurrentMonth: date.getFullYear() === year && date.getMonth() === month,
+    }
+  })
+  const visibleDateKeys = new Set(days.map((day) => day.key))
+  const commentsByDate = new Map(dateComments.map((comment) => [comment.date, comment]))
 
   // Convert API shifts to calendar format
-  const shifts: Record<number, Shift[]> = {}
+  const shifts: Record<string, Shift[]> = {}
   allShifts.forEach((apiShift) => {
     if (!isGroupSchedule && !selectedPhysicianSet.has(apiShift.physician)) {
       return
@@ -261,10 +312,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const startDate = parseDateTime(apiShift.date, apiShift.start_time)
     const endDate = parseDateTime(apiShift.date, apiShift.end_time)
     
-    // Only show shifts from the current month
-    if (startDate.getFullYear() === year && startDate.getMonth() === month) {
-      const dayNum = startDate.getDate()
-      
+    // Include the adjacent-month dates visible in the first and last weeks.
+    if (visibleDateKeys.has(apiShift.date)) {
       // Format time range (e.g., "7a–7p")
       const shift = `${formatDisplayTime(startDate)}-${formatDisplayTime(endDate)}`
       
@@ -274,11 +323,11 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       // Capitalize status
       const statusCapitalized = apiShift.status_display
       
-      if (!shifts[dayNum]) {
-        shifts[dayNum] = []
+      if (!shifts[apiShift.date]) {
+        shifts[apiShift.date] = []
       }
       
-      shifts[dayNum].push({
+      shifts[apiShift.date].push({
         assignmentId: apiShift.id,
         instanceId: apiShift.shift_instance_id,
         physicianId: apiShift.physician,
@@ -318,18 +367,19 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     })
   })
 
-  // Create grid mapping day numbers to cells
-  const days = Array.from({length: cells}).map((_, i) => {
-    const dayNum = i - startingDayOfWeek + 1
-    return dayNum >= 1 && dayNum <= daysInMonth ? dayNum : null
-  })
-
   const hasShifts = Object.keys(shifts).length > 0
 
   const goPrev = () => setViewDate(d => new Date(d.getFullYear(), d.getMonth() - 1, 1))
   const goNext = () => setViewDate(d => new Date(d.getFullYear(), d.getMonth() + 1, 1))
   const goToday = () => setViewDate(new Date(today.getFullYear(), today.getMonth(), 1))
-  const canManage = !forceUserView && Boolean(user?.is_staff || user?.is_superuser || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())))
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate())
+  const dayCellClassName = (day: typeof days[number]) => {
+    const classes = ['day-cell']
+    if (!day.isCurrentMonth) classes.push('day-cell-adjacent')
+    if (day.date.getTime() === todayStart.getTime()) classes.push('day-cell-today')
+    else if (day.date < todayStart) classes.push('day-cell-past')
+    return classes.join(' ')
+  }
   const myAssignments = allShifts.filter((shift) => shift.physician === myPhysicianId)
   const pendingTradeCount = trades.filter((trade) => trade.can_accept || trade.can_review).length
   const pendingTrades = trades.filter((trade) => ['PENDING_RECIPIENT', 'PENDING_SCHEDULER'].includes(trade.status))
@@ -353,14 +403,137 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     ? []
     : tradeOptions.filter((option) => option.physician_id === tradePartnerId)
 
+  const openCommentEditor = (date: string) => {
+    if (!canManage) return
+    const comment = commentsByDate.get(date)
+    setCommentDate(date)
+    setCommentTitle(comment?.title ?? '')
+    setCommentDetails(comment?.details ?? '')
+    setCommentRepeat(
+      comment?.recurrence_type === 'MONTHLY'
+        ? 'MONTHLY'
+        : comment?.recurrence_type === 'WEEKLY'
+          ? `WEEKLY_${comment.interval ?? 1}`
+          : 'NONE',
+    )
+    setCommentEndType(comment?.end_type ?? 'NEVER')
+    setCommentEndDate(comment?.end_date ?? '')
+    setCommentOccurrenceCount(comment?.occurrence_count ?? 10)
+    setCommentEditScope('THIS')
+    setLoadError(null)
+  }
+
+  const commentRecurrencePayload = () => {
+    if (commentRepeat === 'NONE' || !commentDate) return {}
+    const selectedDate = parseDateTime(commentDate, '12:00')
+    const occurrenceNumber = Math.ceil(selectedDate.getDate() / 7)
+    const monthlyOrdinal = occurrenceNumber <= 4 ? occurrenceNumber : -1
+    return {
+      recurrence_type: commentRepeat === 'MONTHLY' ? 'MONTHLY' : 'WEEKLY',
+      interval: commentRepeat.startsWith('WEEKLY_') ? Number(commentRepeat.split('_')[1]) : 1,
+      monthly_ordinal: commentRepeat === 'MONTHLY' ? monthlyOrdinal : null,
+      end_type: commentEndType,
+      end_date: commentEndType === 'ON_DATE' ? commentEndDate : null,
+      occurrence_count: commentEndType === 'AFTER_COUNT' ? commentOccurrenceCount : null,
+    }
+  }
+
+  const saveDateComment = async () => {
+    if (!commentDate) return
+    try {
+      setIsSavingComment(true)
+      setLoadError(null)
+      const existingComment = commentsByDate.get(commentDate)
+      const isRecurring = existingComment?.source === 'RECURRING' && existingComment.series_id != null
+      const url = isRecurring
+        ? `http://localhost:8000/api/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
+        : 'http://localhost:8000/api/published-schedule-comments/'
+      const response = await fetch(url, {
+        method: isRecurring ? 'PATCH' : 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          date: commentDate,
+          title: commentTitle,
+          details: commentDetails,
+          scope: commentEditScope,
+          ...commentRecurrencePayload(),
+        }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail ?? 'Unable to save the calendar comment.')
+      setCommentDate(null)
+      setLocalRefreshToken((current) => current + 1)
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'Unable to save the calendar comment.')
+    } finally {
+      setIsSavingComment(false)
+    }
+  }
+
+  const deleteDateComment = async () => {
+    if (!commentDate) return
+    try {
+      setIsSavingComment(true)
+      setLoadError(null)
+      const existingComment = commentsByDate.get(commentDate)
+      const isRecurring = existingComment?.source === 'RECURRING' && existingComment.series_id != null
+      const url = isRecurring
+        ? `http://localhost:8000/api/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
+        : `http://localhost:8000/api/published-schedule-comments/${commentDate}/`
+      const response = await fetch(url, {
+        method: 'DELETE',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: isRecurring ? JSON.stringify({ scope: commentEditScope }) : undefined,
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail ?? 'Unable to delete the calendar comment.')
+      setCommentDate(null)
+      setLocalRefreshToken((current) => current + 1)
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : 'Unable to delete the calendar comment.')
+    } finally {
+      setIsSavingComment(false)
+    }
+  }
+
+  const editingDateComment = commentDate ? commentsByDate.get(commentDate) : undefined
+  const editingRecurringComment = editingDateComment?.source === 'RECURRING'
+  const commentDateValue = commentDate ? parseDateTime(commentDate, '12:00') : null
+  const commentWeekday = commentDateValue?.toLocaleDateString('en-US', { weekday: 'long' }) ?? ''
+  const commentOrdinalNumber = commentDateValue ? Math.ceil(commentDateValue.getDate() / 7) : 1
+  const commentOrdinal = commentOrdinalNumber === 1
+    ? 'first'
+    : commentOrdinalNumber === 2
+      ? 'second'
+      : commentOrdinalNumber === 3
+        ? 'third'
+        : commentOrdinalNumber === 4
+          ? 'fourth'
+          : 'last'
+  const showRecurrenceSettings = !editingRecurringComment || commentEditScope === 'ALL'
+
   const mutate = async (url: string, body: Record<string, unknown>, method = 'POST') => {
     try {
       setIsMutating(true)
       setLoadError(null)
-      const response = await fetch(`http://localhost:8000/api/${url}`, {
-        method, credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-      })
-      const data = await response.json().catch(() => ({}))
+      const send = async (payload: Record<string, unknown>) => {
+        const response = await fetch(`http://localhost:8000/api/${url}`, {
+          method, credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        })
+        const data = await response.json().catch(() => ({}))
+        return { response, data }
+      }
+      let { response, data } = await send(body)
+      if (
+        response.status === 409
+        && data.requires_confirmation
+        && !data.requires_physician_selection
+        && window.confirm(data.detail ?? 'This action creates a schedule conflict. Proceed anyway?')
+      ) {
+        ({ response, data } = await send({ ...body, force: true }))
+      }
       if (!response.ok) throw new Error(data.detail ?? 'Unable to complete that action.')
       setSelectedShift(null)
       setLocalRefreshToken((current) => current + 1)
@@ -374,10 +547,19 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   return (
     <div className="calendar-card">
       <div className="calendar-header">
-        <div style={{display: 'flex', alignItems: 'center', gap: 8}}>
-          <button onClick={goPrev} aria-label="Previous month">◀</button>
-          <div className="month-label">{viewDate.toLocaleString(undefined, { month: 'long', year: 'numeric' })}</div>
-          <button onClick={goNext} aria-label="Next month">▶</button>
+        <div className="calendar-heading-row">
+          <div className="calendar-month-navigation">
+            <button onClick={goPrev} aria-label="Previous month">◀</button>
+            <div className="month-label">{viewDate.toLocaleString(undefined, { month: 'long', year: 'numeric' })}</div>
+            <button onClick={goNext} aria-label="Next month">▶</button>
+          </div>
+          <div className="schedule-status-legend" aria-label="Schedule highlight legend">
+            <span className="shift-status-own">My shifts</span>
+            <span className="shift-status-posted-other">Posted by another user</span>
+            <span className="shift-status-own-posted">Your posted shift</span>
+            <span className="shift-status-own-pending">Your pending trade</span>
+            <span className="shift-status-open">Open shift</span>
+          </div>
         </div>
         <div className="schedule-toolbar">
           <button type="button" className="trade-center-button" onClick={() => setShowTrades(true)}>
@@ -429,13 +611,6 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       </div>
 
       {loadError && <div className="schedule-filter-error">{loadError}</div>}
-      <div className="schedule-status-legend" aria-label="Schedule highlight legend">
-        <span className="shift-status-own">My shifts</span>
-        <span className="shift-status-posted-other">Posted by another user</span>
-        <span className="shift-status-own-posted">Your posted shift</span>
-        <span className="shift-status-own-pending">Your pending trade</span>
-        <span className="shift-status-open">Open shift</span>
-      </div>
       {!isGroupSchedule && (
         <div className="schedule-filter-status">
           Showing {selectedPhysicianIds.length} selected physician{selectedPhysicianIds.length === 1 ? '' : 's'}.
@@ -443,15 +618,30 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         </div>
       )}
 
+      <div className="calendar-weekday-banner" aria-hidden="true">
+        {['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map((weekday) => (
+          <span key={weekday}>{weekday}</span>
+        ))}
+      </div>
       <div className="grid">
-        {days.map((dayNum, i) => (
-          <div key={i} className="day-cell">
-            {dayNum && (
-              <>
-                <div className="day-number">{dayNum}</div>
-                {shifts[dayNum] && (
-                  <div className="shifts-container">
-                    {shifts[dayNum].map((shift, idx) => (
+        {days.map((day) => (
+          <div key={day.key} className={dayCellClassName(day)}>
+            {canManage ? (
+              <button type="button" className="day-number day-number-button" onClick={() => openCommentEditor(day.key)}>
+                {day.isCurrentMonth
+                  ? day.date.getDate()
+                  : day.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+              </button>
+            ) : (
+              <div className="day-number">
+                {day.isCurrentMonth
+                  ? day.date.getDate()
+                  : day.date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+              </div>
+            )}
+            {shifts[day.key] && (
+              <div className="shifts-container">
+                {shifts[day.key].map((shift, idx) => (
                       <div
                         key={idx}
                         className={`shift-item shift-item-compact clickable ${statusClassForShift(shift)}`}
@@ -464,10 +654,17 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                       >
                         <span>{shift.facility} {shift.shift} {shift.physician_name}</span>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </>
+                ))}
+              </div>
+            )}
+            {commentsByDate.get(day.key) && (
+              <div className="calendar-date-comment">
+                <span>{commentsByDate.get(day.key)!.title}</span>
+                <div className="calendar-date-comment-hover" role="tooltip">
+                  <strong>{commentsByDate.get(day.key)!.title}</strong>
+                  {commentsByDate.get(day.key)!.details && <p>{commentsByDate.get(day.key)!.details}</p>}
+                </div>
+              </div>
             )}
           </div>
         ))}
@@ -479,9 +676,66 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         </div>
       )}
 
+      {commentDate && (
+        <div className="shift-modal-overlay" onClick={() => setCommentDate(null)}>
+          <div className="shift-modal calendar-comment-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="shift-modal-header">
+              <h2>{commentsByDate.has(commentDate) ? 'Edit date comment' : 'Add date comment'}</h2>
+              <small>{parseDateTime(commentDate, '12:00').toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</small>
+            </div>
+            <div className="shift-modal-body">
+              <label>Title<input maxLength={100} value={commentTitle} onChange={(event) => setCommentTitle(event.target.value)} autoFocus /></label>
+              <label>Details<textarea value={commentDetails} onChange={(event) => setCommentDetails(event.target.value)} /></label>
+              {editingRecurringComment && (
+                <label>
+                  Apply changes to
+                  <select value={commentEditScope} onChange={(event) => setCommentEditScope(event.target.value as 'THIS' | 'FUTURE' | 'ALL')}>
+                    <option value="THIS">This date only</option>
+                    <option value="FUTURE">This and future dates</option>
+                    <option value="ALL">Entire series</option>
+                  </select>
+                </label>
+              )}
+              {showRecurrenceSettings && (
+                <label>
+                  Repeat
+                  <select value={commentRepeat} onChange={(event) => setCommentRepeat(event.target.value)}>
+                    {!editingRecurringComment && <option value="NONE">Does not repeat</option>}
+                    <option value="WEEKLY_1">Every week on {commentWeekday}</option>
+                    <option value="WEEKLY_2">Every 2 weeks on {commentWeekday}</option>
+                    <option value="WEEKLY_3">Every 3 weeks on {commentWeekday}</option>
+                    <option value="WEEKLY_4">Every 4 weeks on {commentWeekday}</option>
+                    <option value="MONTHLY">Monthly on the {commentOrdinal} {commentWeekday}</option>
+                  </select>
+                </label>
+              )}
+              {showRecurrenceSettings && commentRepeat !== 'NONE' && (
+                <div className="calendar-comment-end-row">
+                  <label>
+                    Ends
+                    <select value={commentEndType} onChange={(event) => setCommentEndType(event.target.value as 'NEVER' | 'ON_DATE' | 'AFTER_COUNT')}>
+                      <option value="NEVER">Does not end</option>
+                      <option value="ON_DATE">On date</option>
+                      <option value="AFTER_COUNT">After occurrences</option>
+                    </select>
+                  </label>
+                  {commentEndType === 'ON_DATE' && <label>End date<input type="date" min={commentDate ?? undefined} value={commentEndDate} onChange={(event) => setCommentEndDate(event.target.value)} /></label>}
+                  {commentEndType === 'AFTER_COUNT' && <label>Occurrences<input type="number" min={1} step={1} value={commentOccurrenceCount} onChange={(event) => setCommentOccurrenceCount(Number(event.target.value))} /></label>}
+                </div>
+              )}
+            </div>
+            <div className="shift-modal-actions calendar-comment-actions">
+              {commentsByDate.has(commentDate) && <button type="button" className="danger" disabled={isSavingComment} onClick={deleteDateComment}>Delete</button>}
+              <button type="button" className="secondary" disabled={isSavingComment} onClick={() => setCommentDate(null)}>Cancel</button>
+              <button type="button" disabled={isSavingComment || !commentTitle.trim()} onClick={saveDateComment}>{isSavingComment ? 'Saving…' : 'Save'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {selectedShift && (
         <div className="shift-modal-overlay" onClick={() => setSelectedShift(null)}>
-          <div className="shift-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="shift-modal schedule-shift-modal" onClick={(e) => e.stopPropagation()}>
             <div className="shift-modal-header">
               <h2>Shift details</h2>
             </div>
@@ -491,19 +745,27 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
               <div className="detail-row"><span>Role</span><span>{selectedShift.role}</span></div>
               <div className="detail-row"><span>Date</span><span>{selectedShift.date}</span></div>
               <div className="detail-row"><span>Time</span><span>{selectedShift.shift}</span></div>
-              <div className="detail-row"><span>Status</span><span>{selectedShift.status}</span></div>
               {selectedShift.postingMode && <div className="detail-row"><span>Posted</span><span>{selectedShift.postingMode === 'PICKUP' ? 'Available for pickup' : 'Trade only'}</span></div>}
               {selectedShift.assignmentId != null && (selectedShift.physicianId === myPhysicianId || canManage) && (
                 <div className="schedule-shift-actions">
-                  <strong>Post this shift</strong>
                   <div className="shift-post-controls">
-                    <label><input type="radio" checked={tradeOnlyPosting} onChange={() => setTradeOnlyPosting(true)} /> Trade only</label>
+                    <strong>Post this shift</strong>
+                    <label><input type="radio" checked={tradeOnlyPosting} onClick={() => setTradeOnlyPosting((current) => !current)} readOnly /> Trade only</label>
                     <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/posting/`, { mode: tradeOnlyPosting ? 'TRADE_ONLY' : 'PICKUP' })}>Post</button>
                     {selectedShift.postingMode && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/posting/`, { mode: 'CLOSE' })}>Remove posting</button>}
                   </div>
                   <strong>Split shift</strong>
                   <div><input type="time" value={splitTime} onChange={(event) => setSplitTime(event.target.value)} /><button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/split/`, { split_time: splitTime })}>Split</button></div>
-                  {selectedShift.isSplit && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/unsplit/`, {})}>Unsplit shift</button>}
+                  {selectedShift.isSplit && canManage && (
+                    <label>
+                      Recombined shift user if portions differ
+                      <select value={unsplitPhysicianId} onChange={(event) => setUnsplitPhysicianId(Number(event.target.value) || '')}>
+                        <option value="">Use the current user when all portions match</option>
+                        {sortedPhysicians.filter((physician) => physician.active).map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
+                      </select>
+                    </label>
+                  )}
+                  {selectedShift.isSplit && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/unsplit/`, { physician_id: unsplitPhysicianId || null })}>Unsplit shift</button>}
                   {selectedShift.physicianId === myPhysicianId && (
                     <div className="propose-trade-controls">
                       <strong>Propose a trade</strong>
@@ -550,7 +812,6 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
               {selectedShift.assignmentId != null && canManage && (
                 <div className="schedule-shift-actions">
                   <strong>Actual shift times</strong>
-                  <small>Changes this date only. The recurring Shift Builder template will not change.</small>
                   <div className="actual-shift-time-controls">
                     <label>Start<input type="time" value={actualStartTime} onChange={(event) => setActualStartTime(event.target.value)} /></label>
                     <label>End<input type="time" value={actualEndTime} onChange={(event) => setActualEndTime(event.target.value)} /></label>
@@ -562,6 +823,28 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                     {sortedPhysicians.filter((physician) => physician.active).map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
                   </select>
                   <button disabled={isMutating || !reassignPhysicianId} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/reassign/`, { physician_id: reassignPhysicianId })}>Change user</button>
+                  <strong>Swap scheduled users</strong>
+                  <select value={adminSwapAssignmentId} onChange={(event) => setAdminSwapAssignmentId(Number(event.target.value) || '')}>
+                    <option value="">Choose another user&apos;s shift</option>
+                    {tradeOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.physician_name} · {option.date} · {option.facility} · {formatClockValue(option.start_time)}-{formatClockValue(option.end_time)}
+                      </option>
+                    ))}
+                  </select>
+                  <button disabled={isMutating || !adminSwapAssignmentId} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/swap/`, { target_assignment_id: adminSwapAssignmentId })}>Swap users</button>
+                  <strong>Open shift</strong>
+                  <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/open/`, {})}>Open shift</button>
+                </div>
+              )}
+              {selectedShift.assignmentId == null && selectedShift.status.toLowerCase() === 'open' && canManage && (
+                <div className="schedule-shift-actions">
+                  <strong>Fill open shift</strong>
+                  <select value={openShiftPhysicianId} onChange={(event) => setOpenShiftPhysicianId(Number(event.target.value) || '')}>
+                    <option value="">Choose physician</option>
+                    {sortedPhysicians.filter((physician) => physician.active).map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
+                  </select>
+                  <button disabled={isMutating || !openShiftPhysicianId} onClick={() => mutate(`shift-instances/${selectedShift.instanceId}/assign/`, { physician_id: openShiftPhysicianId })}>Assign user</button>
                 </div>
               )}
               {selectedShift.assignmentId != null && pendingTrades.filter((trade) => (

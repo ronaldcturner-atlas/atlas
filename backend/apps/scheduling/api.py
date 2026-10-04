@@ -1,7 +1,8 @@
+import calendar
 import hashlib
 import json
 import secrets
-from datetime import datetime, timedelta, timezone as datetime_timezone
+from datetime import date as date_type, datetime, timedelta, timezone as datetime_timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import UUID
@@ -30,6 +31,9 @@ from .models import (
     OptimizerRun,
     OptimizerControl,
     ScheduleBlock,
+    ScheduleCommentSeries,
+    ScheduleCommentSeriesException,
+    ScheduleDateComment,
     ScheduleRequest,
     ScheduleShiftAssignment,
     ScheduleShiftInstance,
@@ -191,11 +195,7 @@ def shifts_list_create(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
-@permission_classes([IsAuthenticated])
-def published_schedule(request):
-    """Return the assignments from the current published schedule of record."""
+def _published_schedule_authority():
     published_blocks = list(
         ScheduleBlock.objects.filter(published_at__isnull=False)
         .order_by('-published_at', '-id')
@@ -206,6 +206,15 @@ def published_schedule(request):
         while pointer <= block.end_date:
             authoritative_block_by_date.setdefault(pointer, block.id)
             pointer += timedelta(days=1)
+    return published_blocks, authoritative_block_by_date
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def published_schedule(request):
+    """Return the assignments from the current published schedule of record."""
+    published_blocks, authoritative_block_by_date = _published_schedule_authority()
 
     active_runs = {}
     published_versions = ScheduleVersion.objects.filter(
@@ -261,7 +270,6 @@ def published_schedule(request):
         if assignment['shift_instance__split_parent_id'] is not None
     }
     rows = []
-    displayed_instance_ids = set()
     for assignment in published_assignments:
         assignment_date = assignment['shift_instance__date']
         block_id = assignment['shift_instance__schedule_block_id']
@@ -326,15 +334,12 @@ def published_schedule(request):
             'schedule_block': block_id,
             'schedule_version': version_id,
         })
-        displayed_instance_ids.add(instance_id)
     open_instances = ScheduleShiftInstance.objects.filter(
         schedule_block__in=published_blocks,
         schedule_version_id__in=active_runs.keys(),
         is_locked_open=True,
     ).select_related('facility', 'shift_template', 'schedule_block')
     for instance in open_instances:
-        if instance.id in displayed_instance_ids:
-            continue
         if authoritative_block_by_date.get(instance.date) != instance.schedule_block_id:
             continue
         start_time = instance.segment_start_time or instance.shift_template.start_time
@@ -371,6 +376,442 @@ def published_schedule(request):
     return Response(rows)
 
 
+def _schedule_date_comment_payload(comment):
+    return {
+        'id': comment.id,
+        'source': 'ONE_TIME',
+        'series_id': None,
+        'date': comment.date.isoformat(),
+        'title': comment.title,
+        'details': comment.details,
+        'schedule_block': comment.schedule_block_id,
+        'updated_at': comment.updated_at.isoformat(),
+    }
+
+
+def _monthly_series_date(year, month, weekday, ordinal):
+    if ordinal == -1:
+        last_day = calendar.monthrange(year, month)[1]
+        candidate = date_type(year, month, last_day)
+        offset = (int(candidate.strftime('%w')) - weekday) % 7
+        return candidate - timedelta(days=offset)
+    first = date_type(year, month, 1)
+    offset = (weekday - int(first.strftime('%w'))) % 7
+    day_number = 1 + offset + (ordinal - 1) * 7
+    if day_number > calendar.monthrange(year, month)[1]:
+        return None
+    return date_type(year, month, day_number)
+
+
+def _series_occurrence_index(series, candidate):
+    if candidate < series.start_date:
+        return None
+    if series.recurrence_type == ScheduleCommentSeries.RecurrenceType.WEEKLY:
+        period = 7 * series.interval
+        delta = (candidate - series.start_date).days
+        if delta % period:
+            return None
+        return delta // period + 1
+    if int(candidate.strftime('%w')) != series.weekday:
+        return None
+    expected = _monthly_series_date(
+        candidate.year,
+        candidate.month,
+        series.weekday,
+        series.monthly_ordinal,
+    )
+    if expected != candidate:
+        return None
+    month_delta = (
+        (candidate.year - series.start_date.year) * 12
+        + candidate.month - series.start_date.month
+    )
+    return month_delta + 1
+
+
+def _series_occurs_on(series, candidate):
+    occurrence_index = _series_occurrence_index(series, candidate)
+    if occurrence_index is None:
+        return False
+    if (
+        series.end_type == ScheduleCommentSeries.EndType.ON_DATE
+        and series.end_date is not None
+        and candidate > series.end_date
+    ):
+        return False
+    if (
+        series.end_type == ScheduleCommentSeries.EndType.AFTER_COUNT
+        and series.occurrence_count is not None
+        and occurrence_index > series.occurrence_count
+    ):
+        return False
+    return True
+
+
+def _schedule_comment_series_payload(series, occurrence_date, exception=None):
+    title = exception.title if exception and exception.title is not None else series.title
+    details = (
+        exception.details
+        if exception and exception.details is not None
+        else series.details
+    )
+    return {
+        'id': f'series-{series.id}-{occurrence_date.isoformat()}',
+        'source': 'RECURRING',
+        'series_id': series.id,
+        'date': occurrence_date.isoformat(),
+        'title': title,
+        'details': details,
+        'schedule_block': None,
+        'updated_at': series.updated_at.isoformat(),
+        'recurrence_type': series.recurrence_type,
+        'interval': series.interval,
+        'weekday': series.weekday,
+        'monthly_ordinal': series.monthly_ordinal,
+        'end_type': series.end_type,
+        'end_date': series.end_date.isoformat() if series.end_date else None,
+        'occurrence_count': series.occurrence_count,
+    }
+
+
+def _parse_comment_date(value):
+    try:
+        return date_type.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _comment_text(request):
+    title = str(request.data.get('title', '')).strip()
+    details = str(request.data.get('details', '')).strip()
+    if not title:
+        return None, None, Response(
+            {'detail': 'Enter a comment title.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if len(title) > 100:
+        return None, None, Response(
+            {'detail': 'Comment titles may contain at most 100 characters.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return title, details, None
+
+
+def _series_configuration(request, start_date):
+    recurrence_type = request.data.get('recurrence_type')
+    if recurrence_type not in ScheduleCommentSeries.RecurrenceType.values:
+        return None, Response(
+            {'detail': 'Choose a valid recurring comment pattern.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        interval = int(request.data.get('interval', 1))
+        monthly_ordinal_value = request.data.get('monthly_ordinal')
+        monthly_ordinal = (
+            int(monthly_ordinal_value)
+            if monthly_ordinal_value not in (None, '')
+            else None
+        )
+    except (TypeError, ValueError):
+        return None, Response(
+            {'detail': 'Enter a valid recurrence interval.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if interval not in (1, 2, 3, 4):
+        return None, Response(
+            {'detail': 'Weekly comments may repeat every 1 to 4 weeks.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    weekday = int(start_date.strftime('%w'))
+    if recurrence_type == ScheduleCommentSeries.RecurrenceType.MONTHLY:
+        if monthly_ordinal not in (1, 2, 3, 4, -1):
+            return None, Response(
+                {'detail': 'Choose first, second, third, fourth, or last weekday.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if _monthly_series_date(
+            start_date.year, start_date.month, weekday, monthly_ordinal,
+        ) != start_date:
+            return None, Response(
+                {'detail': 'The selected monthly pattern must include the starting date.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        interval = 1
+    else:
+        monthly_ordinal = None
+
+    end_type = request.data.get('end_type', ScheduleCommentSeries.EndType.NEVER)
+    if end_type not in ScheduleCommentSeries.EndType.values:
+        return None, Response(
+            {'detail': 'Choose a valid ending option.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    end_date = None
+    occurrence_count = None
+    if end_type == ScheduleCommentSeries.EndType.ON_DATE:
+        end_date = _parse_comment_date(request.data.get('end_date'))
+        if end_date is None or end_date < start_date:
+            return None, Response(
+                {'detail': 'The ending date must be on or after the starting date.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    elif end_type == ScheduleCommentSeries.EndType.AFTER_COUNT:
+        try:
+            occurrence_count = int(request.data.get('occurrence_count'))
+        except (TypeError, ValueError):
+            occurrence_count = 0
+        if occurrence_count < 1:
+            return None, Response(
+                {'detail': 'Enter at least one occurrence.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+    return {
+        'recurrence_type': recurrence_type,
+        'interval': interval,
+        'weekday': weekday,
+        'monthly_ordinal': monthly_ordinal,
+        'end_type': end_type,
+        'end_date': end_date,
+        'occurrence_count': occurrence_count,
+    }, None
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def published_schedule_comments(request):
+    published_blocks, authoritative_block_by_date = _published_schedule_authority()
+    if request.method == 'GET':
+        comments_by_date = {}
+        authoritative_dates = sorted(authoritative_block_by_date)
+        series_rows = ScheduleCommentSeries.objects.prefetch_related('exceptions')
+        for series in series_rows:
+            exceptions = {row.date: row for row in series.exceptions.all()}
+            for candidate in authoritative_dates:
+                if not _series_occurs_on(series, candidate):
+                    continue
+                exception = exceptions.get(candidate)
+                if exception and exception.is_cancelled:
+                    continue
+                comments_by_date[candidate] = _schedule_comment_series_payload(
+                    series,
+                    candidate,
+                    exception,
+                )
+        comments = ScheduleDateComment.objects.filter(
+            schedule_block__in=published_blocks,
+        ).select_related('schedule_block')
+        for comment in comments:
+            if authoritative_block_by_date.get(comment.date) == comment.schedule_block_id:
+                comments_by_date[comment.date] = _schedule_date_comment_payload(comment)
+        return Response([
+            comments_by_date[comment_date]
+            for comment_date in sorted(comments_by_date)
+        ])
+
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can add calendar comments.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    comment_date = _parse_comment_date(request.data.get('date'))
+    block_id = authoritative_block_by_date.get(comment_date)
+    if block_id is None:
+        return Response(
+            {'detail': 'That date is not part of a published schedule.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    title, details, error = _comment_text(request)
+    if error:
+        return error
+    recurrence_type = request.data.get('recurrence_type')
+    if recurrence_type:
+        configuration, error = _series_configuration(request, comment_date)
+        if error:
+            return error
+        ScheduleDateComment.objects.filter(
+            schedule_block_id=block_id,
+            date=comment_date,
+        ).delete()
+        series = ScheduleCommentSeries.objects.create(
+            title=title,
+            details=details,
+            start_date=comment_date,
+            created_by=request.user,
+            updated_by=request.user,
+            **configuration,
+        )
+        return Response(
+            _schedule_comment_series_payload(series, comment_date),
+            status=status.HTTP_201_CREATED,
+        )
+    comment, created = ScheduleDateComment.objects.update_or_create(
+        schedule_block_id=block_id,
+        date=comment_date,
+        defaults={
+            'title': title,
+            'details': details,
+            'updated_by': request.user,
+        },
+    )
+    if created:
+        comment.created_by = request.user
+        comment.save(update_fields=['created_by'])
+    return Response(_schedule_date_comment_payload(comment))
+
+
+@api_view(['PATCH', 'DELETE'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def published_schedule_comment_series_occurrence(request, series_id, comment_date):
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can change recurring calendar comments.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    series = get_object_or_404(ScheduleCommentSeries, id=series_id)
+    occurrence_date = _parse_comment_date(comment_date)
+    if occurrence_date is None or not _series_occurs_on(series, occurrence_date):
+        return Response(
+            {'detail': 'That date is not an occurrence of this recurring comment.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    scope = request.data.get('scope', 'THIS')
+    if scope not in ('THIS', 'FUTURE', 'ALL'):
+        return Response(
+            {'detail': 'Choose this date, this and future dates, or the entire series.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if request.method == 'DELETE':
+        if scope == 'THIS':
+            ScheduleCommentSeriesException.objects.update_or_create(
+                series=series,
+                date=occurrence_date,
+                defaults={'is_cancelled': True, 'updated_by': request.user},
+            )
+        elif scope == 'ALL' or occurrence_date == series.start_date:
+            series.delete()
+        else:
+            series.end_type = ScheduleCommentSeries.EndType.ON_DATE
+            series.end_date = occurrence_date - timedelta(days=1)
+            series.occurrence_count = None
+            series.updated_by = request.user
+            series.save(update_fields=[
+                'end_type', 'end_date', 'occurrence_count', 'updated_by', 'updated_at',
+            ])
+            ScheduleCommentSeriesException.objects.filter(
+                series=series,
+                date__gte=occurrence_date,
+            ).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    title, details, error = _comment_text(request)
+    if error:
+        return error
+    if scope == 'THIS':
+        exception, _created = ScheduleCommentSeriesException.objects.update_or_create(
+            series=series,
+            date=occurrence_date,
+            defaults={
+                'is_cancelled': False,
+                'title': title,
+                'details': details,
+                'updated_by': request.user,
+            },
+        )
+        return Response(_schedule_comment_series_payload(
+            series,
+            occurrence_date,
+            exception,
+        ))
+    if scope == 'ALL':
+        configuration, error = _series_configuration(request, series.start_date)
+        if error:
+            return error
+        for field, value in configuration.items():
+            setattr(series, field, value)
+        series.title = title
+        series.details = details
+        series.updated_by = request.user
+        series.save()
+        ScheduleCommentSeriesException.objects.filter(
+            series=series,
+            date=occurrence_date,
+        ).delete()
+        return Response(_schedule_comment_series_payload(series, occurrence_date))
+
+    occurrence_index = _series_occurrence_index(series, occurrence_date)
+    configuration = {
+        'recurrence_type': series.recurrence_type,
+        'interval': series.interval,
+        'weekday': series.weekday,
+        'monthly_ordinal': series.monthly_ordinal,
+        'end_type': series.end_type,
+        'end_date': series.end_date,
+        'occurrence_count': series.occurrence_count,
+    }
+    if (
+        configuration['end_type'] == ScheduleCommentSeries.EndType.AFTER_COUNT
+        and configuration['occurrence_count'] is not None
+    ):
+        configuration['occurrence_count'] = max(
+            1,
+            configuration['occurrence_count'] - occurrence_index + 1,
+        )
+    with transaction.atomic():
+        old_series_id = series.id
+        replace_entire_series = occurrence_date == series.start_date
+        if not replace_entire_series:
+            series.end_type = ScheduleCommentSeries.EndType.ON_DATE
+            series.end_date = occurrence_date - timedelta(days=1)
+            series.occurrence_count = None
+            series.updated_by = request.user
+            series.save(update_fields=[
+                'end_type', 'end_date', 'occurrence_count', 'updated_by', 'updated_at',
+            ])
+        new_series = ScheduleCommentSeries.objects.create(
+            title=title,
+            details=details,
+            start_date=occurrence_date,
+            created_by=request.user,
+            updated_by=request.user,
+            **configuration,
+        )
+        ScheduleCommentSeriesException.objects.filter(
+            series_id=old_series_id,
+            date__gte=occurrence_date,
+        ).update(series=new_series)
+        ScheduleCommentSeriesException.objects.filter(
+            series=new_series,
+            date=occurrence_date,
+        ).delete()
+        if replace_entire_series:
+            ScheduleCommentSeries.objects.filter(id=old_series_id).delete()
+    return Response(_schedule_comment_series_payload(new_series, occurrence_date))
+
+
+@api_view(['DELETE'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def published_schedule_comment_detail(request, comment_date):
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can delete calendar comments.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    parsed_date = _parse_comment_date(comment_date)
+    _published_blocks, authoritative_block_by_date = _published_schedule_authority()
+    block_id = authoritative_block_by_date.get(parsed_date)
+    comment = get_object_or_404(
+        ScheduleDateComment,
+        schedule_block_id=block_id,
+        date=parsed_date,
+    )
+    comment.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 def _published_assignment_or_404(assignment_id):
     return get_object_or_404(
         ScheduleShiftAssignment.objects.select_related(
@@ -378,6 +819,21 @@ def _published_assignment_or_404(assignment_id):
             'shift_instance__schedule_block', 'shift_instance__schedule_version__domain',
         ), id=assignment_id, shift_instance__schedule_block__published_at__isnull=False,
     )
+
+
+def _schedule_conflict_warning(detail, **extra):
+    return Response(
+        {
+            'detail': detail,
+            'requires_confirmation': True,
+            **extra,
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+def _force_requested(request):
+    return request.data.get('force') is True
 
 
 @api_view(['GET', 'PATCH'])
@@ -475,7 +931,8 @@ def schedule_assignment_split(request, assignment_id):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_unsplit(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
-    if assignment.physician.user_id != request.user.id and not _can_manage_build_workspace(request.user):
+    can_manage = _can_manage_build_workspace(request.user)
+    if assignment.physician.user_id != request.user.id and not can_manage:
         return Response({'detail': 'You may only unsplit your own shift.'}, status=status.HTTP_403_FORBIDDEN)
     instance = assignment.shift_instance
     root = instance.split_parent or instance
@@ -488,41 +945,171 @@ def schedule_assignment_unsplit(request, assignment_id):
         return Response({'detail': 'This shift is not split.'}, status=status.HTTP_400_BAD_REQUEST)
     segment_ids = [segment.id for segment in segments]
     cohort_filter = {'optimizer_run': assignment.optimizer_run}
+    group_assignments = list(
+        ScheduleShiftAssignment.objects.filter(
+            shift_instance_id__in=segment_ids,
+            **cohort_filter,
+        ).select_related('physician__user', 'shift_instance')
+    )
     physician_sets = [
-        set(ScheduleShiftAssignment.objects.filter(shift_instance=segment, **cohort_filter).values_list('physician_id', flat=True))
+        {
+            row.physician_id
+            for row in group_assignments
+            if row.shift_instance_id == segment.id
+        }
         for segment in segments
     ]
-    if not physician_sets[0] or any(physicians != physician_sets[0] for physicians in physician_sets[1:]):
+    same_current_owners = bool(physician_sets[0]) and all(
+        physicians == physician_sets[0]
+        for physicians in physician_sets[1:]
+    )
+    if not same_current_owners and not can_manage:
         return Response(
-            {'detail': 'The split segments have different scheduled users and cannot be recombined until their assignments match.'},
-            status=status.HTTP_400_BAD_REQUEST,
+            {
+                'detail': (
+                    'The split portions currently have different scheduled users. '
+                    'Contact an administrator or scheduler to recombine this shift.'
+                ),
+            },
+            status=status.HTTP_403_FORBIDDEN,
         )
-    group_assignment_ids = ScheduleShiftAssignment.objects.filter(
-        shift_instance_id__in=segment_ids, **cohort_filter,
-    ).values_list('id', flat=True)
-    if ShiftTrade.objects.filter(
-        Q(offered_assignment_id__in=group_assignment_ids) | Q(requested_assignment_id__in=group_assignment_ids)
-    ).exists():
-        return Response(
-            {'detail': 'This split shift has trade history and cannot be recombined.'},
-            status=status.HTTP_400_BAD_REQUEST,
+    selected_physician = None
+    if not same_current_owners:
+        selected_physician_id = request.data.get('physician_id')
+        if selected_physician_id in (None, ''):
+            return _schedule_conflict_warning(
+                'The split portions have different scheduled users. Choose the user who should receive the recombined shift.',
+                requires_physician_selection=True,
+            )
+        selected_physician = get_object_or_404(
+            Physician,
+            id=selected_physician_id,
+            active=True,
         )
+        if not _force_requested(request):
+            return _schedule_conflict_warning(
+                f'The split portions have different scheduled users. Recombine them and assign the full shift to {selected_physician}?',
+            )
     template = root.shift_template
     facility_zone = _timezone_from_name(root.facility.timezone)
     start_at = datetime.combine(root.date, template.start_time, tzinfo=facility_zone)
     end_date = root.date + timedelta(days=1) if template.end_time <= template.start_time else root.date
     end_at = datetime.combine(end_date, template.end_time, tzinfo=facility_zone)
+    resulting_physician_ids = (
+        {selected_physician.id}
+        if selected_physician is not None
+        else physician_sets[0]
+    )
+    group_assignment_ids = [row.id for row in group_assignments]
+    overlap_names = []
+    for physician_id in resulting_physician_ids:
+        physician = next(
+            (
+                row.physician
+                for row in group_assignments
+                if row.physician_id == physician_id
+            ),
+            selected_physician,
+        )
+        overlap = ScheduleShiftAssignment.objects.filter(
+            physician_id=physician_id,
+            optimizer_run=assignment.optimizer_run,
+            shift_instance__schedule_block=instance.schedule_block,
+            shift_instance__start_datetime__lt=end_at,
+            shift_instance__end_datetime__gt=start_at,
+        ).exclude(id__in=group_assignment_ids).exists()
+        if overlap:
+            overlap_names.append(str(physician))
+    if overlap_names:
+        warning = (
+            'Recombining this shift creates an overlapping assignment for '
+            f'{", ".join(overlap_names)}.'
+        )
+        if not can_manage:
+            return Response(
+                {'detail': f'{warning} Contact an administrator or scheduler.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not _force_requested(request):
+            return _schedule_conflict_warning(f'{warning} Proceed anyway?')
+
     with transaction.atomic():
         locked_root = ScheduleShiftInstance.objects.select_for_update().get(id=root.id)
         derived_ids = [segment.id for segment in segments if segment.id != root.id]
+        root_assignments = list(
+            ScheduleShiftAssignment.objects.select_for_update().filter(
+                shift_instance=locked_root,
+                **cohort_filter,
+            )
+        )
+        root_by_physician = {
+            row.physician_id: row
+            for row in root_assignments
+        }
+        if selected_physician is not None:
+            surviving_assignment = (
+                root_by_physician.get(selected_physician.id)
+                or root_assignments[0]
+            )
+            surviving_assignment.physician = selected_physician
+            surviving_assignment.assignment_source = (
+                ScheduleShiftAssignment.AssignmentSource.MANUAL
+            )
+            surviving_assignment.created_by = request.user
+            surviving_assignment.is_locked = True
+            surviving_assignment.save(update_fields=[
+                'physician', 'assignment_source', 'created_by', 'is_locked',
+            ])
+            replacement_by_physician = {
+                row.physician_id: surviving_assignment
+                for row in group_assignments
+            }
+            extra_root_ids = [
+                row.id for row in root_assignments
+                if row.id != surviving_assignment.id
+            ]
+        else:
+            replacement_by_physician = root_by_physician
+            extra_root_ids = []
+
+        now = timezone.now()
+        ShiftTrade.objects.filter(
+            Q(offered_assignment_id__in=group_assignment_ids)
+            | Q(requested_assignment_id__in=group_assignment_ids),
+            status__in=[
+                ShiftTrade.Status.PENDING_RECIPIENT,
+                ShiftTrade.Status.PENDING_SCHEDULER,
+            ],
+        ).update(status=ShiftTrade.Status.CANCELLED, updated_at=now)
+        for row in group_assignments:
+            if row.shift_instance_id == locked_root.id and row.id not in extra_root_ids:
+                continue
+            replacement = replacement_by_physician.get(row.physician_id)
+            if replacement is None and selected_physician is not None:
+                replacement = surviving_assignment
+            if replacement is None:
+                continue
+            ShiftTrade.objects.filter(offered_assignment=row).update(
+                offered_assignment=replacement,
+                updated_at=now,
+            )
+            ShiftTrade.objects.filter(requested_assignment=row).update(
+                requested_assignment=replacement,
+                updated_at=now,
+            )
         ShiftPosting.objects.filter(assignment__shift_instance_id__in=segment_ids).delete()
+        if extra_root_ids:
+            ScheduleShiftAssignment.objects.filter(id__in=extra_root_ids).delete()
         ScheduleShiftInstance.objects.filter(id__in=derived_ids).delete()
         locked_root.start_datetime = start_at
         locked_root.end_datetime = end_at
         locked_root.segment_start_time = None
         locked_root.segment_end_time = None
         locked_root.save(update_fields=['start_datetime', 'end_datetime', 'segment_start_time', 'segment_end_time', 'updated_at'])
-    return Response({'detail': 'Shift recombined successfully.'})
+    return Response({
+        'detail': 'Shift recombined successfully.',
+        'cancelled_active_trades': True,
+    })
 
 
 @api_view(['POST'])
@@ -534,8 +1121,8 @@ def schedule_assignment_reassign(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
     physician = get_object_or_404(Physician, id=request.data.get('physician_id'), active=True)
     valid, reason = _trade_assignment_is_valid(physician, assignment, [assignment.id])
-    if not valid:
-        return Response({'detail': reason}, status=status.HTTP_400_BAD_REQUEST)
+    if not valid and not _force_requested(request):
+        return _schedule_conflict_warning(f'{reason} Proceed anyway?')
     assignment.physician = physician
     assignment.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
     assignment.created_by = request.user
@@ -543,6 +1130,143 @@ def schedule_assignment_reassign(request, assignment_id):
     assignment.save()
     ShiftPosting.objects.filter(assignment=assignment).update(active=False)
     return Response({'detail': 'Scheduled user changed.'})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_open(request, assignment_id):
+    """Remove one published assignment while retaining its trade audit history."""
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can open a scheduled shift.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    assignment = _published_assignment_or_404(assignment_id)
+    instance = assignment.shift_instance
+    now = timezone.now()
+    with transaction.atomic():
+        locked_assignment = (
+            ScheduleShiftAssignment.objects.select_for_update()
+            .select_related(
+                'physician__user', 'shift_instance__facility',
+                'shift_instance__shift_template',
+            )
+            .get(id=assignment.id)
+        )
+        snapshot = _trade_assignment_payload(locked_assignment)
+        offered_trades = ShiftTrade.objects.filter(
+            offered_assignment=locked_assignment,
+        )
+        requested_trades = ShiftTrade.objects.filter(
+            requested_assignment=locked_assignment,
+        )
+        offered_trades.filter(offered_assignment_snapshot={}).update(
+            offered_assignment_snapshot=snapshot,
+        )
+        requested_trades.filter(requested_assignment_snapshot={}).update(
+            requested_assignment_snapshot=snapshot,
+        )
+        ShiftTrade.objects.filter(
+            Q(offered_assignment=locked_assignment)
+            | Q(requested_assignment=locked_assignment),
+            status__in=[
+                ShiftTrade.Status.PENDING_RECIPIENT,
+                ShiftTrade.Status.PENDING_SCHEDULER,
+            ],
+        ).update(status=ShiftTrade.Status.CANCELLED, updated_at=now)
+        ShiftPosting.objects.filter(assignment=locked_assignment).delete()
+        locked_assignment.delete()
+        locked_instance = ScheduleShiftInstance.objects.select_for_update().get(
+            id=instance.id,
+        )
+        locked_instance.is_locked_open = True
+        locked_instance.status = ScheduleShiftInstance.Status.OPEN
+        locked_instance.save(update_fields=['is_locked_open', 'status', 'updated_at'])
+        _set_active_run_locked_open(locked_instance, True)
+    return Response({'detail': 'Shift opened.'})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_instance_assign(request, instance_id):
+    """Assign an explicitly open published shift to a selected user."""
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can fill an open shift.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    instance = get_object_or_404(
+        ScheduleShiftInstance.objects.select_related(
+            'schedule_version', 'schedule_block',
+        ),
+        id=instance_id,
+        schedule_block__published_at__isnull=False,
+        is_locked_open=True,
+    )
+    physician = get_object_or_404(
+        Physician,
+        id=request.data.get('physician_id'),
+        active=True,
+    )
+    active_run = _active_optimizer_run(instance.schedule_version)
+    if active_run is None:
+        return Response(
+            {'detail': 'This published schedule does not have an active run.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    if ScheduleShiftAssignment.objects.filter(
+        shift_instance=instance,
+        optimizer_run=active_run,
+        physician=physician,
+    ).exists():
+        return Response(
+            {'detail': 'That user is already assigned to this shift.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    overlap = ScheduleShiftAssignment.objects.filter(
+        physician=physician,
+        optimizer_run=active_run,
+        shift_instance__schedule_block=instance.schedule_block,
+        shift_instance__start_datetime__lt=instance.end_datetime,
+        shift_instance__end_datetime__gt=instance.start_datetime,
+    ).exclude(shift_instance=instance).exists()
+    if overlap and not _force_requested(request):
+        return _schedule_conflict_warning(
+            f'{physician} has an overlapping assignment. Proceed anyway?'
+        )
+    with transaction.atomic():
+        locked_instance = ScheduleShiftInstance.objects.select_for_update().get(
+            id=instance.id,
+        )
+        assigned_count = ScheduleShiftAssignment.objects.filter(
+            shift_instance=locked_instance,
+            optimizer_run=active_run,
+        ).count()
+        if assigned_count >= locked_instance.required_staffing:
+            return Response(
+                {'detail': 'This shift no longer has an open position.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=locked_instance,
+            physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=active_run,
+            created_by=request.user,
+            is_locked=True,
+        )
+        remains_open = assigned_count + 1 < locked_instance.required_staffing
+        locked_instance.is_locked_open = remains_open
+        locked_instance.status = (
+            ScheduleShiftInstance.Status.OPEN
+            if remains_open
+            else ScheduleShiftInstance.Status.ASSIGNED
+        )
+        locked_instance.save(update_fields=['is_locked_open', 'status', 'updated_at'])
+        _set_active_run_locked_open(locked_instance, remains_open)
+    return Response({'detail': 'Open shift assigned.'})
 
 
 @api_view(['PATCH'])
@@ -571,6 +1295,29 @@ def shift_instance_times(request, instance_id):
     start_at = datetime.combine(instance.date, start_clock, tzinfo=facility_zone)
     end_date = instance.date + timedelta(days=1) if end_clock <= start_clock else instance.date
     end_at = datetime.combine(end_date, end_clock, tzinfo=facility_zone)
+    active_run = _active_optimizer_run(instance.schedule_version)
+    instance_assignments = list(
+        ScheduleShiftAssignment.objects.filter(
+            shift_instance=instance,
+            optimizer_run=active_run,
+        ).select_related('physician')
+    )
+    overlap_names = []
+    for row in instance_assignments:
+        overlap = ScheduleShiftAssignment.objects.filter(
+            physician=row.physician,
+            optimizer_run=active_run,
+            shift_instance__schedule_block=instance.schedule_block,
+            shift_instance__start_datetime__lt=end_at,
+            shift_instance__end_datetime__gt=start_at,
+        ).exclude(shift_instance=instance).exists()
+        if overlap:
+            overlap_names.append(str(row.physician))
+    if overlap_names and not _force_requested(request):
+        return _schedule_conflict_warning(
+            'These times create an overlapping assignment for '
+            f'{", ".join(sorted(set(overlap_names)))}. Proceed anyway?'
+        )
     instance.start_datetime = start_at
     instance.end_datetime = end_at
     instance.segment_start_time = start_clock
@@ -590,9 +1337,9 @@ def shift_instance_times(request, instance_id):
     })
 
 
-def _trade_assignment_payload(assignment):
+def _trade_assignment_payload(assignment, snapshot=None):
     if assignment is None:
-        return None
+        return snapshot or None
     instance = assignment.shift_instance
     physician = assignment.physician
     return {
@@ -616,8 +1363,14 @@ def _trade_payload(trade, user):
         'trade_type': trade.trade_type,
         'requester_id': trade.requester_id,
         'recipient_id': trade.recipient_id,
-        'offered_assignment': _trade_assignment_payload(trade.offered_assignment),
-        'requested_assignment': _trade_assignment_payload(trade.requested_assignment),
+        'offered_assignment': _trade_assignment_payload(
+            trade.offered_assignment,
+            trade.offered_assignment_snapshot,
+        ),
+        'requested_assignment': _trade_assignment_payload(
+            trade.requested_assignment,
+            trade.requested_assignment_snapshot,
+        ),
         'created_at': trade.created_at.isoformat(),
         'can_accept': trade.status == ShiftTrade.Status.PENDING_RECIPIENT and trade.recipient and trade.recipient.user_id == user.id,
         'can_cancel': trade.status in (ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER) and trade.requester.user_id == user.id,
@@ -685,13 +1438,15 @@ def shift_trades(request):
         return Response({'detail': 'This shift already has a pending request.'}, status=status.HTTP_400_BAD_REQUEST)
     trade = ShiftTrade.objects.create(
         offered_assignment=target, requested_assignment=offered,
+        offered_assignment_snapshot=_trade_assignment_payload(target),
+        requested_assignment_snapshot=_trade_assignment_payload(offered) or {},
         requester=physician, recipient=target.physician, trade_type=trade_type,
         note=str(request.data.get('note', '')).strip(),
     )
     return Response(_trade_payload(_trade_queryset().get(id=trade.id), request.user), status=status.HTTP_201_CREATED)
 
 
-def _trade_options_for_assignment(offered):
+def _trade_options_for_assignment(offered, allow_conflicts=False):
     proposer = offered.physician
     run = offered.optimizer_run
     block = offered.shift_instance.schedule_block
@@ -721,9 +1476,13 @@ def _trade_options_for_assignment(offered):
         if target['physician_id'] == proposer.id:
             continue
         target_date = target['shift_instance__date']
-        if target_date in proposer_work_dates:
+        if not allow_conflicts and target_date in proposer_work_dates:
             continue
-        if offered.shift_instance.date in physician_dates.get(target['physician_id'], set()):
+        if (
+            not allow_conflicts
+            and offered.shift_instance.date
+            in physician_dates.get(target['physician_id'], set())
+        ):
             continue
         start_time = target['shift_instance__segment_start_time'] or target['shift_instance__shift_template__start_time']
         end_time = target['shift_instance__segment_end_time'] or target['shift_instance__shift_template__end_time']
@@ -749,9 +1508,109 @@ def _trade_options_for_assignment(offered):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_trade_options(request, assignment_id):
     offered = _published_assignment_or_404(assignment_id)
-    if offered.physician.user_id != request.user.id:
+    can_manage = _can_manage_build_workspace(request.user)
+    if offered.physician.user_id != request.user.id and not can_manage:
         return Response({'detail': 'You may only propose a trade from your own shift.'}, status=status.HTTP_403_FORBIDDEN)
-    return Response(_trade_options_for_assignment(offered))
+    return Response(_trade_options_for_assignment(
+        offered,
+        allow_conflicts=can_manage,
+    ))
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_assignment_swap(request, assignment_id):
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can directly swap scheduled users.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    source = _published_assignment_or_404(assignment_id)
+    target = _published_assignment_or_404(request.data.get('target_assignment_id'))
+    if source.id == target.id or source.physician_id == target.physician_id:
+        return Response(
+            {'detail': 'Choose a shift assigned to a different user.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if (
+        source.shift_instance.schedule_block_id
+        != target.shift_instance.schedule_block_id
+        or source.optimizer_run_id != target.optimizer_run_id
+    ):
+        return Response(
+            {'detail': 'Both shifts must belong to the same published schedule.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    excluded = [source.id, target.id]
+    warnings = []
+    valid, reason = _trade_assignment_is_valid(
+        target.physician,
+        source,
+        excluded,
+    )
+    if not valid:
+        warnings.append(reason)
+    valid, reason = _trade_assignment_is_valid(
+        source.physician,
+        target,
+        excluded,
+    )
+    if not valid:
+        warnings.append(reason)
+    if warnings and not _force_requested(request):
+        return _schedule_conflict_warning(
+            f'{" ".join(warnings)} Proceed anyway?'
+        )
+
+    now = timezone.now()
+    with transaction.atomic():
+        locked = {
+            row.id: row
+            for row in ScheduleShiftAssignment.objects.select_for_update().filter(
+                id__in=excluded,
+            ).select_related('physician')
+        }
+        locked_source = locked[source.id]
+        locked_target = locked[target.id]
+        source_physician = locked_source.physician
+        target_physician = locked_target.physician
+        ShiftTrade.objects.filter(
+            Q(offered_assignment_id__in=excluded)
+            | Q(requested_assignment_id__in=excluded),
+            status__in=[
+                ShiftTrade.Status.PENDING_RECIPIENT,
+                ShiftTrade.Status.PENDING_SCHEDULER,
+            ],
+        ).update(status=ShiftTrade.Status.CANCELLED, updated_at=now)
+        ShiftPosting.objects.filter(assignment_id__in=excluded).update(
+            active=False,
+            updated_at=now,
+        )
+        locked_source.physician = target_physician
+        locked_target.physician = source_physician
+        for row in (locked_source, locked_target):
+            row.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
+            row.created_by = request.user
+            row.is_locked = True
+            row.save(update_fields=[
+                'physician', 'assignment_source', 'created_by', 'is_locked',
+            ])
+        ShiftTrade.objects.create(
+            offered_assignment=locked_target,
+            requested_assignment=locked_source,
+            offered_assignment_snapshot=_trade_assignment_payload(locked_target),
+            requested_assignment_snapshot=_trade_assignment_payload(locked_source),
+            requester=source_physician,
+            recipient=target_physician,
+            trade_type=ShiftTrade.TradeType.TRADE,
+            status=ShiftTrade.Status.APPROVED,
+            responded_at=now,
+            reviewed_at=now,
+            reviewed_by=request.user,
+            note='Direct scheduler/admin swap.',
+        )
+    return Response({'detail': 'Scheduled users swapped.'})
 
 
 def _trade_assignment_is_valid(physician, assignment, excluded_ids):
@@ -760,6 +1619,8 @@ def _trade_assignment_is_valid(physician, assignment, excluded_ids):
         return False, f'{physician} is not an active physician.'
     overlap = ScheduleShiftAssignment.objects.filter(
         physician=physician,
+        optimizer_run=assignment.optimizer_run,
+        shift_instance__schedule_block=instance.schedule_block,
         shift_instance__start_datetime__lt=instance.end_datetime,
         shift_instance__end_datetime__gt=instance.start_datetime,
     ).exclude(id__in=excluded_ids).exists()
@@ -768,7 +1629,7 @@ def _trade_assignment_is_valid(physician, assignment, excluded_ids):
     return True, ''
 
 
-def _apply_shift_trade(trade, reviewed_by=None):
+def _apply_shift_trade(trade, reviewed_by=None, force=False):
     now = timezone.now()
     with transaction.atomic():
         target = ScheduleShiftAssignment.objects.select_for_update().select_related('physician', 'shift_instance__schedule_version__domain', 'shift_instance__facility').get(id=trade.offered_assignment_id)
@@ -779,11 +1640,11 @@ def _apply_shift_trade(trade, reviewed_by=None):
             return False, 'An assignment changed after this request was created.'
         excluded = [target.id] + ([offered.id] if offered else [])
         valid, reason = _trade_assignment_is_valid(trade.requester, target, excluded)
-        if not valid:
+        if not valid and not force:
             return False, reason
         if offered:
             valid, reason = _trade_assignment_is_valid(trade.recipient, offered, excluded)
-            if not valid:
+            if not valid and not force:
                 return False, reason
         target.physician = trade.requester
         target.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
@@ -840,9 +1701,13 @@ def shift_trade_action(request, trade_id, action):
         if not _can_manage_build_workspace(request.user) or trade.status != ShiftTrade.Status.PENDING_SCHEDULER:
             return Response({'detail': 'This trade is not awaiting scheduler review.'}, status=status.HTTP_403_FORBIDDEN)
         if action == 'approve':
-            applied, reason = _apply_shift_trade(trade, reviewed_by=request.user)
+            applied, reason = _apply_shift_trade(
+                trade,
+                reviewed_by=request.user,
+                force=_force_requested(request),
+            )
             if not applied:
-                return Response({'detail': reason}, status=status.HTTP_400_BAD_REQUEST)
+                return _schedule_conflict_warning(f'{reason} Proceed anyway?')
         else:
             trade.status = ShiftTrade.Status.DECLINED
             trade.reviewed_at, trade.reviewed_by = now, request.user

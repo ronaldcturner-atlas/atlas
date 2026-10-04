@@ -160,6 +160,121 @@ class ScheduleBlock(models.Model):
         ordering = ['-created_at', '-id']
 
 
+class ScheduleDateComment(models.Model):
+    """Scheduler-authored note displayed on one date of a published block."""
+
+    schedule_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.CASCADE,
+        related_name='date_comments',
+    )
+    date = models.DateField()
+    title = models.CharField(max_length=100)
+    details = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_date_comments_created',
+    )
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_date_comments_updated',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['date', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_block', 'date'],
+                name='unique_schedule_date_comment_per_block',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.date}: {self.title}'
+
+
+class ScheduleCommentSeries(models.Model):
+    class RecurrenceType(models.TextChoices):
+        WEEKLY = 'WEEKLY', 'Weekly interval'
+        MONTHLY = 'MONTHLY', 'Monthly weekday'
+
+    class EndType(models.TextChoices):
+        NEVER = 'NEVER', 'Does not end'
+        ON_DATE = 'ON_DATE', 'End on date'
+        AFTER_COUNT = 'AFTER_COUNT', 'End after occurrences'
+
+    title = models.CharField(max_length=100)
+    details = models.TextField(blank=True)
+    start_date = models.DateField()
+    recurrence_type = models.CharField(max_length=12, choices=RecurrenceType.choices)
+    interval = models.PositiveSmallIntegerField(default=1)
+    weekday = models.PositiveSmallIntegerField()
+    monthly_ordinal = models.SmallIntegerField(null=True, blank=True)
+    end_type = models.CharField(
+        max_length=16,
+        choices=EndType.choices,
+        default=EndType.NEVER,
+    )
+    end_date = models.DateField(null=True, blank=True)
+    occurrence_count = models.PositiveIntegerField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_comment_series_created',
+    )
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_comment_series_updated',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['start_date', 'id']
+
+
+class ScheduleCommentSeriesException(models.Model):
+    series = models.ForeignKey(
+        ScheduleCommentSeries,
+        on_delete=models.CASCADE,
+        related_name='exceptions',
+    )
+    date = models.DateField()
+    is_cancelled = models.BooleanField(default=False)
+    title = models.CharField(max_length=100, null=True, blank=True)
+    details = models.TextField(null=True, blank=True)
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_comment_series_exceptions_updated',
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['date', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['series', 'date'],
+                name='unique_schedule_comment_series_exception',
+            ),
+        ]
+
+
 class ScheduleVersion(models.Model):
     """A domain-scoped schedule workspace version for a Schedule Block."""
 
@@ -419,12 +534,15 @@ class ShiftTrade(models.Model):
         CANCELLED = 'CANCELLED', 'Cancelled'
 
     offered_assignment = models.ForeignKey(
-        ScheduleShiftAssignment, on_delete=models.PROTECT, related_name='trades_offered',
-    )
-    requested_assignment = models.ForeignKey(
-        ScheduleShiftAssignment, on_delete=models.PROTECT, related_name='trades_requested',
+        ScheduleShiftAssignment, on_delete=models.SET_NULL, related_name='trades_offered',
         null=True, blank=True,
     )
+    requested_assignment = models.ForeignKey(
+        ScheduleShiftAssignment, on_delete=models.SET_NULL, related_name='trades_requested',
+        null=True, blank=True,
+    )
+    offered_assignment_snapshot = models.JSONField(default=dict, blank=True)
+    requested_assignment_snapshot = models.JSONField(default=dict, blank=True)
     requester = models.ForeignKey(
         Physician, on_delete=models.PROTECT, related_name='shift_trades_requested',
     )

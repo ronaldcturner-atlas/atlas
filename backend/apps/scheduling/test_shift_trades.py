@@ -11,6 +11,7 @@ from apps.domains.models import Domain
 from apps.facilities.models import Facility
 from .models import (
     Contract, ContractUserAssignment, OptimizerRun, ScheduleBlock,
+    ScheduleCommentSeries, ScheduleCommentSeriesException, ScheduleDateComment,
     ScheduleShiftAssignment, ScheduleShiftInstance, ScheduleVersion,
     ShiftPosting, ShiftStatsGroup, ShiftTemplate, ShiftTrade, ShiftTradePolicy,
 )
@@ -71,6 +72,274 @@ class ShiftTradeApiTests(TestCase):
         self.assignment.shift_instance.refresh_from_db()
         self.assertIsNone(self.assignment.shift_instance.segment_start_time)
         self.assertIsNone(self.assignment.shift_instance.segment_end_time)
+
+    def test_owner_can_unsplit_after_cancelled_trade_history(self):
+        self.client.force_authenticate(self.owner_user)
+        split = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/split/',
+            {'split_time': '12:00'},
+            format='json',
+        )
+        self.assertEqual(split.status_code, 200)
+        derived_assignment = ScheduleShiftAssignment.objects.exclude(
+            id=self.assignment.id,
+        ).get(physician=self.owner)
+        historical_trade = ShiftTrade.objects.create(
+            offered_assignment=derived_assignment,
+            requested_assignment=self.assignment,
+            requester=self.owner,
+            recipient=self.owner,
+            trade_type=ShiftTrade.TradeType.TRADE,
+            status=ShiftTrade.Status.CANCELLED,
+        )
+
+        unsplit = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/unsplit/',
+            {},
+            format='json',
+        )
+
+        self.assertEqual(unsplit.status_code, 200)
+        self.assertEqual(
+            ScheduleShiftInstance.objects.filter(schedule_version=self.version).count(),
+            1,
+        )
+        historical_trade.refresh_from_db()
+        self.assertEqual(historical_trade.offered_assignment_id, self.assignment.id)
+        self.assertEqual(historical_trade.requested_assignment_id, self.assignment.id)
+        self.assertEqual(historical_trade.status, ShiftTrade.Status.CANCELLED)
+
+    def test_mixed_split_owners_require_scheduler_selection_and_override(self):
+        self.client.force_authenticate(self.owner_user)
+        split = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/split/',
+            {'split_time': '12:00'},
+            format='json',
+        )
+        self.assertEqual(split.status_code, 200)
+        derived_assignment = ScheduleShiftAssignment.objects.exclude(
+            id=self.assignment.id,
+        ).get(physician=self.owner)
+        derived_assignment.physician = self.requester
+        derived_assignment.save(update_fields=['physician'])
+
+        denied = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/unsplit/',
+            {},
+            format='json',
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertIn('Contact an administrator or scheduler', denied.json()['detail'])
+
+        self.client.force_authenticate(self.scheduler_user)
+        selection_required = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/unsplit/',
+            {},
+            format='json',
+        )
+        self.assertEqual(selection_required.status_code, 409)
+        self.assertTrue(selection_required.json()['requires_physician_selection'])
+        warning = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/unsplit/',
+            {'physician_id': self.requester.id},
+            format='json',
+        )
+        self.assertEqual(warning.status_code, 409)
+        self.assertTrue(warning.json()['requires_confirmation'])
+        completed = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/unsplit/',
+            {'physician_id': self.requester.id, 'force': True},
+            format='json',
+        )
+        self.assertEqual(completed.status_code, 200)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.physician, self.requester)
+        self.assertEqual(
+            ScheduleShiftInstance.objects.filter(schedule_version=self.version).count(),
+            1,
+        )
+
+    def test_scheduler_can_confirm_overlapping_reassignment(self):
+        overlap_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2026, 9, 1),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2026, 9, 1, 8)),
+            end_datetime=timezone.make_aware(datetime(2026, 9, 1, 12)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=overlap_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=self.run,
+        )
+        self.client.force_authenticate(self.scheduler_user)
+
+        warning = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/reassign/',
+            {'physician_id': self.requester.id},
+            format='json',
+        )
+        self.assertEqual(warning.status_code, 409)
+        self.assertTrue(warning.json()['requires_confirmation'])
+        completed = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/reassign/',
+            {'physician_id': self.requester.id, 'force': True},
+            format='json',
+        )
+        self.assertEqual(completed.status_code, 200)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.physician, self.requester)
+
+    def test_scheduler_can_open_shift_without_losing_trade_history(self):
+        historical_trade = ShiftTrade.objects.create(
+            offered_assignment=self.assignment,
+            requester=self.requester,
+            recipient=self.owner,
+            trade_type=ShiftTrade.TradeType.PICKUP,
+            status=ShiftTrade.Status.CANCELLED,
+        )
+        ShiftPosting.objects.create(
+            assignment=self.assignment,
+            posted_by=self.owner_user,
+            mode=ShiftPosting.Mode.PICKUP,
+        )
+        self.client.force_authenticate(self.scheduler_user)
+
+        opened = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/open/',
+            {},
+            format='json',
+        )
+
+        self.assertEqual(opened.status_code, 200)
+        self.assertFalse(ScheduleShiftAssignment.objects.filter(
+            id=self.assignment.id,
+        ).exists())
+        historical_trade.refresh_from_db()
+        self.assertIsNone(historical_trade.offered_assignment_id)
+        self.assertEqual(
+            historical_trade.offered_assignment_snapshot['physician_name'],
+            'Owner',
+        )
+        schedule = self.client.get('/api/published-schedule/').json()
+        open_row = next(
+            row for row in schedule
+            if row['shift_instance_id'] == self.assignment.shift_instance_id
+        )
+        self.assertEqual(open_row['status'], 'open')
+        trades = self.client.get('/api/shift-trades/').json()
+        payload = next(row for row in trades if row['id'] == historical_trade.id)
+        self.assertEqual(payload['offered_assignment']['physician_name'], 'Owner')
+
+    def test_scheduler_can_fill_open_shift_with_overlap_override(self):
+        overlap_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2026, 9, 1),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2026, 9, 1, 8)),
+            end_datetime=timezone.make_aware(datetime(2026, 9, 1, 12)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=overlap_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=self.run,
+        )
+        instance_id = self.assignment.shift_instance_id
+        self.client.force_authenticate(self.scheduler_user)
+        opened = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/open/',
+            {},
+            format='json',
+        )
+        self.assertEqual(opened.status_code, 200)
+
+        warning = self.client.post(
+            f'/api/shift-instances/{instance_id}/assign/',
+            {'physician_id': self.requester.id},
+            format='json',
+        )
+        self.assertEqual(warning.status_code, 409)
+        self.assertTrue(warning.json()['requires_confirmation'])
+        assigned = self.client.post(
+            f'/api/shift-instances/{instance_id}/assign/',
+            {'physician_id': self.requester.id, 'force': True},
+            format='json',
+        )
+        self.assertEqual(assigned.status_code, 200)
+        replacement = ScheduleShiftAssignment.objects.get(
+            shift_instance_id=instance_id,
+            optimizer_run=self.run,
+        )
+        self.assertEqual(replacement.physician, self.requester)
+        self.assertTrue(replacement.is_locked)
+        replacement.shift_instance.refresh_from_db()
+        self.assertFalse(replacement.shift_instance.is_locked_open)
+
+    def test_scheduler_can_directly_swap_users_with_conflict_override(self):
+        target_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2026, 9, 2),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        target = ScheduleShiftAssignment.objects.create(
+            shift_instance=target_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=self.run,
+        )
+        owner_overlap_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2026, 9, 2),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 8)),
+            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 12)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=owner_overlap_instance,
+            physician=self.owner,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=self.run,
+        )
+        self.client.force_authenticate(self.scheduler_user)
+
+        warning = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/swap/',
+            {'target_assignment_id': target.id},
+            format='json',
+        )
+        self.assertEqual(warning.status_code, 409)
+        completed = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/swap/',
+            {'target_assignment_id': target.id, 'force': True},
+            format='json',
+        )
+        self.assertEqual(completed.status_code, 200)
+        self.assignment.refresh_from_db()
+        target.refresh_from_db()
+        self.assertEqual(self.assignment.physician, self.requester)
+        self.assertEqual(target.physician, self.owner)
+        self.assertTrue(ShiftTrade.objects.filter(
+            offered_assignment=target,
+            requested_assignment=self.assignment,
+            status=ShiftTrade.Status.APPROVED,
+            reviewed_by=self.scheduler_user,
+        ).exists())
 
     def test_pickup_auto_approves_after_owner_accepts(self):
         ShiftPosting.objects.create(assignment=self.assignment, posted_by=self.owner_user, mode=ShiftPosting.Mode.PICKUP)
@@ -281,6 +550,136 @@ class ShiftTradeApiTests(TestCase):
         deleted = self.client.delete(f'/api/stats-groups/{group_id}/')
         self.assertEqual(deleted.status_code, 204)
         self.assertFalse(ShiftStatsGroup.objects.filter(id=group_id).exists())
+
+    def test_scheduler_manages_published_date_comments_and_users_can_view_them(self):
+        comment_date = '2026-09-21'
+        self.client.force_authenticate(self.owner_user)
+        denied = self.client.post('/api/published-schedule-comments/', {
+            'date': comment_date,
+            'title': 'Department meeting',
+            'details': 'Conference room at 8:00 AM.',
+        }, format='json')
+        self.assertEqual(denied.status_code, 403)
+
+        self.client.force_authenticate(self.scheduler_user)
+        created = self.client.post('/api/published-schedule-comments/', {
+            'date': comment_date,
+            'title': 'Department meeting',
+            'details': 'Conference room at 8:00 AM.',
+        }, format='json')
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(ScheduleDateComment.objects.count(), 1)
+
+        updated = self.client.post('/api/published-schedule-comments/', {
+            'date': comment_date,
+            'title': 'Meeting moved',
+            'details': 'Conference room at 9:00 AM.',
+        }, format='json')
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(ScheduleDateComment.objects.count(), 1)
+
+        self.client.force_authenticate(self.owner_user)
+        visible = self.client.get('/api/published-schedule-comments/')
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(visible.json()[0]['title'], 'Meeting moved')
+
+        self.client.force_authenticate(self.scheduler_user)
+        deleted = self.client.delete(
+            f'/api/published-schedule-comments/{comment_date}/',
+        )
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(ScheduleDateComment.objects.exists())
+
+    def test_recurring_comment_without_end_appears_only_as_schedules_publish(self):
+        self.client.force_authenticate(self.scheduler_user)
+        created = self.client.post('/api/published-schedule-comments/', {
+            'date': '2026-09-02',
+            'title': 'Operations meeting',
+            'details': 'Main conference room.',
+            'recurrence_type': 'WEEKLY',
+            'interval': 3,
+            'end_type': 'NEVER',
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+        series_id = created.json()['series_id']
+        self.assertTrue(ScheduleCommentSeries.objects.filter(id=series_id).exists())
+
+        september = self.client.get('/api/published-schedule-comments/').json()
+        self.assertEqual(
+            [row['date'] for row in september],
+            ['2026-09-02', '2026-09-23'],
+        )
+
+        October_block = ScheduleBlock.objects.create(
+            start_date=date(2026, 10, 1),
+            end_date=date(2026, 10, 31),
+            request_open_datetime=timezone.now(),
+            request_close_datetime=timezone.now(),
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        october = self.client.get('/api/published-schedule-comments/').json()
+        self.assertIn('2026-10-14', [row['date'] for row in october])
+
+        changed = self.client.patch(
+            f'/api/published-schedule-comment-series/{series_id}/occurrences/2026-09-23/',
+            {
+                'scope': 'THIS',
+                'title': 'Meeting moved',
+                'details': 'Use conference room B.',
+            },
+            format='json',
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertTrue(ScheduleCommentSeriesException.objects.filter(
+            series_id=series_id,
+            date=date(2026, 9, 23),
+            title='Meeting moved',
+        ).exists())
+
+        removed = self.client.delete(
+            f'/api/published-schedule-comment-series/{series_id}/occurrences/2026-09-23/',
+            {'scope': 'THIS'},
+            format='json',
+        )
+        self.assertEqual(removed.status_code, 204)
+        dates = [
+            row['date']
+            for row in self.client.get('/api/published-schedule-comments/').json()
+        ]
+        self.assertNotIn('2026-09-23', dates)
+
+    def test_recurring_comment_can_change_this_and_future_occurrences(self):
+        self.client.force_authenticate(self.scheduler_user)
+        created = self.client.post('/api/published-schedule-comments/', {
+            'date': '2026-09-02',
+            'title': 'Weekly huddle',
+            'details': '',
+            'recurrence_type': 'WEEKLY',
+            'interval': 1,
+            'end_type': 'NEVER',
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+        original_series_id = created.json()['series_id']
+
+        changed = self.client.patch(
+            f'/api/published-schedule-comment-series/{original_series_id}/occurrences/2026-09-16/',
+            {
+                'scope': 'FUTURE',
+                'title': 'Clinical huddle',
+                'details': 'New agenda begins this week.',
+            },
+            format='json',
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertNotEqual(changed.json()['series_id'], original_series_id)
+        comments = {
+            row['date']: row
+            for row in self.client.get('/api/published-schedule-comments/').json()
+        }
+        self.assertEqual(comments['2026-09-09']['title'], 'Weekly huddle')
+        self.assertEqual(comments['2026-09-16']['title'], 'Clinical huddle')
+        self.assertEqual(comments['2026-09-23']['title'], 'Clinical huddle')
 
     def test_scheduler_changes_actual_instance_times_without_changing_template(self):
         self.client.force_authenticate(self.owner_user)
