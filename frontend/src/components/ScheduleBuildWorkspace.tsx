@@ -143,6 +143,7 @@ type OptimizerSummary = {
     facility: number
     time_of_day: number
     is_penalty: false
+    unit?: 'PERCENT'
   }
   debug?: Record<string, unknown> | string
   request_violations_summary?: {
@@ -485,6 +486,10 @@ function formatScore(value: string | number | null | undefined) {
     return '-'
   }
   return Number(value).toFixed(1)
+}
+
+function formatDistribution(value: number, unit?: 'PERCENT') {
+  return `${value.toFixed(1)}${unit === 'PERCENT' ? '%' : ''}`
 }
 
 function isCompletedOptimizerRun(run: OptimizerRun) {
@@ -3222,12 +3227,18 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <strong>{(optimizerSummary.score_breakdown?.shift_rule_score ?? 0).toFixed(1)}</strong>
               </div>
               <div>
-                <span>Facility proportionality</span>
-                <strong>{(optimizerSummary.proportionality?.facility ?? 0).toFixed(1)}</strong>
+                <span>Facility distribution</span>
+                <strong>{formatDistribution(
+                  optimizerSummary.proportionality?.facility ?? 0,
+                  optimizerSummary.proportionality?.unit,
+                )}</strong>
               </div>
               <div>
-                <span>Time proportionality</span>
-                <strong>{(optimizerSummary.proportionality?.time_of_day ?? 0).toFixed(1)}</strong>
+                <span>Time distribution</span>
+                <strong>{formatDistribution(
+                  optimizerSummary.proportionality?.time_of_day ?? 0,
+                  optimizerSummary.proportionality?.unit,
+                )}</strong>
               </div>
               <div>
                 <span>Request violations</span>

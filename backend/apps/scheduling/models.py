@@ -621,3 +621,82 @@ class ContractUserAssignment(models.Model):
                 name='unique_physician_default_contract_per_domain',
             ),
         ]
+
+
+class SharedRule(models.Model):
+    """A reusable custom shift rule shared by multiple contracts."""
+
+    class PeriodType(models.TextChoices):
+        WEEK = 'WEEK', 'Week'
+        MONTH = 'MONTH', 'Month'
+        SCHEDULE_BLOCK = 'SCHEDULE_BLOCK', 'Schedule Block'
+
+    class Units(models.TextChoices):
+        HOURS = 'HOURS', 'Hours'
+        SHIFTS = 'SHIFTS', 'Shifts'
+
+    domain = models.ForeignKey(
+        Domain, on_delete=models.CASCADE, related_name='shared_rules',
+    )
+    name = models.CharField(max_length=255)
+    active = models.BooleanField(default=True)
+    period_type = models.CharField(
+        max_length=20,
+        choices=PeriodType.choices,
+        default=PeriodType.SCHEDULE_BLOCK,
+    )
+    units = models.CharField(
+        max_length=10,
+        choices=Units.choices,
+        default=Units.SHIFTS,
+    )
+    shift_templates = models.ManyToManyField(
+        ShiftTemplate, related_name='shared_rules',
+    )
+    contracts = models.ManyToManyField(
+        Contract,
+        through='SharedRuleContract',
+        related_name='shared_rules',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.domain.name}: {self.name}'
+
+    class Meta:
+        ordering = ['domain__name', 'name', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['domain', 'name'],
+                name='unique_shared_rule_name_per_domain',
+            ),
+        ]
+
+
+class SharedRuleContract(models.Model):
+    """Contract-specific limits for one reusable Shared Rule."""
+
+    shared_rule = models.ForeignKey(
+        SharedRule, on_delete=models.CASCADE, related_name='contract_links',
+    )
+    contract = models.ForeignKey(
+        Contract, on_delete=models.CASCADE, related_name='shared_rule_links',
+    )
+    enabled = models.BooleanField(default=True)
+    min_value = models.PositiveIntegerField(null=True, blank=True)
+    max_value = models.PositiveIntegerField(null=True, blank=True)
+    min_penalty_weight = models.PositiveIntegerField(null=True, blank=True)
+    max_penalty_weight = models.PositiveIntegerField(null=True, blank=True)
+    spread_violations = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['contract__name', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['shared_rule', 'contract'],
+                name='unique_contract_per_shared_rule',
+            ),
+        ]

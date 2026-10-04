@@ -132,6 +132,7 @@ type ViolationReport = {
     facility: number
     time_of_day: number
     is_penalty: false
+    unit?: 'PERCENT'
   }
   rule_summary: Array<{
     score_component: string
@@ -265,6 +266,10 @@ function formatNumber(value: number | null | undefined, digits = 1) {
     return '-'
   }
   return value.toFixed(digits)
+}
+
+function formatDistribution(value: number, unit?: 'PERCENT') {
+  return `${value.toFixed(1)}${unit === 'PERCENT' ? '%' : ''}`
 }
 
 function workloadUnitsLabel(units: string | null | undefined) {
@@ -454,20 +459,22 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
 
           <div className="proportionality-context-grid">
             <section>
-              <h3>Facility proportionality</h3>
-              <strong>{(report.proportionality?.facility ?? 0).toFixed(1)}</strong>
-              <p><b>Lower is better.</b> This measures how closely each eligible non-nocturnist physician's facility mix follows the available optimizer-controlled shift supply.</p>
+              <h3>Facility distribution</h3>
+              <strong>{formatDistribution(
+                report.proportionality?.facility ?? 0,
+                report.proportionality?.unit,
+              )}</strong>
+              <p><b>Lower is better.</b></p>
             </section>
             <section>
-              <h3>Time proportionality</h3>
-              <strong>{(report.proportionality?.time_of_day ?? 0).toFixed(1)}</strong>
-              <p><b>Lower is better.</b> This measures how closely each eligible non-nocturnist physician's early, midday, and late shift mix follows the available optimizer-controlled shift supply.</p>
+              <h3>Time distribution</h3>
+              <strong>{formatDistribution(
+                report.proportionality?.time_of_day ?? 0,
+                report.proportionality?.unit,
+              )}</strong>
+              <p><b>Lower is better.</b></p>
             </section>
           </div>
-          <p className="proportionality-context-note">
-            These proportionality values are not penalties and are not included in the total score. The optimizer uses them only to prefer a more even distribution when the official penalty does not increase. The scheduler decides whether further distribution-focused optimization is worthwhile.
-          </p>
-
           <div className="violation-table-wrap">
             <table className="scheduler-table violation-table violation-summary-table">
               <thead>
@@ -526,11 +533,11 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
         ))}
       </div>
       <div className="violation-proportionality-scores" aria-label="Distribution measures">
-        <div><span>Facility proportionality</span><strong>{(report.proportionality?.facility ?? 0).toFixed(1)}</strong></div>
-        <div><span>Time proportionality</span><strong>{(report.proportionality?.time_of_day ?? 0).toFixed(1)}</strong></div>
+        <div><span>Facility distribution</span><strong>{formatDistribution(report.proportionality?.facility ?? 0, report.proportionality?.unit)}</strong></div>
+        <div><span>Time distribution</span><strong>{formatDistribution(report.proportionality?.time_of_day ?? 0, report.proportionality?.unit)}</strong></div>
       </div>
       <p className="proportionality-context-note">
-        Lower facility and time proportionality values are better. They are not penalties and are not included in Total score; the optimizer uses them only to prefer a more even distribution when the official penalty does not increase.
+        Lower is better.
       </p>
 
       <p className="violation-filter-status">

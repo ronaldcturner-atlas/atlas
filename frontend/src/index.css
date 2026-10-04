@@ -487,6 +487,31 @@ select option:checked{
 .contracts-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
 .contracts-inline-checkbox{gap:10px;min-width:150px}
 .contracts-domain-filter{min-width:240px}
+.contract-page-tabs{display:flex;gap:8px;margin-bottom:18px;border-bottom:1px solid #40516a}
+.contract-page-tabs button{border:0;border-bottom:3px solid transparent;background:transparent;color:#c7d2e3;padding:10px 14px;font-weight:700;cursor:pointer}
+.contract-page-tabs button.active{border-bottom-color:#8b7cf6;color:#fff}
+.shared-rule-status-filter{display:flex;gap:14px;align-items:center;min-height:38px;padding:0 10px;border:1px solid #52627a;border-radius:6px}
+.shared-rule-status-filter label{display:flex;gap:6px;align-items:center}
+.shared-rule-contract-chips{display:flex;flex-wrap:wrap;gap:5px}
+.shared-rule-contract-chips span{background:#263d5b;border:1px solid #49617f;border-radius:999px;padding:3px 8px;font-size:12px}
+.shared-rule-contract-card{border-color:#6f5ce7}
+.shared-rule-readonly-badge{align-self:flex-start;padding:4px 9px;border:1px solid #8274ee;border-radius:999px;background:rgba(111,92,231,.16);color:#d9d4ff;font-size:12px;font-weight:700;white-space:nowrap}
+.table-subtext{font-size:12px;color:#aebbd0;margin-top:3px}
+.shared-rule-modal{width:min(1180px,94vw);max-height:92vh;overflow:auto}
+.shared-rule-step{border:1px solid #41516a;border-radius:8px;padding:16px;margin:14px 0;background:#142238}
+.shared-rule-step h3{margin:0 0 6px}
+.shared-rule-contract-grid,.shared-rule-template-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px;margin-top:12px}
+.shared-rule-contract-grid label,.shared-rule-template-grid label{display:flex;gap:9px;align-items:flex-start;border:1px solid #485a74;border-radius:6px;padding:9px;background:#203149}
+.shared-rule-contract-grid label.disabled{opacity:.45}
+.shared-rule-contract-grid span,.shared-rule-template-grid span{display:flex;flex-direction:column;gap:2px}
+.shared-rule-contract-grid small,.shared-rule-template-grid small{color:#aebbd0}
+.shared-rule-definition-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:12px;align-items:end;margin-top:12px}
+.shared-rule-compatibility{display:grid;gap:6px;margin-top:12px}
+.shared-rule-compatibility>div{display:flex;justify-content:space-between;border-left:4px solid #2e9f62;background:#1c2c42;padding:7px 10px}
+.shared-rule-compatibility>div.partial{border-left-color:#d9a227}
+.shared-rule-compatibility>div.incompatible{border-left-color:#d9534f}
+.scheduler-table.compact input{width:110px}
+@media(max-width:800px){.shared-rule-definition-grid{grid-template-columns:1fr 1fr}.shared-rule-modal{width:96vw}}
 
 .contract-modal{max-width:min(1400px,96vw)}
 .sidebar + .main-area .contract-modal-overlay{left:250px}

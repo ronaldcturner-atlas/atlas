@@ -40,6 +40,8 @@ from .models import (
     ShiftTrade,
     ShiftTradePolicy,
     ShiftTemplate,
+    SharedRule,
+    SharedRuleContract,
 )
 from .optimizer import (
     build_violation_report,
@@ -67,6 +69,11 @@ from .serializers import (
     ScheduleVersionWorkspaceSerializer,
     ShiftSerializer,
     ShiftTemplateSerializer,
+    SharedRuleSerializer,
+)
+from .shared_rules import (
+    remove_shared_rule_from_contracts,
+    sync_shared_rule_contract_settings,
 )
 from .workload_feasibility import build_workload_feasibility
 
@@ -4336,7 +4343,11 @@ def schedule_block_unpublish(request, block_id):
 @permission_classes([IsAuthenticated])
 def contracts_list_create(request):
     if request.method == 'GET':
-        contracts = Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments__physician__user').all()
+        contracts = Contract.objects.select_related('domain').prefetch_related(
+            'facilities',
+            'user_assignments__physician__user',
+            'shared_rule_links__shared_rule__shift_templates__facility',
+        ).all()
 
         domain_id = request.query_params.get('domain')
         include_inactive = request.query_params.get('include_inactive') == 'true'
@@ -4361,6 +4372,91 @@ def contracts_list_create(request):
     return Response(ContractSerializer(contract).data, status=status.HTTP_201_CREATED)
 
 
+def _shared_rule_queryset():
+    return (
+        SharedRule.objects.select_related('domain')
+        .prefetch_related(
+            'shift_templates__facility',
+            'contract_links__contract',
+        )
+    )
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shared_rules_list_create(request):
+    if request.method == 'GET':
+        queryset = _shared_rule_queryset()
+        domain_id = request.query_params.get('domain')
+        active_view = request.query_params.get('status', 'active')
+        if domain_id:
+            queryset = queryset.filter(domain_id=domain_id)
+        queryset = queryset.filter(active=active_view != 'inactive')
+        return Response(SharedRuleSerializer(queryset, many=True).data)
+
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can create Shared Rules.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    serializer = SharedRuleSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    with transaction.atomic():
+        shared_rule = serializer.save()
+        first_link = shared_rule.contract_links.select_related('contract').first()
+        if first_link:
+            _mark_contract_domain_scores_stale(first_link.contract)
+    shared_rule = _shared_rule_queryset().get(id=shared_rule.id)
+    return Response(
+        SharedRuleSerializer(shared_rule).data,
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shared_rule_detail(request, shared_rule_id):
+    shared_rule = get_object_or_404(
+        _shared_rule_queryset(), id=shared_rule_id,
+    )
+    if request.method == 'GET':
+        return Response(SharedRuleSerializer(shared_rule).data)
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can change Shared Rules.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if request.method == 'DELETE':
+        with transaction.atomic():
+            contract_ids = list(
+                shared_rule.contract_links.values_list('contract_id', flat=True)
+            )
+            first_contract = Contract.objects.filter(
+                id__in=contract_ids,
+            ).first()
+            remove_shared_rule_from_contracts(shared_rule.id, contract_ids)
+            shared_rule.delete()
+            if first_contract:
+                _mark_contract_domain_scores_stale(first_contract)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    serializer = SharedRuleSerializer(
+        shared_rule,
+        data=request.data,
+        partial=request.method == 'PATCH',
+    )
+    serializer.is_valid(raise_exception=True)
+    with transaction.atomic():
+        shared_rule = serializer.save()
+        first_link = shared_rule.contract_links.select_related('contract').first()
+        if first_link:
+            _mark_contract_domain_scores_stale(first_link.contract)
+    shared_rule = _shared_rule_queryset().get(id=shared_rule.id)
+    return Response(SharedRuleSerializer(shared_rule).data)
+
+
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -4380,7 +4476,11 @@ def contract_detail(request, contract_id):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     contract = get_object_or_404(
-        Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments__physician__user'),
+        Contract.objects.select_related('domain').prefetch_related(
+            'facilities',
+            'user_assignments__physician__user',
+            'shared_rule_links__shared_rule__shift_templates__facility',
+        ),
         id=contract_id,
     )
 
@@ -4437,6 +4537,23 @@ def contract_duplicate(request, contract_id):
             request_settings=_copy_json_dict(source_contract.request_settings),
         )
         duplicate.facilities.set(source_contract.facilities.all())
+        SharedRuleContract.objects.bulk_create([
+            SharedRuleContract(
+                shared_rule=link.shared_rule,
+                contract=duplicate,
+                enabled=link.enabled,
+                min_value=link.min_value,
+                max_value=link.max_value,
+                min_penalty_weight=link.min_penalty_weight,
+                max_penalty_weight=link.max_penalty_weight,
+                spread_violations=link.spread_violations,
+            )
+            for link in source_contract.shared_rule_links.select_related(
+                'shared_rule',
+            )
+        ])
+        for shared_rule in duplicate.shared_rules.all():
+            sync_shared_rule_contract_settings(shared_rule)
 
     serializer = ContractSerializer(duplicate)
     return Response(serializer.data, status=status.HTTP_201_CREATED)

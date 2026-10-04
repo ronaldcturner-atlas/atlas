@@ -8519,6 +8519,120 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(result['facility_distribution_score'], Decimal('0'))
         self.assertEqual(result['time_distribution_score'], Decimal('0'))
 
+    def test_facility_proportionality_targets_are_jointly_feasible_with_exclusions(self):
+        physicians = [
+            SimpleNamespace(id=1, display_name='Flexible'),
+            SimpleNamespace(id=2, display_name='Facility A only'),
+        ]
+        contracts = {
+            physician.id: SimpleNamespace(
+                id=physician.id,
+                name=physician.display_name,
+                manual_assignment_only=False,
+                workload_settings={}, shift_settings={}, night_settings={},
+                weekend_settings={},
+            )
+            for physician in physicians
+        }
+        templates = {
+            10: SimpleNamespace(
+                id=10, start_time=time(7, 0), night_shift=False,
+                weekend_days=[],
+            ),
+            20: SimpleNamespace(
+                id=20, start_time=time(7, 0), night_shift=False,
+                weekend_days=[],
+            ),
+        }
+        instances = []
+        for index, facility_id in enumerate((10, 20), start=1):
+            start = timezone.make_aware(datetime(2026, 7, index, 7, 0))
+            instances.append(SimpleNamespace(
+                id=index,
+                date=start.date(),
+                start_datetime=start,
+                end_datetime=start + timedelta(hours=8),
+                required_staffing=1,
+                facility_id=facility_id,
+                shift_template_id=templates[facility_id].id,
+                shift_template=templates[facility_id],
+            ))
+
+        result = _distribution_score(
+            instances,
+            physicians,
+            defaultdict(list, {1: [2], 2: [1]}),
+            contracts,
+            {1: {10, 20}, 2: {10}},
+        )
+
+        # The only jointly feasible allocation is physician 2 at facility 10
+        # and physician 1 at facility 20. Independent per-user normalization
+        # incorrectly penalized physician 1 for not splitting one shift 50/50.
+        self.assertEqual(result['facility_distribution_score'], Decimal('0.0'))
+
+    def test_distribution_scores_are_assignment_weighted_percentages(self):
+        physicians = [
+            SimpleNamespace(id=1, display_name='One'),
+            SimpleNamespace(id=2, display_name='Two'),
+        ]
+        contracts = {
+            physician.id: SimpleNamespace(
+                id=physician.id,
+                name=physician.display_name,
+                manual_assignment_only=False,
+                workload_settings={}, shift_settings={}, night_settings={},
+                weekend_settings={},
+            )
+            for physician in physicians
+        }
+        templates = {
+            10: SimpleNamespace(
+                id=10, start_time=time(7, 0), night_shift=False,
+                weekend_days=[],
+            ),
+            20: SimpleNamespace(
+                id=20, start_time=time(14, 0), night_shift=False,
+                weekend_days=[],
+            ),
+        }
+        instances = []
+        for index, facility_id in enumerate((10, 10, 20, 20), start=1):
+            template = templates[facility_id]
+            start = timezone.make_aware(datetime.combine(
+                date(2026, 7, index), template.start_time,
+            ))
+            instances.append(SimpleNamespace(
+                id=index,
+                date=start.date(),
+                start_datetime=start,
+                end_datetime=start + timedelta(hours=8),
+                required_staffing=1,
+                facility_id=facility_id,
+                shift_template_id=template.id,
+                shift_template=template,
+            ))
+        clustered = defaultdict(list, {
+            1: [1], 2: [1], 3: [2], 4: [2],
+        })
+
+        result = _distribution_score(
+            instances,
+            physicians,
+            clustered,
+            contracts,
+            {1: {10, 20}, 2: {10, 20}},
+        )
+
+        # Two of four assignments must trade categories to reach the feasible
+        # one-at-each-facility target for both physicians.
+        self.assertAlmostEqual(
+            float(result['facility_distribution_score']), 50.0,
+        )
+        self.assertAlmostEqual(
+            float(result['time_distribution_score']), 50.0,
+        )
+
     def test_explicit_shift_rules_remove_templates_from_default_proportionality(self):
         physician = SimpleNamespace(id=1, display_name='Rule Guided')
         early_template = SimpleNamespace(
@@ -8740,6 +8854,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertIn('total_score', payload)
         self.assertIn('score_breakdown', payload)
         self.assertFalse(payload['proportionality']['is_penalty'])
+        self.assertEqual(payload['proportionality']['unit'], 'PERCENT')
         self.assertNotIn('targets', payload['proportionality'])
         self.assertNotIn('shift_deviation_assessment', payload['proportionality'])
         self.assertTrue(payload['debug']['violations_recomputed_from_final_assignments'])

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import SharedRulesView from './SharedRulesView'
 
 type Domain = {
   id: number
@@ -46,6 +47,7 @@ type ContractRecord = {
   request_settings: RequestSettings
   assigned_users: Array<{ id: number; name: string }>
   assigned_users_count: number
+  shared_rules: SharedContractRule[]
 }
 
 type PeriodType = 'WEEK' | 'MONTH' | 'SCHEDULE_BLOCK'
@@ -126,6 +128,21 @@ type ShiftSettings = {
   rules: ShiftRule[]
 }
 
+type SharedContractRule = {
+  id: number
+  name: string
+  active: boolean
+  enabled: boolean
+  period_type: PeriodType
+  units: RuleUnits
+  shift_templates: Array<{ id: number; name: string; facility_id: number; facility_name: string }>
+  min_value: string
+  max_value: string
+  min_penalty_weight: string
+  max_penalty_weight: string
+  spread_violations: boolean
+}
+
 type NightSettings = {
   period_rules: NightPeriodRule[]
   min_consecutive_night_shifts: string
@@ -178,6 +195,7 @@ type ContractFormState = {
   assigned_user_ids: number[]
   workload_settings: WorkloadSettings
   shift_settings: ShiftSettings
+  shared_rules: SharedContractRule[]
   night_settings: NightSettings
   weekend_settings: WeekendSettings
   request_settings: RequestSettings
@@ -263,8 +281,9 @@ function emptyFormState(): ContractFormState {
       max_same_shifts_in_row_penalty_weight: '',
     },
     shift_settings: {
-      rules: [makeShiftRule()],
+      rules: [],
     },
+    shared_rules: [],
     night_settings: {
       period_rules: [makeNightRule('WEEK')],
       min_consecutive_night_shifts: '',
@@ -405,17 +424,23 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
         : fallback.workload_settings.period_rules).map((rule) => normalizeMinMaxRule(rule as Partial<MinMaxRule> & Record<string, unknown>)),
     },
     shift_settings: {
-      rules: ((shiftSettings.rules && shiftSettings.rules.length)
+      rules: (Array.isArray(shiftSettings.rules)
         ? shiftSettings.rules
-        : fallback.shift_settings.rules).map((rule) => ({
+        : fallback.shift_settings.rules)
+        .filter((rule) => !('shared_rule_id' in (rule as unknown as Record<string, unknown>)))
+        .map((rule) => ({
         ...makeShiftRule(),
         ...rule,
         id: makeId('shift-group'),
-        period_rules: ((rule.period_rules && rule.period_rules.length)
+        period_rules: (Array.isArray(rule.period_rules)
           ? rule.period_rules
-          : [makeMinMaxRule('WEEK')]).map((periodRule) => normalizeMinMaxRule(periodRule as Partial<MinMaxRule> & Record<string, unknown>)),
+          : [makeMinMaxRule('WEEK')])
+          .map((periodRule) => normalizeMinMaxRule(periodRule as Partial<MinMaxRule> & Record<string, unknown>)),
       })),
     },
+    shared_rules: Array.isArray(contract.shared_rules)
+      ? contract.shared_rules.map((rule) => ({ ...rule }))
+      : [],
     night_settings: {
       ...normalizedNightSettings,
       period_rules: ((nightSettings.period_rules && nightSettings.period_rules.length)
@@ -454,6 +479,13 @@ function sanitizeFormPayload(formState: ContractFormState) {
         period_rules: rule.period_rules.map(({ id, ...periodRule }) => periodRule),
       })),
     },
+    shared_rule_settings: formState.shared_rules.map((rule) => ({
+      shared_rule_id: rule.id,
+      min_value: rule.min_value,
+      max_value: rule.max_value,
+      min_penalty_weight: rule.min_penalty_weight,
+      max_penalty_weight: rule.max_penalty_weight,
+    })),
     night_settings: {
       ...formState.night_settings,
       period_rules: formState.night_settings.period_rules.map(({ id, ...rule }) => rule),
@@ -517,6 +549,7 @@ function isActiveValue(value: unknown) {
 }
 
 export default function ContractsView() {
+  const [pageTab, setPageTab] = useState<'contracts' | 'shared_rules'>('contracts')
   const [contracts, setContracts] = useState<ContractRecord[]>([])
   const [domains, setDomains] = useState<Domain[]>([])
   const [facilities, setFacilities] = useState<Facility[]>([])
@@ -829,7 +862,7 @@ export default function ContractsView() {
       facilityCount: formState.facility_ids.length,
       usersCount: formState.assigned_user_ids.length,
       workloadRuleCount: formState.workload_settings.period_rules.length,
-      shiftRuleCount: formState.shift_settings.rules.length,
+      shiftRuleCount: formState.shift_settings.rules.length + formState.shared_rules.filter((rule) => rule.active && rule.enabled).length,
       nightRuleCount: formState.night_settings.period_rules.length,
       weekendRuleCount: formState.weekend_settings.period_rules.length,
     }
@@ -839,8 +872,16 @@ export default function ContractsView() {
     return <div className="scheduler-loading">Loading contracts...</div>
   }
 
+  if (pageTab === 'shared_rules') {
+    return <SharedRulesView onShowContracts={() => setPageTab('contracts')} />
+  }
+
   return (
     <div className="facilities-view-card">
+      <div className="contract-page-tabs" role="tablist">
+        <button type="button" className="active" aria-selected="true">Contracts</button>
+        <button type="button" onClick={() => setPageTab('shared_rules')}>Shared Rules</button>
+      </div>
       <div className="facilities-header contracts-header">
         <h2>Contracts</h2>
         <div className="contracts-toolbar">
@@ -1104,8 +1145,47 @@ export default function ContractsView() {
               {activeTab === 'shifts' && (
                 <div className="contract-section-stack">
                   <h3>Shift Rules</h3>
+                  <div className="request-existing-note">Rules shared across contracts are managed from the Shared Rules tab.</div>
+                  {!!formState.shared_rules.length && (
+                    <div className="contract-section-stack">
+                      <h4>Shared Rules used by this contract</h4>
+                      {formState.shared_rules.map((sharedRule) => (
+                        <div key={sharedRule.id} className="contract-shift-card shared-rule-contract-card">
+                          <div className="contract-shift-card-header">
+                            <div>
+                              <strong>{sharedRule.name}</strong>
+                              <div className="table-subtext">
+                                {sharedRule.active && sharedRule.enabled ? 'Active' : 'Inactive'} · {sharedRule.period_type === 'SCHEDULE_BLOCK' ? 'Schedule Block' : sharedRule.period_type === 'MONTH' ? 'Month' : 'Week'} · {sharedRule.units === 'HOURS' ? 'Hours' : 'Shifts'} · Spread {sharedRule.spread_violations ? 'on' : 'off'}
+                              </div>
+                            </div>
+                            <span className="shared-rule-readonly-badge">Shared Rule</span>
+                          </div>
+                          <div className="request-existing-note">
+                            {sharedRule.shift_templates.length
+                              ? sharedRule.shift_templates.map((template) => `${template.name} (${template.facility_name})`).join(', ')
+                              : 'No eligible shifts in this contract.'}
+                          </div>
+                          <div className="contract-minmax-columns">
+                            <div className="contract-minmax-column">
+                              <div className="contract-minmax-title">Min</div>
+                              <label className="facility-field"><span>Min value</span><input type="number" min="0" step="1" value={sharedRule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_value: event.target.value } : rule) }))} /></label>
+                              <label className="facility-field"><span>Min penalty</span><input type="number" min="0" step="1" value={sharedRule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_penalty_weight: event.target.value } : rule) }))} /></label>
+                            </div>
+                            <div className="contract-minmax-column">
+                              <div className="contract-minmax-title">Max</div>
+                              <label className="facility-field"><span>Max value</span><input type="number" min="0" step="1" value={sharedRule.max_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_value: event.target.value } : rule) }))} /></label>
+                              <label className="facility-field"><span>Max penalty</span><input type="number" min="0" step="1" value={sharedRule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_penalty_weight: event.target.value } : rule) }))} /></label>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {!formState.facility_ids.length && (
                     <div className="request-existing-note">Select facilities first.</div>
+                  )}
+                  {!formState.shift_settings.rules.length && (
+                    <div className="empty-state">No contract-specific Shift Rules.</div>
                   )}
                   {formState.shift_settings.rules.map((shiftRule, shiftIndex) => (
                     <div key={shiftRule.id} className="contract-shift-card">
@@ -1137,7 +1217,6 @@ export default function ContractsView() {
                               rules: current.shift_settings.rules.filter((_, itemIndex) => itemIndex !== shiftIndex),
                             },
                           }))}
-                          disabled={formState.shift_settings.rules.length === 1}
                         >
                           Remove rule group
                         </button>
@@ -1206,7 +1285,7 @@ export default function ContractsView() {
                               <label className="facility-field"><span>Units</span><select value={rule.units} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, units: event.target.value as RuleUnits } : periodRule) } : item) } }))}><option value="HOURS">Hours</option><option value="SHIFTS">Shifts</option></select></label>
                               <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={rule.spread_violations} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, spread_violations: event.target.checked } : periodRule) } : item) } }))} /></label>
                             </div>
-                            <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.filter((_, targetPeriodIndex) => targetPeriodIndex !== periodIndex) } : item) } }))} disabled={shiftRule.period_rules.length === 1}>Remove</button>
+                            <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.filter((_, targetPeriodIndex) => targetPeriodIndex !== periodIndex) } : item) } }))}>Remove</button>
                           </div>
                         ))}
                       </div>

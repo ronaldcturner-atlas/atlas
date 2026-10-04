@@ -25,6 +25,7 @@ from apps.scheduling.optimizer import (
     _night_minimum_reassignment_candidates,
     _night_recovery_conflict_pairs,
     _effective_workload_rule,
+    _feasible_proportionality_target_matrix,
     _is_weekend_designated,
     _period_windows,
     _published_boundary_context,
@@ -490,14 +491,24 @@ def _pair_shift_rule_deltas(
     )
 
 
-def _proportionality_score_vector(counts, shares, weight):
+def _proportionality_score_vector(
+    counts, shares, weight, normalizer_total=None,
+):
     totals = counts.sum(axis=1)
     result = np.zeros(len(counts), dtype=np.float64)
     usable = totals > 0
     if shares.sum() <= 0 or not np.any(usable):
         return result
-    deviations = counts[usable] - totals[usable, None] * shares[None, :]
-    result[usable] = weight * np.square(deviations).sum(axis=1) / totals[usable]
+    usable_shares = shares[usable] if shares.ndim == 2 else shares[None, :]
+    deviations = counts[usable] - totals[usable, None] * usable_shares
+    denominator = (
+        float(normalizer_total)
+        if normalizer_total is not None
+        else totals[usable]
+    )
+    if np.isscalar(denominator) and denominator <= 0:
+        return result
+    result[usable] = weight * np.abs(deviations).sum(axis=1) / denominator
     return result
 
 
@@ -505,17 +516,20 @@ def _prepare_proportionality_dimension(
     occupancy, governed, eligible_facility, available_slots,
     shift_categories, shift_facility, category_count, weight,
     shift_for_assignment, physician_for_assignment,
+    target_shares=None, normalizer_total=None,
 ):
     assignment_count = len(shift_for_assignment)
     shift_count = occupancy.shape[1]
     score_delta = np.zeros((assignment_count, shift_count), dtype=np.float64)
     baseline_delta = np.zeros((assignment_count, shift_count), dtype=np.float64)
-    base_score_total = 0.0
-    base_baseline_total = 0.0
+    counts_by_physician = np.zeros(
+        (occupancy.shape[0], category_count), dtype=np.float64,
+    )
+    opportunities_by_physician = np.zeros_like(counts_by_physician)
     for physician_idx in range(occupancy.shape[0]):
         unguided = ~governed[physician_idx]
         current_shifts = np.flatnonzero(occupancy[physician_idx] & unguided)
-        counts = np.bincount(
+        counts_by_physician[physician_idx] = np.bincount(
             shift_categories[current_shifts], minlength=category_count,
         ).astype(np.float64)
         opportunity_mask = (
@@ -523,26 +537,44 @@ def _prepare_proportionality_dimension(
             & eligible_facility[physician_idx, shift_facility]
             & (available_slots > 0)
         )
-        opportunities = np.bincount(
+        opportunities_by_physician[physician_idx] = np.bincount(
             shift_categories[opportunity_mask],
             weights=available_slots[opportunity_mask],
             minlength=category_count,
         ).astype(np.float64)
-        opportunity_total = opportunities.sum()
-        shares = (
-            opportunities / opportunity_total
-            if opportunity_total > 0 else np.zeros(category_count)
+
+    if target_shares is None:
+        target_rows = np.asarray(
+            _feasible_proportionality_target_matrix(
+                tuple(tuple(int(value) for value in row) for row in counts_by_physician),
+                tuple(
+                    tuple(int(value) for value in row)
+                    for row in opportunities_by_physician
+                ),
+            ),
+            dtype=np.float64,
         )
+        row_totals = counts_by_physician.sum(axis=1)
+        target_shares = np.divide(
+            target_rows,
+            row_totals[:, None],
+            out=np.zeros_like(target_rows),
+            where=row_totals[:, None] > 0,
+        )
+    else:
+        target_shares = np.asarray(target_shares, dtype=np.float64)
+    if normalizer_total is None:
+        normalizer_total = float(counts_by_physician.sum())
+
+    base_score_total = 0.0
+    for physician_idx in range(occupancy.shape[0]):
+        unguided = ~governed[physician_idx]
+        counts = counts_by_physician[physician_idx]
+        shares = target_shares[physician_idx]
         base_score = _proportionality_score_vector(
-            counts[None, :], shares, weight,
+            counts[None, :], shares, weight, normalizer_total,
         )[0]
-        neutral = (
-            weight * (1.0 - float(np.dot(shares, shares)))
-            if opportunity_total > 0 else 0.0
-        )
-        base_baseline = neutral if counts.sum() > 0 else 0.0
         base_score_total += base_score
-        base_baseline_total += base_baseline
         assignment_indexes = np.flatnonzero(
             physician_for_assignment == physician_idx,
         )
@@ -561,11 +593,12 @@ def _prepare_proportionality_dimension(
                     shift_categories[new_unguided.astype(bool)],
                 ] += 1
                 after_scores = _proportionality_score_vector(
-                    after_counts, shares, weight,
+                    after_counts, shares, weight, normalizer_total,
                 )
-                after_totals = after_counts.sum(axis=1)
-                after_baselines = np.where(after_totals > 0, neutral, 0.0)
-                rows = (after_scores - base_score, after_baselines - base_baseline)
+                rows = (
+                    after_scores - base_score,
+                    np.zeros(shift_count, dtype=np.float64),
+                )
                 cached[key] = rows
             score_delta[assignment_idx] = rows[0]
             baseline_delta[assignment_idx] = rows[1]
@@ -573,7 +606,9 @@ def _prepare_proportionality_dimension(
         'score_delta': score_delta,
         'baseline_delta': baseline_delta,
         'base_score': base_score_total,
-        'base_baseline': base_baseline_total,
+        'base_baseline': 100.0 if normalizer_total > 0 else 0.0,
+        'target_shares': target_shares,
+        'normalizer_total': float(normalizer_total),
     }
 
 
@@ -2630,11 +2665,13 @@ class Command(BaseCommand):
 
         facility_counts = np.zeros((physician_count, facility_count), dtype=np.int16)
         time_counts = np.zeros((physician_count, time_count), dtype=np.int16)
-        facility_expected = np.zeros((physician_count, facility_count), dtype=np.float64)
-        time_expected = np.zeros((physician_count, time_count), dtype=np.float64)
+        facility_opportunities = np.zeros(
+            (physician_count, facility_count), dtype=np.int32,
+        )
+        time_opportunities = np.zeros(
+            (physician_count, time_count), dtype=np.int32,
+        )
         assigned_totals = np.zeros(physician_count, dtype=np.int16)
-        facility_baseline = 0.0
-        time_baseline = 0.0
         for physician_idx in range(physician_count):
             unguided_owned = np.flatnonzero(
                 occupancy[physician_idx] & ~governed[physician_idx]
@@ -2652,65 +2689,76 @@ class Command(BaseCommand):
                 & eligible_facility[physician_idx, shift_facility]
                 & (available_slots > 0)
             )
-            facility_opportunities = np.bincount(
+            facility_opportunities[physician_idx] = np.bincount(
                 shift_facility[opportunity_mask],
                 weights=available_slots[opportunity_mask],
                 minlength=facility_count,
             )
-            time_opportunities = np.bincount(
+            time_opportunities[physician_idx] = np.bincount(
                 shift_time[opportunity_mask],
                 weights=available_slots[opportunity_mask],
                 minlength=time_count,
             )
-            if assigned_totals[physician_idx] and facility_opportunities.sum():
-                facility_expected[physician_idx] = (
-                    assigned_totals[physician_idx]
-                    * facility_opportunities / facility_opportunities.sum()
-                )
-                facility_baseline += _neutral_baseline(
-                    DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT,
-                    facility_opportunities,
-                )
-            if assigned_totals[physician_idx] and time_opportunities.sum():
-                time_expected[physician_idx] = (
-                    assigned_totals[physician_idx]
-                    * time_opportunities / time_opportunities.sum()
-                )
-                time_baseline += _neutral_baseline(
-                    DEFAULT_TIME_PROPORTIONALITY_WEIGHT,
-                    time_opportunities,
-                )
 
-        facility_deviation = facility_counts.astype(np.float64) - facility_expected
-        time_deviation = time_counts.astype(np.float64) - time_expected
+        def feasible_target_shares(counts, opportunities):
+            target_rows = np.asarray(
+                _feasible_proportionality_target_matrix(
+                    tuple(tuple(int(value) for value in row) for row in counts),
+                    tuple(
+                        tuple(int(value) for value in row)
+                        for row in opportunities
+                    ),
+                ),
+                dtype=np.float64,
+            )
+            totals = counts.sum(axis=1, dtype=np.float64)
+            return np.divide(
+                target_rows,
+                totals[:, None],
+                out=np.zeros_like(target_rows),
+                where=totals[:, None] > 0,
+            )
+
+        facility_target_shares = feasible_target_shares(
+            facility_counts, facility_opportunities,
+        )
+        time_target_shares = feasible_target_shares(
+            time_counts, time_opportunities,
+        )
+        facility_normalizer_total = float(facility_counts.sum())
+        time_normalizer_total = float(time_counts.sum())
         component_started = perf_counter()
         if engine_context_cache_hit:
             cached_tables = cached_engine_context.assignment_rows.tables
-            facility_scores = np.divide(
-                np.square(facility_deviation).sum(axis=1),
-                assigned_totals,
-                out=np.zeros(physician_count, dtype=np.float64),
-                where=assigned_totals > 0,
-            ) * float(DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT)
-            time_scores = np.divide(
-                np.square(time_deviation).sum(axis=1),
-                assigned_totals,
-                out=np.zeros(physician_count, dtype=np.float64),
-                where=assigned_totals > 0,
-            ) * float(DEFAULT_TIME_PROPORTIONALITY_WEIGHT)
+            facility_scores = _proportionality_score_vector(
+                facility_counts,
+                facility_target_shares,
+                float(DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT),
+                facility_normalizer_total,
+            )
+            time_scores = _proportionality_score_vector(
+                time_counts,
+                time_target_shares,
+                float(DEFAULT_TIME_PROPORTIONALITY_WEIGHT),
+                time_normalizer_total,
+            )
             facility_proportionality_kernel = {
                 'score_delta': cached_tables['facility_proportionality_score'],
                 'baseline_delta': cached_tables[
                     'facility_proportionality_baseline'
                 ],
                 'base_score': float(facility_scores.sum()),
-                'base_baseline': float(facility_baseline),
+                'base_baseline': 100.0 if facility_normalizer_total > 0 else 0.0,
+                'target_shares': facility_target_shares,
+                'normalizer_total': facility_normalizer_total,
             }
             time_proportionality_kernel = {
                 'score_delta': cached_tables['time_proportionality_score'],
                 'baseline_delta': cached_tables['time_proportionality_baseline'],
                 'base_score': float(time_scores.sum()),
-                'base_baseline': float(time_baseline),
+                'base_baseline': 100.0 if time_normalizer_total > 0 else 0.0,
+                'target_shares': time_target_shares,
+                'normalizer_total': time_normalizer_total,
             }
         else:
             facility_proportionality_kernel = _prepare_proportionality_dimension(
@@ -2718,12 +2766,16 @@ class Command(BaseCommand):
                 shift_facility, shift_facility, facility_count,
                 float(DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT),
                 shift_for_assignment, physician_for_assignment,
+                target_shares=facility_target_shares,
+                normalizer_total=facility_normalizer_total,
             )
             time_proportionality_kernel = _prepare_proportionality_dimension(
                 occupancy, governed, eligible_facility, available_slots,
                 shift_time, shift_facility, time_count,
                 float(DEFAULT_TIME_PROPORTIONALITY_WEIGHT),
                 shift_for_assignment, physician_for_assignment,
+                target_shares=time_target_shares,
+                normalizer_total=time_normalizer_total,
             )
         preparation_breakdown['proportionality_kernel_seconds'] = (
             perf_counter() - component_started
@@ -2882,6 +2934,12 @@ class Command(BaseCommand):
                 float(DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT),
                 refreshed_shift_for_assignment,
                 refreshed_physician_for_assignment,
+                target_shares=facility_proportionality_kernel[
+                    'target_shares'
+                ][affected_global_indexes],
+                normalizer_total=facility_proportionality_kernel[
+                    'normalizer_total'
+                ],
             )
             refresh_breakdown['facility_proportionality_seconds'] = (
                 perf_counter() - refresh_component_started
@@ -2898,6 +2956,12 @@ class Command(BaseCommand):
                 float(DEFAULT_TIME_PROPORTIONALITY_WEIGHT),
                 refreshed_shift_for_assignment,
                 refreshed_physician_for_assignment,
+                target_shares=time_proportionality_kernel[
+                    'target_shares'
+                ][affected_global_indexes],
+                normalizer_total=time_proportionality_kernel[
+                    'normalizer_total'
+                ],
             )
             refresh_breakdown['time_proportionality_seconds'] = (
                 perf_counter() - refresh_component_started
@@ -3579,6 +3643,12 @@ class Command(BaseCommand):
                 float(DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT),
                 affected_shift_for_assignment,
                 affected_physician_for_assignment,
+                target_shares=facility_proportionality_kernel[
+                    'target_shares'
+                ][affected_global_indexes],
+                normalizer_total=facility_proportionality_kernel[
+                    'normalizer_total'
+                ],
             )
             affected_time_proportionality = _prepare_proportionality_dimension(
                 affected_occupancy,
@@ -3591,6 +3661,12 @@ class Command(BaseCommand):
                 float(DEFAULT_TIME_PROPORTIONALITY_WEIGHT),
                 affected_shift_for_assignment,
                 affected_physician_for_assignment,
+                target_shares=time_proportionality_kernel[
+                    'target_shares'
+                ][affected_global_indexes],
+                normalizer_total=time_proportionality_kernel[
+                    'normalizer_total'
+                ],
             )
             affected_refresh_breakdown['proportionality_kernel_seconds'] = (
                 perf_counter() - component_started

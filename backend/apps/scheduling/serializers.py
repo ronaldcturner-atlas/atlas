@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from django.db import models
 from rest_framework import serializers
@@ -18,7 +19,10 @@ from .models import (
     Shift,
     ShiftTemplate,
 )
-from .models import Contract, ContractUserAssignment
+from .models import (
+    Contract, ContractUserAssignment, SharedRule, SharedRuleContract,
+)
+from .shared_rules import sync_shared_rule_contract_settings
 
 
 class ShiftSerializer(serializers.ModelSerializer):
@@ -682,6 +686,10 @@ class ContractSerializer(serializers.ModelSerializer):
     )
     assigned_users = serializers.SerializerMethodField()
     assigned_users_count = serializers.SerializerMethodField()
+    shared_rules = serializers.SerializerMethodField()
+    shared_rule_settings = serializers.ListField(
+        child=serializers.DictField(), write_only=True, required=False,
+    )
 
     class Meta:
         model = Contract
@@ -701,6 +709,8 @@ class ContractSerializer(serializers.ModelSerializer):
             'assigned_user_ids',
             'assigned_users',
             'assigned_users_count',
+            'shared_rules',
+            'shared_rule_settings',
             'created_at',
             'updated_at',
         ]
@@ -709,6 +719,7 @@ class ContractSerializer(serializers.ModelSerializer):
             'domain_name',
             'assigned_users',
             'assigned_users_count',
+            'shared_rules',
             'created_at',
             'updated_at',
         ]
@@ -728,6 +739,49 @@ class ContractSerializer(serializers.ModelSerializer):
     def get_assigned_users_count(self, obj):
         return obj.user_assignments.count()
 
+    def get_shared_rules(self, obj):
+        facility_ids = set(obj.facilities.values_list('id', flat=True))
+        rows = []
+        for link in obj.shared_rule_links.select_related(
+            'shared_rule',
+        ).prefetch_related('shared_rule__shift_templates__facility'):
+            rule = link.shared_rule
+            templates = [
+                {
+                    'id': template.id,
+                    'name': template.generated_name(),
+                    'facility_id': template.facility_id,
+                    'facility_name': template.facility.name,
+                }
+                for template in rule.shift_templates.all()
+                if template.facility_id in facility_ids
+            ]
+            rows.append({
+                'id': rule.id,
+                'name': rule.name,
+                'active': rule.active,
+                'enabled': link.enabled,
+                'period_type': rule.period_type,
+                'units': rule.units,
+                'shift_templates': templates,
+                'min_value': (
+                    str(int(link.min_value)) if link.min_value is not None else ''
+                ),
+                'max_value': (
+                    str(int(link.max_value)) if link.max_value is not None else ''
+                ),
+                'min_penalty_weight': (
+                    str(int(link.min_penalty_weight))
+                    if link.min_penalty_weight is not None else ''
+                ),
+                'max_penalty_weight': (
+                    str(int(link.max_penalty_weight))
+                    if link.max_penalty_weight is not None else ''
+                ),
+                'spread_violations': link.spread_violations,
+            })
+        return rows
+
     def validate_name(self, value):
         value = value.strip()
         if not value:
@@ -741,8 +795,112 @@ class ContractSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('One or more physicians do not exist.')
         return unique_ids
 
+    @staticmethod
+    def _normalize_whole_number_fields(row, fields, label):
+        for field in fields:
+            value = row.get(field)
+            if value in (None, ''):
+                continue
+            try:
+                decimal_value = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                raise serializers.ValidationError({
+                    label: f'{field.replace("_", " ")} must be a whole number.',
+                })
+            if (
+                decimal_value != decimal_value.to_integral_value()
+                or decimal_value < 0
+            ):
+                raise serializers.ValidationError({
+                    label: f'{field.replace("_", " ")} must be a nonnegative whole number.',
+                })
+            row[field] = str(int(decimal_value))
+
+    def _normalize_contract_rule_numbers(self, attrs):
+        period_field_sets = {
+            'workload_settings': (
+                'min_value', 'max_value',
+                'min_penalty_weight', 'max_penalty_weight',
+            ),
+            'night_settings': (
+                'min_shifts', 'max_shifts',
+                'min_penalty_weight', 'max_penalty_weight',
+            ),
+            'weekend_settings': (
+                'min_volume', 'max_volume',
+                'min_penalty_weight', 'max_penalty_weight',
+            ),
+        }
+        for settings_name, fields in period_field_sets.items():
+            settings = attrs.get(settings_name)
+            if not isinstance(settings, dict):
+                continue
+            for row in settings.get('period_rules') or []:
+                if isinstance(row, dict):
+                    self._normalize_whole_number_fields(
+                        row, fields, settings_name,
+                    )
+
+        shift_settings = attrs.get('shift_settings')
+        if isinstance(shift_settings, dict):
+            for group in shift_settings.get('rules') or []:
+                if not isinstance(group, dict):
+                    continue
+                for row in group.get('period_rules') or []:
+                    if isinstance(row, dict):
+                        self._normalize_whole_number_fields(
+                            row,
+                            (
+                                'min_value', 'max_value',
+                                'min_penalty_weight', 'max_penalty_weight',
+                            ),
+                            'shift_settings',
+                        )
+
+        scalar_fields = {
+            'workload_settings': (
+                'min_time_off_hours', 'min_time_off_penalty_weight',
+                'circadian_penalty_weight',
+                'min_days_in_row', 'min_days_in_row_penalty_weight',
+                'max_days_in_row', 'max_days_in_row_penalty_weight',
+                'min_same_shifts_in_row',
+                'min_same_shifts_in_row_penalty_weight',
+                'max_same_shifts_in_row',
+                'max_same_shifts_in_row_penalty_weight',
+            ),
+            'night_settings': (
+                'min_consecutive_night_shifts',
+                'min_consecutive_night_shifts_penalty_weight',
+                'max_consecutive_night_shifts',
+                'max_consecutive_night_shifts_penalty_weight',
+                'days_off_after_night_block',
+                'days_off_after_night_block_penalty_weight',
+                'days_off_before_next_night_shift',
+                'days_off_before_next_night_shift_penalty_weight',
+            ),
+            'weekend_settings': (
+                'min_consecutive_weekends',
+                'min_consecutive_weekends_penalty_weight',
+                'max_consecutive_weekends',
+                'max_consecutive_weekends_penalty_weight',
+                'min_consecutive_weekend_shifts',
+                'min_consecutive_weekend_shifts_penalty_weight',
+                'max_consecutive_weekend_shifts',
+                'max_consecutive_weekend_shifts_penalty_weight',
+                'block_friday_night_before_weekend_off_penalty_weight',
+            ),
+        }
+        for settings_name, fields in scalar_fields.items():
+            settings = attrs.get(settings_name)
+            if isinstance(settings, dict):
+                self._normalize_whole_number_fields(
+                    settings, fields, settings_name,
+                )
+        return attrs
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        attrs = self._normalize_contract_rule_numbers(attrs)
 
         assigned_user_ids = attrs.get('assigned_user_ids')
         next_active = attrs.get('active', self.instance.active if self.instance else True)
@@ -751,6 +909,107 @@ class ContractSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'assigned_user_ids': 'Inactive contracts cannot be assigned to users unless reactivated.'
             })
+
+        if self.instance is not None:
+            shared_rule_settings = attrs.get('shared_rule_settings')
+            if shared_rule_settings is not None:
+                links = {
+                    link.shared_rule_id: link
+                    for link in self.instance.shared_rule_links.all()
+                }
+                normalized = []
+                seen = set()
+                for index, row in enumerate(shared_rule_settings, start=1):
+                    try:
+                        shared_rule_id = int(row.get('shared_rule_id') or 0)
+                    except (TypeError, ValueError):
+                        shared_rule_id = 0
+                    if shared_rule_id not in links or shared_rule_id in seen:
+                        raise serializers.ValidationError({
+                            'shared_rule_settings': (
+                                'Only Shared Rules already linked to this contract '
+                                'can be adjusted here.'
+                            ),
+                        })
+                    seen.add(shared_rule_id)
+                    values = {'shared_rule_id': shared_rule_id}
+                    for field in (
+                        'min_value', 'max_value',
+                        'min_penalty_weight', 'max_penalty_weight',
+                    ):
+                        value = row.get(field)
+                        if value in (None, ''):
+                            values[field] = None
+                            continue
+                        try:
+                            decimal_value = Decimal(str(value))
+                        except (InvalidOperation, TypeError, ValueError):
+                            raise serializers.ValidationError({
+                                'shared_rule_settings': (
+                                    f'Shared Rule row {index} has an invalid '
+                                    f'{field.replace("_", " ")}.'
+                                ),
+                            })
+                        if decimal_value != decimal_value.to_integral_value():
+                            raise serializers.ValidationError({
+                                'shared_rule_settings': (
+                                    f'Shared Rule row {index} requires whole '
+                                    f'numbers for {field.replace("_", " ")}.'
+                                ),
+                            })
+                        values[field] = int(decimal_value)
+                    if (
+                        values['min_value'] is not None
+                        and values['max_value'] is not None
+                        and values['min_value'] > values['max_value']
+                    ):
+                        raise serializers.ValidationError({
+                            'shared_rule_settings': (
+                                f'Shared Rule row {index} has a minimum '
+                                'greater than its maximum.'
+                            ),
+                        })
+                    if any(
+                        values[field] is not None and values[field] < 0
+                        for field in ('min_penalty_weight', 'max_penalty_weight')
+                    ):
+                        raise serializers.ValidationError({
+                            'shared_rule_settings': (
+                                f'Shared Rule row {index} has a negative penalty.'
+                            ),
+                        })
+                    normalized.append(values)
+                attrs['shared_rule_settings'] = normalized
+
+            next_domain = attrs.get('domain', self.instance.domain)
+            next_facilities = attrs.get('facilities')
+            facility_ids = (
+                {facility.id for facility in next_facilities}
+                if next_facilities is not None
+                else set(self.instance.facilities.values_list('id', flat=True))
+            )
+            conflicts = []
+            for link in self.instance.shared_rule_links.select_related(
+                'shared_rule',
+            ).prefetch_related('shared_rule__shift_templates'):
+                if not link.enabled or not link.shared_rule.active:
+                    continue
+                rule = link.shared_rule
+                rule_facilities = {
+                    template.facility_id
+                    for template in rule.shift_templates.all()
+                }
+                if rule.domain_id != next_domain.id or not (
+                    rule_facilities & facility_ids
+                ):
+                    conflicts.append(rule.name)
+            if conflicts:
+                raise serializers.ValidationError({
+                    'facility_ids': (
+                        'This change contradicts these active Shared Rules: '
+                        f'{", ".join(sorted(conflicts))}.'
+                    ),
+                })
 
         return attrs
 
@@ -782,6 +1041,7 @@ class ContractSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         assigned_user_ids = validated_data.pop('assigned_user_ids', None)
+        validated_data.pop('shared_rule_settings', None)
         facilities = validated_data.pop('facilities', [])
 
         contract = Contract.objects.create(**validated_data)
@@ -791,6 +1051,7 @@ class ContractSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         assigned_user_ids = validated_data.pop('assigned_user_ids', None)
+        shared_rule_settings = validated_data.pop('shared_rule_settings', None)
         facilities = validated_data.pop('facilities', None)
 
         for field, value in validated_data.items():
@@ -801,4 +1062,246 @@ class ContractSerializer(serializers.ModelSerializer):
             instance.facilities.set(facilities)
 
         self._save_assignments(instance, assigned_user_ids)
+        if shared_rule_settings is not None:
+            links = {
+                link.shared_rule_id: link
+                for link in instance.shared_rule_links.all()
+            }
+            for row in shared_rule_settings:
+                link = links[row['shared_rule_id']]
+                for field in (
+                    'min_value', 'max_value',
+                    'min_penalty_weight', 'max_penalty_weight',
+                ):
+                    setattr(link, field, row[field])
+                link.save(update_fields=[
+                    'min_value', 'max_value',
+                    'min_penalty_weight', 'max_penalty_weight', 'updated_at',
+                ])
+        for shared_rule in instance.shared_rules.all():
+            sync_shared_rule_contract_settings(shared_rule)
+        return instance
+
+
+class SharedRuleSerializer(serializers.ModelSerializer):
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    shift_template_ids = serializers.PrimaryKeyRelatedField(
+        source='shift_templates', many=True,
+        queryset=ShiftTemplate.objects.filter(active=True),
+    )
+    shift_templates = serializers.SerializerMethodField()
+    contract_settings = serializers.ListField(
+        child=serializers.DictField(), write_only=True,
+    )
+    contracts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SharedRule
+        fields = [
+            'id', 'domain', 'domain_name', 'name', 'active',
+            'period_type', 'units', 'shift_template_ids', 'shift_templates',
+            'contract_settings', 'contracts', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'domain_name', 'shift_templates', 'contracts',
+            'created_at', 'updated_at',
+        ]
+
+    def get_shift_templates(self, obj):
+        return [{
+            'id': template.id,
+            'name': template.generated_name(),
+            'facility_id': template.facility_id,
+            'facility_name': template.facility.name,
+        } for template in obj.shift_templates.all()]
+
+    def get_contracts(self, obj):
+        return [{
+            'id': link.contract_id,
+            'name': link.contract.name,
+            'active': link.contract.active,
+            'enabled': link.enabled,
+            'min_value': (
+                str(int(link.min_value)) if link.min_value is not None else ''
+            ),
+            'max_value': (
+                str(int(link.max_value)) if link.max_value is not None else ''
+            ),
+            'min_penalty_weight': (
+                str(int(link.min_penalty_weight))
+                if link.min_penalty_weight is not None else ''
+            ),
+            'max_penalty_weight': (
+                str(int(link.max_penalty_weight))
+                if link.max_penalty_weight is not None else ''
+            ),
+            'spread_violations': link.spread_violations,
+        } for link in obj.contract_links.all()]
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError('Name is required.')
+        return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        domain = attrs.get('domain', getattr(self.instance, 'domain', None))
+        templates = attrs.get(
+            'shift_templates',
+            list(self.instance.shift_templates.all()) if self.instance else [],
+        )
+        contract_settings = attrs.get('contract_settings')
+        if contract_settings is None and self.instance is not None:
+            contract_settings = [
+                {'contract_id': link.contract_id}
+                for link in self.instance.contract_links.all()
+            ]
+        contract_settings = contract_settings or []
+        normalized_settings = []
+        for index, row in enumerate(contract_settings, start=1):
+            normalized = dict(row)
+            for field in (
+                'min_value', 'max_value',
+                'min_penalty_weight', 'max_penalty_weight',
+            ):
+                value = row.get(field)
+                if value in (None, ''):
+                    normalized[field] = None
+                    continue
+                try:
+                    decimal_value = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError):
+                    raise serializers.ValidationError({
+                        'contract_settings': (
+                            f'Contract row {index} has an invalid {field.replace("_", " ")}.'
+                        ),
+                    })
+                if decimal_value != decimal_value.to_integral_value():
+                    raise serializers.ValidationError({
+                        'contract_settings': (
+                            f'Contract row {index} requires whole numbers for '
+                            f'{field.replace("_", " ")}.'
+                        ),
+                    })
+                normalized[field] = int(decimal_value)
+            if (
+                normalized['min_value'] is not None
+                and normalized['max_value'] is not None
+                and normalized['min_value'] > normalized['max_value']
+            ):
+                raise serializers.ValidationError({
+                    'contract_settings': (
+                        f'Contract row {index} has a minimum greater than its maximum.'
+                    ),
+                })
+            for field in ('min_penalty_weight', 'max_penalty_weight'):
+                if normalized[field] is not None and normalized[field] < 0:
+                    raise serializers.ValidationError({
+                        'contract_settings': (
+                            f'Contract row {index} has a negative penalty.'
+                        ),
+                    })
+            normalized_settings.append(normalized)
+        contract_settings = normalized_settings
+        attrs['contract_settings'] = normalized_settings
+        contract_ids = [
+            int(row.get('contract_id') or 0) for row in contract_settings
+        ]
+        if len(set(contract_ids)) < 2:
+            raise serializers.ValidationError({
+                'contract_settings': (
+                    'Select at least two contracts for a Shared Rule.'
+                ),
+            })
+        if len(set(contract_ids)) != len(contract_ids) or 0 in contract_ids:
+            raise serializers.ValidationError({
+                'contract_settings': 'Each selected contract must be unique.',
+            })
+        contracts = list(
+            Contract.objects.filter(id__in=contract_ids)
+            .prefetch_related('facilities')
+        )
+        if len(contracts) != len(contract_ids):
+            raise serializers.ValidationError({
+                'contract_settings': 'One or more contracts do not exist.',
+            })
+        if any(contract.domain_id != domain.id for contract in contracts):
+            raise serializers.ValidationError({
+                'contract_settings': (
+                    'All Shared Rule contracts must use the selected domain.'
+                ),
+            })
+        if not templates:
+            raise serializers.ValidationError({
+                'shift_template_ids': 'Select at least one shift.',
+            })
+        template_facilities = {template.facility_id for template in templates}
+        incompatible = [
+            contract.name for contract in contracts
+            if not template_facilities.intersection(
+                contract.facilities.values_list('id', flat=True)
+            )
+        ]
+        if incompatible:
+            raise serializers.ValidationError({
+                'contract_settings': (
+                    'These contracts exclude every facility represented by '
+                    f'this rule: {", ".join(sorted(incompatible))}.'
+                ),
+            })
+        attrs['_validated_contracts'] = {c.id: c for c in contracts}
+        return attrs
+
+    @staticmethod
+    def _number(value):
+        if value in (None, ''):
+            return None
+        return value
+
+    def _save_links(self, shared_rule, rows):
+        SharedRuleContract.objects.filter(shared_rule=shared_rule).delete()
+        SharedRuleContract.objects.bulk_create([
+            SharedRuleContract(
+                shared_rule=shared_rule,
+                contract_id=int(row['contract_id']),
+                enabled=bool(row.get('enabled', True)),
+                min_value=self._number(row.get('min_value')),
+                max_value=self._number(row.get('max_value')),
+                min_penalty_weight=self._number(
+                    row.get('min_penalty_weight')
+                ),
+                max_penalty_weight=self._number(
+                    row.get('max_penalty_weight')
+                ),
+                spread_violations=bool(row.get('spread_violations', True)),
+            )
+            for row in rows
+        ])
+
+    def create(self, validated_data):
+        rows = validated_data.pop('contract_settings')
+        validated_data.pop('_validated_contracts', None)
+        templates = validated_data.pop('shift_templates')
+        shared_rule = SharedRule.objects.create(**validated_data)
+        shared_rule.shift_templates.set(templates)
+        self._save_links(shared_rule, rows)
+        sync_shared_rule_contract_settings(shared_rule)
+        return shared_rule
+
+    def update(self, instance, validated_data):
+        rows = validated_data.pop('contract_settings', None)
+        validated_data.pop('_validated_contracts', None)
+        templates = validated_data.pop('shift_templates', None)
+        previous_contract_ids = list(
+            instance.contract_links.values_list('contract_id', flat=True)
+        )
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.save()
+        if templates is not None:
+            instance.shift_templates.set(templates)
+        if rows is not None:
+            self._save_links(instance, rows)
+        sync_shared_rule_contract_settings(instance, previous_contract_ids)
         return instance

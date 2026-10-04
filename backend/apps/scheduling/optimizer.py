@@ -4328,6 +4328,197 @@ def _proportionality_measure(
     }
 
 
+@lru_cache(maxsize=512)
+def _feasible_proportionality_target_matrix(actual_rows, opportunity_rows):
+    """Build jointly feasible fractional targets for one distribution dimension.
+
+    Row totals are each physician's applicable assignments and column totals
+    are the assignments that actually have to be distributed in each
+    category.  Iterative proportional fitting preserves both margins while
+    structural zeroes enforce facility eligibility and contract-governed
+    template exclusions.  The current assignment support is included as a
+    safety net, so a valid current schedule always defines a feasible matrix.
+    """
+    if not actual_rows:
+        return ()
+    row_count = len(actual_rows)
+    category_count = len(actual_rows[0]) if actual_rows[0] else 0
+    if not category_count:
+        return tuple(() for _row in actual_rows)
+
+    row_totals = [float(sum(row)) for row in actual_rows]
+    column_totals = [
+        float(sum(actual_rows[row_idx][category_idx] for row_idx in range(row_count)))
+        for category_idx in range(category_count)
+    ]
+    allowed = [
+        [
+            bool(
+                opportunity_rows[row_idx][category_idx] > 0
+                or actual_rows[row_idx][category_idx] > 0
+            )
+            for category_idx in range(category_count)
+        ]
+        for row_idx in range(row_count)
+    ]
+
+    if not any(row_totals) or not any(column_totals):
+        return tuple(
+            tuple(0.0 for _category_idx in range(category_count))
+            for _row_idx in range(row_count)
+        )
+
+    # Resolve forced rows and columns first. Without this reduction, iterative
+    # fitting only approaches boundary solutions asymptotically (for example,
+    # one A-only physician plus one A/B physician and one slot at each site).
+    fixed = [[0.0] * category_count for _row_idx in range(row_count)]
+    remaining_rows = list(row_totals)
+    remaining_columns = list(column_totals)
+    tolerance = 1e-12
+    while True:
+        changed = False
+        for category_idx, target in enumerate(remaining_columns):
+            if target <= tolerance:
+                continue
+            candidates = [
+                row_idx
+                for row_idx in range(row_count)
+                if remaining_rows[row_idx] > tolerance
+                and allowed[row_idx][category_idx]
+            ]
+            if len(candidates) == 1:
+                row_idx = candidates[0]
+                amount = target
+                fixed[row_idx][category_idx] += amount
+                remaining_rows[row_idx] -= amount
+                remaining_columns[category_idx] = 0.0
+                changed = True
+        for row_idx, target in enumerate(remaining_rows):
+            if target <= tolerance:
+                continue
+            candidates = [
+                category_idx
+                for category_idx in range(category_count)
+                if remaining_columns[category_idx] > tolerance
+                and allowed[row_idx][category_idx]
+            ]
+            if len(candidates) == 1:
+                category_idx = candidates[0]
+                amount = target
+                fixed[row_idx][category_idx] += amount
+                remaining_rows[row_idx] = 0.0
+                remaining_columns[category_idx] -= amount
+                changed = True
+        if not changed:
+            break
+
+    matrix = [
+        [
+            (
+                max(float(opportunity_rows[row_idx][category_idx]), 1.0)
+                if allowed[row_idx][category_idx]
+                and remaining_rows[row_idx] > tolerance
+                and remaining_columns[category_idx] > tolerance
+                else 0.0
+            )
+            for category_idx in range(category_count)
+        ]
+        for row_idx in range(row_count)
+    ]
+
+    # The current assignment matrix proves that the remaining margins are
+    # feasible on this support. Fit the non-forced interior proportionally to
+    # the optimizer opportunities.
+    for _iteration in range(300):
+        for row_idx, target in enumerate(remaining_rows):
+            current = sum(matrix[row_idx])
+            if current > 0:
+                scale = target / current
+                matrix[row_idx] = [value * scale for value in matrix[row_idx]]
+        for category_idx, target in enumerate(remaining_columns):
+            current = sum(matrix[row_idx][category_idx] for row_idx in range(row_count))
+            if current > 0:
+                scale = target / current
+                for row_idx in range(row_count):
+                    matrix[row_idx][category_idx] *= scale
+        maximum_error = max(
+            [
+                abs(sum(matrix[row_idx]) - remaining_rows[row_idx])
+                for row_idx in range(row_count)
+            ]
+            + [
+                abs(
+                    sum(matrix[row_idx][category_idx] for row_idx in range(row_count))
+                    - remaining_columns[category_idx]
+                )
+                for category_idx in range(category_count)
+            ]
+        )
+        if maximum_error <= 1e-9:
+            break
+
+    return tuple(
+        tuple(fixed[row_idx][category_idx] + matrix[row_idx][category_idx] for category_idx in range(category_count))
+        for row_idx in range(row_count)
+    )
+
+
+def _feasible_proportionality_percentage(
+    actual_counts_by_physician,
+    opportunity_counts_by_physician,
+):
+    """Return the percent of applicable assignments outside a feasible mix."""
+    physician_ids = sorted(
+        set(actual_counts_by_physician) | set(opportunity_counts_by_physician)
+    )
+    categories = sorted({
+        category
+        for rows in (actual_counts_by_physician, opportunity_counts_by_physician)
+        for counts in rows.values()
+        for category in counts
+    }, key=str)
+    if not physician_ids or not categories:
+        return {
+            'score': Decimal('0'),
+            'theoretical_floor': Decimal('0'),
+            'neutral_baseline': Decimal('0'),
+        }
+
+    actual_rows = tuple(
+        tuple(int(actual_counts_by_physician[physician_id].get(category, 0)) for category in categories)
+        for physician_id in physician_ids
+    )
+    opportunity_rows = tuple(
+        tuple(int(opportunity_counts_by_physician[physician_id].get(category, 0)) for category in categories)
+        for physician_id in physician_ids
+    )
+    target_rows = _feasible_proportionality_target_matrix(
+        actual_rows,
+        opportunity_rows,
+    )
+    assignment_total = sum(sum(row) for row in actual_rows)
+    if assignment_total <= 0:
+        return {
+            'score': Decimal('0'),
+            'theoretical_floor': Decimal('0'),
+            'neutral_baseline': Decimal('0'),
+        }
+    absolute_deviation = sum(
+        abs(float(actual_rows[row_idx][category_idx]) - target_rows[row_idx][category_idx])
+        for row_idx in range(len(actual_rows))
+        for category_idx in range(len(categories))
+    )
+    # Moving one assignment resolves one excess and one deficit, hence / 2.
+    percentage = 100.0 * absolute_deviation / (2.0 * assignment_total)
+    return {
+        'score': Decimal(str(percentage)),
+        'theoretical_floor': Decimal('0'),
+        # Both dimensions are percentages, so a common 100-point baseline
+        # preserves the configured 40/60 facility/time priority weighting.
+        'neutral_baseline': Decimal('100'),
+    }
+
+
 def _proportionality_target(score, theoretical_floor, neutral_baseline):
     """Translate raw proportionality into an attainable-looking target band."""
     floor = max(Decimal(theoretical_floor), Decimal('0'))
@@ -4445,12 +4636,10 @@ def _distribution_score(
                 weekend_counts[physician_id] += 1
 
     consecutive_days_score = Decimal('0')
-    facility_distribution_score = Decimal('0')
-    time_distribution_score = Decimal('0')
-    facility_distribution_floor = Decimal('0')
-    time_distribution_floor = Decimal('0')
-    facility_neutral_baseline = Decimal('0')
-    time_neutral_baseline = Decimal('0')
+    facility_counts_by_physician = {}
+    time_counts_by_physician = {}
+    facility_opportunities_by_physician = {}
+    time_opportunities_by_physician = {}
     total_weekend_assignments = sum(weekend_counts.values())
     default_weekend_target = default_weekend_target_override if default_weekend_target_override is not None else (
         Decimal(total_weekend_assignments) / Decimal(len(physicians))
@@ -4607,24 +4796,19 @@ def _distribution_score(
             facility_opportunities[opportunity['facility_id']] += available_slots
             time_opportunities[opportunity['time_band']] += available_slots
 
-        facility_measure = _proportionality_measure(
-            facility_counts,
-            facility_opportunities,
-            DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT,
-            include_context=include_proportionality_targets,
-        )
-        time_measure = _proportionality_measure(
-            time_counts,
-            time_opportunities,
-            DEFAULT_TIME_PROPORTIONALITY_WEIGHT,
-            include_context=include_proportionality_targets,
-        )
-        facility_distribution_score += facility_measure['score']
-        facility_distribution_floor += facility_measure['theoretical_floor']
-        facility_neutral_baseline += facility_measure['neutral_baseline']
-        time_distribution_score += time_measure['score']
-        time_distribution_floor += time_measure['theoretical_floor']
-        time_neutral_baseline += time_measure['neutral_baseline']
+        facility_counts_by_physician[physician.id] = facility_counts
+        time_counts_by_physician[physician.id] = time_counts
+        facility_opportunities_by_physician[physician.id] = facility_opportunities
+        time_opportunities_by_physician[physician.id] = time_opportunities
+
+    facility_measure = _feasible_proportionality_percentage(
+        facility_counts_by_physician,
+        facility_opportunities_by_physician,
+    )
+    time_measure = _feasible_proportionality_percentage(
+        time_counts_by_physician,
+        time_opportunities_by_physician,
+    )
 
 
     same_shift_score, _violations = _same_shift_violation_report(
@@ -4656,12 +4840,12 @@ def _distribution_score(
         'weekend_score': _weekend_volume_report(
             instances, physicians, state, contract_by_physician, default_weekend_target,
         )['score'],
-        'facility_distribution_score': facility_distribution_score,
-        'time_distribution_score': time_distribution_score,
-        'facility_distribution_floor': facility_distribution_floor,
-        'time_distribution_floor': time_distribution_floor,
-        'facility_neutral_baseline': facility_neutral_baseline,
-        'time_neutral_baseline': time_neutral_baseline,
+        'facility_distribution_score': facility_measure['score'],
+        'time_distribution_score': time_measure['score'],
+        'facility_distribution_floor': facility_measure['theoretical_floor'],
+        'time_distribution_floor': time_measure['theoretical_floor'],
+        'facility_neutral_baseline': facility_measure['neutral_baseline'],
+        'time_neutral_baseline': time_measure['neutral_baseline'],
     }
 
 
@@ -9865,6 +10049,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
                 for key, value in scoring['proportionality_breakdown'].items()
             },
             'is_penalty': False,
+            'unit': 'PERCENT',
         },
         'rule_summary': rule_summary,
         'workload_contract_adjustments': _workload_contract_adjustment_rows(
@@ -10424,6 +10609,7 @@ def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
         'total_score': report['total_score'],
         'final_score': report['total_score'],
         'score_breakdown': breakdown,
+        'proportionality': report['proportionality'],
         'unfilled_shift_count': int(breakdown.get('coverage_score', 0) / COVERAGE_PENALTY),
         'workload_summary': workload_summary,
         'debug': debug,
@@ -15257,6 +15443,7 @@ def optimize_schedule_version(
             },
             'targets': _proportionality_target_payload(final_scoring),
             'is_penalty': False,
+            'unit': 'PERCENT',
         },
         'same_shift_violations_count': same_shift_violations_final,
         'night_violations_count': final_night_report['night_violations_count'],
