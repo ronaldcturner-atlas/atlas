@@ -3,6 +3,10 @@ import SharedRulesView from './SharedRulesView'
 
 type Domain = {
   id: number
+  region: number
+  region_name: string
+  organization: number
+  organization_name: string
   name: string
   active: boolean
   manual_assignment_only: boolean
@@ -10,12 +14,17 @@ type Domain = {
 
 type Facility = {
   id: number
+  region: number
+  region_name: string
   name: string
   active: boolean
 }
 
 type ShiftTemplate = {
   id: number
+  domain: number
+  region: number
+  region_name: string
   facility: number
   name: string
   facility_name: string
@@ -31,12 +40,20 @@ type Physician = {
   last_name: string
   display_name: string
   active: boolean
+  domain_memberships: Array<{
+    domain_id: number
+    role: string
+  }>
 }
 
 type ContractRecord = {
   id: number
   domain: number
   domain_name: string
+  region: number
+  region_name: string
+  organization: number
+  organization_name: string
   name: string
   active: boolean
   facility_ids: number[]
@@ -48,6 +65,7 @@ type ContractRecord = {
   assigned_users: Array<{ id: number; name: string }>
   assigned_users_count: number
   shared_rules: SharedContractRule[]
+  setup_required?: boolean
 }
 
 type PeriodType = 'WEEK' | 'MONTH' | 'SCHEDULE_BLOCK'
@@ -564,20 +582,26 @@ export default function ContractsView() {
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
 
   const [showInactive, setShowInactive] = useState(false)
+  const [regionFilter, setRegionFilter] = useState('')
   const [domainFilter, setDomainFilter] = useState('')
+  const [copySource, setCopySource] = useState<ContractRecord | null>(null)
+  const [copyRegionId, setCopyRegionId] = useState('')
+  const [copyDomainId, setCopyDomainId] = useState('')
 
   const [editingContractId, setEditingContractId] = useState<number | null>(null)
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<ContractTab>('summary')
   const [formState, setFormState] = useState<ContractFormState>(emptyFormState)
 
-  const loadContracts = async (includeInactive: boolean, selectedDomain: string) => {
+  const loadContracts = async (includeInactive: boolean, selectedRegion: string, selectedDomain: string) => {
     const params = new URLSearchParams()
     if (includeInactive) {
       params.set('include_inactive', 'true')
     }
     if (selectedDomain) {
       params.set('domain', selectedDomain)
+    } else if (selectedRegion) {
+      params.set('region', selectedRegion)
     }
 
     const response = await fetch(`${API_BASE}/contracts/?${params.toString()}`, { credentials: 'include' })
@@ -649,11 +673,11 @@ export default function ContractsView() {
     setPhysicians(physiciansData)
   }
 
-  const fetchAllData = async (includeInactive: boolean, selectedDomain: string) => {
+  const fetchAllData = async (includeInactive: boolean, selectedRegion: string, selectedDomain: string) => {
     try {
       setIsLoading(true)
       setError(null)
-      await Promise.all([loadReferenceData(), loadContracts(includeInactive, selectedDomain)])
+      await Promise.all([loadReferenceData(), loadContracts(includeInactive, selectedRegion, selectedDomain)])
     } catch (loadError) {
       console.error(loadError)
       setError(loadError instanceof Error ? loadError.message : 'Unable to load contract data.')
@@ -663,16 +687,34 @@ export default function ContractsView() {
   }
 
   useEffect(() => {
-    fetchAllData(showInactive, domainFilter)
+    fetchAllData(showInactive, regionFilter, domainFilter)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    loadContracts(showInactive, domainFilter).catch((loadError) => {
+    loadContracts(showInactive, regionFilter, domainFilter).catch((loadError) => {
       console.error(loadError)
       setError(loadError instanceof Error ? loadError.message : 'Unable to refresh contracts.')
     })
-  }, [showInactive, domainFilter])
+  }, [showInactive, regionFilter, domainFilter])
+
+  const regions = useMemo(() => Array.from(new Map(domains.map((domain) => [
+    domain.region, { id: domain.region, name: domain.region_name },
+  ])).values()), [domains])
+
+  useEffect(() => {
+    if (!regions.length) return
+    setRegionFilter((current) => regions.some((region) => String(region.id) === current) ? current : String(regions[0].id))
+  }, [regions])
+
+  const domainsForRegion = useMemo(
+    () => domains.filter((domain) => !regionFilter || String(domain.region) === regionFilter),
+    [domains, regionFilter],
+  )
+
+  useEffect(() => {
+    if (domainFilter && !domainsForRegion.some((domain) => String(domain.id) === domainFilter)) setDomainFilter('')
+  }, [domainFilter, domainsForRegion])
 
   const visibleContracts = useMemo(
     () => [...contracts].sort((a, b) => a.name.localeCompare(b.name)),
@@ -680,14 +722,18 @@ export default function ContractsView() {
   )
 
   const activeFacilities = useMemo(
-    () => facilities.filter((facility) => facility.active),
-    [facilities],
+    () => {
+      const selectedDomain = domains.find((domain) => String(domain.id) === formState.domain)
+      return facilities.filter((facility) => facility.active && (!selectedDomain || facility.region === selectedDomain.region))
+    },
+    [domains, facilities, formState.domain],
   )
 
   const openCreateModal = () => {
     setEditingContractId(null)
     setActiveTab('summary')
-    setFormState(emptyFormState())
+    const initialDomain = domainsForRegion[0]
+    setFormState({ ...emptyFormState(), domain: initialDomain ? String(initialDomain.id) : '' })
     setError(null)
     setSaveNotice(null)
     setIsModalOpen(true)
@@ -695,7 +741,7 @@ export default function ContractsView() {
 
   const openEditModal = (contract: ContractRecord) => {
     setEditingContractId(contract.id)
-    setActiveTab('summary')
+    setActiveTab(contract.setup_required || !contract.facility_ids.length ? 'facilities' : 'summary')
     setFormState(normalizeContractToForm(contract))
     setError(null)
     setSaveNotice(null)
@@ -751,7 +797,7 @@ export default function ContractsView() {
         setFormState(normalizeContractToForm(savedContract as ContractRecord))
       }
 
-      await loadContracts(showInactive, domainFilter)
+      await loadContracts(showInactive, regionFilter, domainFilter)
       setSaveNotice('Saved successfully.')
     } catch (saveError) {
       console.error(saveError)
@@ -762,7 +808,7 @@ export default function ContractsView() {
     }
   }
 
-  const duplicateContract = async (contract: ContractRecord) => {
+  const duplicateContract = async (contract: ContractRecord, targetDomainId: string) => {
     try {
       setDuplicatingContractId(contract.id)
       setError(null)
@@ -770,6 +816,8 @@ export default function ContractsView() {
       const response = await fetch(`${API_BASE}/contracts/${contract.id}/duplicate/`, {
         method: 'POST',
         credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: Number(targetDomainId) }),
       })
 
       if (!response.ok) {
@@ -778,9 +826,14 @@ export default function ContractsView() {
       }
 
       const duplicatedContract = await response.json() as ContractRecord
-      await loadContracts(showInactive, domainFilter)
+      await loadContracts(showInactive, regionFilter, domainFilter)
+      setCopySource(null)
       openEditModal(duplicatedContract)
-      setSaveNotice(`Duplicated from ${contract.name}. The new Contract is active and ready to edit.`)
+      setSaveNotice(
+        duplicatedContract.setup_required
+          ? `Copied from ${contract.name}. Select at least one Facility for this Region to finish setup.`
+          : `Copied from ${contract.name}. The new Contract is active and ready to edit.`,
+      )
     } catch (duplicateError) {
       console.error(duplicateError)
       setError(duplicateError instanceof Error ? duplicateError.message : 'Unable to duplicate contract.')
@@ -803,7 +856,7 @@ export default function ContractsView() {
         throw new Error(message ?? `Unable to ${action} contract`)
       }
 
-      await loadContracts(showInactive, domainFilter)
+      await loadContracts(showInactive, regionFilter, domainFilter)
     } catch (toggleError) {
       console.error(toggleError)
       setError(toggleError instanceof Error ? toggleError.message : 'Unable to update contract status.')
@@ -829,7 +882,7 @@ export default function ContractsView() {
         throw new Error(message ?? 'Unable to delete contract')
       }
 
-      await loadContracts(showInactive, domainFilter)
+      await loadContracts(showInactive, regionFilter, domainFilter)
       setSaveNotice(`Deleted ${contract.name}.`)
     } catch (deleteError) {
       console.error(deleteError)
@@ -842,9 +895,14 @@ export default function ContractsView() {
   const selectedDomainId = Number(formState.domain) || null
 
   const usersForSelectedDomain = useMemo(() => {
-    // Domain-specific membership is not modeled yet, so show active physicians.
-    return physicians.filter((physician) => physician.active)
-  }, [physicians])
+    if (selectedDomainId === null) return []
+    return physicians.filter((physician) => (
+      physician.active
+      && physician.domain_memberships.some((membership) => (
+        membership.domain_id === selectedDomainId && membership.role !== 'view_only'
+      ))
+    ))
+  }, [physicians, selectedDomainId])
 
   const templatesForSelectedFacilities = useMemo(() => {
     if (!formState.facility_ids.length) {
@@ -852,13 +910,16 @@ export default function ContractsView() {
     }
 
     const allowedFacilities = new Set(formState.facility_ids)
-    return shiftTemplates.filter((template) => allowedFacilities.has(template.facility))
-  }, [formState.facility_ids, shiftTemplates])
+    return shiftTemplates.filter((template) => (
+      template.domain === selectedDomainId && allowedFacilities.has(template.facility)
+    ))
+  }, [formState.facility_ids, selectedDomainId, shiftTemplates])
 
   const summaryLabel = useMemo(() => {
-    const domainName = domains.find((domain) => domain.id === selectedDomainId)?.name || '-'
+    const selectedDomain = domains.find((domain) => domain.id === selectedDomainId)
     return {
-      domainName,
+      domainName: selectedDomain?.name || '-',
+      regionName: selectedDomain?.region_name || '-',
       facilityCount: formState.facility_ids.length,
       usersCount: formState.assigned_user_ids.length,
       workloadRuleCount: formState.workload_settings.period_rules.length,
@@ -893,11 +954,17 @@ export default function ContractsView() {
               onChange={(event) => setShowInactive(event.target.checked)}
             />
           </label>
+          {regions.length > 1 && <label className="facility-field contracts-domain-filter">
+            <span>Region</span>
+            <select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>
+              {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+            </select>
+          </label>}
           <label className="facility-field contracts-domain-filter">
             <span>Domain</span>
             <select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}>
               <option value="">All domains</option>
-              {domains.map((domain) => (
+              {domainsForRegion.map((domain) => (
                 <option key={domain.id} value={domain.id}>
                   {domain.name} {domain.active ? '' : '(Inactive)'}
                 </option>
@@ -918,6 +985,7 @@ export default function ContractsView() {
           <thead>
             <tr>
               <th>Name</th>
+              {regions.length > 1 && <th>Region</th>}
               <th>Domain</th>
               <th>Status</th>
               <th>Scheduling</th>
@@ -929,8 +997,9 @@ export default function ContractsView() {
             {visibleContracts.map((contract) => (
               <tr key={contract.id}>
                 <td>{contract.name}</td>
+                {regions.length > 1 && <td>{contract.region_name}</td>}
                 <td>{contract.domain_name}</td>
-                <td>{contract.active ? 'Active' : 'Inactive'}</td>
+                <td>{contract.setup_required ? 'Setup needed' : (contract.active ? 'Active' : 'Inactive')}</td>
                 <td>{contract.manual_assignment_only ? 'Manual only' : 'Optimizer'}</td>
                 <td>{contract.assigned_users_count}</td>
                 <td>
@@ -941,9 +1010,13 @@ export default function ContractsView() {
                     <button
                       type="button"
                       disabled={duplicatingContractId !== null}
-                      onClick={() => duplicateContract(contract)}
+                      onClick={() => {
+                        setCopySource(contract)
+                        setCopyRegionId(String(contract.region))
+                        setCopyDomainId(String(contract.domain))
+                      }}
                     >
-                      {duplicatingContractId === contract.id ? 'Duplicating...' : 'Duplicate'}
+                      {duplicatingContractId === contract.id ? 'Copying...' : 'Copy'}
                     </button>
                     <button type="button" onClick={() => toggleActive(contract)}>
                       {contract.active ? 'Deactivate' : 'Reactivate'}
@@ -967,6 +1040,21 @@ export default function ContractsView() {
 
       {!visibleContracts.length && <div className="empty-state">No contracts found</div>}
 
+      {copySource && (
+        <div className="shift-modal-overlay" onClick={() => setCopySource(null)}>
+          <div className="shift-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="shift-modal-header"><h2>Copy Contract</h2></div>
+            <div className="shift-modal-body">
+              <div className="request-existing-note">Copying <strong>{copySource.name}</strong> from {copySource.region_name} / {copySource.domain_name}</div>
+              <label className="facility-field"><span>Destination Region</span><select value={copyRegionId} onChange={(event) => { const nextRegion = event.target.value; setCopyRegionId(nextRegion); setCopyDomainId(String(domains.find((domain) => String(domain.region) === nextRegion)?.id ?? '')) }}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>
+              <label className="facility-field"><span>Destination Domain</span><select value={copyDomainId} onChange={(event) => setCopyDomainId(event.target.value)}>{domains.filter((domain) => String(domain.region) === copyRegionId).map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}</select></label>
+              <div className="request-existing-note">Users and scheduling history are not copied. A copy sent to another Region starts without Facilities or Shared Rules; select the destination Facilities when you first open it.</div>
+            </div>
+            <div className="shift-modal-actions"><button type="button" className="secondary" onClick={() => setCopySource(null)}>Cancel</button><button type="button" disabled={!copyDomainId || duplicatingContractId !== null} onClick={() => duplicateContract(copySource, copyDomainId)}>{duplicatingContractId ? 'Copying...' : 'Copy Contract'}</button></div>
+          </div>
+        </div>
+      )}
+
       {isModalOpen && (
         <div className="shift-modal-overlay contract-modal-overlay">
           <div className="shift-modal schedule-block-modal contract-modal" onClick={(event) => event.stopPropagation()}>
@@ -976,6 +1064,11 @@ export default function ContractsView() {
 
             {error && <div className="facilities-error">{error}</div>}
             {saveNotice && <div className="contract-saved-banner">{saveNotice}</div>}
+            {editingContractId !== null && !formState.facility_ids.length && (
+              <div className="contract-setup-banner">
+                Facility setup required. Select at least one Facility in this Region before assigning users or saving this Contract.
+              </div>
+            )}
 
             <div className="contract-header-grid">
               <label className="facility-field">
@@ -989,13 +1082,28 @@ export default function ContractsView() {
               </label>
 
               <label className="facility-field">
+                <span>Region</span>
+                <select
+                  value={String(domains.find((domain) => String(domain.id) === formState.domain)?.region ?? regionFilter)}
+                  disabled={editingContractId !== null || regions.length <= 1}
+                  onChange={(event) => {
+                    const nextDomain = domains.find((domain) => String(domain.region) === event.target.value)
+                    setFormState((current) => ({ ...current, domain: nextDomain ? String(nextDomain.id) : '', facility_ids: [], assigned_user_ids: [] }))
+                  }}
+                >
+                  {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+                </select>
+              </label>
+
+              <label className="facility-field">
                 <span>Domain</span>
                 <select
                   value={formState.domain}
-                  onChange={(event) => setFormState((current) => ({ ...current, domain: event.target.value }))}
+                  disabled={editingContractId !== null}
+                  onChange={(event) => setFormState((current) => ({ ...current, domain: event.target.value, facility_ids: [], assigned_user_ids: [] }))}
                 >
                   <option value="">Select domain</option>
-                  {domains.map((domain) => (
+                  {domains.filter((domain) => domain.region === (domains.find((item) => String(item.id) === formState.domain)?.region ?? Number(regionFilter))).map((domain) => (
                     <option key={domain.id} value={domain.id}>
                       {domain.name}
                     </option>
@@ -1041,6 +1149,7 @@ export default function ContractsView() {
             <div className="shift-modal-body">
               {activeTab === 'summary' && (
                 <div className="contract-summary-grid">
+                  <div className="request-existing-note">Region: {summaryLabel.regionName}</div>
                   <div className="request-existing-note">Domain: {summaryLabel.domainName}</div>
                   <div className="request-existing-note">Status: {formState.active ? 'Active' : 'Inactive'}</div>
                   <div className="request-existing-note">Scheduling: {formState.manual_assignment_only ? 'Manual assignment only' : 'Optimizer managed'}</div>

@@ -6,6 +6,7 @@ from rest_framework import serializers
 from django.utils import timezone
 
 from apps.accounts.models import Physician
+from apps.domains.models import DomainMembership
 from apps.facilities.models import Facility
 
 from .models import (
@@ -89,6 +90,11 @@ class ShiftSerializer(serializers.ModelSerializer):
 
 
 class ShiftTemplateSerializer(serializers.ModelSerializer):
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    region = serializers.IntegerField(source='domain.region_id', read_only=True)
+    region_name = serializers.CharField(source='domain.region.name', read_only=True)
+    organization = serializers.IntegerField(source='domain.region.organization_id', read_only=True)
+    organization_name = serializers.CharField(source='domain.region.organization.name', read_only=True)
     facility_name = serializers.CharField(source='facility.name', read_only=True)
     facility_sort_order = serializers.IntegerField(source='facility.sort_order', read_only=True)
     name = serializers.SerializerMethodField()
@@ -97,6 +103,12 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
         model = ShiftTemplate
         fields = [
             'id',
+            'domain',
+            'domain_name',
+            'region',
+            'region_name',
+            'organization',
+            'organization_name',
             'facility',
             'facility_name',
             'facility_sort_order',
@@ -109,7 +121,7 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
             'default_staffing_count',
             'active',
         ]
-        read_only_fields = ['id', 'facility_name', 'facility_sort_order', 'name']
+        read_only_fields = ['id', 'domain_name', 'region', 'region_name', 'organization', 'organization_name', 'facility_name', 'facility_sort_order', 'name']
 
     def _format_template_time(self, time_value):
         hour_24 = time_value.hour
@@ -193,6 +205,12 @@ class ShiftTemplateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        domain = attrs.get('domain', self.instance.domain if self.instance else None)
+        facility = attrs.get('facility', self.instance.facility if self.instance else None)
+        if domain and facility and domain.region_id != facility.region_id:
+            raise serializers.ValidationError({
+                'facility': 'Facility must belong to the same Region as the selected Domain.',
+            })
         active_days = attrs.get('active_days_of_week', getattr(self.instance, 'active_days_of_week', []))
         weekend_days = attrs.get('weekend_days', getattr(self.instance, 'weekend_days', []))
 
@@ -673,6 +691,10 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
 
 class ContractSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(source='domain.name', read_only=True)
+    region = serializers.IntegerField(source='domain.region_id', read_only=True)
+    region_name = serializers.CharField(source='domain.region.name', read_only=True)
+    organization = serializers.IntegerField(source='domain.region.organization_id', read_only=True)
+    organization_name = serializers.CharField(source='domain.region.organization.name', read_only=True)
     facility_ids = serializers.PrimaryKeyRelatedField(
         source='facilities',
         many=True,
@@ -687,6 +709,7 @@ class ContractSerializer(serializers.ModelSerializer):
     assigned_users = serializers.SerializerMethodField()
     assigned_users_count = serializers.SerializerMethodField()
     shared_rules = serializers.SerializerMethodField()
+    setup_required = serializers.SerializerMethodField()
     shared_rule_settings = serializers.ListField(
         child=serializers.DictField(), write_only=True, required=False,
     )
@@ -697,6 +720,10 @@ class ContractSerializer(serializers.ModelSerializer):
             'id',
             'domain',
             'domain_name',
+            'region',
+            'region_name',
+            'organization',
+            'organization_name',
             'name',
             'active',
             'manual_assignment_only',
@@ -710,6 +737,7 @@ class ContractSerializer(serializers.ModelSerializer):
             'assigned_users',
             'assigned_users_count',
             'shared_rules',
+            'setup_required',
             'shared_rule_settings',
             'created_at',
             'updated_at',
@@ -717,9 +745,14 @@ class ContractSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'id',
             'domain_name',
+            'region',
+            'region_name',
+            'organization',
+            'organization_name',
             'assigned_users',
             'assigned_users_count',
             'shared_rules',
+            'setup_required',
             'created_at',
             'updated_at',
         ]
@@ -738,6 +771,9 @@ class ContractSerializer(serializers.ModelSerializer):
 
     def get_assigned_users_count(self, obj):
         return obj.user_assignments.count()
+
+    def get_setup_required(self, obj):
+        return not obj.facilities.exists()
 
     def get_shared_rules(self, obj):
         facility_ids = set(obj.facilities.values_list('id', flat=True))
@@ -910,6 +946,34 @@ class ContractSerializer(serializers.ModelSerializer):
                 'assigned_user_ids': 'Inactive contracts cannot be assigned to users unless reactivated.'
             })
 
+        next_domain = attrs.get('domain', self.instance.domain if self.instance else None)
+        next_facilities = attrs.get('facilities')
+        if next_domain and next_facilities is not None:
+            invalid_facilities = [
+                facility.name for facility in next_facilities
+                if facility.region_id != next_domain.region_id
+            ]
+            if invalid_facilities:
+                raise serializers.ValidationError({
+                    'facility_ids': (
+                        'Every selected Facility must belong to the Contract Region. '
+                        f'Invalid: {", ".join(sorted(invalid_facilities))}.'
+                    ),
+                })
+
+        if assigned_user_ids:
+            has_facilities = (
+                bool(next_facilities)
+                if next_facilities is not None
+                else bool(self.instance and self.instance.facilities.exists())
+            )
+            if not has_facilities:
+                raise serializers.ValidationError({
+                    'assigned_user_ids': (
+                        'Select at least one Facility before assigning users to this Contract.'
+                    ),
+                })
+
         if self.instance is not None:
             shared_rule_settings = attrs.get('shared_rule_settings')
             if shared_rule_settings is not None:
@@ -1017,6 +1081,23 @@ class ContractSerializer(serializers.ModelSerializer):
         if assigned_user_ids is None:
             return
 
+        if DomainMembership.objects.filter(domain=contract.domain).exists():
+            eligible_physician_ids = set(
+                Physician.objects.filter(
+                    id__in=assigned_user_ids,
+                    user__domain_memberships__domain=contract.domain,
+                ).exclude(
+                    user__domain_memberships__domain=contract.domain,
+                    user__domain_memberships__role=DomainMembership.Role.VIEW_ONLY,
+                ).values_list('id', flat=True)
+            )
+            if set(assigned_user_ids) - eligible_physician_ids:
+                raise serializers.ValidationError({
+                    'assigned_user_ids': (
+                        'Every assigned user must have working access to this Contract domain.'
+                    ),
+                })
+
         ContractUserAssignment.objects.filter(contract=contract).exclude(physician_id__in=assigned_user_ids).delete()
 
         existing_ids = set(
@@ -1085,6 +1166,8 @@ class ContractSerializer(serializers.ModelSerializer):
 
 class SharedRuleSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(source='domain.name', read_only=True)
+    region = serializers.IntegerField(source='domain.region_id', read_only=True)
+    region_name = serializers.CharField(source='domain.region.name', read_only=True)
     shift_template_ids = serializers.PrimaryKeyRelatedField(
         source='shift_templates', many=True,
         queryset=ShiftTemplate.objects.filter(active=True),
@@ -1094,17 +1177,21 @@ class SharedRuleSerializer(serializers.ModelSerializer):
         child=serializers.DictField(), write_only=True,
     )
     contracts = serializers.SerializerMethodField()
+    setup_required = serializers.SerializerMethodField()
 
     class Meta:
         model = SharedRule
         fields = [
-            'id', 'domain', 'domain_name', 'name', 'active',
+            'id', 'domain', 'domain_name', 'region', 'region_name', 'name', 'active',
             'period_type', 'units', 'shift_template_ids', 'shift_templates',
-            'contract_settings', 'contracts', 'created_at', 'updated_at',
+            'contract_settings', 'contracts', 'reference_contract_settings',
+            'reference_shift_templates',
+            'setup_required', 'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'id', 'domain_name', 'shift_templates', 'contracts',
-            'created_at', 'updated_at',
+            'id', 'domain_name', 'region', 'region_name', 'shift_templates', 'contracts',
+            'reference_contract_settings', 'reference_shift_templates',
+            'setup_required', 'created_at', 'updated_at',
         ]
 
     def get_shift_templates(self, obj):
@@ -1138,6 +1225,12 @@ class SharedRuleSerializer(serializers.ModelSerializer):
             'spread_violations': link.spread_violations,
         } for link in obj.contract_links.all()]
 
+    def get_setup_required(self, obj):
+        return (
+            obj.shift_templates.count() == 0
+            or obj.contract_links.count() < 1
+        )
+
     def validate_name(self, value):
         value = value.strip()
         if not value:
@@ -1147,6 +1240,10 @@ class SharedRuleSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
         domain = attrs.get('domain', getattr(self.instance, 'domain', None))
+        if self.instance is not None and domain.id != self.instance.domain_id:
+            raise serializers.ValidationError({
+                'domain': 'A Shared Rule cannot be moved to another Domain. Copy it instead.',
+            })
         templates = attrs.get(
             'shift_templates',
             list(self.instance.shift_templates.all()) if self.instance else [],
@@ -1208,10 +1305,10 @@ class SharedRuleSerializer(serializers.ModelSerializer):
         contract_ids = [
             int(row.get('contract_id') or 0) for row in contract_settings
         ]
-        if len(set(contract_ids)) < 2:
+        if len(set(contract_ids)) < 1:
             raise serializers.ValidationError({
                 'contract_settings': (
-                    'Select at least two contracts for a Shared Rule.'
+                    'Select at least one contract for a Shared Rule.'
                 ),
             })
         if len(set(contract_ids)) != len(contract_ids) or 0 in contract_ids:
@@ -1303,5 +1400,11 @@ class SharedRuleSerializer(serializers.ModelSerializer):
             instance.shift_templates.set(templates)
         if rows is not None:
             self._save_links(instance, rows)
+        instance.reference_contract_settings = []
+        instance.reference_shift_templates = []
+        instance.save(update_fields=[
+            'reference_contract_settings', 'reference_shift_templates',
+            'updated_at',
+        ])
         sync_shared_rule_contract_settings(instance, previous_contract_ids)
         return instance

@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react'
 
 type Facility = {
   id: number
+  region: number
+  region_name: string
   name: string
   short_name: string
   timezone: string
@@ -11,11 +13,13 @@ type Facility = {
 }
 
 type FacilityFormState = {
+  region: string
   name: string
   short_name: string
   timezone: string
   color: string
 }
+type RegionOption = { id: number; name: string; organization: number; active: boolean }
 
 type FacilitiesViewProps = {
   onFacilitiesChanged: () => void
@@ -24,6 +28,7 @@ type FacilitiesViewProps = {
 const API_BASE = 'http://localhost:8000/api'
 
 const defaultFormState: FacilityFormState = {
+  region: '',
   name: '',
   short_name: '',
   timezone: 'UTC',
@@ -73,6 +78,8 @@ async function getApiErrorMessage(response: Response) {
 
 export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewProps) {
   const [facilities, setFacilities] = useState<Facility[]>([])
+  const [regions, setRegions] = useState<RegionOption[]>([])
+  const [regionFilter, setRegionFilter] = useState('')
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [draggedFacilityId, setDraggedFacilityId] = useState<number | null>(null)
@@ -105,19 +112,32 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
     }
   }
 
+  const fetchRegions = async () => {
+    const organizationsResponse = await fetch(`${API_BASE}/organizations/`, { credentials: 'include' })
+    if (!organizationsResponse.ok) throw new Error(await getApiErrorMessage(organizationsResponse) ?? 'Unable to load organizations')
+    const organizations = await organizationsResponse.json()
+    const responses = await Promise.all(organizations.map((organization: { id: number }) => fetch(`${API_BASE}/organizations/${organization.id}/regions/`, { credentials: 'include' })))
+    const failed = responses.find((response) => !response.ok)
+    if (failed) throw new Error(await getApiErrorMessage(failed) ?? 'Unable to load regions')
+    const loadedRegions: RegionOption[] = (await Promise.all(responses.map((response) => response.json()))).flat()
+    setRegions(loadedRegions)
+    setRegionFilter((current) => loadedRegions.some((region) => String(region.id) === current) ? current : String(loadedRegions[0]?.id ?? ''))
+  }
+
   useEffect(() => {
-    fetchFacilities()
+    Promise.all([fetchFacilities(), fetchRegions()]).catch((loadError) => setError(loadError instanceof Error ? loadError.message : 'Unable to load facilities.'))
   }, [])
 
   const openCreateModal = () => {
     setEditingFacilityId(null)
-    setFormState(defaultFormState)
+    setFormState({ ...defaultFormState, region: regionFilter || String(regions[0]?.id ?? '') })
     setIsModalOpen(true)
   }
 
   const openEditModal = (facility: Facility) => {
     setEditingFacilityId(facility.id)
     setFormState({
+      region: String(facility.region),
       name: facility.name,
       short_name: facility.short_name,
       timezone: facility.timezone,
@@ -133,6 +153,10 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
   }
 
   const saveFacility = async () => {
+    if (!formState.region) {
+      setError('Region is required.')
+      return
+    }
     if (!formState.name.trim()) {
       setError('Facility name is required.')
       return
@@ -160,6 +184,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
         },
         credentials: 'include',
         body: JSON.stringify({
+          region: Number(formState.region),
           name: formState.name.trim(),
           short_name: formState.short_name.trim(),
           timezone: formState.timezone.trim() || 'UTC',
@@ -241,18 +266,19 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
       return
     }
 
+    const visibleFacilities = facilities.filter((facility) => String(facility.region) === regionFilter)
     const previousFacilities = facilities
-    const draggedIndex = facilities.findIndex((facility) => facility.id === draggedFacilityId)
-    const targetIndex = facilities.findIndex((facility) => facility.id === targetFacilityId)
+    const draggedIndex = visibleFacilities.findIndex((facility) => facility.id === draggedFacilityId)
+    const targetIndex = visibleFacilities.findIndex((facility) => facility.id === targetFacilityId)
     if (draggedIndex < 0 || targetIndex < 0) {
       setDraggedFacilityId(null)
       return
     }
 
-    const reordered = [...facilities]
+    const reordered = [...visibleFacilities]
     const [dragged] = reordered.splice(draggedIndex, 1)
     reordered.splice(targetIndex, 0, dragged)
-    setFacilities(reordered)
+    setFacilities((current) => [...current.filter((facility) => String(facility.region) !== regionFilter), ...reordered])
     setDraggedFacilityId(null)
 
     try {
@@ -261,13 +287,14 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ facility_ids: reordered.map((facility) => facility.id) }),
+        body: JSON.stringify({ region: Number(regionFilter), facility_ids: reordered.map((facility) => facility.id) }),
       })
       if (!response.ok) {
         const errorMessage = await getApiErrorMessage(response)
         throw new Error(errorMessage ?? 'Unable to save facility order')
       }
-      setFacilities(await response.json())
+      const savedRegionFacilities = await response.json()
+      setFacilities((current) => [...current.filter((facility) => String(facility.region) !== regionFilter), ...savedRegionFacilities])
       onFacilitiesChanged()
     } catch (reorderError) {
       setFacilities(previousFacilities)
@@ -283,9 +310,10 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
     <div className="facilities-view-card">
       <div className="facilities-header">
         <h2>Facility Management</h2>
-        <button type="button" className="primary-action" onClick={openCreateModal}>
-          Add New Facility
-        </button>
+        <div className="contracts-toolbar">
+          {regions.length > 1 && <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>}
+          <button type="button" className="primary-action" onClick={openCreateModal}>Add New Facility</button>
+        </div>
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
@@ -297,6 +325,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
           <thead>
             <tr>
               <th aria-label="Display order" />
+              {regions.length > 1 && <th>Region</th>}
               <th>Name</th>
               <th>Short Name</th>
               <th>Timezone</th>
@@ -306,7 +335,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
             </tr>
           </thead>
           <tbody>
-            {facilities.map((facility) => (
+            {facilities.filter((facility) => !regionFilter || String(facility.region) === regionFilter).map((facility) => (
               <tr
                 key={facility.id}
                 className={draggedFacilityId === facility.id ? 'facility-row-dragging' : ''}
@@ -326,6 +355,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                 }}
               >
                 <td className="facility-drag-handle" title="Drag to reorder" aria-label={`Reorder ${facility.name}`}>⋮⋮</td>
+                {regions.length > 1 && <td>{facility.region_name}</td>}
                 <td>{facility.name}</td>
                 <td>{facility.short_name}</td>
                 <td>{facility.timezone}</td>
@@ -374,6 +404,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
               <h2>{editingFacilityId ? 'Edit Facility' : 'Add New Facility'}</h2>
             </div>
             <div className="shift-modal-body">
+              <label className="facility-field"><span>Region</span><select value={formState.region} disabled={editingFacilityId !== null || regions.length <= 1} onChange={(event) => setFormState((current) => ({ ...current, region: event.target.value }))}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>
               <label className="facility-field">
                 <span>Name</span>
                 <input

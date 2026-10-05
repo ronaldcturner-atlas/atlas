@@ -2,7 +2,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from apps.facilities.models import Facility
 from apps.accounts.models import Physician
-from apps.domains.models import Domain
+from apps.domains.models import Domain, get_default_domain_id
 
 
 def _format_template_time(time_value):
@@ -78,6 +78,12 @@ class ShiftTemplate(models.Model):
     ]
     WEEKEND_ALLOWED_DAYS = ['Friday', 'Saturday', 'Sunday']
 
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.PROTECT,
+        related_name='shift_templates',
+        default=get_default_domain_id,
+    )
     facility = models.ForeignKey(Facility, on_delete=models.CASCADE, related_name='shift_templates')
     name = models.CharField(max_length=120)
     start_time = models.TimeField()
@@ -768,6 +774,8 @@ class SharedRule(models.Model):
         choices=Units.choices,
         default=Units.SHIFTS,
     )
+    reference_contract_settings = models.JSONField(default=list, blank=True)
+    reference_shift_templates = models.JSONField(default=list, blank=True)
     shift_templates = models.ManyToManyField(
         ShiftTemplate, related_name='shared_rules',
     )

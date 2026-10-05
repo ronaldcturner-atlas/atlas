@@ -15,7 +15,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain
+from apps.domains.models import Domain, Region
 from apps.facilities.models import Facility
 
 from . import api
@@ -1919,6 +1919,44 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(overnight_instance.start_datetime.date(), date(2026, 7, 6))
         self.assertEqual(overnight_instance.end_datetime.date(), date(2026, 7, 7))
         self.assertGreater(overnight_instance.end_datetime, overnight_instance.start_datetime)
+
+    def test_generate_uses_only_shift_templates_from_selected_domain(self):
+        other_region = Region.objects.create(
+            organization=self.domain.region.organization,
+            name='Other Region',
+        )
+        other_domain = Domain.objects.create(
+            region=other_region,
+            name='Other Physician Domain',
+        )
+        other_facility = Facility.objects.create(
+            region=other_region,
+            name='Other Hospital',
+            short_name='Other',
+            timezone='UTC',
+        )
+        other_template = ShiftTemplate.objects.create(
+            domain=other_domain,
+            facility=other_facility,
+            start_time=time(7, 0),
+            end_time=time(19, 0),
+            active_days_of_week=['Monday'],
+            weekend_days=[],
+            default_staffing_count=1,
+            active=True,
+        )
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.json())
+        version = ScheduleVersion.objects.get(id=response.json()['schedule_version']['id'])
+        instances = ScheduleShiftInstance.objects.filter(schedule_version=version)
+        self.assertEqual(instances.count(), 2)
+        self.assertFalse(instances.filter(shift_template=other_template).exists())
 
     def test_generate_is_idempotent_for_existing_build_version(self):
         generate_url = f'/api/schedule-blocks/{self.block.id}/build/generate/'

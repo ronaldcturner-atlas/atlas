@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react'
 
 type Physician = {
   id: number
+  user_id: number
   first_name: string
   last_name: string
   display_name: string
@@ -10,7 +11,22 @@ type Physician = {
   current_contracts: Array<{
     id: number
     name: string
+    domain_id: number
     domain: string
+  }>
+  domain_memberships: Array<{
+    id: number
+    domain_id: number
+    domain_name: string
+    organization_id: number
+    region_id: number
+    region_name: string
+    role: string
+  }>
+  organization_memberships: Array<{
+    id: number
+    organization_id: number
+    organization_name: string
   }>
   role: string
   primary_facility: number | null
@@ -21,6 +37,22 @@ type Physician = {
 }
 
 type FacilityOption = {
+  id: number
+  name: string
+  active: boolean
+}
+
+type DomainOption = {
+  id: number
+  region: number
+  region_name: string
+  organization: number
+  organization_name: string
+  name: string
+  active: boolean
+}
+
+type OrganizationOption = {
   id: number
   name: string
   active: boolean
@@ -40,6 +72,15 @@ type PhysicianFormState = {
 }
 
 const API_BASE = 'http://localhost:8000/api'
+const DOMAIN_ROLE_OPTIONS = [
+  ['org_admin', 'Org Admin'],
+  ['medical_director', 'Medical Director'],
+  ['admin', 'Admin'],
+  ['staff_physician', 'Staff Physician'],
+  ['app', 'APP'],
+  ['scheduler', 'Scheduler'],
+  ['view_only', 'View Only'],
+] as const
 
 const defaultFormState: PhysicianFormState = {
   first_name: '',
@@ -98,6 +139,11 @@ async function getApiErrorMessage(response: Response) {
 export default function PhysiciansView() {
   const [physicians, setPhysicians] = useState<Physician[]>([])
   const [facilities, setFacilities] = useState<FacilityOption[]>([])
+  const [domains, setDomains] = useState<DomainOption[]>([])
+  const [organizations, setOrganizations] = useState<OrganizationOption[]>([])
+  const [selectedOrganizationId, setSelectedOrganizationId] = useState<number | null>(null)
+  const [selectedRegionId, setSelectedRegionId] = useState<number | null>(null)
+  const [selectedDomainId, setSelectedDomainId] = useState<number | 'all'>('all')
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -105,25 +151,46 @@ export default function PhysiciansView() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingPhysicianId, setEditingPhysicianId] = useState<number | null>(null)
   const [formState, setFormState] = useState<PhysicianFormState>(defaultFormState)
-  const activePhysicianCount = physicians.filter(
-    (physician) => physician.active === true,
-  ).length
-  const sortedUsers = [...physicians].sort((left, right) => {
+  const [domainRoles, setDomainRoles] = useState<Record<number, string>>({})
+  const selectedOrganizationDomains = domains.filter(
+    (domain) => domain.organization === selectedOrganizationId,
+  )
+  const regions = Array.from(new Map(
+    selectedOrganizationDomains.map((domain) => [domain.region, {
+      id: domain.region,
+      name: domain.region_name,
+    }]),
+  ).values())
+  const selectedRegionDomains = selectedOrganizationDomains.filter(
+    (domain) => domain.region === selectedRegionId,
+  )
+  const filteredUsers = physicians.filter((physician) => physician.domain_memberships.some((membership) => (
+    membership.organization_id === selectedOrganizationId
+    && membership.region_id === selectedRegionId
+    && membership.role !== 'view_only'
+    && (selectedDomainId === 'all' || membership.domain_id === selectedDomainId)
+  )))
+  const activePhysicianCount = filteredUsers.filter((physician) => physician.active).length
+  const sortedUsers = [...filteredUsers].sort((left, right) => {
     const lastNameComparison = left.last_name.localeCompare(right.last_name, undefined, { sensitivity: 'base' })
     if (lastNameComparison !== 0) {
       return lastNameComparison
     }
     return left.first_name.localeCompare(right.first_name, undefined, { sensitivity: 'base' })
   })
+  const editingUser = editingPhysicianId === null
+    ? null
+    : physicians.find((physician) => physician.id === editingPhysicianId) ?? null
 
   const fetchData = async () => {
     try {
       setIsLoading(true)
       setError(null)
 
-      const [physiciansResponse, facilitiesResponse] = await Promise.all([
+      const [physiciansResponse, facilitiesResponse, organizationsResponse] = await Promise.all([
         fetch(`${API_BASE}/physicians/`, { credentials: 'include' }),
         fetch(`${API_BASE}/facilities/`, { credentials: 'include' }),
+        fetch(`${API_BASE}/organizations/`, { credentials: 'include' }),
       ])
 
       if (!physiciansResponse.ok) {
@@ -136,11 +203,32 @@ export default function PhysiciansView() {
         throw new Error(errorMessage ?? 'Unable to load facilities')
       }
 
+      if (!organizationsResponse.ok) {
+        const errorMessage = await getApiErrorMessage(organizationsResponse)
+        throw new Error(errorMessage ?? 'Unable to load organizations')
+      }
+
       const physiciansData = await physiciansResponse.json()
       const facilitiesData = await facilitiesResponse.json()
+      const organizationsData: OrganizationOption[] = await organizationsResponse.json()
+      const domainResponses = await Promise.all(organizationsData.map((organization) => (
+        fetch(`${API_BASE}/domains/?organization=${organization.id}`, { credentials: 'include' })
+      )))
+      const failedDomainResponse = domainResponses.find((response) => !response.ok)
+      if (failedDomainResponse) {
+        throw new Error(await getApiErrorMessage(failedDomainResponse) ?? 'Unable to load domains')
+      }
+      const domainsData = (await Promise.all(domainResponses.map((response) => response.json()))).flat()
 
       setPhysicians(physiciansData)
       setFacilities(facilitiesData)
+      setOrganizations(organizationsData)
+      setDomains(domainsData)
+      setSelectedOrganizationId((current) => (
+        organizationsData.some((organization) => organization.id === current)
+          ? current
+          : organizationsData[0]?.id ?? null
+      ))
     } catch (fetchError) {
       console.error(fetchError)
       setError(fetchError instanceof Error ? fetchError.message : 'Unable to load user data right now.')
@@ -153,9 +241,25 @@ export default function PhysiciansView() {
     fetchData()
   }, [])
 
+  useEffect(() => {
+    const availableRegions = Array.from(new Set(
+      domains.filter((domain) => domain.organization === selectedOrganizationId).map((domain) => domain.region),
+    ))
+    setSelectedRegionId((current) => availableRegions.includes(current ?? -1) ? current : availableRegions[0] ?? null)
+    setSelectedDomainId('all')
+  }, [domains, selectedOrganizationId])
+
+  useEffect(() => {
+    if (selectedDomainId === 'all') return
+    if (!selectedRegionDomains.some((domain) => domain.id === selectedDomainId)) {
+      setSelectedDomainId('all')
+    }
+  }, [selectedRegionId, selectedDomainId, selectedRegionDomains])
+
   const openCreateModal = () => {
     setEditingPhysicianId(null)
     setFormState(defaultFormState)
+    setDomainRoles({})
     setIsModalOpen(true)
   }
 
@@ -173,21 +277,17 @@ export default function PhysiciansView() {
       fte: physician.fte,
       active: physician.active,
     })
+    setDomainRoles(Object.fromEntries(
+      physician.domain_memberships.map((membership) => [membership.domain_id, membership.role]),
+    ))
     setIsModalOpen(true)
   }
 
-  const editingUser = editingPhysicianId === null
-    ? null
-    : physicians.find((physician) => physician.id === editingPhysicianId) ?? null
-  const currentContractLabel = editingUser?.current_contracts.length
-    ? editingUser.current_contracts.map((contract) => (
-      editingUser.current_contracts.length === 1 ? contract.name : `${contract.domain}: ${contract.name}`
-    )).join(', ')
-    : 'Not assigned'
   const closeModal = () => {
     setIsModalOpen(false)
     setEditingPhysicianId(null)
     setFormState(defaultFormState)
+    setDomainRoles({})
   }
 
   const savePhysician = async () => {
@@ -218,7 +318,6 @@ export default function PhysiciansView() {
           display_name: formState.display_name.trim(),
           email: formState.email.trim(),
           phone_number: formState.phone_number.trim(),
-          role: formState.role,
           primary_facility: formState.primary_facility ? Number(formState.primary_facility) : null,
           clinician_type: formState.clinician_type,
           fte: formState.fte,
@@ -229,6 +328,51 @@ export default function PhysiciansView() {
       if (!response.ok) {
         const errorMessage = await getApiErrorMessage(response)
         throw new Error(errorMessage ?? 'Unable to save user')
+      }
+
+
+      const savedUser: Physician = await response.json()
+      const requiredOrganizationIds = new Set(
+        domains.filter((domain) => Boolean(domainRoles[domain.id])).map((domain) => domain.organization),
+      )
+      for (const organizationId of requiredOrganizationIds) {
+        const organizationMembership = savedUser.organization_memberships.find(
+          (membership) => membership.organization_id === organizationId,
+        )
+        if (organizationMembership) continue
+        const createOrganizationMembership = await fetch(`${API_BASE}/organizations/${organizationId}/memberships/`, {
+          method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user: savedUser.user_id }),
+        })
+        if (!createOrganizationMembership.ok) {
+          throw new Error(await getApiErrorMessage(createOrganizationMembership) ?? 'Unable to add the user to the organization.')
+        }
+      }
+      const existingMemberships = new Map(
+        savedUser.domain_memberships.map((membership) => [membership.domain_id, membership]),
+      )
+      for (const domain of domains) {
+        const nextRole = domainRoles[domain.id] ?? ''
+        const membership = existingMemberships.get(domain.id)
+        let membershipResponse: Response | null = null
+        if (membership && !nextRole) {
+          membershipResponse = await fetch(`${API_BASE}/domain-memberships/${membership.id}/`, {
+            method: 'DELETE', credentials: 'include',
+          })
+        } else if (membership && nextRole !== membership.role) {
+          membershipResponse = await fetch(`${API_BASE}/domain-memberships/${membership.id}/`, {
+            method: 'PATCH', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ role: nextRole }),
+          })
+        } else if (!membership && nextRole) {
+          membershipResponse = await fetch(`${API_BASE}/domains/${domain.id}/memberships/`, {
+            method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user: savedUser.user_id, role: nextRole }),
+          })
+        }
+        if (membershipResponse && !membershipResponse.ok) {
+          throw new Error(await getApiErrorMessage(membershipResponse) ?? `Unable to save ${domain.name} access.`)
+        }
       }
 
       await fetchData()
@@ -254,6 +398,50 @@ export default function PhysiciansView() {
             <span>Total Users</span>
             <strong>{activePhysicianCount}</strong>
           </div>
+          {regions.length > 1 && (
+            <label className="user-filter-select">
+              <span>Region</span>
+              <select
+                value={selectedRegionId ?? ''}
+                onChange={(event) => {
+                  setSelectedRegionId(Number(event.target.value))
+                  setSelectedDomainId('all')
+                }}
+              >
+                {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+              </select>
+            </label>
+          )}
+          {organizations.length > 1 && (
+            <label className="user-filter-select">
+              <span>Organization</span>
+              <select
+                value={selectedOrganizationId ?? ''}
+                onChange={(event) => setSelectedOrganizationId(Number(event.target.value))}
+              >
+                {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
+              </select>
+            </label>
+          )}
+          <div className="user-domain-filters" aria-label="Filter users by domain">
+            <button
+              type="button"
+              className={selectedDomainId === 'all' ? 'active' : ''}
+              onClick={() => setSelectedDomainId('all')}
+            >
+              View All
+            </button>
+            {selectedRegionDomains.map((domain) => (
+              <button
+                type="button"
+                className={selectedDomainId === domain.id ? 'active' : ''}
+                key={domain.id}
+                onClick={() => setSelectedDomainId(domain.id)}
+              >
+                {domain.name}
+              </button>
+            ))}
+          </div>
         </div>
         <button type="button" className="primary-action" onClick={openCreateModal}>
           Add New User
@@ -275,7 +463,7 @@ export default function PhysiciansView() {
         ))}
       </div>
 
-      {!physicians.length && <div className="empty-state">No users found</div>}
+      {!filteredUsers.length && <div className="empty-state">No users found for this selection</div>}
 
       {isModalOpen && (
         <div className="shift-modal-overlay" onClick={closeModal}>
@@ -341,27 +529,6 @@ export default function PhysiciansView() {
                 />
               </label>
               <label className="facility-field">
-                <span>Current Contract</span>
-                <input type="text" value={currentContractLabel} readOnly />
-              </label>
-              <label className="facility-field">
-                <span>Role</span>
-                <select
-                  value={formState.role}
-                  onChange={(event) =>
-                    setFormState((current) => ({ ...current, role: event.target.value }))
-                  }
-                >
-                  <option value="">Not assigned</option>
-                  <option value="org_admin">Org Admin</option>
-                  <option value="medical_director">Medical Director</option>
-                  <option value="admin">Admin</option>
-                  <option value="staff_physician">Staff Physician</option>
-                  <option value="app">APP</option>
-                  <option value="scheduler">Scheduler</option>
-                </select>
-              </label>
-              <label className="facility-field">
                 <span>Primary Facility</span>
                 <select
                   value={formState.primary_facility}
@@ -414,6 +581,35 @@ export default function PhysiciansView() {
                 </datalist>
                 <small>1.00 = full time; 0.50 = half time. Used for per-FTE Schedule Block adjustments.</small>
               </label>
+              <div className="user-domain-access">
+                {organizations.map((organization) => {
+                  const organizationDomains = domains.filter((domain) => domain.organization === organization.id)
+                  const organizationRegions = Array.from(new Map(organizationDomains.map((domain) => [
+                    domain.region, { id: domain.region, name: domain.region_name },
+                  ])).values())
+                  if (!organizationDomains.length) return null
+                  return <div className="user-domain-access-group" key={organization.id}>
+                    <div className="user-domain-access-header">
+                      <strong>{organization.name}</strong>
+                      <span>Domain Access</span>
+                    </div>
+                    {organizationRegions.map((region) => <React.Fragment key={region.id}>
+                      {organizationRegions.length > 1 && <div className="user-domain-region-label">{region.name}</div>}
+                      {organizationDomains.filter((domain) => domain.region === region.id).map((domain) => {
+                        const currentContract = editingUser?.current_contracts.find((contract) => contract.domain_id === domain.id)
+                        return <div className="user-domain-access-row" key={domain.id}>
+                          <span>{domain.name}{domain.active ? '' : ' (Inactive)'}</span>
+                          <select value={domainRoles[domain.id] ?? ''} onChange={(event) => setDomainRoles((current) => ({ ...current, [domain.id]: event.target.value }))}>
+                            <option value="">No access</option>
+                            {DOMAIN_ROLE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                          </select>
+                          <span className="user-domain-contract">{currentContract?.name ?? 'No contract'}</span>
+                        </div>
+                      })}
+                    </React.Fragment>)}
+                  </div>
+                })}
+              </div>
               <label className="facility-field physician-active-field">
                 <span>Active</span>
                 <input

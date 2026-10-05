@@ -216,11 +216,19 @@ If Atlas cannot resolve exactly one active Contract for the physician, Request B
 
 `FIXED` is a high-penalty preference, not a hard scheduling constraint.
 
+## Organizations, Regions, and Domains
+
+An Organization is Atlas's tenant-level container. An Organization has one or more named Regions, and every Region has one or more named Domains. Region names are unique within their Organization, and Domain names are unique within their Region rather than globally. Org Admins may manage Regions and Domains. Used Regions or Domains are deactivated instead of deleted. An Organization must retain at least one active Region and one active Domain. For a single-region organization, the Organization and Region may intentionally use the same name so the hierarchy is available without inventing a meaningless label.
+
+Users belong to an Organization through a role-free Organization Membership and may belong to any number of its Domains across any Region. Roles exist only on Domain Memberships: Org Admin, Medical Director, Admin, Staff Physician, APP, Scheduler, or View Only. A user may hold a different role in every Domain. An Org Admin role in any Domain grants management authority for the containing Organization. Domain Membership records are the authoritative foundation for domain-specific access; scheduling screens must not infer Domain membership from clinician type, primary Facility, or Contract alone.
+
+The pre-Organization Atlas data is preserved inside the initial editable `Lowcountry Emergency Physicians` Organization and its initial `Lowcountry Emergency Physicians` Region. Existing Domains, users, Contracts, schedules, and optimizer history retain their identifiers and relationships. A commercial deployment may have its top-level Organization created by an Atlas administrator.
+
 ## Contracts
 
 ### Settled purpose
 
-A Contract is a named, domain-specific scheduling rule set. Contract names are unique within a Domain, not globally.
+A Contract is a named, domain-specific scheduling rule set. Contract names are unique within a Domain, not globally. Contract lists are scoped by Region and then Domain so identical Domain names in separate Regions remain unambiguous.
 
 Each Contract has:
 
@@ -246,9 +254,9 @@ These are configurable mechanisms. Atlas must not hard-code a universal workload
 
 A physician can have at most one default Contract per Domain. Assigning that physician to another Contract in the same Domain replaces the previous default assignment.
 
-Inactive Contracts cannot receive physician assignments unless reactivated. Contracts are deactivated rather than deleted. Duplicating a Contract copies its Domain, Facilities, and rule-setting dictionaries, gives it a unique `(Copy)` name, and creates it inactive. Physician assignments are not copied.
+Inactive Contracts cannot receive physician assignments unless reactivated. Contracts are deactivated rather than deleted. Copying a Contract creates an active Contract because the copy is intended for immediate use or editing; physician assignments and schedule history are not copied. A same-Region copy may reuse its Facilities and applicable Domain resources. A cross-Region copy carries the general workload, night, weekend, request, and other non-Facility-specific settings, but begins with no Facilities, facility-specific Shift rules, Shared Rules, or users. Opening that Contract takes the scheduler directly to Facility setup and requires at least one destination Facility before the Contract can be saved or assigned to users.
 
-Domain-specific physician membership is not modeled yet. The current Contract editor therefore offers all active physicians on its Users tab. This fallback must not be mistaken for a settled cross-domain membership policy.
+Domain-specific user membership is modeled separately from Contract assignment. A user may belong to a Domain without a Contract, but a Contract assignment is valid only inside that Contract's Domain.
 
 ### Current enforcement boundary
 
@@ -258,6 +266,7 @@ Contract rules are persisted as structured JSON configuration. Request Builder c
 
 A Facility represents a medical location where shifts are scheduled. Its settled fields are:
 
+- one Region;
 - full name;
 - required short name;
 - timezone, defaulting to `UTC`;
@@ -266,7 +275,15 @@ A Facility represents a medical location where shifts are scheduled. Its settled
 
 The short name is the compact scheduling label and is used to generate Shift Template names. Timezone and color are presentation/scheduling metadata used in the scheduler experience.
 
-Facilities are disabled and re-enabled rather than deleted. Creation and selection workflows generally offer only active Facilities; disabling preserves existing relationships and history.
+Facilities are disabled and re-enabled rather than deleted. Creation and selection workflows generally offer only active Facilities; disabling preserves existing relationships and history. Facility lists and ordering are scoped to their selected Region.
+
+## Shift Templates
+
+A Shift Template belongs to one Domain and one Facility. Its Facility must belong to the same Region as its Domain. Shift Builder is filtered by Region and Domain, and the selected context is shown when viewing, creating, editing, or copying a template. Existing templates retain their Region and Domain; copying is the supported way to create an equivalent template in another Region or Domain.
+
+BUILD generation uses only active Shift Templates in the Schedule Version's Domain and active Facilities. Templates in any other Domain or Region must never leak into that schedule.
+
+Shared Rules do not follow a Contract across Regions. A scheduler may copy a Shared Rule separately into another Domain as an active setup draft. The draft preserves the source rule's name, period, units, source shift labels, and contract-specific limits as reference only; it has no destination Shift Templates or Contract links until the scheduler explicitly selects them. A Shared Rule may initially apply to one Contract and can be added to more Contracts later. Its Domain is fixed after creation, and its Contract and Shift choices are limited to that Domain. Completing and saving the copied rule replaces the source reference with valid destination relationships.
 
 ## Physicians
 
@@ -275,7 +292,7 @@ A Physician profile is linked one-to-one with an authentication user. Its settle
 - first and last name;
 - unique email, also used as the username;
 - optional phone number;
-- optional profile role label (currently descriptive only and does not grant permissions);
+- transitional profile role label retained for backward compatibility;
 - optional display name;
 - optional primary Facility;
 - clinician type: Physician, PA, or NP;
@@ -286,7 +303,7 @@ Display name is preferred in scheduling interfaces, with the user's full name an
 
 The primary Facility is descriptive/default affiliation; it does not restrict the physician to that Facility. Contract Facilities and actual Shift assignments are separate concepts.
 
-Physicians are disabled rather than deleted. Existing code does not define domain membership for Physicians and does not automatically assign a Contract based on FTE, clinician type, or primary Facility.
+Physicians are disabled rather than deleted. Domain access and domain-specific roles are stored through Domain Memberships. Atlas does not automatically assign a Contract based on FTE, clinician type, or primary Facility.
 
 ## What Atlas Explicitly Should Not Build
 
@@ -306,9 +323,7 @@ The following roadmap items are deferred, not permanently prohibited: the schedu
 
 ## Known Gaps That Must Not Be Filled by Assumption
 
-- Organization has no current data model.
-- Domain membership for Physicians is not modeled.
-- Shift Templates are not currently assigned to Domains; BUILD generation therefore uses the global active template catalog.
+- Organization, Region, and Domain membership are modeled; remaining scheduling interfaces must consistently apply the selected Domain and membership permissions.
 - The full Contract workload, shift, night, and weekend scheduling rule set is not yet evaluated by the schedule builder; Manual Assignment reads Domain and Facility eligibility and separately enforces overlap validity, while Optimizer v0 uses only limited available rule data for simple draft scoring and basic rest checks.
 - Request Builder cannot choose among multiple active Contracts across different Domains; Contract enforcement requires one unambiguous active assignment.
 - Request timestamps do not currently authorize or reject request writes.

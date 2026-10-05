@@ -5,7 +5,7 @@ from django.contrib.auth.models import Group
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from apps.domains.models import Domain
+from apps.domains.models import Domain, Region
 from apps.facilities.models import Facility
 
 from .models import Contract, SharedRule, ShiftTemplate
@@ -91,6 +91,19 @@ class SharedRuleApiTests(TestCase):
                 rule['period_rules'][0]['max_value'],
                 str(int(float(expected_maximum))),
             )
+
+    def test_shared_rule_can_start_with_one_contract(self):
+        response = self.client.post(
+            '/api/shared-rules/', self.payload([self.full.id]), format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.json())
+        shared_rule = SharedRule.objects.get(id=response.json()['id'])
+        self.assertEqual(
+            list(shared_rule.contract_links.values_list('contract_id', flat=True)),
+            [self.full.id],
+        )
+        self.assertFalse(response.json()['setup_required'])
 
     def test_incompatible_contract_is_rejected(self):
         response = self.client.post(
@@ -212,6 +225,119 @@ class SharedRuleApiTests(TestCase):
             duplicate.shift_settings['rules'][0]['shared_rule_id'],
             created.json()['id'],
         )
+
+    def test_shared_rule_can_be_copied_to_another_region_as_setup_reference(self):
+        created = self.client.post(
+            '/api/shared-rules/', self.payload(), format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.json())
+        target_region = Region.objects.create(
+            organization=self.domain.region.organization,
+            name='Shared Rule Target',
+        )
+        target_domain = Domain.objects.create(
+            region=target_region,
+            name='Physician',
+        )
+
+        response = self.client.post(
+            f"/api/shared-rules/{created.json()['id']}/duplicate/",
+            {'domain': target_domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.json())
+        duplicate = SharedRule.objects.get(id=response.json()['id'])
+        self.assertEqual(duplicate.domain, target_domain)
+        self.assertTrue(duplicate.active)
+        self.assertFalse(duplicate.shift_templates.exists())
+        self.assertFalse(duplicate.contract_links.exists())
+        self.assertTrue(response.json()['setup_required'])
+        self.assertEqual(response.json()['reference_shift_templates'], ['BER 4p-1a'])
+        self.assertEqual(
+            {row['contract_name'] for row in response.json()['reference_contract_settings']},
+            {'Full Time', 'Part Time'},
+        )
+
+    def test_existing_shared_rule_cannot_be_moved_to_another_domain(self):
+        created = self.client.post(
+            '/api/shared-rules/', self.payload(), format='json',
+        )
+        target_domain = Domain.objects.create(name='Other Domain', active=True)
+
+        response = self.client.patch(
+            f"/api/shared-rules/{created.json()['id']}/",
+            {'domain': target_domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400, response.json())
+        self.assertIn('cannot be moved', str(response.json()))
+
+    def test_copy_contract_to_another_region_starts_with_facility_setup(self):
+        self.full.shift_settings = {
+            'rules': [{
+                'label': 'Late shifts',
+                'shift_template_ids': [self.four_to_one.id],
+                'period_rules': [],
+            }],
+        }
+        self.full.save(update_fields=['shift_settings', 'updated_at'])
+        target_region = Region.objects.create(
+            organization=self.domain.region.organization,
+            name='Target Region',
+        )
+        target_domain = Domain.objects.create(
+            region=target_region,
+            name='Physician',
+        )
+        response = self.client.post(
+            f'/api/contracts/{self.full.id}/duplicate/',
+            {'domain': target_domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.json())
+        duplicate = Contract.objects.get(id=response.json()['id'])
+        self.assertEqual(duplicate.domain, target_domain)
+        self.assertTrue(duplicate.active)
+        self.assertFalse(duplicate.facilities.exists())
+        self.assertEqual(duplicate.shift_settings['rules'], [])
+        self.assertFalse(duplicate.shared_rules.exists())
+        self.assertFalse(duplicate.user_assignments.exists())
+        self.assertTrue(response.json()['setup_required'])
+
+    def test_cross_region_copy_preserves_general_contract_settings(self):
+        self.full.workload_settings = {'period_rules': [{'min_value': '120'}]}
+        self.full.night_settings = {'max_consecutive_night_shifts': '4'}
+        self.full.weekend_settings = {'max_consecutive_weekends': '2'}
+        self.full.request_settings = {'allowed_types': ['HIGH']}
+        self.full.save(update_fields=[
+            'workload_settings', 'night_settings', 'weekend_settings',
+            'request_settings', 'updated_at',
+        ])
+        target_region = Region.objects.create(
+            organization=self.domain.region.organization,
+            name='Incomplete Region',
+        )
+        target_domain = Domain.objects.create(
+            region=target_region,
+            name='Physician',
+        )
+
+        response = self.client.post(
+            f'/api/contracts/{self.full.id}/duplicate/',
+            {'domain': target_domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.json())
+        duplicate = Contract.objects.get(id=response.json()['id'])
+        self.assertEqual(duplicate.workload_settings, self.full.workload_settings)
+        self.assertEqual(duplicate.night_settings, self.full.night_settings)
+        self.assertEqual(duplicate.weekend_settings, self.full.weekend_settings)
+        self.assertEqual(duplicate.request_settings, self.full.request_settings)
+        self.assertFalse(duplicate.facilities.exists())
 
     def test_contract_can_remove_local_shift_rules_without_removing_shared_rule(self):
         created = self.client.post(

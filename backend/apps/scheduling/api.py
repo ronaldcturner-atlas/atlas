@@ -1,4 +1,5 @@
 import calendar
+import copy
 import hashlib
 import json
 import secrets
@@ -24,6 +25,7 @@ from rest_framework.response import Response
 
 from apps.accounts.models import Physician
 from apps.domains.models import Domain
+from apps.facilities.models import Facility
 
 from .models import (
     Contract,
@@ -94,7 +96,7 @@ SHIFT_TEMPLATE_DISPLAY_ORDER = (
 
 def _ordered_shift_templates(queryset=None):
     queryset = queryset if queryset is not None else ShiftTemplate.objects.all()
-    return queryset.select_related('facility').order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
+    return queryset.select_related('facility', 'domain__region__organization').order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
 
 
 def _timezone_from_name(timezone_name):
@@ -1749,11 +1751,17 @@ def shift_templates_list_create(request):
         templates = _ordered_shift_templates()
 
         facility_id = request.query_params.get('facility')
+        domain_id = request.query_params.get('domain')
+        region_id = request.query_params.get('region')
         active_filter = request.query_params.get('active')
         search = request.query_params.get('search')
 
         if facility_id:
             templates = templates.filter(facility_id=facility_id)
+        if domain_id:
+            templates = templates.filter(domain_id=domain_id)
+        elif region_id:
+            templates = templates.filter(domain__region_id=region_id)
 
         if active_filter in {'true', 'false'}:
             templates = templates.filter(active=active_filter == 'true')
@@ -2870,7 +2878,7 @@ def _shift_generation_required(block, version):
     if version is None:
         return True
     templates = list(
-        ShiftTemplate.objects.filter(active=True, facility__active=True)
+        ShiftTemplate.objects.filter(active=True, facility__active=True, domain=version.domain)
         .select_related('facility')
         .order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
     )
@@ -4871,7 +4879,7 @@ def schedule_block_generate_shift_instances(request, block_id):
             )
 
         templates = list(
-            ShiftTemplate.objects.filter(active=True, facility__active=True)
+            ShiftTemplate.objects.filter(active=True, facility__active=True, domain=domain)
             .select_related('facility')
             .order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
         )
@@ -5208,18 +5216,21 @@ def schedule_block_unpublish(request, block_id):
 @permission_classes([IsAuthenticated])
 def contracts_list_create(request):
     if request.method == 'GET':
-        contracts = Contract.objects.select_related('domain').prefetch_related(
+        contracts = Contract.objects.select_related('domain__region__organization').prefetch_related(
             'facilities',
             'user_assignments__physician__user',
             'shared_rule_links__shared_rule__shift_templates__facility',
         ).all()
 
         domain_id = request.query_params.get('domain')
+        region_id = request.query_params.get('region')
         include_inactive = request.query_params.get('include_inactive') == 'true'
         search = (request.query_params.get('search') or '').strip()
 
         if domain_id:
             contracts = contracts.filter(domain_id=domain_id)
+        elif region_id:
+            contracts = contracts.filter(domain__region_id=region_id)
 
         if not include_inactive:
             contracts = contracts.filter(active=True)
@@ -5239,7 +5250,7 @@ def contracts_list_create(request):
 
 def _shared_rule_queryset():
     return (
-        SharedRule.objects.select_related('domain')
+        SharedRule.objects.select_related('domain__region__organization')
         .prefetch_related(
             'shift_templates__facility',
             'contract_links__contract',
@@ -5254,9 +5265,12 @@ def shared_rules_list_create(request):
     if request.method == 'GET':
         queryset = _shared_rule_queryset()
         domain_id = request.query_params.get('domain')
+        region_id = request.query_params.get('region')
         active_view = request.query_params.get('status', 'active')
         if domain_id:
             queryset = queryset.filter(domain_id=domain_id)
+        elif region_id:
+            queryset = queryset.filter(domain__region_id=region_id)
         queryset = queryset.filter(active=active_view != 'inactive')
         return Response(SharedRuleSerializer(queryset, many=True).data)
 
@@ -5322,6 +5336,57 @@ def shared_rule_detail(request, shared_rule_id):
     return Response(SharedRuleSerializer(shared_rule).data)
 
 
+@api_view(['POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shared_rule_duplicate(request, shared_rule_id):
+    if not _can_manage_build_workspace(request.user):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can copy Shared Rules.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    source = get_object_or_404(
+        _shared_rule_queryset(), id=shared_rule_id,
+    )
+    target_domain_id = request.data.get('domain')
+    target_domain = get_object_or_404(
+        Domain.objects.select_related('region'), id=target_domain_id, active=True,
+    )
+    base_name = f'{source.name} (Copy)'
+    next_name = base_name
+    suffix = 2
+    while SharedRule.objects.filter(domain=target_domain, name=next_name).exists():
+        next_name = f'{base_name} {suffix}'
+        suffix += 1
+
+    reference_contract_settings = [{
+        'contract_name': link.contract.name,
+        'enabled': link.enabled,
+        'min_value': link.min_value,
+        'max_value': link.max_value,
+        'min_penalty_weight': link.min_penalty_weight,
+        'max_penalty_weight': link.max_penalty_weight,
+        'spread_violations': link.spread_violations,
+    } for link in source.contract_links.select_related('contract').all()]
+    reference_shift_templates = [
+        template.generated_name()
+        for template in source.shift_templates.select_related('facility').all()
+    ]
+    duplicate = SharedRule.objects.create(
+        domain=target_domain,
+        name=next_name,
+        active=True,
+        period_type=source.period_type,
+        units=source.units,
+        reference_contract_settings=reference_contract_settings,
+        reference_shift_templates=reference_shift_templates,
+    )
+    return Response(
+        SharedRuleSerializer(_shared_rule_queryset().get(id=duplicate.id)).data,
+        status=status.HTTP_201_CREATED,
+    )
+
+
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -5364,16 +5429,17 @@ def contract_detail(request, contract_id):
 
 def _copy_json_dict(source_value):
     if isinstance(source_value, dict):
-        return dict(source_value)
+        return copy.deepcopy(source_value)
     return {}
 
 
-def _build_duplicate_contract_name(source_contract):
+def _build_duplicate_contract_name(source_contract, target_domain=None):
+    target_domain = target_domain or source_contract.domain
     base_name = f'{source_contract.name} (Copy)'
     next_name = base_name
     suffix = 2
 
-    while Contract.objects.filter(domain=source_contract.domain, name=next_name).exists():
+    while Contract.objects.filter(domain=target_domain, name=next_name).exists():
         next_name = f'{base_name} {suffix}'
         suffix += 1
 
@@ -5385,26 +5451,121 @@ def _build_duplicate_contract_name(source_contract):
 @permission_classes([IsAuthenticated])
 def contract_duplicate(request, contract_id):
     source_contract = get_object_or_404(
-        Contract.objects.select_related('domain').prefetch_related('facilities', 'user_assignments'),
+        Contract.objects.select_related('domain__region').prefetch_related(
+            'facilities', 'user_assignments',
+            'shared_rule_links__shared_rule',
+        ),
         id=contract_id,
     )
 
+    target_domain_id = request.data.get('domain') or source_contract.domain_id
+    target_domain = get_object_or_404(
+        Domain.objects.select_related('region'), id=target_domain_id, active=True,
+    )
+    cross_region_copy = target_domain.region_id != source_contract.domain.region_id
+    source_facilities = list(source_contract.facilities.all())
+    if not cross_region_copy:
+        target_facilities = source_facilities
+    else:
+        target_facilities = []
+
+    shift_settings = _copy_json_dict(source_contract.shift_settings)
+    if cross_region_copy:
+        shift_settings['rules'] = []
+    source_template_ids = {
+        int(template_id)
+        for rule in shift_settings.get('rules', [])
+        if isinstance(rule, dict)
+        for template_id in (rule.get('shift_template_ids') or [])
+    }
+    template_id_map = {}
+    if source_template_ids and target_domain.id != source_contract.domain_id:
+        source_templates = ShiftTemplate.objects.filter(
+            id__in=source_template_ids,
+        ).select_related('facility')
+        target_templates = ShiftTemplate.objects.filter(
+            domain=target_domain,
+        ).select_related('facility')
+        targets_by_signature = {
+            (
+                template.facility.short_name.strip().casefold(),
+                template.start_time,
+                template.end_time,
+            ): template.id
+            for template in target_templates
+        }
+        missing_templates = []
+        for template in source_templates:
+            signature = (
+                template.facility.short_name.strip().casefold(),
+                template.start_time,
+                template.end_time,
+            )
+            target_template_id = targets_by_signature.get(signature)
+            if target_template_id is None:
+                missing_templates.append(template.generated_name())
+            else:
+                template_id_map[template.id] = target_template_id
+        if missing_templates:
+            return Response({
+                'detail': (
+                    'Create matching destination Shift Templates before copying this Contract: '
+                    f'{", ".join(sorted(missing_templates))}.'
+                ),
+            }, status=status.HTTP_400_BAD_REQUEST)
+        for rule in shift_settings.get('rules', []):
+            if isinstance(rule, dict) and rule.get('shift_template_ids'):
+                rule['shift_template_ids'] = [
+                    template_id_map[int(template_id)]
+                    for template_id in rule['shift_template_ids']
+                ]
+
+    source_links = (
+        [] if cross_region_copy
+        else list(source_contract.shared_rule_links.select_related('shared_rule'))
+    )
+    target_shared_rules_by_name = {
+        rule.name.strip().casefold(): rule
+        for rule in SharedRule.objects.filter(domain=target_domain, active=True)
+    }
+    missing_shared_rules = [
+        link.shared_rule.name for link in source_links
+        if link.shared_rule.name.strip().casefold() not in target_shared_rules_by_name
+    ]
+    if target_domain.id != source_contract.domain_id and missing_shared_rules:
+        return Response({
+            'detail': (
+                'Create matching destination Shared Rules before copying this Contract: '
+                f'{", ".join(sorted(missing_shared_rules))}.'
+            ),
+        }, status=status.HTTP_400_BAD_REQUEST)
+    shared_rule_id_map = {
+        link.shared_rule_id: (
+            link.shared_rule_id if target_domain.id == source_contract.domain_id
+            else target_shared_rules_by_name[link.shared_rule.name.strip().casefold()].id
+        )
+        for link in source_links
+    }
+    for rule in shift_settings.get('rules', []):
+        if isinstance(rule, dict) and rule.get('shared_rule_id'):
+            rule['shared_rule_id'] = shared_rule_id_map[int(rule['shared_rule_id'])]
+
     with transaction.atomic():
         duplicate = Contract.objects.create(
-            domain=source_contract.domain,
-            name=_build_duplicate_contract_name(source_contract),
+            domain=target_domain,
+            name=_build_duplicate_contract_name(source_contract, target_domain),
             active=True,
             manual_assignment_only=source_contract.manual_assignment_only,
             workload_settings=_copy_json_dict(source_contract.workload_settings),
-            shift_settings=_copy_json_dict(source_contract.shift_settings),
+            shift_settings=shift_settings,
             night_settings=_copy_json_dict(source_contract.night_settings),
             weekend_settings=_copy_json_dict(source_contract.weekend_settings),
             request_settings=_copy_json_dict(source_contract.request_settings),
         )
-        duplicate.facilities.set(source_contract.facilities.all())
+        duplicate.facilities.set(target_facilities)
         SharedRuleContract.objects.bulk_create([
             SharedRuleContract(
-                shared_rule=link.shared_rule,
+                shared_rule_id=shared_rule_id_map[link.shared_rule_id],
                 contract=duplicate,
                 enabled=link.enabled,
                 min_value=link.min_value,

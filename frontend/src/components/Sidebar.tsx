@@ -1,12 +1,13 @@
 import React from 'react'
 
 type SidebarProps = {
-  activeView: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
-  onSelectView: (view: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians') => void
+  activeView: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'organization'
+  onSelectView: (view: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'organization') => void
   userView: boolean
+  canManageOrganization: boolean
 }
 
-export default function Sidebar({ activeView, onSelectView, userView }: SidebarProps){
+export default function Sidebar({ activeView, onSelectView, userView, canManageOrganization }: SidebarProps){
   const [collapsed, setCollapsed] = React.useState(() => (
     window.localStorage.getItem('atlas-sidebar-collapsed') === 'true'
   ))
@@ -106,6 +107,17 @@ export default function Sidebar({ activeView, onSelectView, userView }: SidebarP
           <span className="nav-icon" aria-hidden="true">●</span>
           <span className="nav-label">Users</span>
         </button>
+        {canManageOrganization && (
+          <button
+            type="button"
+            className={activeView === 'organization' ? 'active' : ''}
+            onClick={() => onSelectView('organization')}
+            title="Organization"
+          >
+            <span className="nav-icon" aria-hidden="true">◎</span>
+            <span className="nav-label">Organization</span>
+          </button>
+        )}
           </>
         )}
       </nav>

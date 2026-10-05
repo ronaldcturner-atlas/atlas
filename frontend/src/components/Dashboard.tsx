@@ -11,9 +11,10 @@ import ContractsView from './ContractsView'
 import FacilitiesView from './FacilitiesView'
 import PhysiciansView from './PhysiciansView'
 import StatsView from './StatsView'
+import OrganizationView from './OrganizationView'
 import { useAuth } from '../contexts/AuthContext'
 
-type AppView = 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians'
+type AppView = 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'organization'
 
 const VIEW_PATHS: Record<AppView, string> = {
   'my-schedule': '/',
@@ -23,6 +24,7 @@ const VIEW_PATHS: Record<AppView, string> = {
   contracts: '/contracts',
   facilities: '/facilities',
   physicians: '/physicians',
+  organization: '/organization',
 }
 
 function viewFromPath(pathname: string): AppView | null {
@@ -51,6 +53,9 @@ function viewFromPath(pathname: string): AppView | null {
   }
   if (pathname === '/physicians') {
     return 'physicians'
+  }
+  if (pathname === '/organization') {
+    return 'organization'
   }
   return null
 }
@@ -110,14 +115,16 @@ export default function Dashboard() {
           ? 'Contracts'
         : activeView === 'facilities'
           ? 'Facilities'
-          : 'Users'
+        : activeView === 'physicians'
+          ? 'Users'
+          : 'Organization'
 
   React.useEffect(() => {
     if (viewFromPath(location.pathname) === null) {
       navigate('/', { replace: true })
       return
     }
-    const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'physicians'].includes(activeView)
+    const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'physicians', 'organization'].includes(activeView)
     if (effectiveUserView && (schedulerOnlyView || buildBlockId !== null || violationVersionId !== null)) {
       navigate('/', { replace: true })
     }
@@ -133,6 +140,7 @@ export default function Dashboard() {
         activeView={activeView}
         onSelectView={(view) => navigate(VIEW_PATHS[view])}
         userView={effectiveUserView}
+        canManageOrganization={Boolean(user?.is_org_admin)}
       />
       <div className="main-area">
         <Topbar
@@ -169,6 +177,7 @@ export default function Dashboard() {
             <FacilitiesView onFacilitiesChanged={handleFacilitiesChanged} />
           )}
           {!effectiveUserView && activeView === 'physicians' && <PhysiciansView />}
+          {!effectiveUserView && activeView === 'organization' && user?.is_org_admin && <OrganizationView />}
         </main>
       </div>
     </div>

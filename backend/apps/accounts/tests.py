@@ -116,6 +116,7 @@ class AccountsTests(TestCase):
         self.assertEqual(response.json()['current_contracts'], [{
             'id': contract.id,
             'name': 'Full Time',
+            'domain_id': domain.id,
             'domain': 'Physician',
         }])
 

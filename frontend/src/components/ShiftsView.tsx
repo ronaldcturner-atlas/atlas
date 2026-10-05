@@ -2,6 +2,10 @@ import React, { useEffect, useMemo, useState } from 'react'
 
 type ShiftTemplate = {
   id: number
+  domain: number
+  domain_name: string
+  region: number
+  region_name: string
   facility: number
   facility_name: string
   facility_sort_order: number
@@ -17,9 +21,13 @@ type ShiftTemplate = {
 
 type FacilityOption = {
   id: number
+  region: number
+  region_name: string
   name: string
   active: boolean
 }
+
+type DomainOption = { id: number; name: string; region: number; region_name: string; organization: number; organization_name: string; active: boolean }
 
 type DayOfWeek =
   | 'Sunday'
@@ -33,6 +41,7 @@ type DayOfWeek =
 type WeekendDay = 'Friday' | 'Saturday' | 'Sunday'
 
 type ShiftTemplateFormState = {
+  domain: string
   facility: string
   start_time: string
   end_time: string
@@ -58,6 +67,7 @@ const DAYS_OF_WEEK: DayOfWeek[] = [
 const WEEKEND_DAY_OPTIONS: WeekendDay[] = ['Friday', 'Saturday', 'Sunday']
 
 const defaultFormState: ShiftTemplateFormState = {
+  domain: '',
   facility: '',
   start_time: '07:00',
   end_time: '19:00',
@@ -125,6 +135,9 @@ function formatTimeLabel(timeValue: string) {
 export default function ShiftsView() {
   const [templates, setTemplates] = useState<ShiftTemplate[]>([])
   const [facilities, setFacilities] = useState<FacilityOption[]>([])
+  const [domains, setDomains] = useState<DomainOption[]>([])
+  const [regionFilter, setRegionFilter] = useState('')
+  const [domainFilter, setDomainFilter] = useState('')
 
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
@@ -132,6 +145,7 @@ export default function ShiftsView() {
 
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingTemplateId, setEditingTemplateId] = useState<number | null>(null)
+  const [isCopyingTemplate, setIsCopyingTemplate] = useState(false)
   const [formState, setFormState] = useState<ShiftTemplateFormState>(defaultFormState)
 
   const fetchFacilities = async () => {
@@ -161,12 +175,18 @@ export default function ShiftsView() {
     setTemplates(normalizedTemplates)
   }
 
+  const fetchDomains = async () => {
+    const response = await fetch(`${API_BASE}/domains/?active=true`, { credentials: 'include' })
+    if (!response.ok) throw new Error(await getApiErrorMessage(response) ?? 'Unable to load domains')
+    setDomains(await response.json())
+  }
+
   useEffect(() => {
     const loadData = async () => {
       try {
         setIsLoading(true)
         setError(null)
-        await Promise.all([fetchFacilities(), fetchTemplates()])
+        await Promise.all([fetchFacilities(), fetchTemplates(), fetchDomains()])
       } catch (loadError) {
         console.error(loadError)
         setError(loadError instanceof Error ? loadError.message : 'Unable to load shift builder data.')
@@ -178,13 +198,25 @@ export default function ShiftsView() {
     loadData()
   }, [])
 
+  const regions = useMemo(() => Array.from(new Map(domains.map((domain) => [domain.region, { id: domain.region, name: domain.region_name }])).values()), [domains])
+  useEffect(() => {
+    if (regions.length) setRegionFilter((current) => regions.some((region) => String(region.id) === current) ? current : String(regions[0].id))
+  }, [regions])
+  const domainsForRegion = useMemo(() => domains.filter((domain) => !regionFilter || String(domain.region) === regionFilter), [domains, regionFilter])
+  useEffect(() => {
+    if (domainFilter && !domainsForRegion.some((domain) => String(domain.id) === domainFilter)) setDomainFilter('')
+  }, [domainFilter, domainsForRegion])
+  const formDomain = domains.find((domain) => String(domain.id) === formState.domain)
   const activeFacilities = useMemo(
-    () => facilities.filter((facility) => facility.active),
-    [facilities],
+    () => facilities.filter((facility) => facility.active && (!formDomain || facility.region === formDomain.region)),
+    [facilities, formDomain],
   )
 
   const sortedTemplates = useMemo(
-    () => [...templates].sort((a, b) => {
+    () => templates.filter((template) => (
+      (!regionFilter || String(template.region) === regionFilter)
+      && (!domainFilter || String(template.domain) === domainFilter)
+    )).sort((a, b) => {
       if (a.active !== b.active) {
         return a.active ? -1 : 1
       }
@@ -194,18 +226,21 @@ export default function ShiftsView() {
         || a.end_time.localeCompare(b.end_time)
         || a.id - b.id
     }),
-    [templates],
+    [domainFilter, regionFilter, templates],
   )
 
   const openCreateModal = () => {
     setEditingTemplateId(null)
-    setFormState(defaultFormState)
+    setIsCopyingTemplate(false)
+    setFormState({ ...defaultFormState, domain: domainsForRegion[0] ? String(domainsForRegion[0].id) : '' })
     setIsModalOpen(true)
   }
 
   const openEditModal = (template: ShiftTemplate) => {
     setEditingTemplateId(template.id)
+    setIsCopyingTemplate(false)
     setFormState({
+      domain: String(template.domain),
       facility: String(template.facility),
       start_time: template.start_time.slice(0, 5),
       end_time: template.end_time.slice(0, 5),
@@ -218,9 +253,22 @@ export default function ShiftsView() {
     setIsModalOpen(true)
   }
 
+  const openCopyModal = (template: ShiftTemplate) => {
+    setEditingTemplateId(null)
+    setIsCopyingTemplate(true)
+    setFormState({
+      domain: String(template.domain), facility: String(template.facility),
+      start_time: template.start_time.slice(0, 5), end_time: template.end_time.slice(0, 5),
+      active_days_of_week: template.active_days_of_week, weekend_days: template.weekend_days,
+      night_shift: template.night_shift, default_staffing_count: String(template.default_staffing_count), active: true,
+    })
+    setIsModalOpen(true)
+  }
+
   const closeModal = () => {
     setIsModalOpen(false)
     setEditingTemplateId(null)
+    setIsCopyingTemplate(false)
     setFormState(defaultFormState)
   }
 
@@ -267,8 +315,8 @@ export default function ShiftsView() {
   const saveTemplate = async () => {
     const staffingCount = Number(formState.default_staffing_count)
 
-    if (!formState.facility || !formState.start_time || !formState.end_time) {
-      setError('Facility, start time, and end time are required.')
+    if (!formState.domain || !formState.facility || !formState.start_time || !formState.end_time) {
+      setError('Region, Domain, Facility, start time, and end time are required.')
       return
     }
 
@@ -305,6 +353,7 @@ export default function ShiftsView() {
         },
         credentials: 'include',
         body: JSON.stringify({
+          domain: Number(formState.domain),
           facility: Number(formState.facility),
           start_time: formState.start_time,
           end_time: formState.end_time,
@@ -372,9 +421,11 @@ export default function ShiftsView() {
     <div className="facilities-view-card">
       <div className="facilities-header">
         <h2>Shift Builder</h2>
-        <button type="button" className="primary-action" onClick={openCreateModal}>
-          Add Shift Template
-        </button>
+        <div className="contracts-toolbar">
+          {regions.length > 1 && <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>}
+          <label className="facility-field contracts-domain-filter"><span>Domain</span><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}><option value="">All domains</option>{domainsForRegion.map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}</select></label>
+          <button type="button" className="primary-action" onClick={openCreateModal}>Add Shift Template</button>
+        </div>
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
@@ -384,6 +435,8 @@ export default function ShiftsView() {
           <thead>
             <tr>
               <th>Name</th>
+              {regions.length > 1 && <th>Region</th>}
+              <th>Domain</th>
               <th>Facility</th>
               <th>Start Time</th>
               <th>End Time</th>
@@ -399,6 +452,8 @@ export default function ShiftsView() {
             {sortedTemplates.map((template) => (
               <tr key={template.id}>
                 <td>{template.name}</td>
+                {regions.length > 1 && <td>{template.region_name}</td>}
+                <td>{template.domain_name}</td>
                 <td>{template.facility_name}</td>
                 <td>{formatTimeLabel(template.start_time)}</td>
                 <td>{formatTimeLabel(template.end_time)}</td>
@@ -422,6 +477,7 @@ export default function ShiftsView() {
                     <button type="button" onClick={() => openEditModal(template)}>
                       Edit
                     </button>
+                    <button type="button" onClick={() => openCopyModal(template)}>Copy</button>
                     <button
                       type="button"
                       onClick={() => disableTemplate(template)}
@@ -443,10 +499,30 @@ export default function ShiftsView() {
         <div className="shift-modal-overlay" onClick={closeModal}>
           <div className="shift-modal shift-modal-wide" onClick={(event) => event.stopPropagation()}>
             <div className="shift-modal-header">
-              <h2>{editingTemplateId ? 'Edit Shift Template' : 'Add Shift Template'}</h2>
+              <h2>{editingTemplateId ? 'Edit Shift Template' : isCopyingTemplate ? 'Copy Shift Template' : 'Add Shift Template'}</h2>
             </div>
 
             <div className="shift-modal-body">
+              <label className="facility-field">
+                <span>Region</span>
+                <select
+                  value={String(formDomain?.region ?? regionFilter)}
+                  disabled={editingTemplateId !== null || regions.length <= 1}
+                  onChange={(event) => {
+                    const nextDomain = domains.find((domain) => String(domain.region) === event.target.value)
+                    setFormState((current) => ({ ...current, domain: nextDomain ? String(nextDomain.id) : '', facility: '' }))
+                  }}
+                >
+                  {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+                </select>
+              </label>
+              <label className="facility-field">
+                <span>Domain</span>
+                <select value={formState.domain} disabled={editingTemplateId !== null} onChange={(event) => setFormState((current) => ({ ...current, domain: event.target.value, facility: '' }))}>
+                  <option value="">Select domain</option>
+                  {domains.filter((domain) => domain.region === (formDomain?.region ?? Number(regionFilter))).map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}
+                </select>
+              </label>
               <label className="facility-field">
                 <span>Facility</span>
                 <select

@@ -10,6 +10,11 @@ interface User {
   is_superuser: boolean
   physician_id: number | null
   groups: string[]
+  organization_memberships: Array<{
+    organization_id: number
+    organization_name: string
+  }>
+  is_org_admin: boolean
 }
 
 interface AuthContextType {

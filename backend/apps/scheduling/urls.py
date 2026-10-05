@@ -10,6 +10,7 @@ urlpatterns = [
     path("contracts/<int:contract_id>/reactivate/", api.contract_reactivate, name="contract_reactivate"),
     path("shared-rules/", api.shared_rules_list_create, name="shared_rules_list_create"),
     path("shared-rules/<int:shared_rule_id>/", api.shared_rule_detail, name="shared_rule_detail"),
+    path("shared-rules/<int:shared_rule_id>/duplicate/", api.shared_rule_duplicate, name="shared_rule_duplicate"),
     path("shifts/", api.shifts_list_create, name="shifts_list_create"),
     path("published-schedule/", api.published_schedule, name="published_schedule"),
     path("published-schedule-comments/", api.published_schedule_comments, name="published_schedule_comments"),

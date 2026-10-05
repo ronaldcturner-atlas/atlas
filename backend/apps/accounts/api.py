@@ -81,6 +81,8 @@ def physicians_list_create(request):
     if request.method == 'GET':
         physicians = Physician.objects.select_related('user', 'primary_facility').prefetch_related(
             'contract_assignments__contract__domain',
+            'user__domain_memberships__domain__region__organization',
+            'user__organization_memberships__organization',
         ).all()
         serializer = PhysicianSerializer(physicians, many=True)
         return Response(serializer.data)
@@ -98,6 +100,8 @@ def physician_detail(request, physician_id):
     physician = get_object_or_404(
         Physician.objects.select_related('user', 'primary_facility').prefetch_related(
             'contract_assignments__contract__domain',
+            'user__domain_memberships__domain__region__organization',
+            'user__organization_memberships__organization',
         ),
         id=physician_id,
     )

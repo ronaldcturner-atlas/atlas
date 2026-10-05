@@ -22,7 +22,13 @@ class CsrfExemptSessionAuthentication(SessionAuthentication):
 @permission_classes([IsAuthenticated])
 def facilities_list_create(request):
 	if request.method == 'GET':
-		facilities = Facility.objects.all()
+		facilities = Facility.objects.select_related('region__organization').all()
+		region_id = request.query_params.get('region')
+		organization_id = request.query_params.get('organization')
+		if region_id:
+			facilities = facilities.filter(region_id=region_id)
+		elif organization_id:
+			facilities = facilities.filter(region__organization_id=organization_id)
 
 		active_filter = request.query_params.get('active')
 		if active_filter in {'true', 'false'}:
@@ -33,7 +39,8 @@ def facilities_list_create(request):
 
 	serializer = FacilitySerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
-	next_sort_order = (Facility.objects.aggregate(max_order=Max('sort_order'))['max_order'] or 0) + 1
+	region = serializer.validated_data['region']
+	next_sort_order = (Facility.objects.filter(region=region).aggregate(max_order=Max('sort_order'))['max_order'] or 0) + 1
 	serializer.save(sort_order=next_sort_order)
 	return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -49,7 +56,13 @@ def facilities_reorder(request):
 			status=status.HTTP_400_BAD_REQUEST,
 		)
 
-	existing_ids = list(Facility.objects.values_list('id', flat=True))
+	region_id = request.data.get('region')
+	if not region_id:
+		region_ids = list(Facility.objects.filter(id__in=facility_ids).order_by().values_list('region_id', flat=True).distinct())
+		if len(region_ids) != 1:
+			return Response({'region': ['Select the Region being reordered.']}, status=status.HTTP_400_BAD_REQUEST)
+		region_id = region_ids[0]
+	existing_ids = list(Facility.objects.filter(region_id=region_id).values_list('id', flat=True))
 	if len(facility_ids) != len(set(facility_ids)) or set(facility_ids) != set(existing_ids):
 		return Response(
 			{'facility_ids': ['Include every facility exactly once.']},
@@ -60,7 +73,7 @@ def facilities_reorder(request):
 		for sort_order, facility_id in enumerate(facility_ids, start=1):
 			Facility.objects.filter(id=facility_id).update(sort_order=sort_order)
 
-	return Response(FacilitySerializer(Facility.objects.all(), many=True).data)
+	return Response(FacilitySerializer(Facility.objects.filter(region_id=region_id), many=True).data)
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
