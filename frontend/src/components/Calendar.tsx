@@ -21,6 +21,18 @@ type APIShift = {
   split_group_id: number | null
   split_group_start_time: string | null
   is_split: boolean
+  domain: number
+  domain_name: string
+  region: number
+  region_name: string
+}
+
+type DomainOption = {
+  id: number
+  name: string
+  region: number
+  region_name: string
+  active: boolean
 }
 
 type Shift = {
@@ -40,6 +52,33 @@ type Shift = {
   splitGroupId: number | null
   splitGroupStartTime: string | null
   isSplit: boolean
+  domainId: number
+  domainName: string
+}
+
+const DOMAIN_RIBBON_COLORS = [
+  '#8b5cf6',
+  '#14b8a6',
+  '#f59e0b',
+  '#38bdf8',
+  '#f43f5e',
+  '#84cc16',
+  '#e879f9',
+  '#fb7185',
+]
+
+function domainPriority(domain: Pick<DomainOption, 'name'>) {
+  const normalized = domain.name.trim().toLowerCase()
+  if (normalized === 'physician') return 0
+  if (normalized === 'app') return 1
+  return 2
+}
+
+function domainRibbonColor(domain: Pick<DomainOption, 'name'>, fallbackIndex: number) {
+  const normalized = domain.name.trim().toLowerCase()
+  if (normalized === 'physician') return DOMAIN_RIBBON_COLORS[0]
+  if (normalized === 'app') return DOMAIN_RIBBON_COLORS[1]
+  return DOMAIN_RIBBON_COLORS[(fallbackIndex + 2) % DOMAIN_RIBBON_COLORS.length]
 }
 
 type Trade = {
@@ -80,6 +119,8 @@ type ScheduleDateComment = {
   title: string
   details: string
   schedule_block: number | null
+  domain?: number | null
+  domain_name?: string | null
   updated_at: string
   recurrence_type?: 'WEEKLY' | 'MONTHLY'
   interval?: number
@@ -128,11 +169,25 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const { user } = useAuth()
   const today = new Date()
   const physicianFilterRef = useRef<HTMLDetailsElement>(null)
+  const domainFilterRef = useRef<HTMLDetailsElement>(null)
 
   // viewDate represents the first day of the currently displayed month
   const [viewDate, setViewDate] = useState<Date>(new Date(today.getFullYear(), today.getMonth(), 1))
   const [selectedShift, setSelectedShift] = useState<Shift | null>(null)
   const [allShifts, setAllShifts] = useState<APIShift[]>([])
+  const [domains, setDomains] = useState<DomainOption[]>([])
+  const [selectedRegionId, setSelectedRegionId] = useState<number | null>(() => {
+    const stored = Number(window.sessionStorage.getItem('atlas.schedule.region'))
+    return Number.isInteger(stored) && stored > 0 ? stored : null
+  })
+  const [selectedDomainIds, setSelectedDomainIds] = useState<number[]>(() => {
+    try {
+      const stored = JSON.parse(window.sessionStorage.getItem('atlas.schedule.domains') ?? '[]')
+      return Array.isArray(stored) ? stored.filter((value) => Number.isInteger(value)) : []
+    } catch {
+      return []
+    }
+  })
   const [physicians, setPhysicians] = useState<PhysicianOption[]>([])
   const [selectedPhysicianIds, setSelectedPhysicianIds] = useState<number[]>([])
   const [isLoading, setIsLoading] = useState(true)
@@ -171,28 +226,31 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const fetchShifts = async () => {
       try {
         setLoadError(null)
-        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse] = await Promise.all([
+        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse] = await Promise.all([
           fetch('http://localhost:8000/api/published-schedule/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/physicians/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/shift-trades/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/shift-trade-policy/', { credentials: 'include' }),
           fetch('http://localhost:8000/api/published-schedule-comments/', { credentials: 'include' }),
+          fetch('http://localhost:8000/api/domains/?active=true&accessible=true', { credentials: 'include' }),
         ])
-        if (!shiftsResponse.ok || !physiciansResponse.ok) {
+        if (!shiftsResponse.ok || !physiciansResponse.ok || !domainsResponse.ok) {
           throw new Error('Unable to load the schedule filters')
         }
-        const [shiftsData, physiciansData, tradesData, policyData, commentsData] = await Promise.all([
+        const [shiftsData, physiciansData, tradesData, policyData, commentsData, domainsData] = await Promise.all([
           shiftsResponse.json(),
           physiciansResponse.json(),
           tradesResponse.ok ? tradesResponse.json() : [],
           policyResponse.ok ? policyResponse.json() : tradePolicy,
           commentsResponse.ok ? commentsResponse.json() : [],
+          domainsResponse.json(),
         ])
         setAllShifts(shiftsData)
         setPhysicians(physiciansData)
         setTrades(tradesData)
         setTradePolicy(policyData)
         setDateComments(commentsData)
+        setDomains(domainsData)
       } catch (error) {
         console.error('Error fetching shifts:', error)
         setLoadError(error instanceof Error ? error.message : 'Unable to load the schedule')
@@ -206,9 +264,10 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
 
   useEffect(() => {
     const closePhysicianFilter = (event: MouseEvent) => {
-      const menu = physicianFilterRef.current
-      if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) {
-        menu.removeAttribute('open')
+      for (const menu of [physicianFilterRef.current, domainFilterRef.current]) {
+        if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) {
+          menu.removeAttribute('open')
+        }
       }
     }
 
@@ -216,11 +275,63 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     return () => document.removeEventListener('mousedown', closePhysicianFilter)
   }, [])
 
-  const sortedPhysicians = [...physicians].sort((left, right) => {
+  const regions = Array.from(new Map(
+    domains.map((domain) => [domain.region, { id: domain.region, name: domain.region_name }]),
+  ).values())
+  const domainsForRegion = domains.filter((domain) => domain.region === selectedRegionId)
+
+  useEffect(() => {
+    if (!domains.length) return
+    const nextRegionId = regions.some((region) => region.id === selectedRegionId)
+      ? selectedRegionId
+      : regions[0]?.id ?? null
+    const regionDomainIds = domains
+      .filter((domain) => domain.region === nextRegionId)
+      .map((domain) => domain.id)
+    const validSelectedIds = selectedDomainIds.filter((id) => regionDomainIds.includes(id))
+    const nextDomainIds = validSelectedIds.length ? validSelectedIds : regionDomainIds
+    if (nextRegionId !== selectedRegionId) setSelectedRegionId(nextRegionId)
+    if (nextDomainIds.join(',') !== selectedDomainIds.join(',')) setSelectedDomainIds(nextDomainIds)
+  }, [domains, regions, selectedDomainIds, selectedRegionId])
+
+  useEffect(() => {
+    if (selectedRegionId) window.sessionStorage.setItem('atlas.schedule.region', String(selectedRegionId))
+  }, [selectedRegionId])
+
+  useEffect(() => {
+    if (selectedDomainIds.length) {
+      window.sessionStorage.setItem('atlas.schedule.domains', JSON.stringify(selectedDomainIds))
+    }
+  }, [selectedDomainIds])
+
+  const selectedDomainSet = new Set(selectedDomainIds)
+  const domainVisibleShifts = allShifts.filter((shift) => selectedDomainSet.has(shift.domain))
+  const visiblePhysicianIds = new Set(
+    domainVisibleShifts.flatMap((shift) => shift.physician == null ? [] : [shift.physician]),
+  )
+  const domainsInDisplayOrder = [...domainsForRegion]
+    .sort((left, right) => (
+      domainPriority(left) - domainPriority(right)
+      || left.name.localeCompare(right.name)
+      || left.id - right.id
+    ))
+  const selectedDomainsInDisplayOrder = domainsInDisplayOrder
+    .filter((domain) => selectedDomainSet.has(domain.id))
+  const showDomainGroups = selectedDomainsInDisplayOrder.length > 1
+  const domainColorById = new Map(domainsInDisplayOrder.map((domain, index) => [
+    domain.id,
+    domainRibbonColor(domain, index),
+  ]))
+
+  const sortedPhysicians = physicians.filter((physician) => visiblePhysicianIds.has(physician.id)).sort((left, right) => {
     const leftName = left.display_name || `${left.first_name} ${left.last_name}`
     const rightName = right.display_name || `${right.first_name} ${right.last_name}`
     return leftName.localeCompare(rightName)
   })
+
+  useEffect(() => {
+    setSelectedPhysicianIds((current) => current.filter((id) => visiblePhysicianIds.has(id)))
+  }, [selectedDomainIds.join(','), allShifts])
   const normalizedUserName = `${user?.first_name ?? ''} ${user?.last_name ?? ''}`.trim().toLowerCase()
   const userLastName = (user?.last_name ?? '').trim().toLowerCase()
   const exactNamePhysician = normalizedUserName
@@ -279,6 +390,15 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     ))
   }
 
+  const toggleDomain = (domainId: number) => {
+    setSelectedDomainIds((current) => {
+      if (current.includes(domainId)) {
+        return current.length === 1 ? current : current.filter((id) => id !== domainId)
+      }
+      return [...current, domainId]
+    })
+  }
+
   const year = viewDate.getFullYear()
   const month = viewDate.getMonth() // 0 = January
 
@@ -301,11 +421,13 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     }
   })
   const visibleDateKeys = new Set(days.map((day) => day.key))
-  const commentsByDate = new Map(dateComments.map((comment) => [comment.date, comment]))
+  const commentsByDate = new Map(dateComments
+    .filter((comment) => comment.domain == null || selectedDomainSet.has(comment.domain))
+    .map((comment) => [comment.date, comment]))
 
   // Convert API shifts to calendar format
   const shifts: Record<string, Shift[]> = {}
-  allShifts.forEach((apiShift) => {
+  domainVisibleShifts.forEach((apiShift) => {
     if (!isGroupSchedule && !selectedPhysicianSet.has(apiShift.physician)) {
       return
     }
@@ -344,6 +466,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         splitGroupId: apiShift.split_group_id,
         splitGroupStartTime: apiShift.split_group_start_time,
         isSplit: apiShift.is_split,
+        domainId: apiShift.domain,
+        domainName: apiShift.domain_name,
       })
     }
   })
@@ -380,7 +504,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     else if (day.date < todayStart) classes.push('day-cell-past')
     return classes.join(' ')
   }
-  const myAssignments = allShifts.filter((shift) => shift.physician === myPhysicianId)
+  const myAssignments = domainVisibleShifts.filter((shift) => shift.physician === myPhysicianId)
   const pendingTradeCount = trades.filter((trade) => trade.can_accept || trade.can_review).length
   const pendingTrades = trades.filter((trade) => ['PENDING_RECIPIENT', 'PENDING_SCHEDULER'].includes(trade.status))
   const pendingAssignmentIds = new Set(pendingTrades.flatMap((trade) => [
@@ -405,6 +529,10 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
 
   const openCommentEditor = (date: string) => {
     if (!canManage) return
+    if (selectedDomainIds.length !== 1) {
+      setLoadError('Select one Domain before adding or editing a calendar comment.')
+      return
+    }
     const comment = commentsByDate.get(date)
     setCommentDate(date)
     setCommentTitle(comment?.title ?? '')
@@ -454,6 +582,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           date: commentDate,
+          domain: selectedDomainIds[0],
           title: commentTitle,
           details: commentDetails,
           scope: commentEditScope,
@@ -480,7 +609,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       const isRecurring = existingComment?.source === 'RECURRING' && existingComment.series_id != null
       const url = isRecurring
         ? `http://localhost:8000/api/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
-        : `http://localhost:8000/api/published-schedule-comments/${commentDate}/`
+        : `http://localhost:8000/api/published-schedule-comments/${commentDate}/?domain=${selectedDomainIds[0]}`
       const response = await fetch(url, {
         method: 'DELETE',
         credentials: 'include',
@@ -544,8 +673,67 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     }
   }
 
+  const allRegionDomainsSelected = domainsForRegion.length > 0
+    && domainsForRegion.every((domain) => selectedDomainSet.has(domain.id))
+  const selectedDomainSummary = allRegionDomainsSelected
+    ? 'All domains'
+    : `${selectedDomainIds.length} domain${selectedDomainIds.length === 1 ? '' : 's'}`
+
   return (
     <div className="calendar-card">
+      <div className="schedule-scope-toolbar">
+        <div className="schedule-scope-field">
+          <span>Region</span>
+          {regions.length > 1 ? (
+            <select
+              value={selectedRegionId ?? ''}
+              onChange={(event) => {
+                const nextRegionId = Number(event.target.value)
+                setSelectedRegionId(nextRegionId)
+                setSelectedDomainIds(domains.filter((domain) => domain.region === nextRegionId).map((domain) => domain.id))
+              }}
+            >
+              {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+            </select>
+          ) : (
+            <strong>{regions[0]?.name ?? 'No accessible Region'}</strong>
+          )}
+        </div>
+        <div className="schedule-scope-field">
+          <span>Domain</span>
+          {domainsForRegion.length > 1 ? (
+            <details ref={domainFilterRef} className="physician-filter-menu schedule-domain-filter-menu">
+              <summary>{selectedDomainSummary}</summary>
+              <div className="physician-filter-popover schedule-domain-filter-popover">
+                <div className="physician-filter-heading">
+                  <strong>Show Domains</strong>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDomainIds(domainsForRegion.map((domain) => domain.id))}
+                    disabled={allRegionDomainsSelected}
+                  >
+                    Show all
+                  </button>
+                </div>
+                <div className="physician-filter-list">
+                  {domainsForRegion.map((domain) => (
+                    <label key={domain.id}>
+                      <input
+                        type="checkbox"
+                        checked={selectedDomainSet.has(domain.id)}
+                        onChange={() => toggleDomain(domain.id)}
+                      />
+                      <span>{domain.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </details>
+          ) : (
+            <strong>{domainsForRegion[0]?.name ?? 'No accessible Domain'}</strong>
+          )}
+        </div>
+      </div>
       <div className="calendar-header">
         <div className="calendar-heading-row">
           <div className="calendar-month-navigation">
@@ -641,10 +829,22 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
             )}
             {shifts[day.key] && (
               <div className="shifts-container">
-                {shifts[day.key].map((shift, idx) => (
+                {selectedDomainsInDisplayOrder.map((domain) => {
+                  const domainShifts = shifts[day.key].filter((shift) => shift.domainId === domain.id)
+                  if (!domainShifts.length) return null
+                  const ribbonColor = domainColorById.get(domain.id) ?? DOMAIN_RIBBON_COLORS[0]
+                  return (
+                    <section
+                      key={domain.id}
+                      className="calendar-domain-group"
+                      style={{ '--domain-ribbon': ribbonColor } as React.CSSProperties}
+                    >
+                      {showDomainGroups && <div className="calendar-domain-heading">{domain.name}</div>}
+                      {domainShifts.map((shift) => (
                       <div
-                        key={idx}
+                        key={`${shift.instanceId}-${shift.assignmentId ?? 'open'}`}
                         className={`shift-item shift-item-compact clickable ${statusClassForShift(shift)}`}
+                        style={{ borderLeftColor: ribbonColor }}
                         onClick={() => {
                           setSelectedShift(shift)
                           setTradeOnlyPosting(shift.postingMode === 'TRADE_ONLY')
@@ -652,9 +852,14 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                           setActualEndTime(shift.endTime.slice(0, 5))
                         }}
                       >
-                        <span>{shift.facility} {shift.shift} {shift.physician_name}</span>
+                        <span>
+                          {shift.facility} {shift.shift} {shift.physician_name}
+                        </span>
                       </div>
-                ))}
+                      ))}
+                    </section>
+                  )
+                })}
               </div>
             )}
             {commentsByDate.get(day.key) && (

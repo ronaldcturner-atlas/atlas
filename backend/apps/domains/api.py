@@ -199,6 +199,13 @@ def domains_list_create(request):
 		domains = Domain.objects.filter(region__organization=organization).select_related('region__organization').annotate(
 			membership_count=Count('memberships'),
 		)
+		if request.query_params.get('accessible') == 'true' and not request.user.is_superuser:
+			membership_domain_ids = DomainMembership.objects.filter(
+				user=request.user,
+				domain__region__organization=organization,
+			).values_list('domain_id', flat=True)
+			if membership_domain_ids.exists():
+				domains = domains.filter(id__in=membership_domain_ids)
 
 		active_filter = request.query_params.get('active')
 		if active_filter in {'true', 'false'}:
@@ -234,7 +241,12 @@ def domain_detail(request, domain_id):
 	if not _is_org_admin(request.user, domain.region.organization):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'DELETE':
-		if domain.schedule_versions.exists() or domain.contracts.exists() or domain.shared_rules.exists():
+		if (
+			domain.schedule_blocks.exists()
+			or domain.schedule_versions.exists()
+			or domain.contracts.exists()
+			or domain.shared_rules.exists()
+		):
 			return Response(
 				{'detail': 'This domain has scheduling history or rules and must be deactivated instead of deleted.'},
 				status=status.HTTP_409_CONFLICT,

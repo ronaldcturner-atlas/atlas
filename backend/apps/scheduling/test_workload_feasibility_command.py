@@ -63,7 +63,8 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(report['sum_effective_maximum_hours'], 8)
         self.assertEqual(report['status'], 'maximum_infeasible')
         self.assertEqual(report['fte_adjustment_preview']['direction'], 'increase_maximum')
-        self.assertEqual(report['fte_adjustment_preview']['required_adjustment_hours'], 2)
+        self.assertEqual(report['fte_adjustment_preview']['required_adjustment_hours'], 10)
+        self.assertEqual(report['fte_adjustment_preview']['adjustment_hours_per_fte'], 7)
 
     def setUp(self):
         self.domain = Domain.objects.create(name='Physician', active=True)
@@ -164,12 +165,12 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertIn('collectively infeasible', aggregate['interpretation'])
         preview = aggregate['fte_adjustment_preview']
         self.assertEqual(preview['direction'], 'decrease_minimum')
-        self.assertEqual(preview['required_adjustment_hours'], 2.0)
+        self.assertEqual(preview['required_adjustment_hours'], 10.0)
         self.assertEqual(preview['total_applicable_fte'], 1.5)
-        self.assertEqual(preview['adjustment_hours_per_fte'], 2.0)
+        self.assertEqual(preview['adjustment_hours_per_fte'], 8.0)
         proposals = {row['physician']: row for row in preview['proposals']}
-        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 2 / 3)
-        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 4 / 3)
+        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 4)
+        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 6)
         self.assertLessEqual(
             sum(
                 max(
@@ -183,7 +184,7 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         )
         self.assertAlmostEqual(
             sum(row['proposed_hours'] for row in preview['proposals']),
-            10.0,
+            2.0,
         )
 
     def test_aggregate_maximum_infeasible(self):
@@ -196,11 +197,11 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(aggregate['status'], 'maximum_infeasible')
         preview = aggregate['fte_adjustment_preview']
         self.assertEqual(preview['direction'], 'increase_maximum')
-        self.assertEqual(preview['required_adjustment_hours'], 2.0)
-        self.assertEqual(preview['adjustment_hours_per_fte'], 2.0)
+        self.assertEqual(preview['required_adjustment_hours'], 10.0)
+        self.assertEqual(preview['adjustment_hours_per_fte'], 7.0)
         proposals = {row['physician']: row for row in preview['proposals']}
-        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 2 / 3)
-        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 4 / 3)
+        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 10 / 3)
+        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 20 / 3)
         self.assertGreaterEqual(
             sum(
                 row['current_hours']
@@ -211,7 +212,7 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         )
         self.assertAlmostEqual(
             sum(row['proposed_hours'] for row in preview['proposals']),
-            10.0,
+            18.0,
         )
 
     def test_manual_only_capacity_counts_only_exact_fixed_coverage(self):
@@ -248,6 +249,7 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(aggregate['manual_only_fixed_hours'], 10)
         self.assertEqual(aggregate['total_available_scheduled_hours'], 10)
         self.assertEqual(aggregate['sum_effective_maximum_hours'], 4)
+        self.assertEqual(aggregate['sum_achievable_maximum_hours'], 0)
         self.assertEqual(aggregate['status'], 'maximum_infeasible')
 
         fixed_assignment.assignment_source = (
@@ -302,16 +304,20 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(deduped['manual_only_fixed_hours'], 10)
         self.assertEqual(deduped['manual_only_fixed_shift_slots'], 1)
 
-    def test_aggregate_feasible(self):
+    def test_aggregate_whole_shift_capacity_is_not_false_feasible(self):
         self._set_ranges(4, 6)
 
         report = self._run()
 
         aggregate = report['aggregate_feasibility']
-        self.assertEqual(aggregate['status'], 'aggregate_feasible')
-        self.assertIsNone(aggregate['fte_adjustment_preview'])
-        self.assertEqual(aggregate['available_minus_total_minimum'], 2.0)
-        self.assertEqual(aggregate['total_maximum_minus_available'], 2.0)
+        self.assertEqual(aggregate['status'], 'minimum_infeasible')
+        self.assertEqual(aggregate['sum_achievable_minimum_hours'], 20.0)
+        self.assertEqual(aggregate['available_minus_total_minimum'], -10.0)
+        self.assertEqual(aggregate['total_maximum_minus_available'], -10.0)
+        self.assertEqual(
+            aggregate['fte_adjustment_preview']['adjustment_hours_per_fte'],
+            8.0,
+        )
         self.assertEqual(report['reduced_contract_focus'][0]['physician'], 'Workload Turner')
 
     def test_optimizer_run_assigned_hours_and_score_contributions_are_included(self):

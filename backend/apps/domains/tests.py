@@ -33,6 +33,25 @@ class DomainsTests(TestCase):
         self.assertIn('Physician', returned_names)
         self.assertNotIn('Critical Care', returned_names)
 
+    def test_accessible_domains_include_view_only_memberships(self):
+        organization = Organization.objects.create(name='Schedule Access Organization')
+        region = Region.objects.create(organization=organization, name='Schedule Access Region')
+        visible_domain = Domain.objects.create(region=region, name='Visible APP Schedule')
+        Domain.objects.create(region=region, name='Hidden Schedule')
+        OrganizationMembership.objects.create(organization=organization, user=self.user)
+        DomainMembership.objects.create(
+            domain=visible_domain,
+            user=self.user,
+            role=DomainMembership.Role.VIEW_ONLY,
+        )
+
+        response = self.client.get(
+            f'/api/domains/?organization={organization.id}&active=true&accessible=true'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['id'] for item in response.json()], [visible_domain.id])
+
     def test_org_admin_can_manage_domains_and_domain_roles(self):
         organization, _ = Organization.objects.get_or_create(name='Lowcountry Emergency Physicians')
         region, _ = Region.objects.get_or_create(organization=organization, name='Lowcountry Emergency Physicians')

@@ -6,15 +6,23 @@ type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 type ScheduleBlock = {
   id: number
   name: string
+  domain: number
+  domain_name: string
+  region: number
+  region_name: string
   start_date: string
   end_date: string
   build_status: BuildStatus
   published_at: string | null
+  preview_optimizer_run: number | null
+  preview_run_number: number | null
 }
 
 type DomainOption = {
   id: number
   name: string
+  region: number
+  region_name: string
 }
 
 type ScheduleVersion = {
@@ -313,6 +321,9 @@ type BuildContext = {
   workload_feasibility?: {
     sum_effective_minimum_hours: number
     sum_effective_maximum_hours: number | null
+    sum_achievable_minimum_hours: number
+    sum_achievable_maximum_hours: number | null
+    shift_hour_granularity: number | null
     total_available_scheduled_hours: number
     total_generated_required_hours: number
     manual_only_fixed_hours: number
@@ -532,9 +543,9 @@ function optimizerRunLabel(run: OptimizerRun) {
     ? ' - Facility/Shift distribution focus'
     : ''
   if (!isCompletedOptimizerRun(run)) {
-    return `Run ${run.run_number}${publishedLabel}${focusLabel} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
+    return `Run ${run.run_number}${publishedLabel}${focusLabel} - ${optimizerRunStatusLabel(run)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel}`
   }
-  return `Run ${run.run_number}${publishedLabel}${copyLabel}${focusLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel} - seed ${run.seed ?? '-'}`
+  return `Run ${run.run_number}${publishedLabel}${copyLabel}${focusLabel} - ${startLabel} - starting penalty ${formatScore(run.initial_score)} - final penalty ${formatScore(run.final_score)} - ${formatTimestamp(run.created_at)}${runtimeLabel}${staleLabel}`
 }
 
 function formatRuntimeMinutes(runtimeSeconds: number) {
@@ -782,6 +793,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [optimizerFocus, setOptimizerFocus] = useState<'STANDARD' | 'DISTRIBUTION'>('STANDARD')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
   const [isSavingCopy, setIsSavingCopy] = useState(false)
+  const [isPreviewingRunId, setIsPreviewingRunId] = useState<number | null>(null)
+  const [isPublishingRunId, setIsPublishingRunId] = useState<number | null>(null)
   const [isMovingBackToBuild, setIsMovingBackToBuild] = useState(false)
   const [clearingAction, setClearingAction] = useState<'optimizer' | 'all' | null>(null)
   const [deletingRunId, setDeletingRunId] = useState<number | null>(null)
@@ -1205,7 +1218,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const optimizerSourceRun = completedOptimizerRuns.find((run) => run.id === optimizerSourceRunId) ?? null
   const selectedRunForActions = completedOptimizerRuns.find((run) => run.id === selectedOptimizerRunId)
     ?? selectedOptimizerRun
-  const activeOptimizerRun = optimizerRuns.find((run) => run.is_active) ?? null
   const viewedOptimizerRunId = context?.run_state?.viewed_run_id ?? selectedOptimizerRunId
 
   const runDeleteProtectionReason = (run: OptimizerRun) => {
@@ -1300,6 +1312,82 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
     } catch (activateError) {
       setError(activateError instanceof Error ? activateError.message : 'Unable to activate optimizer run.')
+    }
+  }
+
+  const publishOptimizerRun = async (run: OptimizerRun) => {
+    const versionId = context?.selected_version?.id
+    if (!context || !versionId || context.schedule_block.build_status !== 'PREVIEW') {
+      setError('The Schedule Block must be in PREVIEW before a run can be published.')
+      return
+    }
+    const sendPublish = (acknowledgeOverlap: boolean) => fetch(
+      `${API_BASE}/schedule-blocks/${context.schedule_block.id}/publish/`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          optimizer_run_id: run.id,
+          acknowledge_overlap: acknowledgeOverlap,
+        }),
+      },
+    )
+    try {
+      setIsPublishingRunId(run.id)
+      setError(null)
+      setNotice(null)
+      let response = await sendPublish(false)
+      let data = await response.json().catch(() => null)
+      if (response.status === 409 && data?.requires_acknowledgement && data?.warning) {
+        const acknowledged = window.confirm(data.warning)
+        if (!acknowledged) return
+        response = await sendPublish(true)
+        data = await response.json().catch(() => null)
+      }
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to publish this optimizer run.'))
+      }
+      setNotice(`Run ${run.run_number} is now the published schedule.`)
+      await fetchContext(versionId, { optimizerRunId: run.id, quiet: true, preserveError: true })
+    } catch (publishError) {
+      setError(publishError instanceof Error ? publishError.message : 'Unable to publish this optimizer run.')
+    } finally {
+      setIsPublishingRunId(null)
+    }
+  }
+
+  const previewOptimizerRun = async (run: OptimizerRun) => {
+    const versionId = context?.selected_version?.id
+    if (!context || !versionId || !['PRE_BUILD', 'BUILD'].includes(context.schedule_block.build_status)) {
+      setError('Return the Schedule Block to BUILD before selecting a run for Preview.')
+      return
+    }
+    try {
+      setIsPreviewingRunId(run.id)
+      setError(null)
+      setNotice(null)
+      const response = await fetch(
+        `${API_BASE}/schedule-blocks/${context.schedule_block.id}/enter-preview/`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ optimizer_run_id: run.id }),
+        },
+      )
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(apiError(data, 'Unable to preview this optimizer run.'))
+      }
+      setNotice(`Run ${run.run_number} is now in Preview.`)
+      setSelectedOptimizerRunId(run.id)
+      updateOptimizerRunUrl(run.id)
+      await fetchContext(versionId, { optimizerRunId: run.id, quiet: true, preserveError: true })
+    } catch (previewError) {
+      setError(previewError instanceof Error ? previewError.message : 'Unable to preview this optimizer run.')
+    } finally {
+      setIsPreviewingRunId(null)
     }
   }
 
@@ -2200,9 +2288,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const selectedRunCanActivate = context.run_state
     ? context.run_state.viewed_run_can_activate
     : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
-  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || isUnlockingPhysicianShifts || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || isSavingCopy || isPreviewingRunId !== null || isPublishingRunId !== null || isMovingBackToBuild || isApplyingWorkloadAdjustment || isUnlockingPhysicianShifts || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const isMutatingBuild = isBuildMutationBusy || isOptimizing
-  const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isPreviewingRunId !== null || isPublishingRunId !== null || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
   const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
   const weekendFeasibility = context?.workload_feasibility?.weekend_feasibility
@@ -2251,6 +2339,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     <div className="facilities-view-card build-workspace">
       <div className="build-workspace-header">
         <div>
+          <div className="build-workspace-scope">
+            {context.schedule_block.region_name} / {context.schedule_block.domain_name}
+          </div>
           <h2>{context.schedule_block.name}</h2>
           <div className="build-workspace-subtitle">
             {formatDate(context.schedule_block.start_date)} – {formatDate(context.schedule_block.end_date)}
@@ -2270,6 +2361,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       {error && <div className="facilities-error">{error}</div>}
       {notice && <div className="contract-saved-banner">{notice}</div>}
+      {context.schedule_block.build_status === 'PREVIEW' && context.schedule_block.preview_run_number && (
+        <div className="contract-saved-banner" role="status">
+          Previewing Run {context.schedule_block.preview_run_number}. This is the only run that can be published from the current Preview.
+        </div>
+      )}
       {context.schedule_block.published_at && (
         <div className="contract-saved-banner" role="status">
           Published schedule snapshot
@@ -2352,19 +2448,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </fieldset>
 
         <div className="build-workspace-control-fields">
-          <label className="facility-field">
-            <span>Domain</span>
-            <select
-              value={selectedDomainId ?? ''}
-              onChange={(event) => setSelectedDomainId(Number(event.target.value))}
-              disabled={Boolean(context.selected_version)}
-            >
-              {!context.domains.length && <option value="">No active domains</option>}
-              {context.domains.map((domain) => (
-                <option key={domain.id} value={domain.id}>{domain.name}</option>
-              ))}
-            </select>
-          </label>
+          <div className="facility-field build-workspace-fixed-domain">
+            <span>Schedule Context</span>
+            <strong>{context.schedule_block.region_name} / {context.schedule_block.domain_name}</strong>
+          </div>
 
           <label className="facility-field">
             <span>Schedule Version</span>
@@ -2380,7 +2467,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               {!context.versions.length && <option value="">No version generated</option>}
               {context.versions.map((version) => (
                 <option key={version.id} value={version.id}>
-                  {version.name} · {version.domain_name} · {version.status}
+                  {version.name} · {version.status}
                 </option>
               ))}
             </select>
@@ -2580,7 +2667,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               <div className="feasibility-hover-panel workload-feasibility-hover-panel" role="tooltip">
                 <h3>Workload feasibility</h3>
                 <dl>
-                  <div><dt>Hours requiring optimization</dt><dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd></div>
+                  <div><dt>Scheduled coverage hours</dt><dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd></div>
                   {context.workload_feasibility.manual_only_physician_count > 0 && (
                     <>
                       <div><dt>Total generated hours</dt><dd>{context.workload_feasibility.total_generated_required_hours.toFixed(1)}</dd></div>
@@ -2594,13 +2681,19 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       ? 'Unbounded'
                       : context.workload_feasibility.sum_effective_maximum_hours.toFixed(1)}</dd>
                   </div>
+                  {context.workload_feasibility.sum_achievable_maximum_hours !== null
+                    && context.workload_feasibility.sum_effective_maximum_hours !== null
+                    && context.workload_feasibility.sum_achievable_maximum_hours
+                      !== context.workload_feasibility.sum_effective_maximum_hours && (
+                    <div><dt>Usable maximum in whole shifts</dt><dd>{context.workload_feasibility.sum_achievable_maximum_hours.toFixed(1)}</dd></div>
+                  )}
                   <div><dt>Difference</dt><dd>Inside aggregate range</dd></div>
                 </dl>
                 <p>{context.workload_feasibility.interpretation}</p>
                 {context.workload_feasibility.physicians_without_hour_ranges.length > 0 && (
                   <p>{context.workload_feasibility.physicians_without_hour_ranges.length} active physician(s) are excluded from bounded totals because they do not have an applicable hour range.</p>
                 )}
-                <small>Manual-only users count only through their exact fixed assignments. This aggregate check does not account for eligibility, nights, rest, or requests.</small>
+                <small>This compares total scheduled coverage with combined contract workload ranges. It does not evaluate how requests or assignments are distributed among users.</small>
               </div>
             </div>
             <WorkloadAdjustmentHover
@@ -2677,7 +2770,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </div>
           <dl>
             <div>
-              <dt>Hours requiring optimization</dt>
+              <dt>Scheduled coverage hours</dt>
               <dd>{context.workload_feasibility.total_available_scheduled_hours.toFixed(1)}</dd>
             </div>
             {context.workload_feasibility.manual_only_physician_count > 0 && (
@@ -2704,13 +2797,22 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   : context.workload_feasibility.sum_effective_maximum_hours.toFixed(1)}
               </dd>
             </div>
+            {context.workload_feasibility.sum_achievable_maximum_hours !== null
+              && context.workload_feasibility.sum_effective_maximum_hours !== null
+              && context.workload_feasibility.sum_achievable_maximum_hours
+                !== context.workload_feasibility.sum_effective_maximum_hours && (
+              <div>
+                <dt>Usable maximum in whole shifts</dt>
+                <dd>{context.workload_feasibility.sum_achievable_maximum_hours.toFixed(1)}</dd>
+              </div>
+            )}
             <div>
               <dt>Difference</dt>
               <dd>
                 {context.workload_feasibility.status === 'minimum_infeasible'
-                  ? `${Math.abs(context.workload_feasibility.available_minus_total_minimum).toFixed(1)}h above available`
+                  ? `${Math.abs(context.workload_feasibility.available_minus_total_minimum).toFixed(1)}h below combined minimum`
                   : context.workload_feasibility.status === 'maximum_infeasible'
-                    ? `${Math.abs(context.workload_feasibility.total_maximum_minus_available ?? 0).toFixed(1)}h short`
+                    ? `${Math.abs(context.workload_feasibility.total_maximum_minus_available ?? 0).toFixed(1)}h above usable maximum`
                     : 'Inside aggregate range'}
               </dd>
             </div>
@@ -2720,7 +2822,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               {context.workload_feasibility.physicians_without_hour_ranges.length} active physician(s) do not have an applicable hour range and are excluded from bounded totals.
             </small>
           )}
-          <small>Aggregate feasibility does not account for eligibility, nights, rest, requests, or locks.</small>
+          <small>This compares total scheduled coverage with combined contract workload ranges. It does not evaluate how requests or assignments are distributed among users.</small>
           {context.workload_feasibility.fte_adjustment_preview && (
             <div className="workload-feasibility-preview">
               <button
@@ -2947,16 +3049,34 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   ))}
                 </select>
               </label>
-              <div className="optimizer-run-status">
-                <span>Viewing Run {selectedRunForActions.run_number}{selectedRunForActions.copied_from_run_number ? ` — Copy of Run ${selectedRunForActions.copied_from_run_number}` : ''}</span>
-                {selectedRunForActions.is_published && <strong>Published</strong>}
-                {selectedRunForActions.is_active ? (
-                  <strong>Active</strong>
-                ) : (
-                  <span>Active Run {activeOptimizerRun?.run_number ?? '-'}</span>
-                )}
-              </div>
               <div className="optimizer-run-actions">
+                {['PRE_BUILD', 'BUILD'].includes(context.schedule_block.build_status) && (
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => void previewOptimizerRun(selectedRunForActions)}
+                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions)}
+                  >
+                    {isPreviewingRunId === selectedRunForActions.id ? 'Opening Preview...' : `Preview Run ${selectedRunForActions.run_number}`}
+                  </button>
+                )}
+                {context.schedule_block.build_status === 'PREVIEW'
+                  && context.schedule_block.preview_optimizer_run === selectedRunForActions.id && (
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => void publishOptimizerRun(selectedRunForActions)}
+                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions)}
+                  >
+                    {isPublishingRunId === selectedRunForActions.id ? 'Publishing...' : `Publish Run ${selectedRunForActions.run_number}`}
+                  </button>
+                )}
+                {context.schedule_block.build_status === 'PREVIEW'
+                  && context.schedule_block.preview_optimizer_run !== selectedRunForActions.id && (
+                  <button type="button" className="secondary" disabled>
+                    Previewing Run {context.schedule_block.preview_run_number ?? '-'}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="secondary"
@@ -3069,7 +3189,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     {run.score_is_stale && <span>Stored under prior schedule/rules</span>}
                     <span>{formatTimestamp(run.created_at)}</span>
                     {run.runtime_seconds != null && <span>Total time {formatRuntimeMinutes(run.runtime_seconds)}</span>}
-                    <span>Seed {run.seed ?? '-'}</span>
                     <span>{run.is_active ? 'Active' : 'Inactive'}</span>
                   </div>
                   <div className="optimizer-run-row-actions">

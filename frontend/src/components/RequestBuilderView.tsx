@@ -92,7 +92,6 @@ type Props = {
 }
 
 const API_BASE = 'http://localhost:8000/api'
-const NIGHTS_ONLY_STORAGE_KEY = 'atlas.requestBuilder.nightsOnly'
 
 const REQUEST_TYPES: Array<{ value: RequestType; label: string }> = [
   { value: 'NONE', label: 'None' },
@@ -344,13 +343,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
   const [requestType, setRequestType] = useState<RequestType>('NONE')
   const [weight, setWeight] = useState<Weight>('MEDIUM')
   const [selectedShiftTemplateIds, setSelectedShiftTemplateIds] = useState<number[]>([])
-  const [nightsOnly, setNightsOnly] = useState(() => {
-    try {
-      return window.localStorage.getItem(NIGHTS_ONLY_STORAGE_KEY) === 'true'
-    } catch {
-      return false
-    }
-  })
+  const [nightsOnly, setNightsOnly] = useState(false)
 
   const [bulkPhysicianIds, setBulkPhysicianIds] = useState<number[]>([])
   const [bulkScope, setBulkScope] = useState<RequestScope>('USER')
@@ -431,16 +424,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     setBulkPendingDates([])
     setCalendarRequestView('INDIVIDUAL')
     setSelectedScope('USER')
+    setNightsOnly(false)
     fetchContext(forceUserView ? physicianId ?? undefined : undefined)
   }, [block.id, block.start_date, block.end_date, block.build_status, forceUserView, physicianId])
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(NIGHTS_ONLY_STORAGE_KEY, String(nightsOnly))
-    } catch {
-      // The in-memory toggle still works when browser storage is unavailable.
-    }
-  }, [nightsOnly])
 
   const requestsByDateAndScope = useMemo(() => {
     const map = new Map<string, RequestItem>()
@@ -1015,15 +1001,15 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
 
       <div className="request-builder-toolbar">
         <div className="request-builder-physician">
-          <span>Selected Physician</span>
+          <span>Selected User</span>
           {isSchedulerMode ? (
             <>
               <input
                 type="search"
                 value={physicianSearch}
                 onChange={(event) => setPhysicianSearch(event.target.value)}
-                placeholder="Search physicians"
-                aria-label="Search physicians"
+                placeholder="Search users"
+                aria-label="Search users"
               />
               <div className="request-builder-physician-controls">
                 <select
@@ -1031,7 +1017,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                   onChange={(event) => void handlePhysicianChange(Number(event.target.value))}
                   disabled={!contextData.physicians.length}
                 >
-                  {!contextData.physicians.length && <option value="">No physicians available</option>}
+                  {!contextData.physicians.length && <option value="">No users available</option>}
                   {physicianOptions.map((physician) => (
                     <option key={physician.id} value={physician.id}>
                       {physician.name}
@@ -1051,7 +1037,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
               </div>
             </>
           ) : (
-            <div className="request-builder-selected-name">{selectedPhysician?.name ?? 'No physician assigned'}</div>
+            <div className="request-builder-selected-name">{selectedPhysician?.name ?? 'No user assigned'}</div>
           )}
         </div>
 

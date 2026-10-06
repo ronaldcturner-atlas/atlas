@@ -15,7 +15,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain, Region
+from apps.domains.models import Domain, DomainMembership, Region
 from apps.facilities.models import Facility
 
 from . import api
@@ -465,9 +465,13 @@ class SchedulingTests(TestCase):
 
 
 class ScheduleBlockSerializerTests(TestCase):
+    def setUp(self):
+        self.domain = Domain.objects.create(name='Serializer Domain', active=True)
+
     def test_schedule_block_length_cannot_exceed_twelve_months(self):
         serializer = ScheduleBlockSerializer(
             data={
+                'domain': self.domain.id,
                 'start_date': '2026-01-01',
                 'end_date': '2027-02-01',
                 'request_open_datetime': '2025-11-01T00:00:00Z',
@@ -481,6 +485,7 @@ class ScheduleBlockSerializerTests(TestCase):
     def test_request_close_must_be_after_open(self):
         serializer = ScheduleBlockSerializer(
             data={
+                'domain': self.domain.id,
                 'start_date': '2026-01-01',
                 'end_date': '2026-01-31',
                 'request_open_datetime': '2025-11-01T00:00:00Z',
@@ -499,6 +504,7 @@ class ScheduleBlockApiTests(TestCase):
         scheduler_group, _ = Group.objects.get_or_create(name='Scheduler')
         self.user.groups.add(scheduler_group)
         self.client.force_authenticate(user=self.user)
+        self.domain = Domain.objects.create(name='Schedule Block Domain', active=True)
 
     def _create_block(self, **overrides):
         defaults = {
@@ -507,9 +513,64 @@ class ScheduleBlockApiTests(TestCase):
             'request_open_datetime': timezone.make_aware(datetime(2026, 5, 1, 12, 0, 0)),
             'request_close_datetime': timezone.make_aware(datetime(2026, 5, 15, 12, 0, 0)),
             'build_status': ScheduleBlock.BuildStatus.PRE_BUILD,
+            'domain': self.domain,
         }
         defaults.update(overrides)
         return ScheduleBlock.objects.create(**defaults)
+
+    def test_list_can_be_filtered_to_one_domain_and_returns_region_context(self):
+        included = self._create_block()
+        other_domain = Domain.objects.create(name='Other Schedule Domain', active=True)
+        self._create_block(
+            domain=other_domain,
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+        )
+
+        response = self.client.get(f'/api/schedule-blocks/?domain={self.domain.id}')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['id'] for item in response.json()], [included.id])
+        self.assertEqual(response.json()[0]['domain'], self.domain.id)
+        self.assertEqual(response.json()[0]['domain_name'], self.domain.name)
+        self.assertEqual(response.json()[0]['region'], self.domain.region_id)
+        self.assertEqual(response.json()[0]['region_name'], self.domain.region.name)
+
+    def test_schedule_block_domain_cannot_be_changed(self):
+        block = self._create_block()
+        other_domain = Domain.objects.create(name='Immutable Domain', active=True)
+
+        response = self.client.patch(
+            f'/api/schedule-blocks/{block.id}/',
+            data={'domain': other_domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        block.refresh_from_db()
+        self.assertEqual(block.domain, self.domain)
+
+    def test_published_overlap_is_scoped_to_domain(self):
+        self._create_block(
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        other_domain = Domain.objects.create(name='Independent Region Schedule', active=True)
+
+        response = self.client.post(
+            '/api/schedule-blocks/',
+            data={
+                'domain': other_domain.id,
+                'start_date': '2026-07-01',
+                'end_date': '2026-07-31',
+                'request_open_datetime': '2026-05-01T12:00:00Z',
+                'request_close_datetime': '2026-05-15T12:00:00Z',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['domain'], other_domain.id)
 
     def test_delete_allowed_for_unpublished_build_block(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.BUILD)
@@ -530,19 +591,185 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertTrue(ScheduleBlock.objects.filter(id=block.id).exists())
 
+    def test_enter_preview_uses_the_explicitly_selected_completed_run(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.BUILD)
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            version_number=1,
+            name='Preview Version',
+        )
+        run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=3,
+            status=OptimizerRun.Status.COMPLETED,
+            final_score=Decimal('25'),
+        )
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/enter-preview/',
+            data={'optimizer_run_id': run.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        block.refresh_from_db()
+        self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.PREVIEW)
+        self.assertEqual(block.preview_optimizer_run_id, run.id)
+        self.assertEqual(response.json()['preview_run_number'], 3)
+
+    def test_enter_preview_requires_an_explicit_completed_run(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.BUILD)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/enter-preview/', data={}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('optimizer_run_id', response.json())
+        block.refresh_from_db()
+        self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.BUILD)
+        self.assertIsNone(block.preview_optimizer_run_id)
+
+    def test_preview_workspace_defaults_to_the_bound_preview_run(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            version_number=1,
+            name='Bound Preview Version',
+        )
+        preview_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+        )
+        OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+        block.preview_optimizer_run = preview_run
+        block.save(update_fields=['preview_optimizer_run'])
+
+        response = self.client.get(f'/api/schedule-blocks/{block.id}/build/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['selected_optimizer_run']['id'], preview_run.id)
+        self.assertEqual(response.json()['schedule_block']['preview_run_number'], 1)
+
     def test_publish_sets_archive_and_timestamp(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            version_number=1,
+            name='Publish Version',
+        )
+        run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+        block.preview_optimizer_run = run
+        block.save(update_fields=['preview_optimizer_run'])
 
-        response = self.client.post(f'/api/schedule-blocks/{block.id}/publish/', data={}, format='json')
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/publish/',
+            data={'optimizer_run_id': run.id},
+            format='json',
+        )
 
         self.assertEqual(response.status_code, 200)
         block.refresh_from_db()
         self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.ARCHIVE)
         self.assertIsNotNone(block.published_at)
 
+    def test_publish_uses_the_explicitly_selected_completed_run(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            version_number=1,
+            name='Independent V2 Result',
+        )
+        older_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+            final_score=Decimal('100'),
+        )
+        latest_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+            final_score=Decimal('0'),
+        )
+        block.preview_optimizer_run = older_run
+        block.save(update_fields=['preview_optimizer_run'])
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/publish/',
+            data={'optimizer_run_id': older_run.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        version.refresh_from_db()
+        self.assertEqual(version.published_optimizer_run_id, older_run.id)
+        self.assertNotEqual(version.published_optimizer_run_id, latest_run.id)
+
+    def test_publish_requires_an_explicit_completed_run(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/publish/', data={}, format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('optimizer_run_id', response.json())
+        block.refresh_from_db()
+        self.assertIsNone(block.published_at)
+
+    def test_publish_rejects_a_completed_run_other_than_the_preview_run(self):
+        block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            version_number=1,
+            name='Preview Publication Version',
+        )
+        preview_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+        other_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+        block.preview_optimizer_run = preview_run
+        block.save(update_fields=['preview_optimizer_run'])
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{block.id}/publish/',
+            data={'optimizer_run_id': other_run.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        block.refresh_from_db()
+        self.assertIsNone(block.published_at)
+        self.assertEqual(block.preview_optimizer_run_id, preview_run.id)
+
     def test_publish_captures_run_and_freezes_scoring_until_unpublished(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
-        domain = Domain.objects.create(name='Publication Snapshot Domain', active=True)
+        domain = self.domain
         version = ScheduleVersion.objects.create(
             schedule_block=block,
             domain=domain,
@@ -562,9 +789,13 @@ class ScheduleBlockApiTests(TestCase):
             name='Publication Snapshot Contract',
             active=True,
         )
+        block.preview_optimizer_run = published_run
+        block.save(update_fields=['preview_optimizer_run'])
 
         response = self.client.post(
-            f'/api/schedule-blocks/{block.id}/publish/', data={}, format='json',
+            f'/api/schedule-blocks/{block.id}/publish/',
+            data={'optimizer_run_id': published_run.id},
+            format='json',
         )
 
         self.assertEqual(response.status_code, 200)
@@ -631,7 +862,7 @@ class ScheduleBlockApiTests(TestCase):
             build_status=ScheduleBlock.BuildStatus.ARCHIVE,
             published_at=timezone.now(),
         )
-        domain = Domain.objects.create(name='Published Schedule Domain', active=True)
+        domain = self.domain
         facility = Facility.objects.create(name='Published Hospital', short_name='PUB', sort_order=7)
         physician_user = get_user_model().objects.create_user(
             username='published@example.com',
@@ -715,7 +946,94 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(payload[0]['facility_name'], 'Published Hospital')
         self.assertEqual(payload[0]['facility_short_name'], 'PUB')
         self.assertEqual(payload[0]['facility_sort_order'], 7)
+        self.assertEqual(payload[0]['domain'], domain.id)
+        self.assertEqual(payload[0]['domain_name'], domain.name)
+        self.assertEqual(payload[0]['region'], domain.region_id)
         self.assertNotEqual(payload[0]['physician_name'], 'Later Physician')
+
+    def test_published_schedule_recovers_latest_completed_independent_run(self):
+        block = self._create_block(
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        facility = Facility.objects.create(
+            name='Independent Run Hospital', short_name='IRH', sort_order=1,
+        )
+        physician_user = get_user_model().objects.create_user(
+            username='independent@example.com', first_name='Independent', last_name='APP',
+        )
+        physician = Physician.objects.create(
+            user=physician_user, display_name='Independent APP',
+        )
+        template = ShiftTemplate.objects.create(
+            facility=facility,
+            start_time=time(7, 0),
+            end_time=time(19, 0),
+            active_days_of_week=['Wednesday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=self.domain,
+            version_number=1,
+            name='Published Independent Version',
+        )
+        instance = ScheduleShiftInstance.objects.create(
+            schedule_version=version,
+            schedule_block=block,
+            date=date(2026, 7, 1),
+            shift_template=template,
+            facility=facility,
+            start_datetime=timezone.make_aware(datetime(2026, 7, 1, 7, 0)),
+            end_datetime=timezone.make_aware(datetime(2026, 7, 1, 19, 0)),
+            required_staffing=1,
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        independent_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=4,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+            final_score=Decimal('0'),
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=physician,
+            created_by=self.user,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=independent_run,
+        )
+
+        response = self.client.get('/api/published-schedule/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+        self.assertEqual(response.json()[0]['physician_name'], 'Independent APP')
+
+    def test_published_schedule_authority_is_independent_per_domain(self):
+        other_domain = Domain.objects.create(name='APP Schedule Domain', active=True)
+        first_block = self._create_block(
+            domain=self.domain,
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now() - timedelta(minutes=1),
+        )
+        second_block = self._create_block(
+            domain=other_domain,
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+
+        published_blocks, authority = api._published_schedule_authority([
+            self.domain.id,
+            other_domain.id,
+        ])
+
+        self.assertEqual({block.id for block in published_blocks}, {first_block.id, second_block.id})
+        self.assertEqual(authority[(self.domain.id, date(2026, 7, 1))], first_block.id)
+        self.assertEqual(authority[(other_domain.id, date(2026, 7, 1))], second_block.id)
 
     def test_preview_block_fields_are_read_only(self):
         block = self._create_block(build_status=ScheduleBlock.BuildStatus.PREVIEW)
@@ -952,6 +1270,115 @@ class ScheduleRequestApiTests(TestCase):
         returned_ids = {item['id'] for item in payload['physicians']}
         self.assertIn(self.physician.id, returned_ids)
         self.assertNotIn(inactive_physician.id, returned_ids)
+
+    def test_request_context_and_writes_are_scoped_to_schedule_block_domain(self):
+        physician_domain = Domain.objects.create(name='Physician Request Domain', active=True)
+        app_domain = Domain.objects.create(name='APP Request Domain', active=True)
+        self.block.domain = app_domain
+        self.block.save(update_fields=['domain', 'updated_at'])
+
+        self.shift_template.domain = physician_domain
+        self.shift_template.save(update_fields=['domain'])
+        app_template = ShiftTemplate.objects.create(
+            domain=app_domain,
+            facility=self.facility,
+            start_time=time(9, 0),
+            end_time=time(17, 0),
+            active_days_of_week=['Wednesday'],
+            weekend_days=[],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+
+        DomainMembership.objects.create(
+            domain=app_domain,
+            user=self.physician_user,
+            role=DomainMembership.Role.VIEW_ONLY,
+        )
+        app_user = get_user_model().objects.create_user(
+            username='app.request.user@example.com',
+            email='app.request.user@example.com',
+            first_name='Alex',
+            last_name='APP',
+        )
+        app_physician = Physician.objects.create(user=app_user, display_name='Alex APP')
+        DomainMembership.objects.create(
+            domain=app_domain,
+            user=app_user,
+            role=DomainMembership.Role.APP,
+        )
+        DomainMembership.objects.create(
+            domain=physician_domain,
+            user=app_user,
+            role=DomainMembership.Role.VIEW_ONLY,
+        )
+        app_contract = Contract.objects.create(
+            domain=app_domain,
+            name='APP Request Contract',
+            active=True,
+            request_settings={'allow_shift_on': True},
+        )
+        app_contract.facilities.add(self.facility)
+        ContractUserAssignment.objects.create(
+            contract=app_contract,
+            domain=app_domain,
+            physician=app_physician,
+        )
+
+        self.client.force_authenticate(user=self.scheduler_user)
+        context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
+
+        self.assertEqual(context_response.status_code, 200)
+        self.assertEqual(
+            {item['id'] for item in context_response.json()['physicians']},
+            {app_physician.id},
+        )
+        self.assertEqual(
+            {item['id'] for item in context_response.json()['shift_templates']},
+            {app_template.id},
+        )
+
+        foreign_user_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+        foreign_shift_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': app_physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'SHIFT_ON',
+                'weight': 'HIGH',
+                'shift_template_ids': [self.shift_template.id],
+            },
+            format='json',
+        )
+        app_shift_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': app_physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'SHIFT_ON',
+                'weight': 'HIGH',
+                'shift_template_ids': [app_template.id],
+            },
+            format='json',
+        )
+
+        self.assertEqual(foreign_user_response.status_code, 400)
+        self.assertEqual(foreign_shift_response.status_code, 400)
+        self.assertEqual(app_shift_response.status_code, 200)
 
     def test_shift_template_lists_follow_calendar_facility_and_start_time_order(self):
         self.facility.sort_order = 2
@@ -1817,6 +2244,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             active=True,
         )
         self.block = ScheduleBlock.objects.create(
+            domain=self.domain,
             start_date=date(2026, 7, 6),
             end_date=date(2026, 7, 7),
             request_open_datetime=timezone.make_aware(datetime(2026, 5, 1, 12, 0)),
@@ -1957,6 +2385,19 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         instances = ScheduleShiftInstance.objects.filter(schedule_version=version)
         self.assertEqual(instances.count(), 2)
         self.assertFalse(instances.filter(shift_template=other_template).exists())
+
+    def test_generate_rejects_a_domain_other_than_the_block_domain(self):
+        other_domain = Domain.objects.create(name='Wrong Build Domain', active=True)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': other_domain.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('different Domain', response.json()['domain_id'])
+        self.assertFalse(ScheduleVersion.objects.filter(schedule_block=self.block).exists())
 
     def test_generate_is_idempotent_for_existing_build_version(self):
         generate_url = f'/api/schedule-blocks/{self.block.id}/build/generate/'
@@ -2923,7 +3364,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             is_active=True,
         )
         self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
-        self.block.save(update_fields=['build_status', 'updated_at'])
+        self.block.preview_optimizer_run = existing_run
+        self.block.save(update_fields=['build_status', 'preview_optimizer_run', 'updated_at'])
 
         blocked_assignment = self.client.post(
             assignment_url, data={'physician_id': second.id}, format='json'
@@ -2942,6 +3384,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(moved.status_code, 200)
         self.assertEqual(moved.json()['build_status'], ScheduleBlock.BuildStatus.BUILD)
+        self.block.refresh_from_db()
+        self.assertIsNone(self.block.preview_optimizer_run_id)
         self.assertTrue(ScheduleVersion.objects.filter(id=version.id).exists())
         self.assertTrue(ScheduleShiftInstance.objects.filter(id=shift_instance.id).exists())
         self.assertTrue(OptimizerRun.objects.filter(id=existing_run.id).exists())
@@ -4113,6 +4557,74 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             ),
             [(instance.id, physician.id)],
         )
+
+    def test_atlas_v2_completes_zero_score_fixed_manual_schedule_without_search(self):
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        physician = self._create_assignment_physician(
+            'v2.manual.complete@example.com', 'V2 Manual Complete',
+            facilities=[self.facility],
+        )
+        manual_contract = Contract.objects.get(
+            user_assignments__physician=physician,
+        )
+        manual_contract.manual_assignment_only = True
+        manual_contract.save(update_fields=[
+            'manual_assignment_only', 'updated_at',
+        ])
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            max_runtime_seconds=60,
+            seed=9184,
+        )
+
+        def bootstrap(_version, **kwargs):
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=(
+                    ScheduleShiftAssignment.AssignmentSource.MANUAL
+                ),
+                optimizer_run=kwargs['optimizer_run'],
+                is_locked=True,
+            )
+            return {
+                'unfilled_shift_count': 0,
+                'final_overlap_violations': 0,
+                'final_score': 0,
+            }
+
+        with patch(
+            'apps.scheduling.initial_schedule.construct_complete_fresh_fill_schedule',
+            side_effect=bootstrap,
+        ), patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+        ) as search:
+            summary = optimize_schedule_version_v2_test(
+                version,
+                optimizer_run=v2_run,
+                source_run=None,
+                created_by=self.scheduler_user,
+            )
+
+        search.assert_not_called()
+        v2_run.refresh_from_db()
+        self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
+        self.assertEqual(v2_run.final_score, 0)
+        self.assertEqual(summary['stopped_reason'], 'complete_fixed_schedule')
+        self.assertEqual(summary['unfilled_shift_count'], 0)
 
     @override_settings(ATLAS_V2_ENABLED=False)
     def test_background_atlas_v2_test_is_gated_until_workers_restart(self):
@@ -9591,6 +10103,24 @@ class ContractApiTests(TestCase):
             ['SCHEDULE_BLOCK', 'MONTH', 'WEEK'],
         )
         self.assertEqual(payload['assigned_users_count'], 1)
+
+    def test_contract_assignment_uses_role_in_contract_domain_only(self):
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=self.physician.user,
+            role=DomainMembership.Role.APP,
+        )
+        other_domain = Domain.objects.create(name='Other Contract Domain', active=True)
+        DomainMembership.objects.create(
+            domain=other_domain,
+            user=self.physician.user,
+            role=DomainMembership.Role.VIEW_ONLY,
+        )
+
+        response = self.client.post('/api/contracts/', data=self._build_payload(), format='json')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['assigned_users_count'], 1)
 
     def test_create_contract_can_enable_manual_assignment_only(self):
         payload = self._build_payload()

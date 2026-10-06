@@ -1,6 +1,8 @@
 from collections import defaultdict
 from datetime import timedelta
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from functools import reduce
+from math import gcd
 
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
 from .optimizer import (
@@ -25,6 +27,36 @@ from .run_state import assignments_for_viewed_run
 
 def _number(value):
     return float(value) if value is not None else None
+
+
+def _workload_hour_granularity(instances):
+    """Return the smallest hour increment representable by shift durations."""
+    duration_minutes = {
+        int((_shift_hours(instance) * Decimal('60')).to_integral_value())
+        for instance in instances
+        if _shift_hours(instance) > 0
+    }
+    if not duration_minutes:
+        return None
+    return Decimal(reduce(gcd, duration_minutes)) / Decimal('60')
+
+
+def _floor_to_granularity(value, granularity):
+    if value is None or granularity is None:
+        return value
+    return (
+        (value / granularity).to_integral_value(rounding=ROUND_FLOOR)
+        * granularity
+    )
+
+
+def _ceil_to_granularity(value, granularity):
+    if value is None or granularity is None or value <= 0:
+        return value
+    return (
+        (value / granularity).to_integral_value(rounding=ROUND_CEILING)
+        * granularity
+    )
 
 
 def _manual_only_fixed_coverage_by_instance(
@@ -265,7 +297,10 @@ def _aggregate_hour_rule_bounds(rule_rows):
     )
 
 
-def _fte_adjustment_preview(status, physician_rows, available_hours, aggregate_min, total_max):
+def _fte_adjustment_preview(
+    status, physician_rows, available_hours, aggregate_min, total_max,
+    hour_granularity=None,
+):
     if status == 'maximum_infeasible':
         candidates = [
             row for row in physician_rows
@@ -355,6 +390,36 @@ def _fte_adjustment_preview(status, physician_rows, available_hours, aggregate_m
         Decimal('1'),
         required_rate.quantize(Decimal('1'), rounding=ROUND_CEILING),
     )
+    if hour_granularity is not None:
+        # Raw hour totals can appear feasible even though no combination of
+        # whole shifts fits inside the adjusted bounds. Raise the recommended
+        # whole-hour rate until the bounds contain the required coverage at
+        # the schedule's actual shift-duration increment.
+        while recommended_rate <= Decimal('1000'):
+            adjusted_bounds = []
+            for row in candidates:
+                current = Decimal(str(row[current_key]))
+                adjusted = recommended_rate * Decimal(str(row['fte']))
+                proposed = (
+                    current + adjusted
+                    if direction == 'increase_maximum'
+                    else max(Decimal('0'), current - adjusted)
+                )
+                adjusted_bounds.append(
+                    _floor_to_granularity(proposed, hour_granularity)
+                    if direction == 'increase_maximum'
+                    else _ceil_to_granularity(proposed, hour_granularity)
+                )
+            adjusted_total = sum(adjusted_bounds, Decimal('0'))
+            if (
+                direction == 'increase_maximum'
+                and adjusted_total >= available_hours
+            ) or (
+                direction == 'decrease_minimum'
+                and adjusted_total <= available_hours
+            ):
+                break
+            recommended_rate += Decimal('1')
     return {
         'direction': direction,
         'required_adjustment_hours': _number(required),
@@ -1220,6 +1285,7 @@ def build_workload_feasibility(
             'schedule_block', 'shift_template__facility', 'facility',
         ).order_by('date', 'id')
     )
+    hour_granularity = _workload_hour_granularity(instances)
     available_hours = sum(
         (_shift_hours(instance) * instance.required_staffing for instance in instances),
         Decimal('0'),
@@ -1302,6 +1368,8 @@ def build_workload_feasibility(
     physician_rows = []
     aggregate_min = Decimal('0')
     aggregate_max = Decimal('0')
+    achievable_aggregate_min = Decimal('0')
+    achievable_aggregate_max = Decimal('0')
     aggregate_max_unbounded = False
     physicians_without_hour_ranges = []
 
@@ -1355,15 +1423,23 @@ def build_workload_feasibility(
                 })
 
         physician_min, physician_max = _aggregate_hour_rule_bounds(rule_rows)
+        achievable_physician_min = _ceil_to_granularity(
+            physician_min, hour_granularity,
+        )
+        achievable_physician_max = _floor_to_granularity(
+            physician_max, hour_granularity,
+        )
         physician_max_unbounded = physician_max is None
         name = _physician_display_name(physician)
         if not rule_rows:
             physicians_without_hour_ranges.append(name)
         aggregate_min += physician_min
+        achievable_aggregate_min += achievable_physician_min
         if physician_max_unbounded or not rule_rows:
             aggregate_max_unbounded = True
         else:
             aggregate_max += physician_max
+            achievable_aggregate_max += achievable_physician_max
         score_contribution = sum(
             (Decimal(str(row['workload_score_contribution'])) for row in rule_rows),
             Decimal('0'),
@@ -1377,6 +1453,13 @@ def build_workload_feasibility(
             'effective_min_hours': _number(physician_min) if rule_rows else None,
             'effective_max_hours': (
                 None if physician_max_unbounded or not rule_rows else _number(physician_max)
+            ),
+            'achievable_min_hours': (
+                _number(achievable_physician_min) if rule_rows else None
+            ),
+            'achievable_max_hours': (
+                None if physician_max_unbounded or not rule_rows
+                else _number(achievable_physician_max)
             ),
             'assigned_hours': _number(assigned_total) if detailed_run else None,
             'deficit_hours': (
@@ -1408,12 +1491,26 @@ def build_workload_feasibility(
         physician_rows.append(physician_row)
 
     total_max = None if aggregate_max_unbounded else aggregate_max
-    if optimizer_required_hours < aggregate_min:
+    achievable_total_max = (
+        None if aggregate_max_unbounded else achievable_aggregate_max
+    )
+    if optimizer_required_hours < achievable_aggregate_min:
         status = 'minimum_infeasible'
-        interpretation = 'Minimum requirements are collectively infeasible.'
-    elif total_max is not None and optimizer_required_hours > total_max:
+        interpretation = (
+            'Combined contract minimums are collectively infeasible: '
+            'scheduled coverage is below the combined usable minimum after '
+            'accounting for whole shifts.'
+        )
+    elif (
+        achievable_total_max is not None
+        and optimizer_required_hours > achievable_total_max
+    ):
         status = 'maximum_infeasible'
-        interpretation = 'Maximum requirements are collectively infeasible.'
+        interpretation = (
+            'Combined contract maximums are collectively infeasible: '
+            'scheduled coverage exceeds the combined usable maximum after '
+            'accounting for whole shifts.'
+        )
     else:
         status = 'aggregate_feasible'
         interpretation = (
@@ -1445,8 +1542,9 @@ def build_workload_feasibility(
         status,
         physician_rows,
         optimizer_required_hours,
-        aggregate_min,
-        total_max,
+        achievable_aggregate_min,
+        achievable_total_max,
+        hour_granularity,
     )
     night_feasibility = _night_feasibility(
         version, instances, contract_assignments, optimizer_run,
@@ -1553,17 +1651,24 @@ def build_workload_feasibility(
         'aggregate_feasibility': {
             'sum_effective_minimum_hours': _number(aggregate_min),
             'sum_effective_maximum_hours': _number(total_max),
+            'sum_achievable_minimum_hours': _number(
+                achievable_aggregate_min
+            ),
+            'sum_achievable_maximum_hours': _number(
+                achievable_total_max
+            ),
+            'shift_hour_granularity': _number(hour_granularity),
             'total_available_scheduled_hours': _number(optimizer_required_hours),
             'total_generated_required_hours': _number(available_hours),
             'manual_only_fixed_hours': _number(manual_only_fixed_hours),
             'manual_only_fixed_shift_slots': manual_only_fixed_slots,
             'manual_only_physician_count': len(manual_only_physician_ids),
             'available_minus_total_minimum': _number(
-                optimizer_required_hours - aggregate_min
+                optimizer_required_hours - achievable_aggregate_min
             ),
             'total_maximum_minus_available': (
-                _number(total_max - optimizer_required_hours)
-                if total_max is not None else None
+                _number(achievable_total_max - optimizer_required_hours)
+                if achievable_total_max is not None else None
             ),
             'status': status,
             'interpretation': interpretation,

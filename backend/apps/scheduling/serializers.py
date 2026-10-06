@@ -6,7 +6,7 @@ from rest_framework import serializers
 from django.utils import timezone
 
 from apps.accounts.models import Physician
-from apps.domains.models import DomainMembership
+from apps.domains.models import Domain, DomainMembership
 from apps.facilities.models import Facility
 
 from .models import (
@@ -227,12 +227,23 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
     request_status = serializers.SerializerMethodField()
     published_runs = serializers.SerializerMethodField()
+    domain = serializers.PrimaryKeyRelatedField(queryset=Domain.objects.filter(active=True))
+    domain_name = serializers.CharField(source='domain.name', read_only=True)
+    region = serializers.IntegerField(source='domain.region_id', read_only=True)
+    region_name = serializers.CharField(source='domain.region.name', read_only=True)
+    preview_run_number = serializers.IntegerField(
+        source='preview_optimizer_run.run_number', read_only=True, allow_null=True,
+    )
 
     class Meta:
         model = ScheduleBlock
         fields = [
             'id',
             'name',
+            'domain',
+            'domain_name',
+            'region',
+            'region_name',
             'start_date',
             'end_date',
             'request_open_datetime',
@@ -243,16 +254,23 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
             'updated_at',
             'published_at',
             'published_runs',
+            'preview_optimizer_run',
+            'preview_run_number',
         ]
         read_only_fields = [
             'id',
             'name',
+            'domain_name',
+            'region',
+            'region_name',
             'request_status',
             'build_status',
             'created_at',
             'updated_at',
             'published_at',
             'published_runs',
+            'preview_optimizer_run',
+            'preview_run_number',
         ]
 
     def get_name(self, obj):
@@ -280,9 +298,9 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
                     else None
                 ),
             }
-            for version in obj.schedule_versions.select_related(
+            for version in obj.schedule_versions.filter(domain=obj.domain).select_related(
                 'domain', 'published_optimizer_run',
-            ).order_by('domain__name', 'id')
+            ).order_by('id')
         ]
 
     def validate(self, attrs):
@@ -290,6 +308,11 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
 
         if 'build_status' in self.initial_data:
             raise serializers.ValidationError({'build_status': 'build_status cannot be edited manually.'})
+
+        if self.instance is not None and 'domain' in attrs and attrs['domain'].id != self.instance.domain_id:
+            raise serializers.ValidationError({
+                'domain': 'A Schedule Block cannot be moved to another Domain.',
+            })
 
         instance = self.instance
         start_date = attrs.get('start_date', getattr(instance, 'start_date', None))
@@ -1082,13 +1105,15 @@ class ContractSerializer(serializers.ModelSerializer):
             return
 
         if DomainMembership.objects.filter(domain=contract.domain).exists():
+            working_user_ids = DomainMembership.objects.filter(
+                domain=contract.domain,
+            ).exclude(
+                role=DomainMembership.Role.VIEW_ONLY,
+            ).values_list('user_id', flat=True)
             eligible_physician_ids = set(
                 Physician.objects.filter(
                     id__in=assigned_user_ids,
-                    user__domain_memberships__domain=contract.domain,
-                ).exclude(
-                    user__domain_memberships__domain=contract.domain,
-                    user__domain_memberships__role=DomainMembership.Role.VIEW_ONLY,
+                    user_id__in=working_user_ids,
                 ).values_list('id', flat=True)
             )
             if set(assigned_user_ids) - eligible_physician_ids:

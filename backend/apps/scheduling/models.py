@@ -137,6 +137,12 @@ class ScheduleBlock(models.Model):
         PREVIEW = 'PREVIEW', 'PREVIEW'
         ARCHIVE = 'ARCHIVE', 'ARCHIVE'
 
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.PROTECT,
+        related_name='schedule_blocks',
+        default=get_default_domain_id,
+    )
     start_date = models.DateField()
     end_date = models.DateField()
     request_open_datetime = models.DateTimeField()
@@ -150,6 +156,13 @@ class ScheduleBlock(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     published_at = models.DateTimeField(null=True, blank=True)
+    preview_optimizer_run = models.ForeignKey(
+        'OptimizerRun',
+        on_delete=models.SET_NULL,
+        related_name='preview_schedule_blocks',
+        null=True,
+        blank=True,
+    )
 
     def __str__(self):
         return self.generated_name

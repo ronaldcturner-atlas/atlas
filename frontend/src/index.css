@@ -70,6 +70,11 @@ select option:checked{
 .content{padding:20px}
 .page-title{margin:0 0 16px 0;font-size:20px}
 .calendar-card{background:var(--surface);padding:16px;border-radius:8px;min-height:520px}
+.schedule-scope-toolbar{display:flex;align-items:flex-end;gap:12px;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.09)}
+.schedule-scope-field{display:grid;gap:4px;min-width:190px;color:var(--muted);font-size:11px}
+.schedule-scope-field>strong{display:flex;align-items:center;min-height:34px;color:var(--sidebar-fg);font-size:13px}
+.schedule-scope-field>select{height:34px;padding:0 10px;border:1px solid rgba(255,255,255,.14);border-radius:7px;background:#111c2e;color:var(--sidebar-fg)}
+.schedule-domain-filter-menu summary{min-width:190px}.schedule-domain-filter-popover{left:0;right:auto;width:250px}
 .calendar-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .calendar-heading-row{display:flex;align-items:center;gap:12px;min-width:0}
 .calendar-month-navigation{display:grid;grid-template-columns:28px 126px 28px;align-items:center;gap:4px;flex:0 0 auto}
@@ -142,6 +147,9 @@ select option:checked{
 .propose-trade-controls textarea{min-height:64px;resize:vertical}
 .shift-item-compact{padding:4px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;font-weight:500}
 .shift-item-compact span{display:block;overflow:hidden;text-overflow:ellipsis}
+.calendar-domain-group{display:flex;flex-direction:column;gap:3px;border-left:3px solid var(--domain-ribbon);padding-left:4px}
+.calendar-domain-group+.calendar-domain-group{margin-top:5px;padding-top:4px;border-top:1px solid rgba(255,255,255,.1)}
+.calendar-domain-heading{color:var(--domain-ribbon);font-size:8px;font-weight:850;line-height:1;text-transform:uppercase;letter-spacing:.055em}
 .shift-time-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
 .shift-time{font-weight:700;color:var(--shift-accent, var(--accent));font-size:11px}
 .shift-role-badge{padding:2px 6px;border-radius:999px;background:var(--shift-badge-bg, rgba(255,255,255,0.08));color:var(--shift-badge-fg, var(--sidebar-fg));font-size:9px;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;white-space:nowrap}
@@ -400,10 +408,8 @@ select option:checked{
 .build-workspace-maintenance-actions .optimizer-action-message{flex:1 1 280px;max-width:none}
 .build-workspace-empty{display:grid;justify-items:center;gap:14px;padding:54px 20px;border:1px dashed rgba(255,255,255,0.16);border-radius:12px;color:var(--muted)}
 .optimizer-run-selector-panel,.optimizer-summary-card{display:grid;gap:8px;padding:10px;border:1px solid rgba(147,197,253,0.2);border-radius:8px;background:rgba(15,23,42,0.34)}
-.optimizer-run-selector-main{display:grid;grid-template-columns:minmax(260px,1fr) auto auto;gap:8px;align-items:end}
+.optimizer-run-selector-main{display:grid;grid-template-columns:minmax(260px,1fr) auto;gap:8px;align-items:end}
 .optimizer-run-select{min-width:0}
-.optimizer-run-status{display:flex;align-items:center;gap:8px;min-height:34px;color:var(--muted);font-size:12px;white-space:nowrap}
-.optimizer-run-status strong{padding:3px 7px;border:1px solid rgba(34,197,94,0.45);border-radius:999px;background:rgba(34,197,94,0.14);color:#bbf7d0;font-size:11px}
 .optimizer-history-toggle{justify-self:start;min-height:30px;padding:5px 9px}
 .optimizer-runs-list{display:grid;gap:8px}
 .optimizer-run-bulk-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px;border:1px solid rgba(248,113,113,0.3);border-radius:6px;background:rgba(127,29,29,0.1)}
@@ -545,7 +551,6 @@ select option:checked{
   .build-workspace-runtime-note{flex-basis:100%}
   .build-workspace-controls .primary-action,.build-workspace-controls .secondary{height:auto;min-height:34px}
   .optimizer-run-selector-main{grid-template-columns:1fr}
-  .optimizer-run-status{min-height:0}
   .optimizer-summary-grid,.optimizer-extra-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}
   .optimizer-run-row{align-items:flex-start;flex-wrap:wrap}
   .optimizer-run-actions{justify-content:flex-start}
@@ -557,6 +562,14 @@ select option:checked{
 .contracts-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
 .contracts-inline-checkbox{gap:10px;min-width:150px}
 .contracts-domain-filter{min-width:240px}
+.schedule-block-header-actions,.schedule-block-scope{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
+.schedule-block-scope-field{display:grid;gap:4px;min-width:170px;color:var(--muted);font-size:12px}
+.schedule-block-scope-field select{height:36px;padding:0 10px;border:1px solid #52627a;border-radius:6px;background:#e8edf4;color:#111827}
+.schedule-block-scope-field strong{display:flex;align-items:center;min-height:36px;color:var(--sidebar-fg);font-size:14px}
+.schedule-block-modal-scope{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:14px;padding:10px 12px;border:1px solid #40516a;border-radius:7px;background:#17263b}
+.schedule-block-modal-scope div{display:grid;gap:3px}.schedule-block-modal-scope span{color:var(--muted);font-size:11px}.schedule-block-modal-scope strong{font-size:14px}
+.build-workspace-scope{margin-bottom:3px;color:#aebbd0;font-size:12px;font-weight:700}
+.build-workspace-fixed-domain{display:grid;align-content:end;gap:7px;min-height:59px}.build-workspace-fixed-domain strong{display:flex;align-items:center;min-height:36px;padding:0 11px;border:1px solid rgba(148,163,184,.28);border-radius:6px;background:rgba(255,255,255,.04);font-size:13px}
 .contract-page-tabs{display:flex;gap:8px;margin-bottom:18px;border-bottom:1px solid #40516a}
 .contract-page-tabs button{border:0;border-bottom:3px solid transparent;background:transparent;color:#c7d2e3;padding:10px 14px;font-weight:700;cursor:pointer}
 .contract-page-tabs button.active{border-bottom-color:#8b7cf6;color:#fff}
@@ -1259,7 +1272,6 @@ textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba
 .muted,
 .facility-field span,
 .build-workspace-subtitle,
-.optimizer-run-status,
 .optimizer-summary-grid span,
 .optimizer-extra-grid span,
 .optimizer-workload-item span,

@@ -70,6 +70,7 @@ class Command(BaseCommand):
         best_swaps = list(initial_swaps)
         global_fingerprints = set()
         epoch_fingerprints = set()
+        repeated_state_visits = 0
         neighborhoods = []
         total_evaluations = 0
         total_kernel_seconds = 0.0
@@ -395,11 +396,17 @@ class Command(BaseCommand):
                 )
             resolved_run_number = int(kernel_result['run_number'])
             fingerprint = kernel_result['schedule_fingerprint']
-            if fingerprint in epoch_fingerprints:
-                raise CommandError(
-                    'The v2 restart revisited a state within the same epoch.'
-                )
-            epoch_fingerprints.add(fingerprint)
+            fingerprint_visit = (fingerprint, selection_mode)
+            repeated_state = fingerprint_visit in epoch_fingerprints
+            if repeated_state:
+                repeated_state_visits += 1
+            # A completed diversification pass intentionally evaluates the
+            # resulting schedule once more in improvement mode. That is a
+            # mode handoff, not a search cycle. Continue to reject revisiting
+            # the same state within either mode by treating it as an exhausted
+            # neighborhood, while allowing the legal cross-mode evaluation.
+            else:
+                epoch_fingerprints.add(fingerprint_visit)
             global_fingerprints.add(fingerprint)
             evaluated = int(kernel_result['distinct_candidate_schedules'])
             kernel_seconds = float(kernel_result['elapsed_seconds'])
@@ -408,6 +415,12 @@ class Command(BaseCommand):
             transition = kernel_result.get(
                 'best_candidate_transition_validation'
             )
+            if repeated_state:
+                # A repeated state is a local search exhaustion signal, not a
+                # reason to discard the complete schedule. Ignore any move
+                # proposed from the duplicate state and advance through the
+                # normal improvement/restart workflow below.
+                transition = None
             authoritative_current = kernel_result.get(
                 'authoritative_current_score'
             )
@@ -450,6 +463,7 @@ class Command(BaseCommand):
                 'restart_mode': epoch_kind,
                 'selection_mode': selection_mode,
                 'schedule_fingerprint': fingerprint,
+                'repeated_state': repeated_state,
                 'evaluations': evaluated,
                 'kernel_seconds': kernel_seconds,
                 'preparation_seconds': float(
@@ -642,6 +656,7 @@ class Command(BaseCommand):
             'total_evaluations': total_evaluations,
             'unique_evaluated_states': len(global_fingerprints),
             'unique_accepted_states': len(global_fingerprints),
+            'repeated_state_visits': repeated_state_visits,
             'initial_transitions': len(initial_swaps),
             'accepted_transitions': accepted_transition_count,
             'improving_transitions': improving_transition_count,

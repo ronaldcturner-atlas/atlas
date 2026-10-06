@@ -152,13 +152,37 @@ def optimize_schedule_version_v2(
     if progress_callback is not None:
         progress_callback(initial_score, force=True)
 
+    source_assignments = list(
+        assignments_for_viewed_run(schedule_version, source_run)
+        .select_related('shift_instance', 'physician')
+        .order_by('shift_instance_id', 'physician_id', 'id')
+    )
+    has_movable_assignment = any(
+        assignment.assignment_source
+        != ScheduleShiftAssignment.AssignmentSource.MANUAL
+        for assignment in source_assignments
+    )
+
     output = io.StringIO()
     remaining_runtime_seconds = max(
         float(optimizer_run.max_runtime_seconds) - (monotonic() - overall_started),
         0.0,
     )
     user_stopped = bool(stop_requested is not None and stop_requested())
-    if remaining_runtime_seconds <= 0 or user_stopped:
+    if initial_score == 0 and not has_movable_assignment:
+        search_result = {
+            'stage': 'V2_CONTINUOUS_IMPROVEMENT_CHAIN',
+            'swaps': [],
+            'wall_seconds': 0.0,
+            'stopped_reason': 'complete_fixed_schedule',
+            'total_evaluations': 0,
+            'accepted_transitions': 0,
+            'improving_transitions': 0,
+            'neighborhoods': [],
+            'predicted_final_score': 0.0,
+            'score_checkpoints': [],
+        }
+    elif remaining_runtime_seconds <= 0 or user_stopped:
         search_result = {
             'stage': 'V2_CONTINUOUS_IMPROVEMENT_CHAIN',
             'swaps': [],
@@ -208,11 +232,6 @@ def optimize_schedule_version_v2(
             search_result, initial_score,
         )
 
-    source_assignments = list(
-        assignments_for_viewed_run(schedule_version, source_run)
-        .select_related('shift_instance', 'physician')
-        .order_by('shift_instance_id', 'physician_id', 'id')
-    )
     state, _locked_manual_pairs = state_from_assignments(source_assignments)
     state = _apply_search_operations(state, search_result['swaps'])
 

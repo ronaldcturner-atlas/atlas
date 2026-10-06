@@ -42,10 +42,10 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
           type="button"
           className={activeView === 'my-schedule' ? 'active' : ''}
           onClick={() => onSelectView('my-schedule')}
-          title="My Schedule"
+          title="Schedule"
         >
           <span className="nav-icon" aria-hidden="true">▦</span>
-          <span className="nav-label">My Schedule</span>
+          <span className="nav-label">Schedule</span>
         </button>
         <button
           type="button"

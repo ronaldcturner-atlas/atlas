@@ -104,7 +104,7 @@ export default function Dashboard() {
       : requestBlockId !== null
       ? 'Request Builder'
       : activeView === 'my-schedule'
-      ? 'My Schedule'
+      ? 'Schedule'
       : activeView === 'stats'
       ? 'Stats'
         : activeView === 'shift-builder'

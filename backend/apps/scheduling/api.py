@@ -24,7 +24,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain
+from apps.domains.models import Domain, DomainMembership
 from apps.facilities.models import Facility
 
 from .models import (
@@ -197,16 +197,56 @@ def shifts_list_create(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-def _published_schedule_authority():
-    published_blocks = list(
-        ScheduleBlock.objects.filter(published_at__isnull=False)
-        .order_by('-published_at', '-id')
-    )
+def _accessible_published_schedule_domains(user):
+    domains = Domain.objects.filter(active=True, region__active=True)
+    if user.is_superuser:
+        return domains
+    membership_domain_ids = DomainMembership.objects.filter(
+        user=user,
+        domain__active=True,
+        domain__region__active=True,
+    ).values_list('domain_id', flat=True)
+    if membership_domain_ids.exists():
+        return domains.filter(id__in=membership_domain_ids)
+    # Compatibility for accounts created before Domain memberships existed.
+    return domains
+
+
+def _requested_published_schedule_domains(request):
+    accessible_domains = _accessible_published_schedule_domains(request.user)
+    raw_domain_ids = request.query_params.get('domains') or request.query_params.get('domain')
+    if not raw_domain_ids:
+        return accessible_domains, None
+    try:
+        requested_ids = {
+            int(value)
+            for value in str(raw_domain_ids).split(',')
+            if value.strip()
+        }
+    except (TypeError, ValueError):
+        return None, Response(
+            {'detail': 'domains must be a comma-separated list of Domain IDs.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    accessible_ids = set(accessible_domains.values_list('id', flat=True))
+    if not requested_ids or not requested_ids.issubset(accessible_ids):
+        return None, Response(
+            {'detail': 'You do not have access to one or more selected Domains.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return accessible_domains.filter(id__in=requested_ids), None
+
+
+def _published_schedule_authority(domain_ids=None):
+    published_blocks_query = ScheduleBlock.objects.filter(published_at__isnull=False)
+    if domain_ids is not None:
+        published_blocks_query = published_blocks_query.filter(domain_id__in=domain_ids)
+    published_blocks = list(published_blocks_query.order_by('-published_at', '-id'))
     authoritative_block_by_date = {}
     for block in published_blocks:
         pointer = block.start_date
         while pointer <= block.end_date:
-            authoritative_block_by_date.setdefault(pointer, block.id)
+            authoritative_block_by_date.setdefault((block.domain_id, pointer), block.id)
             pointer += timedelta(days=1)
     return published_blocks, authoritative_block_by_date
 
@@ -216,7 +256,11 @@ def _published_schedule_authority():
 @permission_classes([IsAuthenticated])
 def published_schedule(request):
     """Return the assignments from the current published schedule of record."""
-    published_blocks, authoritative_block_by_date = _published_schedule_authority()
+    domains, domain_error = _requested_published_schedule_domains(request)
+    if domain_error:
+        return domain_error
+    domain_ids = list(domains.values_list('id', flat=True))
+    published_blocks, authoritative_block_by_date = _published_schedule_authority(domain_ids)
 
     active_runs = {}
     published_versions = ScheduleVersion.objects.filter(
@@ -226,11 +270,11 @@ def published_schedule(request):
         published_run = version.published_optimizer_run
         if published_run is None:
             # Compatibility for legacy published rows before publication
-            # snapshots were introduced. The migration backfills normal cases.
+            # snapshots were introduced, and for independently saved V2 runs
+            # that were published before the publication fallback was added.
             published_run = version.optimizer_runs.filter(
-                is_active=True,
                 status=OptimizerRun.Status.COMPLETED,
-            ).order_by('-run_number').first()
+            ).order_by('-is_active', '-run_number').first()
         if published_run is not None:
             active_runs[version.id] = published_run
     active_run_ids = [published_run.id for published_run in active_runs.values()]
@@ -251,6 +295,10 @@ def published_schedule(request):
             'physician__display_name', 'physician__user__first_name',
             'physician__user__last_name', 'physician__user__username',
             'shift_instance__schedule_block_id', 'shift_instance__schedule_version_id',
+            'shift_instance__schedule_version__domain_id',
+            'shift_instance__schedule_version__domain__name',
+            'shift_instance__schedule_version__domain__region_id',
+            'shift_instance__schedule_version__domain__region__name',
             'shift_instance__id', 'shift_instance__split_parent_id',
             'shift_instance__split_parent__segment_start_time',
             'shift_instance__split_parent__shift_template__start_time',
@@ -276,7 +324,8 @@ def published_schedule(request):
         assignment_date = assignment['shift_instance__date']
         block_id = assignment['shift_instance__schedule_block_id']
         version_id = assignment['shift_instance__schedule_version_id']
-        if authoritative_block_by_date.get(assignment_date) != block_id:
+        domain_id = assignment['shift_instance__schedule_version__domain_id']
+        if authoritative_block_by_date.get((domain_id, assignment_date)) != block_id:
             continue
         active_run = active_runs.get(version_id)
         if active_run is not None and active_run.run_kind in (
@@ -335,14 +384,22 @@ def published_schedule(request):
             'status_display': 'Scheduled',
             'schedule_block': block_id,
             'schedule_version': version_id,
+            'domain': domain_id,
+            'domain_name': assignment['shift_instance__schedule_version__domain__name'],
+            'region': assignment['shift_instance__schedule_version__domain__region_id'],
+            'region_name': assignment['shift_instance__schedule_version__domain__region__name'],
         })
     open_instances = ScheduleShiftInstance.objects.filter(
         schedule_block__in=published_blocks,
         schedule_version_id__in=active_runs.keys(),
         is_locked_open=True,
-    ).select_related('facility', 'shift_template', 'schedule_block')
+    ).select_related(
+        'facility', 'shift_template', 'schedule_block',
+        'schedule_version__domain__region',
+    )
     for instance in open_instances:
-        if authoritative_block_by_date.get(instance.date) != instance.schedule_block_id:
+        domain = instance.schedule_version.domain
+        if authoritative_block_by_date.get((domain.id, instance.date)) != instance.schedule_block_id:
             continue
         start_time = instance.segment_start_time or instance.shift_template.start_time
         end_time = instance.segment_end_time or instance.shift_template.end_time
@@ -370,6 +427,10 @@ def published_schedule(request):
             'status_display': 'Open',
             'schedule_block': instance.schedule_block_id,
             'schedule_version': instance.schedule_version_id,
+            'domain': domain.id,
+            'domain_name': domain.name,
+            'region': domain.region_id,
+            'region_name': domain.region.name,
         })
     rows.sort(key=lambda row: (
         row['date'], row['facility_sort_order'], row['facility_name'],
@@ -387,6 +448,8 @@ def _schedule_date_comment_payload(comment):
         'title': comment.title,
         'details': comment.details,
         'schedule_block': comment.schedule_block_id,
+        'domain': comment.schedule_block.domain_id,
+        'domain_name': comment.schedule_block.domain.name,
         'updated_at': comment.updated_at.isoformat(),
     }
 
@@ -582,10 +645,14 @@ def _series_configuration(request, start_date):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule_comments(request):
-    published_blocks, authoritative_block_by_date = _published_schedule_authority()
+    domains, domain_error = _requested_published_schedule_domains(request)
+    if domain_error:
+        return domain_error
+    domain_ids = list(domains.values_list('id', flat=True))
+    published_blocks, authoritative_block_by_date = _published_schedule_authority(domain_ids)
     if request.method == 'GET':
-        comments_by_date = {}
-        authoritative_dates = sorted(authoritative_block_by_date)
+        comments_by_key = {}
+        authoritative_dates = sorted({key[1] for key in authoritative_block_by_date})
         series_rows = ScheduleCommentSeries.objects.prefetch_related('exceptions')
         for series in series_rows:
             exceptions = {row.date: row for row in series.exceptions.all()}
@@ -595,20 +662,24 @@ def published_schedule_comments(request):
                 exception = exceptions.get(candidate)
                 if exception and exception.is_cancelled:
                     continue
-                comments_by_date[candidate] = _schedule_comment_series_payload(
+                comments_by_key[('series', candidate)] = _schedule_comment_series_payload(
                     series,
                     candidate,
                     exception,
                 )
         comments = ScheduleDateComment.objects.filter(
             schedule_block__in=published_blocks,
-        ).select_related('schedule_block')
+        ).select_related('schedule_block__domain')
         for comment in comments:
-            if authoritative_block_by_date.get(comment.date) == comment.schedule_block_id:
-                comments_by_date[comment.date] = _schedule_date_comment_payload(comment)
+            key = (comment.schedule_block.domain_id, comment.date)
+            if authoritative_block_by_date.get(key) == comment.schedule_block_id:
+                comments_by_key[key] = _schedule_date_comment_payload(comment)
         return Response([
-            comments_by_date[comment_date]
-            for comment_date in sorted(comments_by_date)
+            payload
+            for _key, payload in sorted(
+                comments_by_key.items(),
+                key=lambda item: (item[1]['date'], str(item[0][0])),
+            )
         ])
 
     if not _can_manage_build_workspace(request.user):
@@ -617,7 +688,30 @@ def published_schedule_comments(request):
             status=status.HTTP_403_FORBIDDEN,
         )
     comment_date = _parse_comment_date(request.data.get('date'))
-    block_id = authoritative_block_by_date.get(comment_date)
+    raw_domain_id = request.data.get('domain')
+    if raw_domain_id in (None, ''):
+        candidate_domain_ids = {
+            domain_id
+            for domain_id, candidate_date in authoritative_block_by_date
+            if candidate_date == comment_date
+        }
+        domain_id = next(iter(candidate_domain_ids)) if len(candidate_domain_ids) == 1 else None
+    else:
+        try:
+            domain_id = int(raw_domain_id)
+        except (TypeError, ValueError):
+            domain_id = None
+    if domain_id is None:
+        return Response(
+            {'detail': 'Select one Domain before adding a calendar comment.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if domain_id not in domain_ids:
+        return Response(
+            {'detail': 'You do not have access to the selected Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    block_id = authoritative_block_by_date.get((domain_id, comment_date))
     if block_id is None:
         return Response(
             {'detail': 'That date is not part of a published schedule.'},
@@ -803,8 +897,25 @@ def published_schedule_comment_detail(request, comment_date):
             status=status.HTTP_403_FORBIDDEN,
         )
     parsed_date = _parse_comment_date(comment_date)
-    _published_blocks, authoritative_block_by_date = _published_schedule_authority()
-    block_id = authoritative_block_by_date.get(parsed_date)
+    domains, domain_error = _requested_published_schedule_domains(request)
+    if domain_error:
+        return domain_error
+    domain_ids = list(domains.values_list('id', flat=True))
+    _published_blocks, authoritative_block_by_date = _published_schedule_authority(domain_ids)
+    if len(domain_ids) != 1:
+        candidate_domain_ids = {
+            domain_id
+            for domain_id, candidate_date in authoritative_block_by_date
+            if candidate_date == parsed_date
+        }
+        if len(candidate_domain_ids) == 1:
+            domain_ids = list(candidate_domain_ids)
+    if len(domain_ids) != 1:
+        return Response(
+            {'detail': 'Select one Domain before deleting a calendar comment.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    block_id = authoritative_block_by_date.get((domain_ids[0], parsed_date))
     comment = get_object_or_404(
         ScheduleDateComment,
         schedule_block_id=block_id,
@@ -1873,8 +1984,11 @@ def stats_group_detail(request, group_id):
     return Response(_stats_group_payload(group))
 
 
-def _has_published_overlap(start_date, end_date, exclude_id=None):
-    published_blocks = ScheduleBlock.objects.filter(published_at__isnull=False)
+def _has_published_overlap(domain, start_date, end_date, exclude_id=None):
+    published_blocks = ScheduleBlock.objects.filter(
+        domain=domain,
+        published_at__isnull=False,
+    )
     if exclude_id is not None:
         published_blocks = published_blocks.exclude(id=exclude_id)
     return published_blocks.filter(start_date__lte=end_date, end_date__gte=start_date).exists()
@@ -1892,22 +2006,29 @@ def _can_manage_requests(user):
     )
 
 
-def _request_blocks_for_regular_user():
-    """Return only the latest published block and the nearest active/upcoming block."""
-    latest_published = (
-        ScheduleBlock.objects.filter(published_at__isnull=False)
-        .order_by('-published_at')
-        .first()
-    )
-    upcoming = (
-        ScheduleBlock.objects.filter(
-            published_at__isnull=True,
-            end_date__gte=timezone.localdate(),
+def _request_blocks_for_regular_user(user):
+    """Return the relevant published and upcoming block for each accessible Domain."""
+    domain_ids = list(user.domain_memberships.values_list('domain_id', flat=True))
+    domains = Domain.objects.filter(id__in=domain_ids) if domain_ids else Domain.objects.all()
+    block_ids = []
+    for domain_id in domains.values_list('id', flat=True):
+        domain_blocks = ScheduleBlock.objects.filter(domain_id=domain_id)
+        latest_published = (
+            domain_blocks.filter(published_at__isnull=False)
+            .order_by('-published_at')
+            .first()
         )
-        .order_by('start_date', 'created_at')
-        .first()
-    )
-    block_ids = [block.id for block in (latest_published, upcoming) if block is not None]
+        upcoming = (
+            domain_blocks.filter(
+                published_at__isnull=True,
+                end_date__gte=timezone.localdate(),
+            )
+            .order_by('start_date', 'created_at')
+            .first()
+        )
+        block_ids.extend(
+            block.id for block in (latest_published, upcoming) if block is not None
+        )
     return ScheduleBlock.objects.filter(id__in=block_ids)
 
 
@@ -1949,13 +2070,38 @@ def _parse_request_date(raw_value):
         return None
 
 
-def _get_request_contract(physician):
-    """Return the single active contract when Request Builder can resolve one unambiguously."""
-    contracts = list(
-        Contract.objects.filter(
-            active=True,
-            user_assignments__physician=physician,
+def _domain_has_memberships(domain):
+    return bool(domain and DomainMembership.objects.filter(domain=domain).exists())
+
+
+def _working_request_physicians(block):
+    """Return active users allowed to work in this Schedule Block's domain."""
+    physicians = Physician.objects.filter(active=True).select_related('user')
+    if _domain_has_memberships(block.domain):
+        working_user_ids = DomainMembership.objects.filter(
+            domain=block.domain,
+        ).exclude(
+            role=DomainMembership.Role.VIEW_ONLY,
+        ).values_list('user_id', flat=True)
+        physicians = physicians.filter(
+            user_id__in=working_user_ids,
         )
+    return physicians.distinct().order_by('user__last_name', 'user__first_name')
+
+
+def _get_request_contract(physician, domain=None):
+    """Return the single active contract when Request Builder can resolve one unambiguously."""
+    contracts_query = Contract.objects.filter(
+        active=True,
+        user_assignments__physician=physician,
+    )
+    if domain is not None:
+        domain_contracts = contracts_query.filter(domain=domain)
+        if domain_contracts.exists() or _domain_has_memberships(domain):
+            contracts_query = domain_contracts
+
+    contracts = list(
+        contracts_query
         .prefetch_related('facilities')
         .distinct()[:2]
     )
@@ -1974,14 +2120,15 @@ def _parse_request_limit(value):
     return parsed if parsed >= 0 else None
 
 
-def _get_request_policy(physician, can_manage=False):
+def _get_request_policy(physician, can_manage=False, domain=None):
     all_types = [choice[0] for choice in ScheduleRequest.RequestType.choices]
-    contract = _get_request_contract(physician)
+    contract = _get_request_contract(physician, domain)
 
     if contract is None:
         return {
             'contract_id': None,
             'contract_name': None,
+            'domain_id': domain.id if domain else None,
             'allowed_request_types': all_types if can_manage else [],
             'eligible_facility_ids': None,
             'limits': {
@@ -2009,6 +2156,7 @@ def _get_request_policy(physician, can_manage=False):
     return {
         'contract_id': contract.id,
         'contract_name': contract.name,
+        'domain_id': contract.domain_id,
         'allowed_request_types': all_types if can_manage else contract_allowed_types,
         'eligible_facility_ids': list(contract.facilities.values_list('id', flat=True)),
         'limits': {
@@ -2021,18 +2169,20 @@ def _get_request_policy(physician, can_manage=False):
     }
 
 
-def _get_eligible_shift_templates(eligible_facility_ids=None):
+def _get_eligible_shift_templates(eligible_facility_ids=None, domain_id=None):
     templates = _ordered_shift_templates(ShiftTemplate.objects.filter(active=True))
+    if domain_id is not None:
+        templates = templates.filter(domain_id=domain_id)
     if eligible_facility_ids is not None:
         templates = templates.filter(facility_id__in=eligible_facility_ids)
     return list(templates)
 
 
-def _get_available_shift_templates_for_date(target_date, eligible_facility_ids=None):
+def _get_available_shift_templates_for_date(target_date, eligible_facility_ids=None, domain_id=None):
     day_name = target_date.strftime('%A')
     return [
         template
-        for template in _get_eligible_shift_templates(eligible_facility_ids)
+        for template in _get_eligible_shift_templates(eligible_facility_ids, domain_id)
         if day_name in (template.active_days_of_week or [])
     ]
 
@@ -2044,6 +2194,7 @@ def _request_counts_as_weekend(schedule_request, eligible_facility_ids=None):
         available_templates = _get_available_shift_templates_for_date(
             schedule_request.date,
             eligible_facility_ids,
+            schedule_request.schedule_block.domain_id,
         )
         return any(day_name in (template.weekend_days or []) for template in available_templates)
 
@@ -2097,6 +2248,7 @@ def _request_counter_increments(request_date, request_type, weight, selected_tem
         available_templates = _get_available_shift_templates_for_date(
             request_date,
             policy['eligible_facility_ids'],
+            policy['domain_id'],
         )
         increments['WEEKEND'] = int(
             any(day_name in (template.weekend_days or []) for template in available_templates)
@@ -2241,14 +2393,13 @@ def schedule_block_requests_context(request, block_id):
     can_manage = _can_manage_requests(request.user)
 
     if can_manage:
-        physicians = list(
-            Physician.objects.filter(active=True)
-            .select_related('user')
-            .order_by('user__last_name', 'user__first_name')
-        )
+        physicians = list(_working_request_physicians(block))
     else:
         self_physician = _resolve_self_physician(request.user)
-        physicians = [self_physician] if self_physician else []
+        working_physician_ids = set(
+            _working_request_physicians(block).filter(id=self_physician.id).values_list('id', flat=True)
+        ) if self_physician else set()
+        physicians = [self_physician] if self_physician and self_physician.id in working_physician_ids else []
 
     selected_physician_id_param = request.query_params.get('physician_id')
     selected_physician_id = physicians[0].id if physicians else None
@@ -2283,7 +2434,7 @@ def schedule_block_requests_context(request, block_id):
         (physician for physician in physicians if physician.id == selected_physician_id),
         None,
     )
-    policy = _get_request_policy(selected_physician, can_manage) if selected_physician else None
+    policy = _get_request_policy(selected_physician, can_manage, block.domain) if selected_physician else None
 
     visible_requests = (
         ScheduleRequest.objects.filter(
@@ -2297,7 +2448,7 @@ def schedule_block_requests_context(request, block_id):
         else request_items
     )
 
-    templates = _ordered_shift_templates(ShiftTemplate.objects.filter(active=True))
+    templates = _ordered_shift_templates(ShiftTemplate.objects.filter(active=True, domain=block.domain))
     if policy and policy['eligible_facility_ids'] is not None:
         templates = templates.filter(facility_id__in=policy['eligible_facility_ids'])
 
@@ -2353,14 +2504,24 @@ def schedule_block_request_upsert(request, block_id):
         return Response({'physician_id': 'physician_id is required and must be a valid integer.'}, status=status.HTTP_400_BAD_REQUEST)
 
     if can_manage:
-        physician = get_object_or_404(Physician.objects.select_related('user'), id=physician_id)
+        physician = _working_request_physicians(block).filter(id=physician_id).first()
+        if physician is None:
+            return Response(
+                {'physician_id': 'The selected user does not have working access to this Schedule Block domain.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
     else:
         if not self_physician:
             return Response({'detail': 'Authenticated user is not linked to a physician profile.'}, status=status.HTTP_403_FORBIDDEN)
         if physician_id != self_physician.id:
             return Response({'detail': 'You do not have permission to modify requests for this physician.'}, status=status.HTTP_403_FORBIDDEN)
         physician = self_physician
-    policy = _get_request_policy(physician, can_manage)
+        if not _working_request_physicians(block).filter(id=physician.id).exists():
+            return Response(
+                {'detail': 'You do not have working access to this Schedule Block domain.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+    policy = _get_request_policy(physician, can_manage, block.domain)
 
     parsed_date = _parse_request_date(request.data.get('date'))
     if not parsed_date:
@@ -2404,7 +2565,10 @@ def schedule_block_request_upsert(request, block_id):
     except (TypeError, ValueError):
         return Response({'shift_template_ids': 'shift_template_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    eligible_templates = _get_eligible_shift_templates(policy['eligible_facility_ids'])
+    eligible_templates = _get_eligible_shift_templates(
+        policy['eligible_facility_ids'],
+        block.domain_id,
+    )
     eligible_template_ids = {template.id for template in eligible_templates}
     day_name = parsed_date.strftime('%A')
     available_templates = [
@@ -2584,9 +2748,12 @@ def schedule_block_bulk_requests(request, block_id):
     except (TypeError, ValueError):
         return Response({'physician_ids': 'physician_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    physicians = list(Physician.objects.filter(id__in=physician_ids))
+    physicians = list(_working_request_physicians(block).filter(id__in=physician_ids))
     if len(physicians) != len(physician_ids):
-        return Response({'physician_ids': 'One or more physicians were not found.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {'physician_ids': 'One or more selected users do not have working access to this Schedule Block domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     raw_dates = request.data.get('dates') or []
     if not isinstance(raw_dates, list) or not raw_dates:
@@ -2614,8 +2781,11 @@ def schedule_block_bulk_requests(request, block_id):
 
     plans = {}
     for physician in physicians:
-        policy = _get_request_policy(physician, can_manage=True)
-        eligible_templates = _get_eligible_shift_templates(policy['eligible_facility_ids'])
+        policy = _get_request_policy(physician, can_manage=True, domain=block.domain)
+        eligible_templates = _get_eligible_shift_templates(
+            policy['eligible_facility_ids'],
+            block.domain_id,
+        )
         eligible_template_ids = {template.id for template in eligible_templates}
         selected_templates = [
             template for template in eligible_templates if template.id in shift_template_ids
@@ -2727,7 +2897,7 @@ def _build_workspace_forbidden_response():
 
 def _schedule_version_queryset(block):
     return (
-        ScheduleVersion.objects.filter(schedule_block=block)
+        ScheduleVersion.objects.filter(schedule_block=block, domain=block.domain)
         .select_related('domain', 'published_optimizer_run')
     )
 
@@ -2902,7 +3072,10 @@ def _facility_timezone(facility):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_build_context(request, block_id):
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(
+        ScheduleBlock.objects.select_related('domain__region', 'preview_optimizer_run'),
+        id=block_id,
+    )
     can_manage = _can_manage_build_workspace(request.user)
     if not can_manage and block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
         return _build_workspace_forbidden_response()
@@ -2923,10 +3096,17 @@ def schedule_block_build_context(request, block_id):
         selected_version = versions.filter(status=ScheduleVersion.Status.BUILD).first() or versions.first()
 
     optimizer_run_id = request.query_params.get('optimizer_run_id')
+    if (
+        block.build_status == ScheduleBlock.BuildStatus.PREVIEW
+        and block.preview_optimizer_run_id
+        and (not optimizer_run_id or not can_manage)
+    ):
+        optimizer_run_id = str(block.preview_optimizer_run_id)
     if optimizer_run_id and not version_id:
         requested_optimizer_run = OptimizerRun.objects.filter(
             id=optimizer_run_id,
             schedule_version__schedule_block=block,
+            schedule_version__domain=block.domain,
         ).select_related('schedule_version').first()
         if requested_optimizer_run is not None:
             selected_version = requested_optimizer_run.schedule_version
@@ -2977,8 +3157,12 @@ def schedule_block_build_context(request, block_id):
                 getattr(settings, 'ATLAS_V2_ENABLED', False)
             ),
             'domains': [
-                {'id': domain.id, 'name': domain.name}
-                for domain in Domain.objects.filter(active=True).order_by('name')
+                {
+                    'id': block.domain_id,
+                    'name': block.domain.name,
+                    'region': block.domain.region_id,
+                    'region_name': block.domain.region.name,
+                }
             ],
             'versions': ScheduleVersionWorkspaceSerializer(versions, many=True).data,
             'selected_version': (
@@ -4843,13 +5027,18 @@ def schedule_block_generate_shift_instances(request, block_id):
         )
 
     try:
-        domain_id = int(request.data.get('domain_id'))
+        domain_id = int(request.data.get('domain_id', block.domain_id))
     except (TypeError, ValueError):
         return Response(
             {'domain_id': 'domain_id is required and must be a valid integer.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    domain = get_object_or_404(Domain, id=domain_id, active=True)
+    if domain_id != block.domain_id:
+        return Response(
+            {'domain_id': 'This Schedule Block belongs to a different Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    domain = get_object_or_404(Domain, id=block.domain_id, active=True)
 
     with transaction.atomic():
         version = (
@@ -4987,7 +5176,14 @@ def schedule_block_generate_shift_instances(request, block_id):
 def schedule_blocks_list_create(request):
     if request.method == 'GET':
         can_manage = _can_manage_build_workspace(request.user) or _can_manage_requests(request.user)
-        blocks = ScheduleBlock.objects.all() if can_manage else _request_blocks_for_regular_user()
+        blocks = ScheduleBlock.objects.all() if can_manage else _request_blocks_for_regular_user(request.user)
+        blocks = blocks.select_related('domain__region')
+        domain_id = request.query_params.get('domain')
+        region_id = request.query_params.get('region')
+        if domain_id:
+            blocks = blocks.filter(domain_id=domain_id)
+        elif region_id:
+            blocks = blocks.filter(domain__region_id=region_id)
         payload = ScheduleBlockSerializer(blocks, many=True).data
         if not can_manage:
             physician = _resolve_self_physician(request.user)
@@ -5020,9 +5216,10 @@ def schedule_blocks_list_create(request):
 
     start_date = serializer.validated_data['start_date']
     end_date = serializer.validated_data['end_date']
+    domain = serializer.validated_data['domain']
     acknowledged_overlap = bool(request.data.get('acknowledge_overlap', False))
 
-    if _has_published_overlap(start_date, end_date) and not acknowledged_overlap:
+    if _has_published_overlap(domain, start_date, end_date) and not acknowledged_overlap:
         return Response(
             {
                 'warning': (
@@ -5084,18 +5281,51 @@ def schedule_block_enter_preview(request, block_id):
     if not _can_manage_build_workspace(request.user):
         return _build_workspace_forbidden_response()
 
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(
+        ScheduleBlock.objects.select_related('preview_optimizer_run'), id=block_id,
+    )
 
     if block.build_status == ScheduleBlock.BuildStatus.ARCHIVE:
         return Response({'detail': 'Archived Schedule Blocks cannot enter preview.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    optimizer_run_id = request.data.get('optimizer_run_id')
+    if optimizer_run_id in (None, ''):
+        return Response(
+            {'optimizer_run_id': 'Select the completed optimizer run to preview.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        optimizer_run_id = int(optimizer_run_id)
+    except (TypeError, ValueError):
+        return Response(
+            {'optimizer_run_id': 'optimizer_run_id must be a valid optimizer run ID.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    preview_run = get_object_or_404(
+        OptimizerRun,
+        id=optimizer_run_id,
+        schedule_version__schedule_block=block,
+        schedule_version__domain=block.domain,
+    )
+    if preview_run.status != OptimizerRun.Status.COMPLETED:
+        return Response(
+            {'optimizer_run_id': 'Only a completed optimizer run can enter preview.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     if block.build_status == ScheduleBlock.BuildStatus.PREVIEW:
+        if block.preview_optimizer_run_id != preview_run.id:
+            return Response(
+                {'detail': 'Move the Schedule Block back to BUILD before previewing a different run.'},
+                status=status.HTTP_409_CONFLICT,
+            )
         return Response(ScheduleBlockSerializer(block).data)
 
     # Request intake is out of scope; allow PRE_BUILD to progress into PREVIEW for lifecycle testing.
     if block.build_status in {ScheduleBlock.BuildStatus.PRE_BUILD, ScheduleBlock.BuildStatus.BUILD}:
         block.build_status = ScheduleBlock.BuildStatus.PREVIEW
-        block.save(update_fields=['build_status', 'updated_at'])
+        block.preview_optimizer_run = preview_run
+        block.save(update_fields=['build_status', 'preview_optimizer_run', 'updated_at'])
         return Response(ScheduleBlockSerializer(block).data)
 
     return Response({'detail': 'Schedule Block cannot enter preview from its current state.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -5116,7 +5346,8 @@ def schedule_block_move_back_to_build(request, block_id):
         )
 
     block.build_status = ScheduleBlock.BuildStatus.BUILD
-    block.save(update_fields=['build_status', 'updated_at'])
+    block.preview_optimizer_run = None
+    block.save(update_fields=['build_status', 'preview_optimizer_run', 'updated_at'])
     return Response(ScheduleBlockSerializer(block).data)
 
 
@@ -5132,8 +5363,43 @@ def schedule_block_publish(request, block_id):
     if block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
         return Response({'detail': 'Only PREVIEW Schedule Blocks can be published.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    optimizer_run_id = request.data.get('optimizer_run_id')
+    if optimizer_run_id in (None, ''):
+        return Response(
+            {'optimizer_run_id': 'Select the completed optimizer run to publish.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        optimizer_run_id = int(optimizer_run_id)
+    except (TypeError, ValueError):
+        return Response(
+            {'optimizer_run_id': 'optimizer_run_id must be a valid optimizer run ID.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    published_run = get_object_or_404(
+        OptimizerRun.objects.select_related('schedule_version'),
+        id=optimizer_run_id,
+        schedule_version__schedule_block=block,
+        schedule_version__domain=block.domain,
+    )
+    if published_run.status != OptimizerRun.Status.COMPLETED:
+        return Response(
+            {'optimizer_run_id': 'Only a completed optimizer run can be published.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if block.preview_optimizer_run_id != published_run.id:
+        return Response(
+            {'optimizer_run_id': 'Only the optimizer run currently in Preview can be published.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     acknowledged_overlap = bool(request.data.get('acknowledge_overlap', False))
-    if _has_published_overlap(block.start_date, block.end_date, exclude_id=block.id) and not acknowledged_overlap:
+    if _has_published_overlap(
+        block.domain,
+        block.start_date,
+        block.end_date,
+        exclude_id=block.id,
+    ) and not acknowledged_overlap:
         return Response(
             {
                 'warning': (
@@ -5147,36 +5413,31 @@ def schedule_block_publish(request, block_id):
             status=status.HTTP_409_CONFLICT,
         )
 
-    versions = list(
-        ScheduleVersion.objects.filter(schedule_block=block)
-        .select_related('domain', 'schedule_block')
-    )
-    publication_snapshots = []
-    for version in versions:
-        published_run = version.optimizer_runs.filter(
-            status=OptimizerRun.Status.COMPLETED,
-            is_active=True,
-        ).order_by('-run_number').first()
-        report = build_violation_report(version, optimizer_run=published_run)
-        publication_snapshots.append((
-            version.id,
-            published_run,
-            json.loads(json.dumps(report, cls=DjangoJSONEncoder)),
-        ))
+    version = published_run.schedule_version
+    report = build_violation_report(version, optimizer_run=published_run)
+    frozen_report = json.loads(json.dumps(report, cls=DjangoJSONEncoder))
 
     with transaction.atomic():
         block = ScheduleBlock.objects.select_for_update().get(id=block.id)
         block.published_at = timezone.now()
         block.build_status = ScheduleBlock.BuildStatus.ARCHIVE
-        block.save(update_fields=['published_at', 'build_status', 'updated_at'])
-        for version_id, published_run, report in publication_snapshots:
-            ScheduleVersion.objects.filter(id=version_id).update(
-                published_optimizer_run=published_run,
-                published_violation_report=report,
-                score_is_stale=False,
-            )
-            if published_run is not None:
-                OptimizerRun.objects.filter(id=published_run.id).update(score_is_stale=False)
+        block.preview_optimizer_run = None
+        block.save(update_fields=[
+            'published_at', 'build_status', 'preview_optimizer_run', 'updated_at',
+        ])
+        ScheduleVersion.objects.filter(
+            schedule_block=block,
+            domain=block.domain,
+        ).exclude(id=version.id).update(
+            published_optimizer_run=None,
+            published_violation_report={},
+        )
+        ScheduleVersion.objects.filter(id=version.id).update(
+            published_optimizer_run=published_run,
+            published_violation_report=frozen_report,
+            score_is_stale=False,
+        )
+        OptimizerRun.objects.filter(id=published_run.id).update(score_is_stale=False)
     return Response(ScheduleBlockSerializer(block).data)
 
 

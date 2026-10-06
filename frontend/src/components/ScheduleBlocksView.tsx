@@ -6,6 +6,10 @@ type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 type ScheduleBlock = {
   id: number
   name: string
+  domain: number
+  domain_name: string
+  region: number
+  region_name: string
   start_date: string
   end_date: string
   request_open_datetime: string
@@ -28,6 +32,14 @@ type ScheduleBlock = {
   }>
 }
 
+type DomainOption = {
+  id: number
+  name: string
+  region: number
+  region_name: string
+  active: boolean
+}
+
 type ScheduleBlockFormState = {
   start_date: string
   end_date: string
@@ -45,6 +57,8 @@ type ScheduleBlocksViewProps = {
 }
 
 const API_BASE = 'http://localhost:8000/api'
+const SCHEDULE_BLOCK_REGION_KEY = 'atlas.scheduleBlocks.region'
+const SCHEDULE_BLOCK_DOMAIN_KEY = 'atlas.scheduleBlocks.domain'
 
 const defaultFormState: ScheduleBlockFormState = {
   start_date: '',
@@ -203,6 +217,15 @@ export default function ScheduleBlocksView({
   onOpenBuild,
 }: ScheduleBlocksViewProps) {
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([])
+  const [domains, setDomains] = useState<DomainOption[]>([])
+  const [selectedRegionId, setSelectedRegionId] = useState<number | null>(() => {
+    const stored = Number(window.sessionStorage.getItem(SCHEDULE_BLOCK_REGION_KEY))
+    return Number.isInteger(stored) && stored > 0 ? stored : null
+  })
+  const [selectedDomainId, setSelectedDomainId] = useState<number | null>(() => {
+    const stored = Number(window.sessionStorage.getItem(SCHEDULE_BLOCK_DOMAIN_KEY))
+    return Number.isInteger(stored) && stored > 0 ? stored : null
+  })
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -219,17 +242,25 @@ export default function ScheduleBlocksView({
       setIsLoading(true)
       setError(null)
 
-      const response = await fetch(`${API_BASE}/schedule-blocks/`, {
-        credentials: 'include',
-      })
+      const [response, domainsResponse] = await Promise.all([
+        fetch(`${API_BASE}/schedule-blocks/`, { credentials: 'include' }),
+        fetch(`${API_BASE}/domains/`, { credentials: 'include' }),
+      ])
 
       if (!response.ok) {
         const parsed = await parseApiResponseError(response)
         throw new Error(parsed.message ?? 'Unable to load Schedule Blocks.')
       }
 
+      if (!domainsResponse.ok) {
+        const parsed = await parseApiResponseError(domainsResponse)
+        throw new Error(parsed.message ?? 'Unable to load scheduling Domains.')
+      }
+
       const data = await response.json()
+      const domainData = await domainsResponse.json()
       setBlocks(data)
+      setDomains(domainData.filter((domain: DomainOption) => domain.active))
     } catch (fetchError) {
       console.error(fetchError)
       setError(fetchError instanceof Error ? fetchError.message : 'Unable to load Schedule Blocks right now.')
@@ -241,6 +272,46 @@ export default function ScheduleBlocksView({
   useEffect(() => {
     fetchBlocks()
   }, [])
+
+  const regions = useMemo(() => Array.from(
+    new Map(domains.map((domain) => [domain.region, domain.region_name])).entries(),
+  ).map(([id, name]) => ({ id, name })), [domains])
+
+  const domainsForRegion = useMemo(
+    () => domains.filter((domain) => domain.region === selectedRegionId),
+    [domains, selectedRegionId],
+  )
+
+  useEffect(() => {
+    if (!domains.length) return
+
+    const requestedBlock = requestBlockId === null
+      ? null
+      : blocks.find((block) => block.id === requestBlockId) ?? null
+    if (requestedBlock) {
+      setSelectedRegionId(requestedBlock.region)
+      setSelectedDomainId(requestedBlock.domain)
+      return
+    }
+
+    const regionId = regions.some((region) => region.id === selectedRegionId)
+      ? selectedRegionId
+      : regions[0]?.id ?? null
+    const eligibleDomains = domains.filter((domain) => domain.region === regionId)
+    const domainId = eligibleDomains.some((domain) => domain.id === selectedDomainId)
+      ? selectedDomainId
+      : eligibleDomains[0]?.id ?? null
+    if (regionId !== selectedRegionId) setSelectedRegionId(regionId)
+    if (domainId !== selectedDomainId) setSelectedDomainId(domainId)
+  }, [blocks, domains, regions, requestBlockId, selectedDomainId, selectedRegionId])
+
+  useEffect(() => {
+    if (selectedRegionId) window.sessionStorage.setItem(SCHEDULE_BLOCK_REGION_KEY, String(selectedRegionId))
+  }, [selectedRegionId])
+
+  useEffect(() => {
+    if (selectedDomainId) window.sessionStorage.setItem(SCHEDULE_BLOCK_DOMAIN_KEY, String(selectedDomainId))
+  }, [selectedDomainId])
 
   useEffect(() => {
     if (editingBlockId === null) {
@@ -288,7 +359,9 @@ export default function ScheduleBlocksView({
       || right.end_date.localeCompare(left.end_date)
       || right.created_at.localeCompare(left.created_at)
     )
-    const sorted = [...blocks].sort(newestScheduleFirst)
+    const sorted = blocks
+      .filter((block) => block.domain === selectedDomainId)
+      .sort(newestScheduleFirst)
     if (!requestUserView) {
       return sorted
     }
@@ -303,7 +376,7 @@ export default function ScheduleBlocksView({
       [latestPublished, upcoming].filter((block): block is ScheduleBlock => Boolean(block))
         .map((block) => [block.id, block]),
     ).values()).sort(newestScheduleFirst)
-  }, [blocks, requestUserView])
+  }, [blocks, requestUserView, selectedDomainId])
 
   const requestTypeLabel = (requestType: string) => requestType
     .toLowerCase()
@@ -312,6 +385,10 @@ export default function ScheduleBlocksView({
     .join(' ')
 
   const openCreateModal = () => {
+    if (!selectedDomainId) {
+      setError('Select a Domain before creating a Schedule Block.')
+      return
+    }
     setEditingBlockId(null)
     setIsReadOnlyOpen(false)
     setOpenedBlock(null)
@@ -361,11 +438,17 @@ export default function ScheduleBlocksView({
       return
     }
 
+    if (editingBlockId === null && !selectedDomainId) {
+      setError('Select a Domain before creating a Schedule Block.')
+      return
+    }
+
     const payload = {
       start_date: formState.start_date,
       end_date: formState.end_date,
       request_open_datetime: toIsoFromDatetimeLocal(formState.request_open_datetime),
       request_close_datetime: toIsoFromDatetimeLocal(formState.request_close_datetime),
+      ...(editingBlockId === null ? { domain: selectedDomainId } : {}),
     }
 
     try {
@@ -457,30 +540,6 @@ export default function ScheduleBlocksView({
     }
   }
 
-  const enterPreview = async (block: ScheduleBlock) => {
-    try {
-      setError(null)
-      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/enter-preview/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({}),
-      })
-
-      if (!response.ok) {
-        const parsed = await parseApiResponseError(response)
-        throw new Error(parsed.message ?? 'Unable to enter preview.')
-      }
-
-      await fetchBlocks()
-    } catch (previewError) {
-      console.error(previewError)
-      setError(previewError instanceof Error ? previewError.message : 'Unable to enter preview.')
-    }
-  }
-
   const moveBackToBuild = async (block: ScheduleBlock) => {
     const confirmed = window.confirm(
       'Move this schedule block back to BUILD? Users will no longer be viewing it as preview, and scheduler edits/optimization will be enabled again.',
@@ -506,55 +565,49 @@ export default function ScheduleBlocksView({
     }
   }
 
-  const publishBlock = async (block: ScheduleBlock) => {
-    try {
-      setError(null)
-      let response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/publish/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({}),
-      })
-
-      let parsedError: { message: string | null; requiresAcknowledgement: boolean } | null = null
-      if (!response.ok) {
-        parsedError = await parseApiResponseError(response)
-
-        if (parsedError.requiresAcknowledgement && parsedError.message) {
-          const acknowledged = window.confirm(parsedError.message)
-          if (acknowledged) {
-            response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/publish/`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              credentials: 'include',
-              body: JSON.stringify({ acknowledge_overlap: true }),
-            })
-            parsedError = null
-          }
-        }
-      }
-
-      if (!response.ok) {
-        if (!parsedError) {
-          parsedError = await parseApiResponseError(response)
-        }
-        throw new Error(parsedError.message ?? 'Unable to publish Schedule Block.')
-      }
-
-      await fetchBlocks()
-    } catch (publishError) {
-      console.error(publishError)
-      setError(publishError instanceof Error ? publishError.message : 'Unable to publish Schedule Block.')
-    }
-  }
-
   if (isLoading) {
     return <div className="scheduler-loading">Loading Schedule Blocks...</div>
   }
+
+  const selectedRegion = regions.find((region) => region.id === selectedRegionId) ?? null
+  const selectedDomain = domains.find((domain) => domain.id === selectedDomainId) ?? null
+  const modalRegionName = openedBlock?.region_name ?? selectedRegion?.name ?? ''
+  const modalDomainName = openedBlock?.domain_name ?? selectedDomain?.name ?? ''
+  const schedulingScopeControls = (
+    <div className="schedule-block-scope" aria-label="Schedule Block scope">
+      <div className="schedule-block-scope-field">
+        <span>Region</span>
+        {regions.length > 1 ? (
+          <select
+            value={selectedRegionId ?? ''}
+            onChange={(event) => {
+              const nextRegionId = Number(event.target.value)
+              const firstDomain = domains.find((domain) => domain.region === nextRegionId)
+              setSelectedRegionId(nextRegionId)
+              setSelectedDomainId(firstDomain?.id ?? null)
+            }}
+          >
+            {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
+          </select>
+        ) : (
+          <strong>{selectedRegion?.name ?? 'No active Region'}</strong>
+        )}
+      </div>
+      <div className="schedule-block-scope-field">
+        <span>Domain</span>
+        {domainsForRegion.length > 1 ? (
+          <select
+            value={selectedDomainId ?? ''}
+            onChange={(event) => setSelectedDomainId(Number(event.target.value))}
+          >
+            {domainsForRegion.map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}
+          </select>
+        ) : (
+          <strong>{selectedDomain?.name ?? 'No active Domain'}</strong>
+        )}
+      </div>
+    </div>
+  )
 
   const unpublishBlock = async (block: ScheduleBlock) => {
     const confirmed = window.confirm(
@@ -589,6 +642,7 @@ export default function ScheduleBlocksView({
             <h2>Schedule Blocks</h2>
             <p className="user-view-helper">Choose Requests while a request period is open.</p>
           </div>
+          {schedulingScopeControls}
         </div>
         {error && <div className="facilities-error">{error}</div>}
         <div className="scheduler-table-wrap">
@@ -653,9 +707,12 @@ export default function ScheduleBlocksView({
     <div className="facilities-view-card">
       <div className="facilities-header">
         <h2>Schedule Blocks</h2>
-        <button type="button" className="primary-action" onClick={openCreateModal}>
-          Create New
-        </button>
+        <div className="schedule-block-header-actions">
+          {schedulingScopeControls}
+          <button type="button" className="primary-action" onClick={openCreateModal} disabled={!selectedDomainId}>
+            Create New
+          </button>
+        </div>
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
@@ -713,14 +770,8 @@ export default function ScheduleBlocksView({
                     {!block.published_at && (
                       <button type="button" onClick={() => deleteBlock(block)}>Delete</button>
                     )}
-                    {(block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
-                      <button type="button" onClick={() => enterPreview(block)}>Enter Preview</button>
-                    )}
                     {block.build_status === 'PREVIEW' && (
-                      <>
-                        <button type="button" onClick={() => publishBlock(block)}>Publish</button>
-                        <button type="button" onClick={() => moveBackToBuild(block)}>Move Back to Build</button>
-                      </>
+                      <button type="button" onClick={() => moveBackToBuild(block)}>Move Back to Build</button>
                     )}
                     {block.build_status === 'ARCHIVE' && block.published_at && (
                       <button type="button" onClick={() => unpublishBlock(block)}>Unpublish / Return to Build</button>
@@ -784,6 +835,10 @@ export default function ScheduleBlocksView({
             <div className="shift-modal-body">
               {activeModalTab === 'details' && (
                 <>
+                  <div className="schedule-block-modal-scope">
+                    <div><span>Region</span><strong>{modalRegionName}</strong></div>
+                    <div><span>Domain</span><strong>{modalDomainName}</strong></div>
+                  </div>
                   <label className="facility-field">
                     <span>Schedule Block Name</span>
                     <input
