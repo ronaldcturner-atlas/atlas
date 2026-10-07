@@ -15,6 +15,29 @@ interface User {
     organization_name: string
   }>
   is_org_admin: boolean
+  permissions: string[]
+  can_manage_schedules: boolean
+  can_test_access: boolean
+  test_access: {
+    domain_id: number
+    domain_name: string
+    region_id: number
+    region_name: string
+    role_template_id: number
+    role_name: string
+    clinically_active: boolean
+  } | null
+  domain_access: Array<{
+    domain_id: number
+    domain_name: string
+    region_id: number
+    region_name: string
+    role_template_id: number | null
+    role_name: string
+    clinically_active: boolean
+    active: boolean
+    permissions: string[]
+  }>
 }
 
 interface AuthContextType {

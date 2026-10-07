@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 
 type ShiftTemplate = {
   id: number
@@ -136,8 +137,8 @@ export default function ShiftsView() {
   const [templates, setTemplates] = useState<ShiftTemplate[]>([])
   const [facilities, setFacilities] = useState<FacilityOption[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
-  const [regionFilter, setRegionFilter] = useState('')
-  const [domainFilter, setDomainFilter] = useState('')
+  const [regionFilter, setRegionFilter] = useState(() => readSessionString('atlas.shift-builder.region'))
+  const [domainFilter, setDomainFilter] = useState(() => readSessionString('atlas.shift-builder.domain'))
 
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
@@ -204,8 +205,10 @@ export default function ShiftsView() {
   }, [regions])
   const domainsForRegion = useMemo(() => domains.filter((domain) => !regionFilter || String(domain.region) === regionFilter), [domains, regionFilter])
   useEffect(() => {
-    if (domainFilter && !domainsForRegion.some((domain) => String(domain.id) === domainFilter)) setDomainFilter('')
-  }, [domainFilter, domainsForRegion])
+    if (domains.length && domainFilter && !domainsForRegion.some((domain) => String(domain.id) === domainFilter)) setDomainFilter('')
+  }, [domainFilter, domains.length, domainsForRegion])
+  useEffect(() => writeSessionSelection('atlas.shift-builder.region', regionFilter), [regionFilter])
+  useEffect(() => writeSessionSelection('atlas.shift-builder.domain', domainFilter), [domainFilter])
   const formDomain = domains.find((domain) => String(domain.id) === formState.domain)
   const activeFacilities = useMemo(
     () => facilities.filter((facility) => facility.active && (!formDomain || facility.region === formDomain.region)),

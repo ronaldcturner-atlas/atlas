@@ -1,13 +1,14 @@
 import React from 'react'
 
 type SidebarProps = {
-  activeView: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'organization'
-  onSelectView: (view: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'organization') => void
+  activeView: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'roles' | 'organization'
+  onSelectView: (view: 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'roles' | 'organization') => void
   userView: boolean
   canManageOrganization: boolean
+  canViewRoles: boolean
 }
 
-export default function Sidebar({ activeView, onSelectView, userView, canManageOrganization }: SidebarProps){
+export default function Sidebar({ activeView, onSelectView, userView, canManageOrganization, canViewRoles }: SidebarProps){
   const [collapsed, setCollapsed] = React.useState(() => (
     window.localStorage.getItem('atlas-sidebar-collapsed') === 'true'
   ))
@@ -98,15 +99,15 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
           <span className="nav-icon" aria-hidden="true">⌂</span>
           <span className="nav-label">Facilities</span>
         </button>
-        <button
+        {canViewRoles && <button
           type="button"
-          className={activeView === 'physicians' ? 'active' : ''}
-          onClick={() => onSelectView('physicians')}
-          title="Users"
+          className={activeView === 'roles' ? 'active' : ''}
+          onClick={() => onSelectView('roles')}
+          title="Roles"
         >
-          <span className="nav-icon" aria-hidden="true">●</span>
-          <span className="nav-label">Users</span>
-        </button>
+          <span className="nav-icon" aria-hidden="true">◆</span>
+          <span className="nav-label">Roles</span>
+        </button>}
         {canManageOrganization && (
           <button
             type="button"
@@ -120,6 +121,15 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
         )}
           </>
         )}
+        <button
+          type="button"
+          className={activeView === 'physicians' ? 'active' : ''}
+          onClick={() => onSelectView('physicians')}
+          title="Users"
+        >
+          <span className="nav-icon" aria-hidden="true">●</span>
+          <span className="nav-label">Users</span>
+        </button>
       </nav>
     </aside>
   )

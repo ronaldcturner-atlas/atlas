@@ -1107,8 +1107,8 @@ class ContractSerializer(serializers.ModelSerializer):
         if DomainMembership.objects.filter(domain=contract.domain).exists():
             working_user_ids = DomainMembership.objects.filter(
                 domain=contract.domain,
-            ).exclude(
-                role=DomainMembership.Role.VIEW_ONLY,
+                active=True,
+                clinically_active=True,
             ).values_list('user_id', flat=True)
             eligible_physician_ids = set(
                 Physician.objects.filter(

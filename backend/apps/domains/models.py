@@ -114,6 +114,8 @@ class OrganizationMembership(models.Model):
 		on_delete=models.CASCADE,
 		related_name='organization_memberships',
 	)
+	is_org_admin = models.BooleanField(default=False)
+	active = models.BooleanField(default=True)
 	created_at = models.DateTimeField(auto_now_add=True)
 	updated_at = models.DateTimeField(auto_now=True)
 
@@ -136,6 +138,8 @@ class DomainMembership(models.Model):
 		APP = 'app', 'APP'
 		SCHEDULER = 'scheduler', 'Scheduler'
 		VIEW_ONLY = 'view_only', 'View Only'
+		REGIONAL_ADMIN = 'regional_admin', 'Regional Admin'
+		DOMAIN_ADMIN = 'domain_admin', 'Domain Admin'
 
 	domain = models.ForeignKey(
 		Domain,
@@ -148,6 +152,15 @@ class DomainMembership(models.Model):
 		related_name='domain_memberships',
 	)
 	role = models.CharField(max_length=30, choices=Role.choices)
+	role_template = models.ForeignKey(
+		'RoleTemplate',
+		on_delete=models.PROTECT,
+		related_name='memberships',
+		null=True,
+		blank=True,
+	)
+	clinically_active = models.BooleanField(default=True)
+	active = models.BooleanField(default=True)
 	created_at = models.DateTimeField(auto_now_add=True)
 	updated_at = models.DateTimeField(auto_now=True)
 
@@ -159,3 +172,77 @@ class DomainMembership(models.Model):
 				name='unique_user_membership_per_domain',
 			),
 		]
+
+
+class RoleTemplate(models.Model):
+	"""Region-scoped, domain-assignable role definition."""
+
+	region = models.ForeignKey(
+		Region,
+		on_delete=models.CASCADE,
+		related_name='role_templates',
+	)
+	name = models.CharField(max_length=100)
+	system_key = models.SlugField(max_length=80, blank=True)
+	permissions = models.JSONField(default=list)
+	notification_defaults = models.JSONField(default=dict, blank=True)
+	active = models.BooleanField(default=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+	last_unassigned_at = models.DateTimeField(null=True, blank=True)
+
+	def __str__(self):
+		return f'{self.region.name}: {self.name}'
+
+	class Meta:
+		ordering = ['region__name', 'name', 'id']
+		constraints = [
+			models.UniqueConstraint(
+				fields=['region', 'name'],
+				name='unique_role_template_name_per_region',
+			),
+		]
+
+
+class AuditEvent(models.Model):
+	"""Immutable authorization and administrative audit entry."""
+
+	organization = models.ForeignKey(
+		Organization,
+		on_delete=models.PROTECT,
+		related_name='audit_events',
+	)
+	region = models.ForeignKey(
+		Region,
+		on_delete=models.PROTECT,
+		related_name='audit_events',
+		null=True,
+		blank=True,
+	)
+	domain = models.ForeignKey(
+		Domain,
+		on_delete=models.PROTECT,
+		related_name='audit_events',
+		null=True,
+		blank=True,
+	)
+	actor = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.SET_NULL,
+		related_name='atlas_audit_events',
+		null=True,
+		blank=True,
+	)
+	target_user = models.ForeignKey(
+		settings.AUTH_USER_MODEL,
+		on_delete=models.SET_NULL,
+		related_name='atlas_target_audit_events',
+		null=True,
+		blank=True,
+	)
+	action = models.CharField(max_length=120)
+	details = models.JSONField(default=dict, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		ordering = ['-created_at', '-id']

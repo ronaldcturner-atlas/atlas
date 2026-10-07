@@ -25,6 +25,7 @@ from rest_framework.response import Response
 
 from apps.accounts.models import Physician
 from apps.domains.models import Domain, DomainMembership
+from apps.domains.permissions import has_permission, permitted_domain_ids
 from apps.facilities.models import Facility
 
 from .models import (
@@ -197,23 +198,15 @@ def shifts_list_create(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-def _accessible_published_schedule_domains(user):
+def _accessible_published_schedule_domains(user, permission='view_published_schedules'):
     domains = Domain.objects.filter(active=True, region__active=True)
     if user.is_superuser:
         return domains
-    membership_domain_ids = DomainMembership.objects.filter(
-        user=user,
-        domain__active=True,
-        domain__region__active=True,
-    ).values_list('domain_id', flat=True)
-    if membership_domain_ids.exists():
-        return domains.filter(id__in=membership_domain_ids)
-    # Compatibility for accounts created before Domain memberships existed.
-    return domains
+    return domains.filter(id__in=permitted_domain_ids(user, permission))
 
 
-def _requested_published_schedule_domains(request):
-    accessible_domains = _accessible_published_schedule_domains(request.user)
+def _requested_published_schedule_domains(request, permission='view_published_schedules'):
+    accessible_domains = _accessible_published_schedule_domains(request.user, permission)
     raw_domain_ids = request.query_params.get('domains') or request.query_params.get('domain')
     if not raw_domain_ids:
         return accessible_domains, None
@@ -256,7 +249,12 @@ def _published_schedule_authority(domain_ids=None):
 @permission_classes([IsAuthenticated])
 def published_schedule(request):
     """Return the assignments from the current published schedule of record."""
-    domains, domain_error = _requested_published_schedule_domains(request)
+    permission = (
+        'view_domain_statistics'
+        if request.query_params.get('purpose') == 'stats'
+        else 'view_published_schedules'
+    )
+    domains, domain_error = _requested_published_schedule_domains(request, permission)
     if domain_error:
         return domain_error
     domain_ids = list(domains.values_list('id', flat=True))
@@ -1859,7 +1857,13 @@ def shift_detail(request, shift_id):
 @permission_classes([IsAuthenticated])
 def shift_templates_list_create(request):
     if request.method == 'GET':
-        templates = _ordered_shift_templates()
+        allowed_domain_ids = permitted_domain_ids(request.user, 'manage_shift_templates')
+        if not allowed_domain_ids:
+            return Response(
+                {'detail': 'Shift template management permission is required.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        templates = _ordered_shift_templates().filter(domain_id__in=allowed_domain_ids)
 
         facility_id = request.query_params.get('facility')
         domain_id = request.query_params.get('domain')
@@ -1888,6 +1892,12 @@ def shift_templates_list_create(request):
 
     serializer = ShiftTemplateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+    domain = serializer.validated_data['domain']
+    if not has_permission(request.user, 'manage_shift_templates', domain=domain):
+        return Response(
+            {'detail': 'Shift template management permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     serializer.save()
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -1897,9 +1907,15 @@ def shift_templates_list_create(request):
 @permission_classes([IsAuthenticated])
 def shift_template_detail(request, template_id):
     template = get_object_or_404(
-        ShiftTemplate.objects.select_related('facility'),
+        ShiftTemplate.objects.select_related('facility', 'domain__region'),
         id=template_id,
     )
+
+    if not has_permission(request.user, 'manage_shift_templates', domain=template.domain):
+        return Response(
+            {'detail': 'Shift template management permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if request.method == 'GET':
         serializer = ShiftTemplateSerializer(template)
@@ -1908,6 +1924,12 @@ def shift_template_detail(request, template_id):
     partial = request.method == 'PATCH'
     serializer = ShiftTemplateSerializer(template, data=request.data, partial=partial)
     serializer.is_valid(raise_exception=True)
+    target_domain = serializer.validated_data.get('domain', template.domain)
+    if not has_permission(request.user, 'manage_shift_templates', domain=target_domain):
+        return Response(
+            {'detail': 'Shift templates cannot be moved to a Domain you do not manage.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     serializer.save()
     return Response(serializer.data)
 
@@ -1917,6 +1939,7 @@ def _stats_group_payload(group):
         'id': group.id,
         'name': group.name,
         'shift_template_ids': list(group.shift_templates.order_by('facility__sort_order', 'start_time', 'id').values_list('id', flat=True)),
+        'domain_ids': list(group.shift_templates.order_by().values_list('domain_id', flat=True).distinct()),
     }
 
 
@@ -1951,7 +1974,10 @@ def _validate_stats_group_data(data, instance=None):
 @permission_classes([IsAuthenticated])
 def stats_groups_list_create(request):
     if request.method == 'GET':
-        groups = ShiftStatsGroup.objects.prefetch_related('shift_templates')
+        allowed_domain_ids = permitted_domain_ids(request.user, 'view_domain_statistics')
+        groups = ShiftStatsGroup.objects.filter(
+            shift_templates__domain_id__in=allowed_domain_ids,
+        ).prefetch_related('shift_templates').distinct()
         return Response([_stats_group_payload(group) for group in groups])
     if not _can_manage_build_workspace(request.user):
         return _build_workspace_forbidden_response()
@@ -1994,7 +2020,17 @@ def _has_published_overlap(domain, start_date, end_date, exclude_id=None):
     return published_blocks.filter(start_date__lte=end_date, end_date__gte=start_date).exists()
 
 
-def _can_manage_requests(user):
+def _can_manage_requests(user, domain=None):
+    if getattr(user, '_atlas_test_access_active', False):
+        return (
+            has_permission(user, 'administer_requests', domain=domain)
+            if domain is not None
+            else bool(permitted_domain_ids(user, 'administer_requests'))
+        )
+    if domain is not None and has_permission(user, 'administer_requests', domain=domain):
+        return True
+    if domain is None and permitted_domain_ids(user, 'administer_requests'):
+        return True
     if user.is_staff or user.is_superuser:
         return True
 
@@ -2008,7 +2044,10 @@ def _can_manage_requests(user):
 
 def _request_blocks_for_regular_user(user):
     """Return the relevant published and upcoming block for each accessible Domain."""
-    domain_ids = list(user.domain_memberships.values_list('domain_id', flat=True))
+    if getattr(user, '_atlas_test_access_active', False):
+        domain_ids = [user._atlas_test_domain.id]
+    else:
+        domain_ids = list(user.domain_memberships.values_list('domain_id', flat=True))
     domains = Domain.objects.filter(id__in=domain_ids) if domain_ids else Domain.objects.all()
     block_ids = []
     for domain_id in domains.values_list('id', flat=True):
@@ -2037,7 +2076,17 @@ def _request_window_is_open(block):
     return block.request_open_datetime <= now <= block.request_close_datetime
 
 
-def _can_manage_build_workspace(user):
+def _can_manage_build_workspace(user, domain=None):
+    if getattr(user, '_atlas_test_access_active', False):
+        return (
+            has_permission(user, 'manage_build_workspace', domain=domain)
+            if domain is not None
+            else bool(permitted_domain_ids(user, 'manage_build_workspace'))
+        )
+    if domain is not None and has_permission(user, 'manage_build_workspace', domain=domain):
+        return True
+    if domain is None and permitted_domain_ids(user, 'manage_build_workspace'):
+        return True
     if user.is_staff or user.is_superuser:
         return True
 
@@ -2080,8 +2129,8 @@ def _working_request_physicians(block):
     if _domain_has_memberships(block.domain):
         working_user_ids = DomainMembership.objects.filter(
             domain=block.domain,
-        ).exclude(
-            role=DomainMembership.Role.VIEW_ONLY,
+            active=True,
+            clinically_active=True,
         ).values_list('user_id', flat=True)
         physicians = physicians.filter(
             user_id__in=working_user_ids,
@@ -2372,7 +2421,7 @@ def schedule_block_requests_list(request, block_id):
         .prefetch_related('shift_templates__facility')
     )
 
-    if not _can_manage_requests(request.user):
+    if not _can_manage_requests(request.user, block.domain):
         physician = _resolve_self_physician(request.user)
         if physician is None:
             requests = ScheduleRequest.objects.none()
@@ -2390,7 +2439,7 @@ def schedule_block_requests_list(request, block_id):
 @permission_classes([IsAuthenticated])
 def schedule_block_requests_context(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
-    can_manage = _can_manage_requests(request.user)
+    can_manage = _can_manage_requests(request.user, block.domain)
 
     if can_manage:
         physicians = list(_working_request_physicians(block))
@@ -2489,8 +2538,13 @@ def schedule_block_request_upsert(request, block_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    can_manage = _can_manage_requests(request.user)
+    can_manage = _can_manage_requests(request.user, block.domain)
     self_physician = _resolve_self_physician(request.user)
+    if not can_manage and not has_permission(request.user, 'submit_own_requests', domain=block.domain):
+        return Response(
+            {'detail': 'Request submission permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     if not can_manage and not _request_window_is_open(block):
         return Response(
             {'detail': 'The request window for this Schedule Block is not open.'},
@@ -2652,7 +2706,7 @@ def schedule_block_request_detail(request, block_id, request_id):
         date__lte=block.end_date,
     )
 
-    can_manage = _can_manage_requests(request.user)
+    can_manage = _can_manage_requests(request.user, block.domain)
     self_physician = _resolve_self_physician(request.user)
     if not can_manage and (
         self_physician is None
@@ -2663,6 +2717,12 @@ def schedule_block_request_detail(request, block_id, request_id):
 
     if request.method == 'GET':
         return Response(ScheduleRequestSerializer(schedule_request).data)
+
+    if not can_manage and not has_permission(request.user, 'submit_own_requests', domain=block.domain):
+        return Response(
+            {'detail': 'Request submission permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if not can_manage and not _request_window_is_open(block):
         return Response(
@@ -2685,7 +2745,7 @@ def schedule_block_request_detail(request, block_id, request_id):
 @permission_classes([IsAuthenticated])
 def schedule_block_clear_requests(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
-    if not _can_manage_requests(request.user):
+    if not _can_manage_requests(request.user, block.domain):
         return Response(
             {'detail': 'Only admin/scheduler users can clear Schedule Block requests.'},
             status=status.HTTP_403_FORBIDDEN,
@@ -2725,7 +2785,7 @@ def schedule_block_bulk_requests(request, block_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    if not _can_manage_requests(request.user):
+    if not _can_manage_requests(request.user, block.domain):
         return Response({'detail': 'Only admin/scheduler users can create bulk requests.'}, status=status.HTTP_403_FORBIDDEN)
 
     request_scope = str(request.data.get('request_scope') or ScheduleRequest.RequestScope.USER).upper()
@@ -3076,7 +3136,7 @@ def schedule_block_build_context(request, block_id):
         ScheduleBlock.objects.select_related('domain__region', 'preview_optimizer_run'),
         id=block_id,
     )
-    can_manage = _can_manage_build_workspace(request.user)
+    can_manage = _can_manage_build_workspace(request.user, block.domain)
     if not can_manage and block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
         return _build_workspace_forbidden_response()
     versions = _schedule_version_queryset(block)

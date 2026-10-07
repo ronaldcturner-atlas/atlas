@@ -7,7 +7,8 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain
+from apps.domains.models import Domain, DomainMembership, OrganizationMembership, RoleTemplate
+from apps.domains.permissions import CLINICAL_DEFAULTS, SCHEDULER_DEFAULTS
 from apps.facilities.models import Facility
 from .models import (
     Contract, ContractUserAssignment, OptimizerRun, ScheduleBlock,
@@ -29,18 +30,54 @@ class ShiftTradeApiTests(TestCase):
         self.requester = Physician.objects.create(user=self.requester_user, display_name='Requester')
         self.facility = Facility.objects.create(name='Hospital', short_name='H')
         self.domain = Domain.objects.create(name='Physician', active=True)
+        OrganizationMembership.objects.create(
+            organization=self.domain.region.organization,
+            user=self.scheduler_user,
+        )
+        scheduler_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Test Scheduler',
+            system_key='scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        clinical_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Test Staff Physician',
+            system_key='staff_physician',
+            permissions=sorted(CLINICAL_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=self.scheduler_user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=scheduler_role,
+            clinically_active=False,
+        )
+        for clinical_user in (self.owner_user, self.requester_user):
+            OrganizationMembership.objects.create(
+                organization=self.domain.region.organization,
+                user=clinical_user,
+            )
+            DomainMembership.objects.create(
+                domain=self.domain,
+                user=clinical_user,
+                role=DomainMembership.Role.STAFF_PHYSICIAN,
+                role_template=clinical_role,
+                clinically_active=True,
+            )
         contract = Contract.objects.create(name='Test', domain=self.domain, active=True)
         contract.facilities.add(self.facility)
         ContractUserAssignment.objects.create(contract=contract, physician=self.owner)
         ContractUserAssignment.objects.create(contract=contract, physician=self.requester)
         self.block = ScheduleBlock.objects.create(
+            domain=self.domain,
             start_date=date(2026, 9, 1), end_date=date(2026, 9, 30),
             request_open_datetime=timezone.now(), request_close_datetime=timezone.now(),
             build_status=ScheduleBlock.BuildStatus.ARCHIVE, published_at=timezone.now(),
         )
         self.version = ScheduleVersion.objects.create(schedule_block=self.block, domain=self.domain, version_number=1, name='Published')
         self.template = ShiftTemplate.objects.create(
-            facility=self.facility, name='Day', start_time=time(7), end_time=time(16),
+            domain=self.domain, facility=self.facility, name='Day', start_time=time(7), end_time=time(16),
             active_days_of_week=['Tuesday'], weekend_days=[], default_staffing_count=1,
         )
         self.run = OptimizerRun.objects.create(schedule_version=self.version, run_number=1, status=OptimizerRun.Status.COMPLETED, is_active=True)

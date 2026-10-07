@@ -10,6 +10,8 @@ from rest_framework.response import Response
 
 from .models import Facility
 from .serializers import FacilitySerializer
+from apps.domains.models import Region
+from apps.domains.permissions import has_permission, is_org_admin
 
 
 class CsrfExemptSessionAuthentication(SessionAuthentication):
@@ -23,6 +25,11 @@ class CsrfExemptSessionAuthentication(SessionAuthentication):
 def facilities_list_create(request):
 	if request.method == 'GET':
 		facilities = Facility.objects.select_related('region__organization').all()
+		if getattr(request.user, '_atlas_test_access_active', False):
+			facilities = facilities.filter(region_id=request.user._atlas_test_domain.region_id)
+		if not request.user.is_superuser:
+			organization_ids = request.user.organization_memberships.filter(active=True).values_list('organization_id', flat=True)
+			facilities = facilities.filter(region__organization_id__in=organization_ids)
 		region_id = request.query_params.get('region')
 		organization_id = request.query_params.get('organization')
 		if region_id:
@@ -40,6 +47,11 @@ def facilities_list_create(request):
 	serializer = FacilitySerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
 	region = serializer.validated_data['region']
+	if not (
+		is_org_admin(request.user, region.organization)
+		or has_permission(request.user, 'manage_regional_facilities', region=region)
+	):
+		return Response({'detail': 'Regional facility management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	next_sort_order = (Facility.objects.filter(region=region).aggregate(max_order=Max('sort_order'))['max_order'] or 0) + 1
 	serializer.save(sort_order=next_sort_order)
 	return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -62,6 +74,12 @@ def facilities_reorder(request):
 		if len(region_ids) != 1:
 			return Response({'region': ['Select the Region being reordered.']}, status=status.HTTP_400_BAD_REQUEST)
 		region_id = region_ids[0]
+	region = get_object_or_404(Region.objects.select_related('organization'), id=region_id)
+	if not (
+		is_org_admin(request.user, region.organization)
+		or has_permission(request.user, 'manage_regional_facilities', region=region)
+	):
+		return Response({'detail': 'Regional facility management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	existing_ids = list(Facility.objects.filter(region_id=region_id).values_list('id', flat=True))
 	if len(facility_ids) != len(set(facility_ids)) or set(facility_ids) != set(existing_ids):
 		return Response(
@@ -80,7 +98,12 @@ def facilities_reorder(request):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facility_detail(request, facility_id):
-	facility = get_object_or_404(Facility, id=facility_id)
+	facility = get_object_or_404(Facility.objects.select_related('region__organization'), id=facility_id)
+	if request.method != 'GET' and not (
+		is_org_admin(request.user, facility.region.organization)
+		or has_permission(request.user, 'manage_regional_facilities', region=facility.region)
+	):
+		return Response({'detail': 'Regional facility management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'DELETE':
 		try:
 			facility.delete()
@@ -106,7 +129,12 @@ def facility_detail(request, facility_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facility_disable(request, facility_id):
-	facility = get_object_or_404(Facility, id=facility_id)
+	facility = get_object_or_404(Facility.objects.select_related('region__organization'), id=facility_id)
+	if not (
+		is_org_admin(request.user, facility.region.organization)
+		or has_permission(request.user, 'manage_regional_facilities', region=facility.region)
+	):
+		return Response({'detail': 'Regional facility management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	facility.active = False
 	facility.save(update_fields=['active'])
 	serializer = FacilitySerializer(facility)

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { readSessionNumber, readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 
 type Physician = {
   id: number
@@ -22,11 +23,17 @@ type Physician = {
     region_id: number
     region_name: string
     role: string
+    role_template_id: number | null
+    role_name: string
+    clinically_active: boolean
+    active: boolean
   }>
   organization_memberships: Array<{
     id: number
     organization_id: number
     organization_name: string
+    is_org_admin: boolean
+    active: boolean
   }>
   role: string
   primary_facility: number | null
@@ -58,6 +65,14 @@ type OrganizationOption = {
   active: boolean
 }
 
+type RoleTemplateOption = {
+  id: number
+  region: number
+  name: string
+  system_key: string
+  active: boolean
+}
+
 type PhysicianFormState = {
   first_name: string
   last_name: string
@@ -72,16 +87,6 @@ type PhysicianFormState = {
 }
 
 const API_BASE = 'http://localhost:8000/api'
-const DOMAIN_ROLE_OPTIONS = [
-  ['org_admin', 'Org Admin'],
-  ['medical_director', 'Medical Director'],
-  ['admin', 'Admin'],
-  ['staff_physician', 'Staff Physician'],
-  ['app', 'APP'],
-  ['scheduler', 'Scheduler'],
-  ['view_only', 'View Only'],
-] as const
-
 const defaultFormState: PhysicianFormState = {
   first_name: '',
   last_name: '',
@@ -141,9 +146,13 @@ export default function PhysiciansView() {
   const [facilities, setFacilities] = useState<FacilityOption[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
   const [organizations, setOrganizations] = useState<OrganizationOption[]>([])
-  const [selectedOrganizationId, setSelectedOrganizationId] = useState<number | null>(null)
-  const [selectedRegionId, setSelectedRegionId] = useState<number | null>(null)
-  const [selectedDomainId, setSelectedDomainId] = useState<number | 'all'>('all')
+  const [roleTemplates, setRoleTemplates] = useState<RoleTemplateOption[]>([])
+  const [selectedOrganizationId, setSelectedOrganizationId] = useState<number | null>(() => readSessionNumber('atlas.users.organization'))
+  const [selectedRegionId, setSelectedRegionId] = useState<number | null>(() => readSessionNumber('atlas.users.region'))
+  const [selectedDomainId, setSelectedDomainId] = useState<number | 'all'>(() => {
+    const saved = readSessionString('atlas.users.domain', 'all')
+    return saved === 'all' ? 'all' : Number(saved)
+  })
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -151,7 +160,8 @@ export default function PhysiciansView() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingPhysicianId, setEditingPhysicianId] = useState<number | null>(null)
   const [formState, setFormState] = useState<PhysicianFormState>(defaultFormState)
-  const [domainRoles, setDomainRoles] = useState<Record<number, string>>({})
+  const [domainRoleTemplateIds, setDomainRoleTemplateIds] = useState<Record<number, string>>({})
+  const [domainClinicalStatus, setDomainClinicalStatus] = useState<Record<number, boolean>>({})
   const selectedOrganizationDomains = domains.filter(
     (domain) => domain.organization === selectedOrganizationId,
   )
@@ -219,11 +229,18 @@ export default function PhysiciansView() {
         throw new Error(await getApiErrorMessage(failedDomainResponse) ?? 'Unable to load domains')
       }
       const domainsData = (await Promise.all(domainResponses.map((response) => response.json()))).flat()
+      const regionIds = Array.from(new Set((domainsData as DomainOption[]).map((domain) => domain.region)))
+      const roleResponses = await Promise.all(regionIds.map((regionId) => (
+        fetch(`${API_BASE}/regions/${regionId}/roles/`, { credentials: 'include' })
+      )))
+      const readableRoleResponses = roleResponses.filter((response) => response.ok)
+      const roleData = (await Promise.all(readableRoleResponses.map((response) => response.json()))).flat()
 
       setPhysicians(physiciansData)
       setFacilities(facilitiesData)
       setOrganizations(organizationsData)
       setDomains(domainsData)
+      setRoleTemplates(roleData)
       setSelectedOrganizationId((current) => (
         organizationsData.some((organization) => organization.id === current)
           ? current
@@ -242,24 +259,30 @@ export default function PhysiciansView() {
   }, [])
 
   useEffect(() => {
+    if (!domains.length || selectedOrganizationId === null) return
     const availableRegions = Array.from(new Set(
       domains.filter((domain) => domain.organization === selectedOrganizationId).map((domain) => domain.region),
     ))
     setSelectedRegionId((current) => availableRegions.includes(current ?? -1) ? current : availableRegions[0] ?? null)
-    setSelectedDomainId('all')
   }, [domains, selectedOrganizationId])
 
   useEffect(() => {
+    if (!domains.length) return
     if (selectedDomainId === 'all') return
     if (!selectedRegionDomains.some((domain) => domain.id === selectedDomainId)) {
       setSelectedDomainId('all')
     }
-  }, [selectedRegionId, selectedDomainId, selectedRegionDomains])
+  }, [domains.length, selectedRegionId, selectedDomainId, selectedRegionDomains])
+
+  useEffect(() => writeSessionSelection('atlas.users.organization', selectedOrganizationId), [selectedOrganizationId])
+  useEffect(() => writeSessionSelection('atlas.users.region', selectedRegionId), [selectedRegionId])
+  useEffect(() => writeSessionSelection('atlas.users.domain', selectedDomainId), [selectedDomainId])
 
   const openCreateModal = () => {
     setEditingPhysicianId(null)
     setFormState(defaultFormState)
-    setDomainRoles({})
+    setDomainRoleTemplateIds({})
+    setDomainClinicalStatus({})
     setIsModalOpen(true)
   }
 
@@ -277,8 +300,11 @@ export default function PhysiciansView() {
       fte: physician.fte,
       active: physician.active,
     })
-    setDomainRoles(Object.fromEntries(
-      physician.domain_memberships.map((membership) => [membership.domain_id, membership.role]),
+    setDomainRoleTemplateIds(Object.fromEntries(
+      physician.domain_memberships.map((membership) => [membership.domain_id, membership.role_template_id ? String(membership.role_template_id) : '']),
+    ))
+    setDomainClinicalStatus(Object.fromEntries(
+      physician.domain_memberships.map((membership) => [membership.domain_id, membership.clinically_active]),
     ))
     setIsModalOpen(true)
   }
@@ -287,7 +313,8 @@ export default function PhysiciansView() {
     setIsModalOpen(false)
     setEditingPhysicianId(null)
     setFormState(defaultFormState)
-    setDomainRoles({})
+    setDomainRoleTemplateIds({})
+    setDomainClinicalStatus({})
   }
 
   const savePhysician = async () => {
@@ -333,7 +360,7 @@ export default function PhysiciansView() {
 
       const savedUser: Physician = await response.json()
       const requiredOrganizationIds = new Set(
-        domains.filter((domain) => Boolean(domainRoles[domain.id])).map((domain) => domain.organization),
+        domains.filter((domain) => Boolean(domainRoleTemplateIds[domain.id])).map((domain) => domain.organization),
       )
       for (const organizationId of requiredOrganizationIds) {
         const organizationMembership = savedUser.organization_memberships.find(
@@ -352,22 +379,26 @@ export default function PhysiciansView() {
         savedUser.domain_memberships.map((membership) => [membership.domain_id, membership]),
       )
       for (const domain of domains) {
-        const nextRole = domainRoles[domain.id] ?? ''
+        const nextRoleTemplateId = domainRoleTemplateIds[domain.id] ?? ''
+        const nextClinicallyActive = domainClinicalStatus[domain.id] ?? false
         const membership = existingMemberships.get(domain.id)
         let membershipResponse: Response | null = null
-        if (membership && !nextRole) {
+        if (membership && !nextRoleTemplateId) {
           membershipResponse = await fetch(`${API_BASE}/domain-memberships/${membership.id}/`, {
             method: 'DELETE', credentials: 'include',
           })
-        } else if (membership && nextRole !== membership.role) {
+        } else if (membership && (
+          Number(nextRoleTemplateId) !== membership.role_template_id
+          || nextClinicallyActive !== membership.clinically_active
+        )) {
           membershipResponse = await fetch(`${API_BASE}/domain-memberships/${membership.id}/`, {
             method: 'PATCH', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ role: nextRole }),
+            body: JSON.stringify({ role_template: Number(nextRoleTemplateId), clinically_active: nextClinicallyActive }),
           })
-        } else if (!membership && nextRole) {
+        } else if (!membership && nextRoleTemplateId) {
           membershipResponse = await fetch(`${API_BASE}/domains/${domain.id}/memberships/`, {
             method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user: savedUser.user_id, role: nextRole }),
+            body: JSON.stringify({ user: savedUser.user_id, role_template: Number(nextRoleTemplateId), clinically_active: nextClinicallyActive }),
           })
         }
         if (membershipResponse && !membershipResponse.ok) {
@@ -417,7 +448,11 @@ export default function PhysiciansView() {
               <span>Organization</span>
               <select
                 value={selectedOrganizationId ?? ''}
-                onChange={(event) => setSelectedOrganizationId(Number(event.target.value))}
+                onChange={(event) => {
+                  setSelectedOrganizationId(Number(event.target.value))
+                  setSelectedRegionId(null)
+                  setSelectedDomainId('all')
+                }}
               >
                 {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
               </select>
@@ -469,7 +504,12 @@ export default function PhysiciansView() {
         <div className="shift-modal-overlay" onClick={closeModal}>
           <div className="shift-modal physician-profile-modal" onClick={(event) => event.stopPropagation()}>
             <div className="shift-modal-header">
-              <h2>{editingPhysicianId ? 'User Profile' : 'Add New User'}</h2>
+              <h2>
+                {editingPhysicianId ? 'User Profile' : 'Add New User'}
+                {editingUser?.organization_memberships.some((membership) => membership.active && membership.is_org_admin) && (
+                  <small className="org-admin-badge">Org Admin</small>
+                )}
+              </h2>
             </div>
             <div className="shift-modal-body user-profile-form">
               <label className="facility-field">
@@ -599,10 +639,26 @@ export default function PhysiciansView() {
                         const currentContract = editingUser?.current_contracts.find((contract) => contract.domain_id === domain.id)
                         return <div className="user-domain-access-row" key={domain.id}>
                           <span>{domain.name}{domain.active ? '' : ' (Inactive)'}</span>
-                          <select value={domainRoles[domain.id] ?? ''} onChange={(event) => setDomainRoles((current) => ({ ...current, [domain.id]: event.target.value }))}>
+                          <select value={domainRoleTemplateIds[domain.id] ?? ''} onChange={(event) => {
+                            const nextRoleId = event.target.value
+                            const selectedRole = roleTemplates.find((role) => role.id === Number(nextRoleId))
+                            setDomainRoleTemplateIds((current) => ({ ...current, [domain.id]: nextRoleId }))
+                            if (!nextRoleId || selectedRole?.system_key === 'view_only') {
+                              setDomainClinicalStatus((current) => ({ ...current, [domain.id]: false }))
+                            }
+                          }}>
                             <option value="">No access</option>
-                            {DOMAIN_ROLE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                            {roleTemplates.filter((role) => role.region === domain.region && role.active).map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
                           </select>
+                          <label className="user-domain-clinical-toggle" title="Eligible to work shifts in this Domain">
+                            <input
+                              type="checkbox"
+                              checked={domainClinicalStatus[domain.id] ?? false}
+                              disabled={!domainRoleTemplateIds[domain.id] || roleTemplates.find((role) => role.id === Number(domainRoleTemplateIds[domain.id]))?.system_key === 'view_only'}
+                              onChange={(event) => setDomainClinicalStatus((current) => ({ ...current, [domain.id]: event.target.checked }))}
+                            />
+                            <span>Clinically active</span>
+                          </label>
                           <span className="user-domain-contract">{currentContract?.name ?? 'No contract'}</span>
                         </div>
                       })}

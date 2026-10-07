@@ -12,9 +12,11 @@ import FacilitiesView from './FacilitiesView'
 import PhysiciansView from './PhysiciansView'
 import StatsView from './StatsView'
 import OrganizationView from './OrganizationView'
+import RolesView from './RolesView'
+import UserDirectoryView from './UserDirectoryView'
 import { useAuth } from '../contexts/AuthContext'
 
-type AppView = 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'organization'
+type AppView = 'my-schedule' | 'stats' | 'shift-builder' | 'schedule-blocks' | 'contracts' | 'facilities' | 'physicians' | 'roles' | 'organization'
 
 const VIEW_PATHS: Record<AppView, string> = {
   'my-schedule': '/',
@@ -24,6 +26,7 @@ const VIEW_PATHS: Record<AppView, string> = {
   contracts: '/contracts',
   facilities: '/facilities',
   physicians: '/physicians',
+  roles: '/roles',
   organization: '/organization',
 }
 
@@ -54,6 +57,9 @@ function viewFromPath(pathname: string): AppView | null {
   if (pathname === '/physicians') {
     return 'physicians'
   }
+  if (pathname === '/roles') {
+    return 'roles'
+  }
   if (pathname === '/organization') {
     return 'organization'
   }
@@ -73,11 +79,7 @@ export default function Dashboard() {
   const violationVersionId = violationReportMatch ? Number(violationReportMatch[1]) : null
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
   const [shiftsRefreshToken, setShiftsRefreshToken] = React.useState(0)
-  const canManageSchedules = Boolean(
-    user?.is_staff
-    || user?.is_superuser
-    || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())),
-  )
+  const canManageSchedules = Boolean(user?.can_manage_schedules)
   const [userView, setUserView] = React.useState(() => {
     try {
       return window.localStorage.getItem('atlas-interface-view') === 'user'
@@ -117,6 +119,8 @@ export default function Dashboard() {
           ? 'Facilities'
         : activeView === 'physicians'
           ? 'Users'
+        : activeView === 'roles'
+          ? 'Roles'
           : 'Organization'
 
   React.useEffect(() => {
@@ -124,7 +128,7 @@ export default function Dashboard() {
       navigate('/', { replace: true })
       return
     }
-    const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'physicians', 'organization'].includes(activeView)
+    const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'roles', 'organization'].includes(activeView)
     if (effectiveUserView && (schedulerOnlyView || buildBlockId !== null || violationVersionId !== null)) {
       navigate('/', { replace: true })
     }
@@ -141,6 +145,7 @@ export default function Dashboard() {
         onSelectView={(view) => navigate(VIEW_PATHS[view])}
         userView={effectiveUserView}
         canManageOrganization={Boolean(user?.is_org_admin)}
+        canViewRoles={Boolean(user?.is_org_admin || user?.permissions.includes('view_roles'))}
       />
       <div className="main-area">
         <Topbar
@@ -176,7 +181,8 @@ export default function Dashboard() {
           {!effectiveUserView && activeView === 'facilities' && (
             <FacilitiesView onFacilitiesChanged={handleFacilitiesChanged} />
           )}
-          {!effectiveUserView && activeView === 'physicians' && <PhysiciansView />}
+          {activeView === 'physicians' && (effectiveUserView ? <UserDirectoryView /> : <PhysiciansView />)}
+          {!effectiveUserView && activeView === 'roles' && (user?.is_org_admin || user?.permissions.includes('view_roles')) && <RolesView />}
           {!effectiveUserView && activeView === 'organization' && user?.is_org_admin && <OrganizationView />}
         </main>
       </div>

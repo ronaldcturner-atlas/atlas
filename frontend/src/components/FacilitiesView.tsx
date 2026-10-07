@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 
 type Facility = {
   id: number
@@ -79,7 +80,7 @@ async function getApiErrorMessage(response: Response) {
 export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewProps) {
   const [facilities, setFacilities] = useState<Facility[]>([])
   const [regions, setRegions] = useState<RegionOption[]>([])
-  const [regionFilter, setRegionFilter] = useState('')
+  const [regionFilter, setRegionFilter] = useState(() => readSessionString('atlas.facilities.region'))
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [draggedFacilityId, setDraggedFacilityId] = useState<number | null>(null)
@@ -127,6 +128,8 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
   useEffect(() => {
     Promise.all([fetchFacilities(), fetchRegions()]).catch((loadError) => setError(loadError instanceof Error ? loadError.message : 'Unable to load facilities.'))
   }, [])
+
+  useEffect(() => writeSessionSelection('atlas.facilities.region', regionFilter), [regionFilter])
 
   const openCreateModal = () => {
     setEditingFacilityId(null)

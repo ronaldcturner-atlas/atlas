@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import SharedRulesView from './SharedRulesView'
+import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 
 type Domain = {
   id: number
@@ -582,8 +583,8 @@ export default function ContractsView() {
   const [saveNotice, setSaveNotice] = useState<string | null>(null)
 
   const [showInactive, setShowInactive] = useState(false)
-  const [regionFilter, setRegionFilter] = useState('')
-  const [domainFilter, setDomainFilter] = useState('')
+  const [regionFilter, setRegionFilter] = useState(() => readSessionString('atlas.contracts.region'))
+  const [domainFilter, setDomainFilter] = useState(() => readSessionString('atlas.contracts.domain'))
   const [copySource, setCopySource] = useState<ContractRecord | null>(null)
   const [copyRegionId, setCopyRegionId] = useState('')
   const [copyDomainId, setCopyDomainId] = useState('')
@@ -713,8 +714,11 @@ export default function ContractsView() {
   )
 
   useEffect(() => {
-    if (domainFilter && !domainsForRegion.some((domain) => String(domain.id) === domainFilter)) setDomainFilter('')
-  }, [domainFilter, domainsForRegion])
+    if (domains.length && domainFilter && !domainsForRegion.some((domain) => String(domain.id) === domainFilter)) setDomainFilter('')
+  }, [domainFilter, domains.length, domainsForRegion])
+
+  useEffect(() => writeSessionSelection('atlas.contracts.region', regionFilter), [regionFilter])
+  useEffect(() => writeSessionSelection('atlas.contracts.domain', domainFilter), [domainFilter])
 
   const visibleContracts = useMemo(
     () => [...contracts].sort((a, b) => a.name.localeCompare(b.name)),

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 
 const API_BASE = 'http://localhost:8000/api'
 
@@ -38,8 +39,8 @@ export default function SharedRulesView({ onShowContracts }: { onShowContracts: 
   const [domainRows, setDomainRows] = useState<Domain[]>([])
   const [templates, setTemplates] = useState<ShiftTemplate[]>([])
   const [view, setView] = useState<'active' | 'inactive'>('active')
-  const [regionFilter, setRegionFilter] = useState('')
-  const [domainFilter, setDomainFilter] = useState('')
+  const [regionFilter, setRegionFilter] = useState(() => readSessionString('atlas.contracts.region'))
+  const [domainFilter, setDomainFilter] = useState(() => readSessionString('atlas.contracts.domain'))
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -104,7 +105,9 @@ export default function SharedRulesView({ onShowContracts }: { onShowContracts: 
   }
   useEffect(() => { loadAll() }, [])
   useEffect(() => { if (!loading) loadRules(view, domainFilter, regionFilter).catch((loadError) => setError(loadError.message)) }, [view, domainFilter, regionFilter])
-  useEffect(() => { if (domainFilter && !domains.some(([id]) => String(id) === domainFilter)) setDomainFilter('') }, [domainFilter, domains])
+  useEffect(() => { if (domainRows.length && domainFilter && !domains.some(([id]) => String(id) === domainFilter)) setDomainFilter('') }, [domainFilter, domainRows.length, domains])
+  useEffect(() => writeSessionSelection('atlas.contracts.region', regionFilter), [regionFilter])
+  useEffect(() => writeSessionSelection('atlas.contracts.domain', domainFilter), [domainFilter])
 
   const toggleContract = (contract: Contract) => setForm((current) => {
     if (editingRule && contract.domain !== editingRule.domain) return current

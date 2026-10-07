@@ -1,4 +1,4 @@
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
@@ -6,13 +6,25 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Domain, DomainMembership, Organization, OrganizationMembership, Region
+from .models import (
+	AuditEvent,
+	Domain,
+	DomainMembership,
+	Organization,
+	OrganizationMembership,
+	Region,
+	RoleTemplate,
+)
+from .permissions import DEFAULT_ROLE_DEFINITIONS, has_permission, is_org_admin
 from .serializers import (
+	AuditEventSerializer,
 	DomainMembershipSerializer,
 	DomainSerializer,
 	OrganizationMembershipSerializer,
 	OrganizationSerializer,
 	RegionSerializer,
+	RoleTemplateSerializer,
+	permission_catalog_payload,
 )
 
 
@@ -53,11 +65,36 @@ def _can_access_organization(user, organization):
 
 
 def _is_org_admin(user, organization):
-	return user.is_superuser or DomainMembership.objects.filter(
-		domain__region__organization=organization,
-		user=user,
-		role=DomainMembership.Role.ORG_ADMIN,
-	).exists()
+	return is_org_admin(user, organization)
+
+
+def _record_audit(*, request, organization, action, region=None, domain=None, target_user=None, details=None):
+	AuditEvent.objects.create(
+		organization=organization,
+		region=region,
+		domain=domain,
+		actor=request.user,
+		target_user=target_user,
+		action=action,
+		details=details or {},
+	)
+
+
+def _ensure_region_roles(region):
+	roles = {}
+	for system_key, name, permissions in DEFAULT_ROLE_DEFINITIONS:
+		role, _ = RoleTemplate.objects.get_or_create(
+			region=region,
+			name=name,
+			defaults={
+				'system_key': system_key,
+				'permissions': sorted(permissions),
+				'notification_defaults': {},
+				'active': True,
+			},
+		)
+		roles[system_key] = role
+	return roles
 
 
 def _has_domain_contract_assignment(membership):
@@ -82,10 +119,13 @@ def _organization_from_request(request):
 	if not organization.memberships.exists():
 		OrganizationMembership.objects.create(organization=organization, user=request.user)
 		default_domain = Domain.objects.filter(region__organization=organization).order_by('id').first()
+		roles = _ensure_region_roles(default_domain.region)
+		OrganizationMembership.objects.filter(organization=organization, user=request.user).update(is_org_admin=True)
 		DomainMembership.objects.create(
 			domain=default_domain,
 			user=request.user,
-			role=DomainMembership.Role.ORG_ADMIN,
+			role=DomainMembership.Role.REGIONAL_ADMIN,
+			role_template=roles['regional_admin'],
 		)
 		return organization
 	return None
@@ -111,13 +151,15 @@ def organizations_list_create(request):
 	serializer = OrganizationSerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
 	organization = serializer.save()
-	OrganizationMembership.objects.create(organization=organization, user=request.user)
+	OrganizationMembership.objects.create(organization=organization, user=request.user, is_org_admin=True)
 	default_region = Region.objects.create(organization=organization, name=organization.name)
+	roles = _ensure_region_roles(default_region)
 	default_domain = Domain.objects.create(region=default_region, name='Physician')
 	DomainMembership.objects.create(
 		domain=default_domain,
 		user=request.user,
-		role=DomainMembership.Role.ORG_ADMIN,
+		role=DomainMembership.Role.REGIONAL_ADMIN,
+		role_template=roles['regional_admin'],
 	)
 	return Response(OrganizationSerializer(organization).data, status=status.HTTP_201_CREATED)
 
@@ -155,7 +197,9 @@ def regions_list_create(request, organization_id):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	serializer = RegionSerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
-	serializer.save(organization=organization)
+	region = serializer.save(organization=organization)
+	_ensure_region_roles(region)
+	_record_audit(request=request, organization=organization, region=region, action='region.created', details={'name': region.name})
 	return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -199,6 +243,8 @@ def domains_list_create(request):
 		domains = Domain.objects.filter(region__organization=organization).select_related('region__organization').annotate(
 			membership_count=Count('memberships'),
 		)
+		if getattr(request.user, '_atlas_test_access_active', False):
+			domains = domains.filter(id=request.user._atlas_test_domain.id)
 		if request.query_params.get('accessible') == 'true' and not request.user.is_superuser:
 			membership_domain_ids = DomainMembership.objects.filter(
 				user=request.user,
@@ -215,7 +261,12 @@ def domains_list_create(request):
 		return Response(serializer.data)
 
 	organization = _organization_from_request(request)
-	if organization is None or not _is_org_admin(request.user, organization):
+	region_id = request.data.get('region')
+	region = get_object_or_404(Region.objects.select_related('organization'), id=region_id) if region_id else None
+	if organization is None or region is None or not (
+		_is_org_admin(request.user, organization)
+		or has_permission(request.user, 'manage_domains', region=region)
+	):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	serializer = DomainSerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
@@ -238,7 +289,7 @@ def domain_detail(request, domain_id):
 		domain.membership_count = domain.memberships.count()
 		serializer = DomainSerializer(domain)
 		return Response(serializer.data)
-	if not _is_org_admin(request.user, domain.region.organization):
+	if not (_is_org_admin(request.user, domain.region.organization) or has_permission(request.user, 'manage_domains', region=domain.region)):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'DELETE':
 		if (
@@ -281,7 +332,10 @@ def domain_memberships(request, domain_id):
 	if request.method == 'GET':
 		memberships = domain.memberships.select_related('user', 'domain').all()
 		return Response(DomainMembershipSerializer(memberships, many=True).data)
-	if not _is_org_admin(request.user, domain.region.organization):
+	if not (
+		_is_org_admin(request.user, domain.region.organization)
+		or has_permission(request.user, 'manage_domain_access', domain=domain)
+	):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	user_id = request.data.get('user')
 	if not user_id:
@@ -292,7 +346,19 @@ def domain_memberships(request, domain_id):
 	)
 	serializer = DomainMembershipSerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
-	serializer.save(domain=domain)
+	membership = serializer.save(domain=domain)
+	_record_audit(
+		request=request,
+		organization=domain.region.organization,
+		region=domain.region,
+		domain=domain,
+		target_user=membership.user,
+		action='domain_membership.created',
+		details={
+			'role_template_id': membership.role_template_id,
+			'clinically_active': membership.clinically_active,
+		},
+	)
 	return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -304,30 +370,24 @@ def domain_membership_detail(request, membership_id):
 		DomainMembership.objects.select_related('domain__region__organization', 'user'),
 		id=membership_id,
 	)
-	if not _is_org_admin(request.user, membership.domain.region.organization):
+	if not (
+		_is_org_admin(request.user, membership.domain.region.organization)
+		or has_permission(request.user, 'manage_domain_access', domain=membership.domain)
+	):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
-	is_removing_org_admin = (
-		membership.role == DomainMembership.Role.ORG_ADMIN
-		and (
-			request.method == 'DELETE'
-			or request.data.get('role') not in {None, DomainMembership.Role.ORG_ADMIN}
-		)
-	)
-	if is_removing_org_admin and DomainMembership.objects.filter(
-		domain__region__organization=membership.domain.region.organization,
-		role=DomainMembership.Role.ORG_ADMIN,
-	).count() <= 1:
-		return Response(
-			{'detail': 'An organization must retain at least one Org Admin role in a domain.'},
-			status=status.HTTP_409_CONFLICT,
-		)
 	if request.method == 'DELETE':
 		if _has_domain_contract_assignment(membership):
 			return Response(
 				{'detail': 'Remove this user from their Contract in this domain before removing domain access.'},
 				status=status.HTTP_409_CONFLICT,
 			)
+		old_details = {'role_template_id': membership.role_template_id, 'clinically_active': membership.clinically_active}
 		membership.delete()
+		_record_audit(
+			request=request, organization=membership.domain.region.organization,
+			region=membership.domain.region, domain=membership.domain,
+			target_user=membership.user, action='domain_membership.removed', details=old_details,
+		)
 		return Response(status=status.HTTP_204_NO_CONTENT)
 	if request.data.get('role') == DomainMembership.Role.VIEW_ONLY and _has_domain_contract_assignment(membership):
 		return Response(
@@ -336,7 +396,25 @@ def domain_membership_detail(request, membership_id):
 		)
 	serializer = DomainMembershipSerializer(membership, data=request.data, partial=True)
 	serializer.is_valid(raise_exception=True)
-	serializer.save()
+	old_details = {
+		'role_template_id': membership.role_template_id,
+		'clinically_active': membership.clinically_active,
+		'active': membership.active,
+	}
+	updated_membership = serializer.save()
+	_record_audit(
+		request=request, organization=membership.domain.region.organization,
+		region=membership.domain.region, domain=membership.domain,
+		target_user=membership.user, action='domain_membership.updated',
+		details={
+			'old': old_details,
+			'new': {
+				'role_template_id': updated_membership.role_template_id,
+				'clinically_active': updated_membership.clinically_active,
+				'active': updated_membership.active,
+			},
+		},
+	)
 	return Response(serializer.data)
 
 
@@ -354,3 +432,150 @@ def organization_memberships(request, organization_id):
 		return Response(serializer.data, status=status.HTTP_201_CREATED)
 	memberships = organization.memberships.select_related('user').all()
 	return Response(OrganizationMembershipSerializer(memberships, many=True).data)
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def organization_admins(request, organization_id):
+	"""List and add protected organization-wide Org Admin assignments."""
+	organization = get_object_or_404(Organization, id=organization_id)
+	if not _is_org_admin(request.user, organization):
+		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
+
+	active_memberships = organization.memberships.filter(
+		active=True,
+		user__is_active=True,
+		user__physician__active=True,
+	).select_related('user', 'user__physician').order_by(
+		'user__last_name', 'user__first_name', 'user__email',
+	)
+	if request.method == 'POST':
+		try:
+			user_id = int(request.data.get('user_id'))
+		except (TypeError, ValueError):
+			return Response({'user_id': ['Select an active organization user.']}, status=status.HTTP_400_BAD_REQUEST)
+		membership = get_object_or_404(active_memberships, user_id=user_id)
+		if membership.is_org_admin:
+			return Response({'detail': 'This user is already an Org Admin.'}, status=status.HTTP_409_CONFLICT)
+		membership.is_org_admin = True
+		membership.save(update_fields=['is_org_admin', 'updated_at'])
+		_record_audit(
+			request=request,
+			organization=organization,
+			target_user=membership.user,
+			action='organization_admin.assigned',
+			details={},
+		)
+
+	admins = active_memberships.filter(is_org_admin=True)
+	candidates = active_memberships.filter(is_org_admin=False)
+	return Response({
+		'admins': OrganizationMembershipSerializer(admins, many=True).data,
+		'candidates': OrganizationMembershipSerializer(candidates, many=True).data,
+	})
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def permission_catalog(request):
+	return Response(permission_catalog_payload())
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def role_templates_list_create(request, region_id):
+	region = get_object_or_404(Region.objects.select_related('organization'), id=region_id)
+	if not _can_access_organization(request.user, region.organization):
+		return Response({'detail': 'Organization access is required.'}, status=status.HTTP_403_FORBIDDEN)
+	_ensure_region_roles(region)
+	if request.method == 'GET':
+		if not (
+			_is_org_admin(request.user, region.organization)
+			or has_permission(request.user, 'view_roles', region=region)
+			or has_permission(request.user, 'assign_domain_roles', region=region)
+			or has_permission(request.user, 'manage_domain_access', region=region)
+		):
+			return Response({'detail': 'Role viewing permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+		roles = region.role_templates.annotate(assigned_user_count=Count('memberships', distinct=True))
+		return Response(RoleTemplateSerializer(roles, many=True).data)
+	if not (
+		_is_org_admin(request.user, region.organization)
+		or has_permission(request.user, 'create_roles', region=region)
+	):
+		return Response({'detail': 'Role creation permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+	serializer = RoleTemplateSerializer(data=request.data)
+	serializer.is_valid(raise_exception=True)
+	role = serializer.save(region=region)
+	_record_audit(
+		request=request, organization=region.organization, region=region,
+		action='role.created', details={'role_id': role.id, 'name': role.name, 'permissions': role.permissions},
+	)
+	role.assigned_user_count = 0
+	return Response(RoleTemplateSerializer(role).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET', 'PATCH', 'DELETE'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def role_template_detail(request, role_id):
+	role = get_object_or_404(RoleTemplate.objects.select_related('region__organization'), id=role_id)
+	organization = role.region.organization
+	can_view = _is_org_admin(request.user, organization) or has_permission(request.user, 'view_roles', region=role.region)
+	if request.method == 'GET':
+		if not can_view:
+			return Response({'detail': 'Role viewing permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+		role.assigned_user_count = role.memberships.count()
+		return Response(RoleTemplateSerializer(role).data)
+	required_permission = 'delete_unused_roles' if request.method == 'DELETE' else 'edit_roles'
+	if not (_is_org_admin(request.user, organization) or has_permission(request.user, required_permission, region=role.region)):
+		return Response({'detail': 'Role management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+	if request.method == 'DELETE':
+		if role.memberships.exists():
+			return Response({'detail': 'Reassign all users before deleting this Role.'}, status=status.HTTP_409_CONFLICT)
+		if role.system_key:
+			return Response({'detail': 'Default Roles may be deactivated but not deleted.'}, status=status.HTTP_409_CONFLICT)
+		role.delete()
+		_record_audit(
+			request=request, organization=organization, region=role.region,
+			action='role.deleted', details={'role_id': role_id, 'name': role.name},
+		)
+		return Response(status=status.HTTP_204_NO_CONTENT)
+	old = {'name': role.name, 'permissions': role.permissions, 'active': role.active}
+	serializer = RoleTemplateSerializer(role, data=request.data, partial=True)
+	serializer.is_valid(raise_exception=True)
+	updated_role = serializer.save()
+	_record_audit(
+		request=request, organization=organization, region=role.region,
+		action='role.updated', details={
+			'role_id': role.id, 'affected_users': role.memberships.values('user_id').distinct().count(),
+			'old': old,
+			'new': {'name': updated_role.name, 'permissions': updated_role.permissions, 'active': updated_role.active},
+		},
+	)
+	updated_role.assigned_user_count = updated_role.memberships.count()
+	return Response(RoleTemplateSerializer(updated_role).data)
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfExemptSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def audit_events(request, organization_id):
+	organization = get_object_or_404(Organization, id=organization_id)
+	if not (
+		_is_org_admin(request.user, organization)
+		or has_permission(request.user, 'view_audit_history', organization=organization)
+	):
+		return Response({'detail': 'Audit permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+	events = AuditEvent.objects.filter(organization=organization).select_related(
+		'actor', 'target_user', 'region', 'domain',
+	)
+	region_id = request.query_params.get('region')
+	domain_id = request.query_params.get('domain')
+	if region_id:
+		events = events.filter(region_id=region_id)
+	if domain_id:
+		events = events.filter(domain_id=domain_id)
+	return Response(AuditEventSerializer(events[:500], many=True).data)
