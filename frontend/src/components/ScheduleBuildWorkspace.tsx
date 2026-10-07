@@ -293,6 +293,8 @@ type OptimizerPreflight = {
 type BuildContext = {
   schedule_block: ScheduleBlock
   can_manage_build_workspace: boolean
+  can_view_preview: boolean
+  can_publish_schedule: boolean
   atlas_v2_enabled: boolean
   atlas_v2_test_enabled?: boolean
   shift_generation_required: boolean
@@ -3066,7 +3068,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     type="button"
                     className="primary-action"
                     onClick={() => void publishOptimizerRun(selectedRunForActions)}
-                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions)}
+                    disabled={!context.can_publish_schedule || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions)}
                   >
                     {isPublishingRunId === selectedRunForActions.id ? 'Publishing...' : `Publish Run ${selectedRunForActions.run_number}`}
                   </button>

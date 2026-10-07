@@ -10,7 +10,7 @@ from rest_framework.response import Response
 
 from .models import Facility
 from .serializers import FacilitySerializer
-from apps.domains.models import Region
+from apps.domains.models import DomainMembership, Region
 from apps.domains.permissions import has_permission, is_org_admin
 
 
@@ -19,17 +19,49 @@ class CsrfExemptSessionAuthentication(SessionAuthentication):
 		return
 
 
+def _can_view_region(user, region):
+	if getattr(user, '_atlas_test_access_active', False):
+		return user._atlas_test_domain.region_id == region.id
+	if user.is_superuser or is_org_admin(user, region.organization):
+		return True
+	return DomainMembership.objects.filter(
+		user=user,
+		active=True,
+		domain__active=True,
+		domain__region=region,
+	).exists()
+
+
+def _accessible_region_ids(user):
+	if getattr(user, '_atlas_test_access_active', False):
+		return {user._atlas_test_domain.region_id}
+	if user.is_superuser:
+		return set(Region.objects.filter(active=True).values_list('id', flat=True))
+	org_admin_ids = user.organization_memberships.filter(
+		active=True,
+		is_org_admin=True,
+	).values_list('organization_id', flat=True)
+	region_ids = set(Region.objects.filter(
+		active=True,
+		organization_id__in=org_admin_ids,
+	).values_list('id', flat=True))
+	region_ids.update(DomainMembership.objects.filter(
+		user=user,
+		active=True,
+		domain__active=True,
+		domain__region__active=True,
+	).values_list('domain__region_id', flat=True))
+	return region_ids
+
+
 @api_view(['GET', 'POST'])
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facilities_list_create(request):
 	if request.method == 'GET':
-		facilities = Facility.objects.select_related('region__organization').all()
-		if getattr(request.user, '_atlas_test_access_active', False):
-			facilities = facilities.filter(region_id=request.user._atlas_test_domain.region_id)
-		if not request.user.is_superuser:
-			organization_ids = request.user.organization_memberships.filter(active=True).values_list('organization_id', flat=True)
-			facilities = facilities.filter(region__organization_id__in=organization_ids)
+		facilities = Facility.objects.select_related('region__organization').filter(
+			region_id__in=_accessible_region_ids(request.user),
+		)
 		region_id = request.query_params.get('region')
 		organization_id = request.query_params.get('organization')
 		if region_id:
@@ -99,6 +131,8 @@ def facilities_reorder(request):
 @permission_classes([IsAuthenticated])
 def facility_detail(request, facility_id):
 	facility = get_object_or_404(Facility.objects.select_related('region__organization'), id=facility_id)
+	if request.method == 'GET' and not _can_view_region(request.user, facility.region):
+		return Response({'detail': 'Region access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method != 'GET' and not (
 		is_org_admin(request.user, facility.region.organization)
 		or has_permission(request.user, 'manage_regional_facilities', region=facility.region)

@@ -6,9 +6,12 @@ type SidebarProps = {
   userView: boolean
   canManageOrganization: boolean
   canViewRoles: boolean
+  canManageShiftTemplates: boolean
+  canManageFacilities: boolean
+  canManageContracts: boolean
 }
 
-export default function Sidebar({ activeView, onSelectView, userView, canManageOrganization, canViewRoles }: SidebarProps){
+export default function Sidebar({ activeView, onSelectView, userView, canManageOrganization, canViewRoles, canManageShiftTemplates, canManageFacilities, canManageContracts }: SidebarProps){
   const [collapsed, setCollapsed] = React.useState(() => (
     window.localStorage.getItem('atlas-sidebar-collapsed') === 'true'
   ))
@@ -57,9 +60,7 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
           <span className="nav-icon" aria-hidden="true">▥</span>
           <span className="nav-label">Stats</span>
         </button>
-        {!userView && (
-          <>
-        <button
+        {!userView && canManageShiftTemplates && <button
           type="button"
           className={activeView === 'shift-builder' ? 'active' : ''}
           onClick={() => onSelectView('shift-builder')}
@@ -67,9 +68,7 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
         >
           <span className="nav-icon" aria-hidden="true">✦</span>
           <span className="nav-label">Shift Builder</span>
-        </button>
-          </>
-        )}
+        </button>}
         <button
           type="button"
           className={activeView === 'schedule-blocks' ? 'active' : ''}
@@ -81,7 +80,7 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
         </button>
         {!userView && (
           <>
-        <button
+        {canManageContracts && <button
           type="button"
           className={activeView === 'contracts' ? 'active' : ''}
           onClick={() => onSelectView('contracts')}
@@ -89,8 +88,8 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
         >
           <span className="nav-icon" aria-hidden="true">≡</span>
           <span className="nav-label">Contracts</span>
-        </button>
-        <button
+        </button>}
+        {canManageFacilities && <button
           type="button"
           className={activeView === 'facilities' ? 'active' : ''}
           onClick={() => onSelectView('facilities')}
@@ -98,7 +97,7 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
         >
           <span className="nav-icon" aria-hidden="true">⌂</span>
           <span className="nav-label">Facilities</span>
-        </button>
+        </button>}
         {canViewRoles && <button
           type="button"
           className={activeView === 'roles' ? 'active' : ''}

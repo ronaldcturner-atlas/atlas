@@ -210,6 +210,7 @@ select option:checked{
 .physician-management-heading{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .user-filter-select{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;font-weight:700}
 .user-filter-select select{width:clamp(250px,20vw,330px);height:30px;max-width:min(330px,100%);padding:0 28px 0 9px;border:1px solid rgba(148,163,184,.3);border-radius:7px;background:#eef2f7;color:#162033;font:inherit}
+.user-filter-static,.user-domain-filter-group{display:grid;gap:4px;color:var(--muted);font-size:12px;font-weight:700}.user-filter-static strong,.user-domain-static{display:flex;align-items:center;min-height:30px;color:var(--sidebar-fg);font-size:13px}.user-domain-filter-group>span{line-height:1}
 .user-domain-filters{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
 .user-domain-filters button{height:30px;padding:0 10px;border:1px solid rgba(148,163,184,.3);border-radius:7px;background:rgba(255,255,255,.035);color:#cbd5e1;font-size:12px;font-weight:700;cursor:pointer}
 .user-domain-filters button:hover{border-color:#818cf8;color:#fff}.user-domain-filters button.active{border-color:#8b5cf6;background:#6d4ee8;color:#fff}
@@ -567,6 +568,7 @@ select option:checked{
 .contracts-inline-checkbox{gap:10px;min-width:150px}
 .contracts-domain-filter{width:min(300px,100%);min-width:min(260px,100%)}
 .contracts-domain-filter select{width:100%}
+.context-static-field{display:grid;gap:4px;color:var(--muted);font-size:12px}.context-static-field strong{display:flex;align-items:center;min-height:36px;color:var(--sidebar-fg);font-size:14px}
 .schedule-block-header-actions,.schedule-block-scope{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
 .schedule-block-scope-field{display:grid;gap:4px;min-width:min(260px,100%);color:var(--muted);font-size:12px}
 .schedule-block-scope-field select{width:100%;height:36px;padding:0 34px 0 10px;border:1px solid #52627a;border-radius:6px;background:#e8edf4;color:#111827}

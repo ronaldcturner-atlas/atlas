@@ -177,7 +177,7 @@ export default function ShiftsView() {
   }
 
   const fetchDomains = async () => {
-    const response = await fetch(`${API_BASE}/domains/?active=true`, { credentials: 'include' })
+    const response = await fetch(`${API_BASE}/domains/?active=true&permission=manage_shift_templates`, { credentials: 'include' })
     if (!response.ok) throw new Error(await getApiErrorMessage(response) ?? 'Unable to load domains')
     setDomains(await response.json())
   }
@@ -425,8 +425,12 @@ export default function ShiftsView() {
       <div className="facilities-header">
         <h2>Shift Builder</h2>
         <div className="contracts-toolbar">
-          {regions.length > 1 && <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>}
-          <label className="facility-field contracts-domain-filter"><span>Domain</span><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}><option value="">All domains</option>{domainsForRegion.map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}</select></label>
+          {regions.length > 1
+            ? <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>
+            : <div className="context-static-field contracts-domain-filter"><span>Region</span><strong>{regions[0]?.name ?? '—'}</strong></div>}
+          {domainsForRegion.length > 1
+            ? <label className="facility-field contracts-domain-filter"><span>Domain</span><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}><option value="">All domains</option>{domainsForRegion.map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}</select></label>
+            : <div className="context-static-field contracts-domain-filter"><span>Domain</span><strong>{domainsForRegion[0]?.name ?? '—'}</strong></div>}
           <button type="button" className="primary-action" onClick={openCreateModal}>Add Shift Template</button>
         </div>
       </div>

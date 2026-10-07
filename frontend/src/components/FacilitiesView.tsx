@@ -20,7 +20,7 @@ type FacilityFormState = {
   timezone: string
   color: string
 }
-type RegionOption = { id: number; name: string; organization: number; active: boolean }
+type RegionOption = { id: number; name: string; organization: number; active: boolean; can_manage_facilities: boolean }
 
 type FacilitiesViewProps = {
   onFacilitiesChanged: () => void
@@ -136,6 +136,9 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
     setFormState({ ...defaultFormState, region: regionFilter || String(regions[0]?.id ?? '') })
     setIsModalOpen(true)
   }
+
+  const selectedRegion = regions.find((region) => String(region.id) === regionFilter)
+  const canManageSelectedRegion = Boolean(selectedRegion?.can_manage_facilities)
 
   const openEditModal = (facility: Facility) => {
     setEditingFacilityId(facility.id)
@@ -314,14 +317,14 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
       <div className="facilities-header">
         <h2>Facility Management</h2>
         <div className="contracts-toolbar">
-          {regions.length > 1 && <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label>}
-          <button type="button" className="primary-action" onClick={openCreateModal}>Add New Facility</button>
+          {regions.length > 1 ? <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => setRegionFilter(event.target.value)}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label> : <div className="context-static-field contracts-domain-filter"><span>Region</span><strong>{regions[0]?.name ?? '—'}</strong></div>}
+          {canManageSelectedRegion && <button type="button" className="primary-action" onClick={openCreateModal}>Add New Facility</button>}
         </div>
       </div>
 
       {error && <div className="facilities-error">{error}</div>}
 
-      <div className="facility-order-help">Drag a facility to set the order used on every daily schedule.</div>
+      {canManageSelectedRegion && <div className="facility-order-help">Drag a facility to set the order used on every daily schedule.</div>}
 
       <div className="scheduler-table-wrap">
         <table className="scheduler-table">
@@ -342,7 +345,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
               <tr
                 key={facility.id}
                 className={draggedFacilityId === facility.id ? 'facility-row-dragging' : ''}
-                draggable
+                draggable={canManageSelectedRegion}
                 onDragStart={(event) => {
                   setDraggedFacilityId(facility.id)
                   event.dataTransfer.effectAllowed = 'move'
@@ -357,7 +360,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                   reorderFacilities(facility.id)
                 }}
               >
-                <td className="facility-drag-handle" title="Drag to reorder" aria-label={`Reorder ${facility.name}`}>⋮⋮</td>
+                <td className="facility-drag-handle" title={canManageSelectedRegion ? 'Drag to reorder' : undefined} aria-label={`Reorder ${facility.name}`}>{canManageSelectedRegion ? '⋮⋮' : ''}</td>
                 {regions.length > 1 && <td>{facility.region_name}</td>}
                 <td>{facility.name}</td>
                 <td>{facility.short_name}</td>
@@ -374,7 +377,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                 </td>
                 <td>{facility.active ? 'Active' : 'Disabled'}</td>
                 <td>
-                  <div className="facility-actions">
+                  {canManageSelectedRegion && <div className="facility-actions">
                     <button type="button" onClick={() => openEditModal(facility)}>
                       Edit
                     </button>
@@ -390,7 +393,7 @@ export default function FacilitiesView({ onFacilitiesChanged }: FacilitiesViewPr
                     <button type="button" className="danger" onClick={() => deleteFacility(facility)}>
                       Delete
                     </button>
-                  </div>
+                  </div>}
                 </td>
               </tr>
             ))}

@@ -3,12 +3,33 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from apps.domains.models import Domain, DomainMembership, OrganizationMembership, Region, RoleTemplate
+from apps.domains.permissions import REGIONAL_ADMIN_DEFAULTS
+
 from .models import Facility
 
 
 class FacilitiesTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='facilities-test', password='atlas')
+        self.region = Region.objects.get(id=Facility._meta.get_field('region').get_default())
+        OrganizationMembership.objects.create(
+            organization=self.region.organization,
+            user=self.user,
+        )
+        domain = Domain.objects.create(region=self.region, name='Facilities Test Domain')
+        role = RoleTemplate.objects.create(
+            region=self.region,
+            name='Facilities Test Regional Admin',
+            permissions=sorted(REGIONAL_ADMIN_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=domain,
+            user=self.user,
+            role=DomainMembership.Role.REGIONAL_ADMIN,
+            role_template=role,
+            clinically_active=False,
+        )
         self.client = APIClient()
         self.client.force_authenticate(user=self.user)
 
@@ -94,3 +115,45 @@ class FacilitiesTests(TestCase):
 
         self.assertEqual(response.status_code, 204)
         self.assertFalse(Facility.objects.filter(id=facility.id).exists())
+
+    def test_regional_role_cannot_view_or_create_facilities_in_another_region(self):
+        other_region = Region.objects.create(
+            organization=self.region.organization,
+            name='Other Region',
+        )
+        local = Facility.objects.create(
+            region=self.region,
+            name='Local Facility',
+            short_name='Local',
+        )
+        foreign = Facility.objects.create(
+            region=other_region,
+            name='Foreign Facility',
+            short_name='Foreign',
+        )
+
+        list_response = self.client.get('/api/facilities/')
+        detail_response = self.client.get(f'/api/facilities/{foreign.id}/')
+        create_response = self.client.post(
+            '/api/facilities/',
+            {
+                'region': other_region.id,
+                'name': 'Unauthorized Facility',
+                'short_name': 'Unauthorized',
+                'timezone': 'UTC',
+                'color': '#2563eb',
+            },
+            format='json',
+        )
+        regions_response = self.client.get(
+            f'/api/organizations/{self.region.organization_id}/regions/',
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual({row['id'] for row in list_response.json()}, {local.id})
+        self.assertEqual(detail_response.status_code, 403)
+        self.assertEqual(create_response.status_code, 403)
+        self.assertEqual(
+            {row['id'] for row in regions_response.json()},
+            {self.region.id},
+        )

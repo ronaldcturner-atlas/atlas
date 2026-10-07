@@ -102,7 +102,7 @@ export default function OrganizationView() {
   }
 
   return <div className="facilities-view-card organization-view">
-    <div className="facilities-header"><h2>Organization</h2></div>
+    <div className="facilities-header"><h2>Organization</h2>{organizations.length === 1 && <div className="context-static-field organization-selector"><span>Organization</span><strong>{organizations[0].name}</strong></div>}</div>
     {error && <div className="facilities-error">{error}</div>}{notice && <div className="organization-notice">{notice}</div>}
     {organizations.length > 1 && <label className="facility-field organization-selector"><span>Organization</span><select value={selectedOrganizationId ?? ''} onChange={(e) => setSelectedOrganizationId(Number(e.target.value))}>{organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label>}
     {selectedOrganizationId !== null && <>

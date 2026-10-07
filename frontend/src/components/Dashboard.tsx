@@ -80,6 +80,9 @@ export default function Dashboard() {
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
   const [shiftsRefreshToken, setShiftsRefreshToken] = React.useState(0)
   const canManageSchedules = Boolean(user?.can_manage_schedules)
+  const canManageShiftTemplates = Boolean(user?.is_org_admin || user?.permissions.includes('manage_shift_templates'))
+  const canManageFacilities = Boolean(user?.is_org_admin || user?.permissions.includes('manage_regional_facilities'))
+  const canManageContracts = Boolean(user?.is_org_admin || user?.permissions.includes('manage_build_workspace'))
   const [userView, setUserView] = React.useState(() => {
     try {
       return window.localStorage.getItem('atlas-interface-view') === 'user'
@@ -129,10 +132,18 @@ export default function Dashboard() {
       return
     }
     const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'roles', 'organization'].includes(activeView)
-    if (effectiveUserView && (schedulerOnlyView || buildBlockId !== null || violationVersionId !== null)) {
+    if (effectiveUserView && (schedulerOnlyView || violationVersionId !== null)) {
+      navigate('/', { replace: true })
+      return
+    }
+    if (
+      (!canManageShiftTemplates && activeView === 'shift-builder')
+      || (!canManageFacilities && activeView === 'facilities')
+      || (!canManageContracts && activeView === 'contracts')
+    ) {
       navigate('/', { replace: true })
     }
-  }, [activeView, buildBlockId, effectiveUserView, location.pathname, navigate, violationVersionId])
+  }, [activeView, buildBlockId, canManageContracts, canManageFacilities, canManageShiftTemplates, effectiveUserView, location.pathname, navigate, violationVersionId])
 
   const handleFacilitiesChanged = React.useCallback(() => {
     setFacilitiesRefreshToken((current) => current + 1)
@@ -146,6 +157,9 @@ export default function Dashboard() {
         userView={effectiveUserView}
         canManageOrganization={Boolean(user?.is_org_admin)}
         canViewRoles={Boolean(user?.is_org_admin || user?.permissions.includes('view_roles'))}
+        canManageShiftTemplates={canManageShiftTemplates}
+        canManageFacilities={canManageFacilities}
+        canManageContracts={canManageContracts}
       />
       <div className="main-area">
         <Topbar
@@ -157,11 +171,11 @@ export default function Dashboard() {
           <h1 className="page-title">{pageTitle}</h1>
           {activeView === 'my-schedule' && <Calendar shiftsRefreshToken={shiftsRefreshToken} forceUserView={effectiveUserView} />}
           {activeView === 'stats' && <StatsView limitedToHours={effectiveUserView} />}
-          {!effectiveUserView && activeView === 'shift-builder' && <ShiftsView />}
+          {!effectiveUserView && canManageShiftTemplates && activeView === 'shift-builder' && <ShiftsView />}
           {!effectiveUserView && activeView === 'schedule-blocks' && violationVersionId !== null && (
             <ScheduleVersionViolationReport versionId={violationVersionId} />
           )}
-          {!effectiveUserView && activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId !== null && (
+          {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId !== null && (
             <ScheduleBuildWorkspace
               blockId={buildBlockId}
               onBack={() => navigate('/schedule-blocks')}
@@ -177,8 +191,8 @@ export default function Dashboard() {
               onOpenBuild={(blockId) => navigate(`/schedule-blocks/${blockId}/build`)}
             />
           )}
-          {!effectiveUserView && activeView === 'contracts' && <ContractsView />}
-          {!effectiveUserView && activeView === 'facilities' && (
+          {!effectiveUserView && canManageContracts && activeView === 'contracts' && <ContractsView />}
+          {!effectiveUserView && canManageFacilities && activeView === 'facilities' && (
             <FacilitiesView onFacilitiesChanged={handleFacilitiesChanged} />
           )}
           {activeView === 'physicians' && (effectiveUserView ? <UserDirectoryView /> : <PhysiciansView />)}

@@ -89,8 +89,8 @@ export default function SharedRulesView({ onShowContracts }: { onShowContracts: 
       setLoading(true); setError(null)
       const [contractsResponse, templatesResponse, domainsResponse] = await Promise.all([
         fetch(`${API_BASE}/contracts/?include_inactive=true`, { credentials: 'include' }),
-        fetch(`${API_BASE}/shift-templates/?active=true`, { credentials: 'include' }),
-        fetch(`${API_BASE}/domains/`, { credentials: 'include' }),
+        fetch(`${API_BASE}/shift-templates/?active=true&permission=manage_build_workspace`, { credentials: 'include' }),
+        fetch(`${API_BASE}/domains/?permission=manage_build_workspace`, { credentials: 'include' }),
       ])
       if (!contractsResponse.ok || !templatesResponse.ok || !domainsResponse.ok) throw new Error('Unable to load Shared Rule options.')
       const [contractRows, templateRows, loadedDomains] = await Promise.all([contractsResponse.json(), templatesResponse.json(), domainsResponse.json()])
@@ -179,8 +179,8 @@ export default function SharedRulesView({ onShowContracts }: { onShowContracts: 
     <div className="contract-page-tabs" role="tablist"><button type="button" onClick={onShowContracts}>Contracts</button><button type="button" className="active" aria-selected="true">Shared Rules</button></div>
     <div className="facilities-header contracts-header"><div><h2>Shared Rules</h2><p className="section-help">Custom rules used across multiple contracts.</p></div><div className="contracts-toolbar">
       <div className="shared-rule-status-filter" role="radiogroup" aria-label="Shared Rule status"><label><input type="radio" checked={view === 'active'} onChange={() => setView('active')} /> Active</label><label><input type="radio" checked={view === 'inactive'} onChange={() => setView('inactive')} /> Inactive</label></div>
-      {regions.length > 1 && <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>{regions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label>}
-      <label className="facility-field contracts-domain-filter"><span>Domain</span><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}><option value="">All domains</option>{domains.map(([id, row]) => <option key={id} value={id}>{row.name}</option>)}</select></label>
+      {regions.length > 1 ? <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>{regions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label> : <div className="context-static-field contracts-domain-filter"><span>Region</span><strong>{regions[0]?.[1] ?? '—'}</strong></div>}
+      {domains.length > 1 ? <label className="facility-field contracts-domain-filter"><span>Domain</span><select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}><option value="">All domains</option>{domains.map(([id, row]) => <option key={id} value={id}>{row.name}</option>)}</select></label> : <div className="context-static-field contracts-domain-filter"><span>Domain</span><strong>{domains[0]?.[1].name ?? '—'}</strong></div>}
       <button type="button" className="primary-action" onClick={openCreate}>Add Shared Rule</button>
     </div></div>
     {error && <div className="facilities-error">{error}</div>}{notice && <div className="contract-saved-banner">{notice}</div>}

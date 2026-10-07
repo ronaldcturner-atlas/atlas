@@ -25,7 +25,7 @@ from rest_framework.response import Response
 
 from apps.accounts.models import Physician
 from apps.domains.models import Domain, DomainMembership
-from apps.domains.permissions import has_permission, permitted_domain_ids
+from apps.domains.permissions import has_permission, is_org_admin, permitted_domain_ids
 from apps.facilities.models import Facility
 
 from .models import (
@@ -522,6 +522,7 @@ def _schedule_comment_series_payload(series, occurrence_date, exception=None):
         'id': f'series-{series.id}-{occurrence_date.isoformat()}',
         'source': 'RECURRING',
         'series_id': series.id,
+        'domain': series.domain_id,
         'date': occurrence_date.isoformat(),
         'title': title,
         'details': details,
@@ -651,7 +652,9 @@ def published_schedule_comments(request):
     if request.method == 'GET':
         comments_by_key = {}
         authoritative_dates = sorted({key[1] for key in authoritative_block_by_date})
-        series_rows = ScheduleCommentSeries.objects.prefetch_related('exceptions')
+        series_rows = ScheduleCommentSeries.objects.filter(
+            Q(domain_id__in=domain_ids) | Q(domain__isnull=True),
+        ).prefetch_related('exceptions')
         for series in series_rows:
             exceptions = {row.date: row for row in series.exceptions.all()}
             for candidate in authoritative_dates:
@@ -680,11 +683,6 @@ def published_schedule_comments(request):
             )
         ])
 
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can add calendar comments.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     comment_date = _parse_comment_date(request.data.get('date'))
     raw_domain_id = request.data.get('domain')
     if raw_domain_id in (None, ''):
@@ -709,6 +707,12 @@ def published_schedule_comments(request):
             {'detail': 'You do not have access to the selected Domain.'},
             status=status.HTTP_403_FORBIDDEN,
         )
+    domain = get_object_or_404(Domain, id=domain_id)
+    if not has_permission(request.user, 'manage_date_comments', domain=domain):
+        return Response(
+            {'detail': 'Schedule comment management permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     block_id = authoritative_block_by_date.get((domain_id, comment_date))
     if block_id is None:
         return Response(
@@ -728,6 +732,7 @@ def published_schedule_comments(request):
             date=comment_date,
         ).delete()
         series = ScheduleCommentSeries.objects.create(
+            domain=domain,
             title=title,
             details=details,
             start_date=comment_date,
@@ -758,12 +763,20 @@ def published_schedule_comments(request):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule_comment_series_occurrence(request, series_id, comment_date):
-    if not _can_manage_build_workspace(request.user):
+    series = get_object_or_404(
+        ScheduleCommentSeries.objects.select_related('domain'), id=series_id,
+    )
+    if series.domain_id is None:
+        can_manage_series = is_org_admin(request.user)
+    else:
+        can_manage_series = has_permission(
+            request.user, 'manage_date_comments', domain=series.domain,
+        )
+    if not can_manage_series:
         return Response(
-            {'detail': 'Only a scheduler or administrator can change recurring calendar comments.'},
+            {'detail': 'Schedule comment management permission is required for this Domain.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    series = get_object_or_404(ScheduleCommentSeries, id=series_id)
     occurrence_date = _parse_comment_date(comment_date)
     if occurrence_date is None or not _series_occurs_on(series, occurrence_date):
         return Response(
@@ -865,6 +878,7 @@ def published_schedule_comment_series_occurrence(request, series_id, comment_dat
                 'end_type', 'end_date', 'occurrence_count', 'updated_by', 'updated_at',
             ])
         new_series = ScheduleCommentSeries.objects.create(
+            domain=series.domain,
             title=title,
             details=details,
             start_date=occurrence_date,
@@ -889,11 +903,6 @@ def published_schedule_comment_series_occurrence(request, series_id, comment_dat
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule_comment_detail(request, comment_date):
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can delete calendar comments.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     parsed_date = _parse_comment_date(comment_date)
     domains, domain_error = _requested_published_schedule_domains(request)
     if domain_error:
@@ -912,6 +921,12 @@ def published_schedule_comment_detail(request, comment_date):
         return Response(
             {'detail': 'Select one Domain before deleting a calendar comment.'},
             status=status.HTTP_400_BAD_REQUEST,
+        )
+    domain = get_object_or_404(Domain, id=domain_ids[0])
+    if not has_permission(request.user, 'manage_date_comments', domain=domain):
+        return Response(
+            {'detail': 'Schedule comment management permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
         )
     block_id = authoritative_block_by_date.get((domain_ids[0], parsed_date))
     comment = get_object_or_404(
@@ -952,16 +967,19 @@ def _force_requested(request):
 @permission_classes([IsAuthenticated])
 def shift_trade_policy(request):
     policy = ShiftTradePolicy.load()
+    can_manage_policy = bool(
+        permitted_domain_ids(request.user, 'approve_pickups_trades')
+    ) or is_org_admin(request.user)
     if request.method == 'PATCH':
-        if not _can_manage_build_workspace(request.user):
-            return Response({'detail': 'Only a scheduler or administrator can change trade approval policy.'}, status=status.HTTP_403_FORBIDDEN)
+        if not can_manage_policy:
+            return Response({'detail': 'Shift pickup and trade approval permission is required.'}, status=status.HTTP_403_FORBIDDEN)
         value = request.data.get('require_scheduler_approval')
         if type(value) is not bool:
             return Response({'detail': 'Provide require_scheduler_approval as true or false.'}, status=status.HTTP_400_BAD_REQUEST)
         policy.require_scheduler_approval = value
         policy.updated_by = request.user
         policy.save()
-    return Response({'require_scheduler_approval': policy.require_scheduler_approval, 'can_manage': _can_manage_build_workspace(request.user)})
+    return Response({'require_scheduler_approval': policy.require_scheduler_approval, 'can_manage': can_manage_policy})
 
 
 @api_view(['POST'])
@@ -969,8 +987,11 @@ def shift_trade_policy(request):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_posting(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
-    if assignment.physician.user_id != request.user.id and not _can_manage_build_workspace(request.user):
-        return Response({'detail': 'You may only post your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    domain = assignment.shift_instance.schedule_version.domain
+    owns_shift = assignment.physician.user_id == request.user.id
+    permission = 'post_own_shifts' if owns_shift else 'manage_any_shift_posting'
+    if not has_permission(request.user, permission, domain=domain):
+        return Response({'detail': 'You do not have permission to manage this shift posting.'}, status=status.HTTP_403_FORBIDDEN)
     mode = request.data.get('mode')
     if mode == 'CLOSE':
         ShiftPosting.objects.filter(assignment=assignment).update(active=False)
@@ -987,8 +1008,11 @@ def schedule_assignment_posting(request, assignment_id):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_split(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
-    if assignment.physician.user_id != request.user.id and not _can_manage_build_workspace(request.user):
-        return Response({'detail': 'You may only split your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    domain = assignment.shift_instance.schedule_version.domain
+    owns_shift = assignment.physician.user_id == request.user.id
+    permission = 'split_own_shift' if owns_shift else 'split_any_published_shift'
+    if not has_permission(request.user, permission, domain=domain):
+        return Response({'detail': 'You do not have permission to split this shift.'}, status=status.HTTP_403_FORBIDDEN)
     try:
         split_clock = datetime.strptime(str(request.data.get('split_time', '')), '%H:%M').time()
     except ValueError:
@@ -1042,8 +1066,12 @@ def schedule_assignment_split(request, assignment_id):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_unsplit(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
-    can_manage = _can_manage_build_workspace(request.user)
-    if assignment.physician.user_id != request.user.id and not can_manage:
+    domain = assignment.shift_instance.schedule_version.domain
+    can_manage = has_permission(request.user, 'split_any_published_shift', domain=domain)
+    owns_shift = assignment.physician.user_id == request.user.id
+    if not can_manage and not (
+        owns_shift and has_permission(request.user, 'split_own_shift', domain=domain)
+    ):
         return Response({'detail': 'You may only unsplit your own shift.'}, status=status.HTTP_403_FORBIDDEN)
     instance = assignment.shift_instance
     root = instance.split_parent or instance
@@ -1227,9 +1255,10 @@ def schedule_assignment_unsplit(request, assignment_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_reassign(request, assignment_id):
-    if not _can_manage_build_workspace(request.user):
-        return Response({'detail': 'Only a scheduler or administrator can change the scheduled user.'}, status=status.HTTP_403_FORBIDDEN)
     assignment = _published_assignment_or_404(assignment_id)
+    domain = assignment.shift_instance.schedule_version.domain
+    if not has_permission(request.user, 'manage_published_assignments', domain=domain):
+        return Response({'detail': 'Only a scheduler or administrator can change the scheduled user.'}, status=status.HTTP_403_FORBIDDEN)
     physician = get_object_or_404(Physician, id=request.data.get('physician_id'), active=True)
     valid, reason = _trade_assignment_is_valid(physician, assignment, [assignment.id])
     if not valid and not _force_requested(request):
@@ -1248,12 +1277,13 @@ def schedule_assignment_reassign(request, assignment_id):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_open(request, assignment_id):
     """Remove one published assignment while retaining its trade audit history."""
-    if not _can_manage_build_workspace(request.user):
+    assignment = _published_assignment_or_404(assignment_id)
+    domain = assignment.shift_instance.schedule_version.domain
+    if not has_permission(request.user, 'manage_published_assignments', domain=domain):
         return Response(
             {'detail': 'Only a scheduler or administrator can open a scheduled shift.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    assignment = _published_assignment_or_404(assignment_id)
     instance = assignment.shift_instance
     now = timezone.now()
     with transaction.atomic():
@@ -1303,19 +1333,21 @@ def schedule_assignment_open(request, assignment_id):
 @permission_classes([IsAuthenticated])
 def shift_instance_assign(request, instance_id):
     """Assign an explicitly open published shift to a selected user."""
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can fill an open shift.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     instance = get_object_or_404(
         ScheduleShiftInstance.objects.select_related(
-            'schedule_version', 'schedule_block',
+            'schedule_version__domain', 'schedule_block',
         ),
         id=instance_id,
         schedule_block__published_at__isnull=False,
         is_locked_open=True,
     )
+    if not has_permission(
+        request.user, 'manage_published_assignments', domain=instance.schedule_version.domain,
+    ):
+        return Response(
+            {'detail': 'Only a scheduler or administrator can fill an open shift.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     physician = get_object_or_404(
         Physician,
         id=request.data.get('physician_id'),
@@ -1385,15 +1417,26 @@ def shift_instance_assign(request, instance_id):
 @permission_classes([IsAuthenticated])
 def shift_instance_times(request, instance_id):
     """Change one published shift instance without altering its recurring template."""
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can change actual shift times.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     instance = get_object_or_404(
-        ScheduleShiftInstance.objects.select_related('facility', 'schedule_block'),
+        ScheduleShiftInstance.objects.select_related('facility', 'schedule_block', 'schedule_version__domain'),
         id=instance_id, schedule_block__published_at__isnull=False,
     )
+    domain = instance.schedule_version.domain
+    owns_shift = ScheduleShiftAssignment.objects.filter(
+        shift_instance=instance,
+        physician__user=request.user,
+    ).exists()
+    if not (
+        has_permission(request.user, 'modify_any_published_shift_times', domain=domain)
+        or (
+            owns_shift
+            and has_permission(request.user, 'modify_own_shift_times', domain=domain)
+        )
+    ):
+        return Response(
+            {'detail': 'You do not have permission to change this shift’s actual times.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     try:
         start_clock = datetime.strptime(str(request.data.get('start_time', '')), '%H:%M').time()
         end_clock = datetime.strptime(str(request.data.get('end_time', '')), '%H:%M').time()
@@ -1466,6 +1509,11 @@ def _trade_assignment_payload(assignment, snapshot=None):
 
 
 def _trade_payload(trade, user):
+    domain_assignment = trade.offered_assignment or trade.requested_assignment
+    trade_domain = trade.domain or (
+        domain_assignment.shift_instance.schedule_version.domain
+        if domain_assignment is not None else None
+    )
     return {
         'id': trade.id,
         'status': trade.status,
@@ -1485,21 +1533,28 @@ def _trade_payload(trade, user):
         'created_at': trade.created_at.isoformat(),
         'can_accept': trade.status == ShiftTrade.Status.PENDING_RECIPIENT and trade.recipient and trade.recipient.user_id == user.id,
         'can_cancel': trade.status in (ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER) and trade.requester.user_id == user.id,
-        'can_review': trade.status == ShiftTrade.Status.PENDING_SCHEDULER and _can_manage_build_workspace(user),
+        'can_review': (
+            trade.status == ShiftTrade.Status.PENDING_SCHEDULER
+            and trade_domain is not None
+            and has_permission(user, 'approve_pickups_trades', domain=trade_domain)
+        ),
     }
 
 
 def _trade_queryset():
     return ShiftTrade.objects.select_related(
+        'domain',
         'requester__user', 'recipient__user',
         'offered_assignment__physician__user',
         'offered_assignment__shift_instance__facility',
         'offered_assignment__shift_instance__shift_template',
         'offered_assignment__shift_instance__schedule_block',
+        'offered_assignment__shift_instance__schedule_version__domain',
         'requested_assignment__physician__user',
         'requested_assignment__shift_instance__facility',
         'requested_assignment__shift_instance__shift_template',
         'requested_assignment__shift_instance__schedule_block',
+        'requested_assignment__shift_instance__schedule_version__domain',
     )
 
 
@@ -1508,20 +1563,22 @@ def _trade_queryset():
 @permission_classes([IsAuthenticated])
 def shift_trades(request):
     physician = getattr(request.user, 'physician', None)
-    can_manage = _can_manage_build_workspace(request.user)
+    managed_domain_ids = (
+        permitted_domain_ids(request.user, 'manage_user_offers_trades')
+        | permitted_domain_ids(request.user, 'approve_pickups_trades')
+    )
     if request.method == 'GET':
         trades = _trade_queryset()
-        if not can_manage:
-            if physician is None:
-                return Response([])
-            trades = trades.filter(Q(requester=physician) | Q(recipient=physician))
+        access_filter = Q(domain_id__in=managed_domain_ids)
+        if physician is not None:
+            access_filter |= Q(requester=physician) | Q(recipient=physician)
+        trades = trades.filter(access_filter).distinct()
         return Response([_trade_payload(trade, request.user) for trade in trades[:200]])
 
-    if physician is None and not can_manage:
-        return Response({'detail': 'Your user account is not linked to a physician.'}, status=status.HTTP_403_FORBIDDEN)
     if physician is None:
         return Response({'detail': 'Your user account is not linked to a physician.'}, status=status.HTTP_403_FORBIDDEN)
     target = _published_assignment_or_404(request.data.get('target_assignment_id'))
+    domain = target.shift_instance.schedule_version.domain
     posting = ShiftPosting.objects.filter(assignment=target, active=True).first()
     offered_id = request.data.get('offered_assignment_id')
     if target.physician_id == physician.id:
@@ -1529,6 +1586,8 @@ def shift_trades(request):
     offered = None
     trade_type = ShiftTrade.TradeType.PICKUP
     if offered_id:
+        if not has_permission(request.user, 'propose_trade', domain=domain):
+            return Response({'detail': 'You do not have permission to propose a trade in this Domain.'}, status=status.HTTP_403_FORBIDDEN)
         offered = _published_assignment_or_404(offered_id)
         trade_type = ShiftTrade.TradeType.TRADE
         if offered.physician_id != physician.id:
@@ -1540,6 +1599,8 @@ def shift_trades(request):
         }
         if target.id not in valid_option_ids:
             return Response({'detail': 'That shift is not a valid trade option for your current schedule.'}, status=status.HTTP_400_BAD_REQUEST)
+    elif not has_permission(request.user, 'pick_up_shifts', domain=domain):
+        return Response({'detail': 'You do not have permission to pick up shifts in this Domain.'}, status=status.HTTP_403_FORBIDDEN)
     elif not posting or posting.mode != ShiftPosting.Mode.PICKUP:
         return Response({'detail': 'This shift is not posted for pickup.'}, status=status.HTTP_400_BAD_REQUEST)
     if ShiftTrade.objects.filter(
@@ -1548,6 +1609,7 @@ def shift_trades(request):
     ).exists():
         return Response({'detail': 'This shift already has a pending request.'}, status=status.HTTP_400_BAD_REQUEST)
     trade = ShiftTrade.objects.create(
+        domain=domain,
         offered_assignment=target, requested_assignment=offered,
         offered_assignment_snapshot=_trade_assignment_payload(target),
         requested_assignment_snapshot=_trade_assignment_payload(offered) or {},
@@ -1619,9 +1681,14 @@ def _trade_options_for_assignment(offered, allow_conflicts=False):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_trade_options(request, assignment_id):
     offered = _published_assignment_or_404(assignment_id)
-    can_manage = _can_manage_build_workspace(request.user)
+    domain = offered.shift_instance.schedule_version.domain
+    can_manage = has_permission(request.user, 'manage_user_offers_trades', domain=domain)
     if offered.physician.user_id != request.user.id and not can_manage:
         return Response({'detail': 'You may only propose a trade from your own shift.'}, status=status.HTTP_403_FORBIDDEN)
+    if offered.physician.user_id == request.user.id and not has_permission(
+        request.user, 'propose_trade', domain=domain,
+    ):
+        return Response({'detail': 'You do not have permission to propose a trade in this Domain.'}, status=status.HTTP_403_FORBIDDEN)
     return Response(_trade_options_for_assignment(
         offered,
         allow_conflicts=can_manage,
@@ -1632,12 +1699,13 @@ def schedule_assignment_trade_options(request, assignment_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_swap(request, assignment_id):
-    if not _can_manage_build_workspace(request.user):
+    source = _published_assignment_or_404(assignment_id)
+    domain = source.shift_instance.schedule_version.domain
+    if not has_permission(request.user, 'manage_published_assignments', domain=domain):
         return Response(
             {'detail': 'Only a scheduler or administrator can directly swap scheduled users.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    source = _published_assignment_or_404(assignment_id)
     target = _published_assignment_or_404(request.data.get('target_assignment_id'))
     if source.id == target.id or source.physician_id == target.physician_id:
         return Response(
@@ -1708,6 +1776,7 @@ def schedule_assignment_swap(request, assignment_id):
                 'physician', 'assignment_source', 'created_by', 'is_locked',
             ])
         ShiftTrade.objects.create(
+            domain=domain,
             offered_assignment=locked_target,
             requested_assignment=locked_source,
             offered_assignment_snapshot=_trade_assignment_payload(locked_target),
@@ -1809,7 +1878,10 @@ def shift_trade_action(request, trade_id, action):
         trade.status = ShiftTrade.Status.CANCELLED
         trade.save(update_fields=['status', 'updated_at'])
     elif action in ('approve', 'reject'):
-        if not _can_manage_build_workspace(request.user) or trade.status != ShiftTrade.Status.PENDING_SCHEDULER:
+        domain = trade.domain or trade.offered_assignment.shift_instance.schedule_version.domain
+        if not has_permission(
+            request.user, 'approve_pickups_trades', domain=domain,
+        ) or trade.status != ShiftTrade.Status.PENDING_SCHEDULER:
             return Response({'detail': 'This trade is not awaiting scheduler review.'}, status=status.HTTP_403_FORBIDDEN)
         if action == 'approve':
             applied, reason = _apply_shift_trade(
@@ -1857,10 +1929,24 @@ def shift_detail(request, shift_id):
 @permission_classes([IsAuthenticated])
 def shift_templates_list_create(request):
     if request.method == 'GET':
-        allowed_domain_ids = permitted_domain_ids(request.user, 'manage_shift_templates')
+        requested_permission = request.query_params.get(
+            'permission', 'manage_shift_templates',
+        )
+        if requested_permission not in {
+            'manage_shift_templates',
+            'manage_build_workspace',
+            'view_domain_statistics',
+        }:
+            return Response(
+                {'permission': ['This permission cannot be used to view Shift Templates.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        allowed_domain_ids = permitted_domain_ids(
+            request.user, requested_permission,
+        )
         if not allowed_domain_ids:
             return Response(
-                {'detail': 'Shift template management permission is required.'},
+                {'detail': 'Shift Template access is required.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
         templates = _ordered_shift_templates().filter(domain_id__in=allowed_domain_ids)
@@ -1979,11 +2065,16 @@ def stats_groups_list_create(request):
             shift_templates__domain_id__in=allowed_domain_ids,
         ).prefetch_related('shift_templates').distinct()
         return Response([_stats_group_payload(group) for group in groups])
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
     name, template_ids, error = _validate_stats_group_data(request.data)
     if error:
         return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+    template_domain_ids = set(ShiftTemplate.objects.filter(
+        id__in=template_ids,
+    ).values_list('domain_id', flat=True))
+    if not template_domain_ids.issubset(
+        permitted_domain_ids(request.user, 'manage_build_workspace')
+    ):
+        return _build_workspace_forbidden_response()
     with transaction.atomic():
         group = ShiftStatsGroup.objects.create(name=name, created_by=request.user)
         group.shift_templates.set(template_ids)
@@ -1994,15 +2085,22 @@ def stats_groups_list_create(request):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def stats_group_detail(request, group_id):
-    if not _can_manage_build_workspace(request.user):
+    group = get_object_or_404(ShiftStatsGroup.objects.prefetch_related('shift_templates'), id=group_id)
+    allowed_domain_ids = permitted_domain_ids(request.user, 'manage_build_workspace')
+    existing_domain_ids = set(group.shift_templates.values_list('domain_id', flat=True))
+    if not existing_domain_ids or not existing_domain_ids.issubset(allowed_domain_ids):
         return _build_workspace_forbidden_response()
-    group = get_object_or_404(ShiftStatsGroup, id=group_id)
     if request.method == 'DELETE':
         group.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
     name, template_ids, error = _validate_stats_group_data(request.data, group)
     if error:
         return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+    target_domain_ids = set(ShiftTemplate.objects.filter(
+        id__in=template_ids,
+    ).values_list('domain_id', flat=True))
+    if not target_domain_ids.issubset(allowed_domain_ids):
+        return _build_workspace_forbidden_response()
     with transaction.atomic():
         group.name = name
         group.save(update_fields=['name', 'updated_at'])
@@ -2021,36 +2119,26 @@ def _has_published_overlap(domain, start_date, end_date, exclude_id=None):
 
 
 def _can_manage_requests(user, domain=None):
-    if getattr(user, '_atlas_test_access_active', False):
-        return (
-            has_permission(user, 'administer_requests', domain=domain)
-            if domain is not None
-            else bool(permitted_domain_ids(user, 'administer_requests'))
-        )
-    if domain is not None and has_permission(user, 'administer_requests', domain=domain):
-        return True
-    if domain is None and permitted_domain_ids(user, 'administer_requests'):
-        return True
-    if user.is_staff or user.is_superuser:
-        return True
+    return (
+        has_permission(user, 'administer_requests', domain=domain)
+        if domain is not None
+        else bool(permitted_domain_ids(user, 'administer_requests'))
+    )
 
-    if user.groups.filter(Q(name__iexact='admin') | Q(name__iexact='scheduler')).exists():
-        return True
 
-    return user.has_perm('scheduling.add_schedulerequest') or user.has_perm(
-        'scheduling.change_schedulerequest'
+def _can_submit_own_requests(user, domain=None):
+    return (
+        has_permission(user, 'submit_own_requests', domain=domain)
+        if domain is not None
+        else bool(permitted_domain_ids(user, 'submit_own_requests'))
     )
 
 
 def _request_blocks_for_regular_user(user):
     """Return the relevant published and upcoming block for each accessible Domain."""
-    if getattr(user, '_atlas_test_access_active', False):
-        domain_ids = [user._atlas_test_domain.id]
-    else:
-        domain_ids = list(user.domain_memberships.values_list('domain_id', flat=True))
-    domains = Domain.objects.filter(id__in=domain_ids) if domain_ids else Domain.objects.all()
+    request_domain_ids = permitted_domain_ids(user, 'submit_own_requests')
     block_ids = []
-    for domain_id in domains.values_list('id', flat=True):
+    for domain_id in request_domain_ids:
         domain_blocks = ScheduleBlock.objects.filter(domain_id=domain_id)
         latest_published = (
             domain_blocks.filter(published_at__isnull=False)
@@ -2065,10 +2153,57 @@ def _request_blocks_for_regular_user(user):
             .order_by('start_date', 'created_at')
             .first()
         )
-        block_ids.extend(
-            block.id for block in (latest_published, upcoming) if block is not None
+        if latest_published is not None:
+            block_ids.append(latest_published.id)
+        if upcoming is not None:
+            block_ids.append(upcoming.id)
+    return ScheduleBlock.objects.filter(
+        Q(id__in=block_ids)
+        | Q(
+            domain_id__in=permitted_domain_ids(user, 'view_preview'),
+            build_status=ScheduleBlock.BuildStatus.PREVIEW,
         )
-    return ScheduleBlock.objects.filter(id__in=block_ids)
+    )
+
+
+def _schedule_block_capabilities(user, block):
+    can_manage_build = _can_manage_build_workspace(user, block.domain)
+    can_administer_requests = _can_manage_requests(user, block.domain)
+    can_submit_requests = _can_submit_own_requests(user, block.domain)
+    can_view_preview = has_permission(user, 'view_preview', domain=block.domain)
+    return {
+        'can_manage_build_workspace': can_manage_build,
+        'can_administer_requests': can_administer_requests,
+        'can_submit_own_requests': can_submit_requests,
+        'can_view_preview': can_view_preview,
+        'can_open_build_workspace': can_manage_build or (
+            block.build_status == ScheduleBlock.BuildStatus.PREVIEW and can_view_preview
+        ),
+        'can_publish_schedule': can_manage_build and has_permission(
+            user, 'publish_schedule', domain=block.domain,
+        ),
+        'can_unpublish_schedule': can_manage_build and has_permission(
+            user, 'unpublish_schedule', domain=block.domain,
+        ),
+    }
+
+
+def _serialize_schedule_block_for_user(user, block):
+    return {
+        **ScheduleBlockSerializer(block).data,
+        **_schedule_block_capabilities(user, block),
+    }
+
+
+def _can_access_schedule_block(user, block):
+    if _can_manage_build_workspace(user, block.domain) or _can_manage_requests(user, block.domain):
+        return True
+    if (
+        block.build_status == ScheduleBlock.BuildStatus.PREVIEW
+        and has_permission(user, 'view_preview', domain=block.domain)
+    ):
+        return True
+    return _request_blocks_for_regular_user(user).filter(id=block.id).exists()
 
 
 def _request_window_is_open(block):
@@ -2077,24 +2212,10 @@ def _request_window_is_open(block):
 
 
 def _can_manage_build_workspace(user, domain=None):
-    if getattr(user, '_atlas_test_access_active', False):
-        return (
-            has_permission(user, 'manage_build_workspace', domain=domain)
-            if domain is not None
-            else bool(permitted_domain_ids(user, 'manage_build_workspace'))
-        )
-    if domain is not None and has_permission(user, 'manage_build_workspace', domain=domain):
-        return True
-    if domain is None and permitted_domain_ids(user, 'manage_build_workspace'):
-        return True
-    if user.is_staff or user.is_superuser:
-        return True
-
-    if user.groups.filter(Q(name__iexact='admin') | Q(name__iexact='scheduler')).exists():
-        return True
-
-    return user.has_perm('scheduling.add_scheduleversion') or user.has_perm(
-        'scheduling.change_scheduleversion'
+    return (
+        has_permission(user, 'manage_build_workspace', domain=domain)
+        if domain is not None
+        else bool(permitted_domain_ids(user, 'manage_build_workspace'))
     )
 
 
@@ -2131,6 +2252,10 @@ def _working_request_physicians(block):
             domain=block.domain,
             active=True,
             clinically_active=True,
+        ).exclude(
+            role=DomainMembership.Role.VIEW_ONLY,
+        ).exclude(
+            role_template__system_key='view_only',
         ).values_list('user_id', flat=True)
         physicians = physicians.filter(
             user_id__in=working_user_ids,
@@ -2411,6 +2536,14 @@ def _validate_request_payload(
 @permission_classes([IsAuthenticated])
 def schedule_block_requests_list(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
+    if not (
+        _can_manage_requests(request.user, block.domain)
+        or _can_submit_own_requests(request.user, block.domain)
+    ):
+        return Response(
+            {'detail': 'Schedule request access is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     requests = (
         ScheduleRequest.objects.filter(
             schedule_block=block,
@@ -2440,6 +2573,12 @@ def schedule_block_requests_list(request, block_id):
 def schedule_block_requests_context(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
     can_manage = _can_manage_requests(request.user, block.domain)
+    can_submit_own = _can_submit_own_requests(request.user, block.domain)
+    if not can_manage and not can_submit_own:
+        return Response(
+            {'detail': 'Schedule request access is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if can_manage:
         physicians = list(_working_request_physicians(block))
@@ -2515,6 +2654,7 @@ def schedule_block_requests_context(request, block_id):
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
             'can_manage_requests': can_manage,
+            'can_submit_own_requests': can_submit_own,
             'is_scheduler_or_admin': can_manage,
             'selected_physician_id': selected_physician_id,
             'physicians': [_serialize_physician_choice(physician) for physician in physicians],
@@ -2707,6 +2847,12 @@ def schedule_block_request_detail(request, block_id, request_id):
     )
 
     can_manage = _can_manage_requests(request.user, block.domain)
+    can_submit_own = _can_submit_own_requests(request.user, block.domain)
+    if not can_manage and not can_submit_own:
+        return Response(
+            {'detail': 'Schedule request access is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     self_physician = _resolve_self_physician(request.user)
     if not can_manage and (
         self_physician is None
@@ -2718,7 +2864,7 @@ def schedule_block_request_detail(request, block_id, request_id):
     if request.method == 'GET':
         return Response(ScheduleRequestSerializer(schedule_request).data)
 
-    if not can_manage and not has_permission(request.user, 'submit_own_requests', domain=block.domain):
+    if not can_manage and not can_submit_own:
         return Response(
             {'detail': 'Request submission permission is required for this Domain.'},
             status=status.HTTP_403_FORBIDDEN,
@@ -3137,7 +3283,10 @@ def schedule_block_build_context(request, block_id):
         id=block_id,
     )
     can_manage = _can_manage_build_workspace(request.user, block.domain)
-    if not can_manage and block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
+    can_view_preview = has_permission(request.user, 'view_preview', domain=block.domain)
+    if not can_manage and not (
+        block.build_status == ScheduleBlock.BuildStatus.PREVIEW and can_view_preview
+    ):
         return _build_workspace_forbidden_response()
     versions = _schedule_version_queryset(block)
     selected_version = None
@@ -3209,6 +3358,10 @@ def schedule_block_build_context(request, block_id):
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
             'can_manage_build_workspace': can_manage,
+            'can_view_preview': can_view_preview,
+            'can_publish_schedule': can_manage and has_permission(
+                request.user, 'publish_schedule', domain=block.domain,
+            ),
             'atlas_v2_enabled': bool(
                 getattr(settings, 'ATLAS_V2_ENABLED', False)
             ),
@@ -3279,10 +3432,9 @@ def schedule_block_build_context(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_schedule_versions(request, block_id):
-    if not _can_manage_build_workspace(request.user):
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not _can_manage_build_workspace(request.user, block.domain):
         return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
     return Response(ScheduleVersionSerializer(_schedule_version_queryset(block), many=True).data)
 
 
@@ -3290,11 +3442,11 @@ def schedule_block_schedule_versions(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_workload_hour_adjustment(request, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'), id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if version.status != ScheduleVersion.Status.BUILD:
         return Response({'detail': 'Only a Build schedule version can be adjusted.'}, status=status.HTTP_409_CONFLICT)
     if request.data.get('reset') is True:
@@ -3348,15 +3500,14 @@ def schedule_version_workload_hour_adjustment(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_shift_instances(request, block_id, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('domain'),
         id=version_id,
         schedule_block=block,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     optimizer_run = _get_optimizer_run_for_version(version, request.query_params.get('optimizer_run_id'))
     return Response(
         ScheduleShiftInstanceSerializer(
@@ -3633,12 +3784,12 @@ def _optimizer_preflight_response(version, start_mode, source_run):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_optimizer_preflight(request, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
@@ -3738,7 +3889,10 @@ def _run_optimizer_response(request, version):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_stop_optimizer(request, version_id):
-    if not _can_manage_build_workspace(request.user):
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('domain'), id=version_id,
+    )
+    if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
     run_id = request.data.get('optimizer_run_id')
     controls = OptimizerControl.objects.filter(
@@ -3765,15 +3919,14 @@ def schedule_version_stop_optimizer(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_optimize(request, block_id, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
         schedule_block=block,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     return _run_optimizer_response(request, version)
 
 
@@ -3781,10 +3934,9 @@ def schedule_version_optimize(request, block_id, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_optimizer_runs(request, version_id):
-    if not _can_manage_build_workspace(request.user):
+    version = get_object_or_404(ScheduleVersion.objects.select_related('domain'), id=version_id)
+    if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
-
-    version = get_object_or_404(ScheduleVersion, id=version_id)
     _cleanup_stale_optimizer_runs(version)
     runs = OptimizerRun.objects.filter(schedule_version=version).order_by('-run_number')
     return Response(OptimizerRunSerializer(runs, many=True).data)
@@ -3794,13 +3946,12 @@ def schedule_version_optimizer_runs(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_run_optimizer(request, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if not request.data.get('background'):
         return _run_optimizer_response(request, version)
     seed, seed_error = _parse_optimizer_seed(request)
@@ -3954,12 +4105,12 @@ def schedule_version_run_optimizer(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_recalculate_score(request, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if (
         version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -3995,13 +4146,13 @@ def schedule_version_recalculate_score(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_save_copy(request, run_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
     source = get_object_or_404(
-        OptimizerRun.objects.select_related('schedule_version__schedule_block'),
+        OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
         id=run_id, status=OptimizerRun.Status.COMPLETED,
     )
     version = source.schedule_version
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if version.status != ScheduleVersion.Status.BUILD or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD:
         return Response({'detail': 'Copies can only be saved in a BUILD Schedule Version.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -4069,13 +4220,12 @@ def optimizer_run_save_copy(request, run_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_detail(request, run_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     optimizer_run = get_object_or_404(
         OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
         id=run_id,
     )
+    if not _can_manage_build_workspace(request.user, optimizer_run.schedule_version.domain):
+        return _build_workspace_forbidden_response()
     if request.method == 'DELETE':
         if (
             optimizer_run.schedule_version.status != ScheduleVersion.Status.BUILD
@@ -4181,11 +4331,11 @@ def optimizer_run_detail(request, run_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_runs_bulk_delete(request, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
     version = get_object_or_404(
-        ScheduleVersion.objects.select_related('schedule_block'), id=version_id,
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'), id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if (
         version.status != ScheduleVersion.Status.BUILD
         or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
@@ -4314,13 +4464,12 @@ def optimizer_runs_bulk_delete(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_activate(request, run_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     optimizer_run = get_object_or_404(
-        OptimizerRun.objects.select_related('schedule_version__schedule_block'),
+        OptimizerRun.objects.select_related('schedule_version__schedule_block', 'schedule_version__domain'),
         id=run_id,
     )
+    if not _can_manage_build_workspace(request.user, optimizer_run.schedule_version.domain):
+        return _build_workspace_forbidden_response()
     if optimizer_run.schedule_version.schedule_block.published_at is not None:
         return Response(
             {'detail': 'Unpublish this Schedule Block before activating another optimizer run.'},
@@ -4404,15 +4553,14 @@ def _published_violation_report(version):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_violation_report(request, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     version = get_object_or_404(
         ScheduleVersion.objects.select_related(
             'schedule_block', 'domain', 'published_optimizer_run',
         ),
         id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if version.schedule_block.published_at is not None:
         requested_run_id = request.query_params.get('optimizer_run_id')
         if requested_run_id not in (None, '') and str(
@@ -4457,9 +4605,6 @@ def schedule_version_violation_report(request, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_violations(request, run_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     optimizer_run = get_object_or_404(
         OptimizerRun.objects.select_related(
             'schedule_version__schedule_block',
@@ -4468,6 +4613,8 @@ def optimizer_run_violations(request, run_id):
         ),
         id=run_id,
     )
+    if not _can_manage_build_workspace(request.user, optimizer_run.schedule_version.domain):
+        return _build_workspace_forbidden_response()
     if optimizer_run.schedule_version.schedule_block.published_at is not None:
         if optimizer_run.schedule_version.published_optimizer_run_id != optimizer_run.id:
             return Response(
@@ -4518,15 +4665,14 @@ def _schedule_version_assignment_summary(version, message, cleared_count=0):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
         schedule_block=block,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -4585,15 +4731,14 @@ def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_clear_all_assignments(request, block_id, version_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     version = get_object_or_404(
         ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
         schedule_block=block,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -4803,10 +4948,7 @@ def _assignment_context_payload(shift_instance):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_shift_assignments(request, block_id, shift_instance_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     shift_instance = get_object_or_404(
         ScheduleShiftInstance.objects.select_related(
             'facility',
@@ -4815,6 +4957,8 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
         id=shift_instance_id,
         schedule_block=block,
     )
+    if not _can_manage_build_workspace(request.user, shift_instance.schedule_version.domain):
+        return _build_workspace_forbidden_response()
 
     if request.method == 'GET':
         return Response(_assignment_context_payload(shift_instance))
@@ -4927,15 +5071,14 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assignment_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     shift_instance = get_object_or_404(
-        ScheduleShiftInstance.objects.select_related('schedule_version'),
+        ScheduleShiftInstance.objects.select_related('schedule_version__domain'),
         id=shift_instance_id,
         schedule_block=block,
     )
+    if not _can_manage_build_workspace(request.user, shift_instance.schedule_version.domain):
+        return _build_workspace_forbidden_response()
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or shift_instance.schedule_version.status != ScheduleVersion.Status.BUILD
@@ -5019,13 +5162,12 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_unlock_physician_assignments(request, version_id, physician_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     version = get_object_or_404(
-        ScheduleVersion.objects.select_related('schedule_block'),
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
         id=version_id,
     )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
     if (
         version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -5073,10 +5215,9 @@ def schedule_version_unlock_physician_assignments(request, version_id, physician
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_generate_shift_instances(request, block_id):
-    if not _can_manage_build_workspace(request.user):
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not _can_manage_build_workspace(request.user, block.domain):
         return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
     if block.build_status not in {
         ScheduleBlock.BuildStatus.PRE_BUILD,
         ScheduleBlock.BuildStatus.BUILD,
@@ -5235,8 +5376,14 @@ def schedule_block_generate_shift_instances(request, block_id):
 @permission_classes([IsAuthenticated])
 def schedule_blocks_list_create(request):
     if request.method == 'GET':
-        can_manage = _can_manage_build_workspace(request.user) or _can_manage_requests(request.user)
-        blocks = ScheduleBlock.objects.all() if can_manage else _request_blocks_for_regular_user(request.user)
+        full_access_domain_ids = (
+            permitted_domain_ids(request.user, 'manage_build_workspace')
+            | permitted_domain_ids(request.user, 'administer_requests')
+        )
+        regular_block_ids = _request_blocks_for_regular_user(request.user).values_list('id', flat=True)
+        blocks = ScheduleBlock.objects.filter(
+            Q(domain_id__in=full_access_domain_ids) | Q(id__in=regular_block_ids),
+        ).distinct()
         blocks = blocks.select_related('domain__region')
         domain_id = request.query_params.get('domain')
         region_id = request.query_params.get('region')
@@ -5244,32 +5391,29 @@ def schedule_blocks_list_create(request):
             blocks = blocks.filter(domain_id=domain_id)
         elif region_id:
             blocks = blocks.filter(domain__region_id=region_id)
-        payload = ScheduleBlockSerializer(blocks, many=True).data
-        if not can_manage:
-            physician = _resolve_self_physician(request.user)
-            requests_by_block = {}
-            if physician is not None:
-                own_requests = (
-                    ScheduleRequest.objects.filter(
-                        schedule_block__in=blocks,
-                        physician=physician,
-                        request_scope=ScheduleRequest.RequestScope.USER,
-                    )
-                    .select_related('physician__user')
-                    .prefetch_related('shift_templates__facility')
-                    .order_by('date')
+        blocks = list(blocks)
+        payload = [_serialize_schedule_block_for_user(request.user, block) for block in blocks]
+        physician = _resolve_self_physician(request.user)
+        requests_by_block = {}
+        if physician is not None:
+            own_requests = (
+                ScheduleRequest.objects.filter(
+                    schedule_block__in=blocks,
+                    physician=physician,
+                    request_scope=ScheduleRequest.RequestScope.USER,
                 )
-                for schedule_request in own_requests:
-                    requests_by_block.setdefault(schedule_request.schedule_block_id, []).append(schedule_request)
-            for block_payload in payload:
-                block_payload['my_requests'] = ScheduleRequestSerializer(
-                    requests_by_block.get(block_payload['id'], []),
-                    many=True,
-                ).data
+                .select_related('physician__user')
+                .prefetch_related('shift_templates__facility')
+                .order_by('date')
+            )
+            for schedule_request in own_requests:
+                requests_by_block.setdefault(schedule_request.schedule_block_id, []).append(schedule_request)
+        for block_payload in payload:
+            block_payload['my_requests'] = ScheduleRequestSerializer(
+                requests_by_block.get(block_payload['id'], []),
+                many=True,
+            ).data
         return Response(payload)
-
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
 
     serializer = ScheduleBlockSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -5277,6 +5421,8 @@ def schedule_blocks_list_create(request):
     start_date = serializer.validated_data['start_date']
     end_date = serializer.validated_data['end_date']
     domain = serializer.validated_data['domain']
+    if not _can_manage_build_workspace(request.user, domain):
+        return _build_workspace_forbidden_response()
     acknowledged_overlap = bool(request.data.get('acknowledge_overlap', False))
 
     if _has_published_overlap(domain, start_date, end_date) and not acknowledged_overlap:
@@ -5300,13 +5446,14 @@ def schedule_blocks_list_create(request):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_detail(request, block_id):
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain__region'), id=block_id)
 
     if request.method == 'GET':
-        serializer = ScheduleBlockSerializer(block)
-        return Response(serializer.data)
+        if not _can_access_schedule_block(request.user, block):
+            return _build_workspace_forbidden_response()
+        return Response(_serialize_schedule_block_for_user(request.user, block))
 
-    if not _can_manage_build_workspace(request.user):
+    if not _can_manage_build_workspace(request.user, block.domain):
         return _build_workspace_forbidden_response()
 
     if request.method == 'PATCH':
@@ -5338,12 +5485,11 @@ def schedule_block_detail(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_enter_preview(request, block_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
     block = get_object_or_404(
-        ScheduleBlock.objects.select_related('preview_optimizer_run'), id=block_id,
+        ScheduleBlock.objects.select_related('domain', 'preview_optimizer_run'), id=block_id,
     )
+    if not _can_manage_build_workspace(request.user, block.domain):
+        return _build_workspace_forbidden_response()
 
     if block.build_status == ScheduleBlock.BuildStatus.ARCHIVE:
         return Response({'detail': 'Archived Schedule Blocks cannot enter preview.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -5395,10 +5541,9 @@ def schedule_block_enter_preview(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_move_back_to_build(request, block_id):
-    if not _can_manage_build_workspace(request.user):
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not _can_manage_build_workspace(request.user, block.domain):
         return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
     if block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
         return Response(
             {'detail': 'Only PREVIEW Schedule Blocks can move back to BUILD.'},
@@ -5415,10 +5560,15 @@ def schedule_block_move_back_to_build(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_publish(request, block_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not (
+        _can_manage_build_workspace(request.user, block.domain)
+        and has_permission(request.user, 'publish_schedule', domain=block.domain)
+    ):
+        return Response(
+            {'detail': 'Publish schedule permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if block.build_status != ScheduleBlock.BuildStatus.PREVIEW:
         return Response({'detail': 'Only PREVIEW Schedule Blocks can be published.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -5505,10 +5655,15 @@ def schedule_block_publish(request, block_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_unpublish(request, block_id):
-    if not _can_manage_build_workspace(request.user):
-        return _build_workspace_forbidden_response()
-
-    block = get_object_or_404(ScheduleBlock, id=block_id)
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not (
+        _can_manage_build_workspace(request.user, block.domain)
+        and has_permission(request.user, 'unpublish_schedule', domain=block.domain)
+    ):
+        return Response(
+            {'detail': 'Unpublish schedule permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     if block.build_status != ScheduleBlock.BuildStatus.ARCHIVE or block.published_at is None:
         return Response(
             {'detail': 'Only a published Schedule Block can be returned to BUILD.'},
@@ -5537,11 +5692,12 @@ def schedule_block_unpublish(request, block_id):
 @permission_classes([IsAuthenticated])
 def contracts_list_create(request):
     if request.method == 'GET':
+        allowed_domain_ids = permitted_domain_ids(request.user, 'manage_build_workspace')
         contracts = Contract.objects.select_related('domain__region__organization').prefetch_related(
             'facilities',
             'user_assignments__physician__user',
             'shared_rule_links__shared_rule__shift_templates__facility',
-        ).all()
+        ).filter(domain_id__in=allowed_domain_ids)
 
         domain_id = request.query_params.get('domain')
         region_id = request.query_params.get('region')
@@ -5564,6 +5720,9 @@ def contracts_list_create(request):
 
     serializer = ContractSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+    domain = serializer.validated_data['domain']
+    if not _can_manage_build_workspace(request.user, domain):
+        return _build_workspace_forbidden_response()
     contract = serializer.save()
     _mark_contract_domain_scores_stale(contract)
     return Response(ContractSerializer(contract).data, status=status.HTTP_201_CREATED)
@@ -5584,7 +5743,9 @@ def _shared_rule_queryset():
 @permission_classes([IsAuthenticated])
 def shared_rules_list_create(request):
     if request.method == 'GET':
-        queryset = _shared_rule_queryset()
+        queryset = _shared_rule_queryset().filter(
+            domain_id__in=permitted_domain_ids(request.user, 'manage_build_workspace'),
+        )
         domain_id = request.query_params.get('domain')
         region_id = request.query_params.get('region')
         active_view = request.query_params.get('status', 'active')
@@ -5595,13 +5756,11 @@ def shared_rules_list_create(request):
         queryset = queryset.filter(active=active_view != 'inactive')
         return Response(SharedRuleSerializer(queryset, many=True).data)
 
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can create Shared Rules.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     serializer = SharedRuleSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+    domain = serializer.validated_data['domain']
+    if not _can_manage_build_workspace(request.user, domain):
+        return _build_workspace_forbidden_response()
     with transaction.atomic():
         shared_rule = serializer.save()
         first_link = shared_rule.contract_links.select_related('contract').first()
@@ -5621,13 +5780,10 @@ def shared_rule_detail(request, shared_rule_id):
     shared_rule = get_object_or_404(
         _shared_rule_queryset(), id=shared_rule_id,
     )
+    if not _can_manage_build_workspace(request.user, shared_rule.domain):
+        return _build_workspace_forbidden_response()
     if request.method == 'GET':
         return Response(SharedRuleSerializer(shared_rule).data)
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can change Shared Rules.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     if request.method == 'DELETE':
         with transaction.atomic():
             contract_ids = list(
@@ -5661,11 +5817,6 @@ def shared_rule_detail(request, shared_rule_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shared_rule_duplicate(request, shared_rule_id):
-    if not _can_manage_build_workspace(request.user):
-        return Response(
-            {'detail': 'Only a scheduler or administrator can copy Shared Rules.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
     source = get_object_or_404(
         _shared_rule_queryset(), id=shared_rule_id,
     )
@@ -5673,6 +5824,11 @@ def shared_rule_duplicate(request, shared_rule_id):
     target_domain = get_object_or_404(
         Domain.objects.select_related('region'), id=target_domain_id, active=True,
     )
+    if not (
+        _can_manage_build_workspace(request.user, source.domain)
+        and _can_manage_build_workspace(request.user, target_domain)
+    ):
+        return _build_workspace_forbidden_response()
     base_name = f'{source.name} (Copy)'
     next_name = base_name
     suffix = 2
@@ -5712,20 +5868,6 @@ def shared_rule_duplicate(request, shared_rule_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_detail(request, contract_id):
-    if request.method == 'DELETE':
-        with transaction.atomic():
-            contract = get_object_or_404(
-                Contract.objects.select_for_update(),
-                id=contract_id,
-            )
-            if contract.user_assignments.exists():
-                return Response(
-                    {'detail': 'Remove all assigned users before deleting this Contract.'},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            contract.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
     contract = get_object_or_404(
         Contract.objects.select_related('domain').prefetch_related(
             'facilities',
@@ -5734,6 +5876,19 @@ def contract_detail(request, contract_id):
         ),
         id=contract_id,
     )
+    if not _can_manage_build_workspace(request.user, contract.domain):
+        return _build_workspace_forbidden_response()
+
+    if request.method == 'DELETE':
+        with transaction.atomic():
+            contract = Contract.objects.select_for_update().get(id=contract.id)
+            if contract.user_assignments.exists():
+                return Response(
+                    {'detail': 'Remove all assigned users before deleting this Contract.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            contract.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     if request.method == 'GET':
         serializer = ContractSerializer(contract)
@@ -5783,6 +5938,11 @@ def contract_duplicate(request, contract_id):
     target_domain = get_object_or_404(
         Domain.objects.select_related('region'), id=target_domain_id, active=True,
     )
+    if not (
+        _can_manage_build_workspace(request.user, source_contract.domain)
+        and _can_manage_build_workspace(request.user, target_domain)
+    ):
+        return _build_workspace_forbidden_response()
     cross_region_copy = target_domain.region_id != source_contract.domain.region_id
     source_facilities = list(source_contract.facilities.all())
     if not cross_region_copy:
@@ -5910,7 +6070,9 @@ def contract_duplicate(request, contract_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_deactivate(request, contract_id):
-    contract = get_object_or_404(Contract, id=contract_id)
+    contract = get_object_or_404(Contract.objects.select_related('domain'), id=contract_id)
+    if not _can_manage_build_workspace(request.user, contract.domain):
+        return _build_workspace_forbidden_response()
     contract.active = False
     contract.save(update_fields=['active', 'updated_at'])
     _mark_contract_domain_scores_stale(contract)
@@ -5921,7 +6083,9 @@ def contract_deactivate(request, contract_id):
 @authentication_classes([CsrfExemptSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_reactivate(request, contract_id):
-    contract = get_object_or_404(Contract, id=contract_id)
+    contract = get_object_or_404(Contract.objects.select_related('domain'), id=contract_id)
+    if not _can_manage_build_workspace(request.user, contract.domain):
+        return _build_workspace_forbidden_response()
     contract.active = True
     contract.save(update_fields=['active', 'updated_at'])
     _mark_contract_domain_scores_stale(contract)

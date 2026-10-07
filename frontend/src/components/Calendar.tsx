@@ -765,7 +765,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
           <details ref={physicianFilterRef} className="physician-filter-menu">
             <summary>
               {isGroupSchedule
-                ? 'All physicians'
+                ? 'All Users'
                 : `${selectedPhysicianIds.length} physician${selectedPhysicianIds.length === 1 ? '' : 's'}`}
             </summary>
             <div className="physician-filter-popover">

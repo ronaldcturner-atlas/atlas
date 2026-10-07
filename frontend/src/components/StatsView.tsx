@@ -181,6 +181,7 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
   const visibleShifts = shifts
     .filter((shift) => (
       shift.physician === user?.physician_id
+      && shift.domain === selectedDomainId
       && shift.status !== 'open'
       && shift.date >= fromDate
       && shift.date <= throughDate
@@ -258,7 +259,7 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
         <button type="button" className={activeStats === 'mine' ? 'active' : ''} onClick={() => setActiveStats('mine')}>My Stats</button>
         {!!statsDomains.length && <button type="button" className={activeStats === 'group' ? 'active' : ''} onClick={() => setActiveStats('group')}>Group Stats</button>}
       </div>
-      {activeStats === 'group' && !!statsDomains.length && <div className="stats-scope-controls">
+      {!!statsDomains.length && <div className="stats-scope-controls">
         <label className="stats-scope-field">
           <span>Region</span>
           {statsRegions.length > 1 ? <select value={selectedRegionId ?? ''} onChange={(event) => { setSelectedRegionId(Number(event.target.value)); setSelectedDomainId(null) }}>{statsRegions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select> : <strong>{statsRegions[0]?.name}</strong>}

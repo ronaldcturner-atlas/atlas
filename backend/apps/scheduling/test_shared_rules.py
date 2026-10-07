@@ -1,11 +1,17 @@
 from datetime import time
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from apps.domains.models import Domain, Region
+from apps.domains.models import (
+    Domain,
+    DomainMembership,
+    OrganizationMembership,
+    Region,
+    RoleTemplate,
+)
+from apps.domains.permissions import SCHEDULER_DEFAULTS
 from apps.facilities.models import Facility
 
 from .models import Contract, SharedRule, ShiftTemplate
@@ -15,11 +21,25 @@ class SharedRuleApiTests(TestCase):
     def setUp(self):
         User = get_user_model()
         self.scheduler = User.objects.create_user('shared.scheduler', password='x')
-        scheduler_group, _ = Group.objects.get_or_create(name='Scheduler')
-        self.scheduler.groups.add(scheduler_group)
         self.client = APIClient()
         self.client.force_authenticate(self.scheduler)
         self.domain = Domain.objects.create(name='Shared Physician', active=True)
+        OrganizationMembership.objects.create(
+            organization=self.domain.region.organization,
+            user=self.scheduler,
+        )
+        scheduler_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Shared Rule Test Scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=self.scheduler,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=scheduler_role,
+            clinically_active=False,
+        )
         self.berkeley = Facility.objects.create(
             name='Berkeley', short_name='BER',
         )
@@ -70,6 +90,20 @@ class SharedRuleApiTests(TestCase):
                 'spread_violations': True,
             } for contract_id in contract_ids],
         }
+
+    def grant_target_scheduler_access(self, domain):
+        role = RoleTemplate.objects.create(
+            region=domain.region,
+            name=f'{domain.region.name} Test Scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=domain,
+            user=self.scheduler,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=role,
+            clinically_active=False,
+        )
 
     def test_create_materializes_one_shared_rule_for_each_contract(self):
         response = self.client.post(
@@ -239,6 +273,7 @@ class SharedRuleApiTests(TestCase):
             region=target_region,
             name='Physician',
         )
+        self.grant_target_scheduler_access(target_domain)
 
         response = self.client.post(
             f"/api/shared-rules/{created.json()['id']}/duplicate/",
@@ -291,6 +326,7 @@ class SharedRuleApiTests(TestCase):
             region=target_region,
             name='Physician',
         )
+        self.grant_target_scheduler_access(target_domain)
         response = self.client.post(
             f'/api/contracts/{self.full.id}/duplicate/',
             {'domain': target_domain.id},
@@ -324,6 +360,7 @@ class SharedRuleApiTests(TestCase):
             region=target_region,
             name='Physician',
         )
+        self.grant_target_scheduler_access(target_domain)
 
         response = self.client.post(
             f'/api/contracts/{self.full.id}/duplicate/',

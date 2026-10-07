@@ -125,7 +125,7 @@ export default function RolesView() {
     <div className="facilities-header roles-toolbar">
       <div><h2>Roles</h2><p>Regional templates assigned independently within each Domain.</p></div>
       <div className="roles-scope-controls">
-        {organizations.length > 1 && <label><span>Organization</span><select value={organizationId ?? ''} onChange={(e) => { setOrganizationId(Number(e.target.value)); setRegionId(null) }}>{organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label>}
+        {organizations.length > 1 ? <label><span>Organization</span><select value={organizationId ?? ''} onChange={(e) => { setOrganizationId(Number(e.target.value)); setRegionId(null) }}>{organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}</select></label> : <div className="roles-single-region"><span>Organization</span><strong>{organizations[0]?.name ?? '—'}</strong></div>}
         {regions.length > 1 ? <label><span>Region</span><select value={regionId ?? ''} onChange={(e) => setRegionId(Number(e.target.value))}>{regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}</select></label> : <div className="roles-single-region"><span>Region</span><strong>{regions[0]?.name ?? '—'}</strong></div>}
         <button type="button" className="primary-action" onClick={openCreate}>Add Role</button>
       </div>

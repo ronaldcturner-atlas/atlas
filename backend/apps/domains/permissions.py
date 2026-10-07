@@ -1,6 +1,6 @@
 from collections import OrderedDict
 
-from .models import DomainMembership, OrganizationMembership
+from .models import Domain, DomainMembership, OrganizationMembership
 
 
 PERMISSION_GROUPS = OrderedDict([
@@ -223,7 +223,7 @@ def permitted_domain_ids(user, permission):
     organization_ids = set(OrganizationMembership.objects.filter(
         user=user, active=True, is_org_admin=True,
     ).values_list('organization_id', flat=True))
-    return {
+    permitted_ids = {
         membership.domain_id
         for membership in memberships
         if (
@@ -234,3 +234,10 @@ def permitted_domain_ids(user, permission):
             )
         )
     }
+    if organization_ids:
+        permitted_ids.update(Domain.objects.filter(
+            active=True,
+            region__active=True,
+            region__organization_id__in=organization_ids,
+        ).values_list('id', flat=True))
+    return permitted_ids

@@ -429,7 +429,7 @@ export default function PhysiciansView() {
             <span>Total Users</span>
             <strong>{activePhysicianCount}</strong>
           </div>
-          {regions.length > 1 && (
+          {regions.length > 1 ? (
             <label className="user-filter-select">
               <span>Region</span>
               <select
@@ -442,8 +442,8 @@ export default function PhysiciansView() {
                 {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
               </select>
             </label>
-          )}
-          {organizations.length > 1 && (
+          ) : <div className="user-filter-static"><span>Region</span><strong>{regions[0]?.name ?? '—'}</strong></div>}
+          {organizations.length > 1 ? (
             <label className="user-filter-select">
               <span>Organization</span>
               <select
@@ -457,8 +457,10 @@ export default function PhysiciansView() {
                 {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
               </select>
             </label>
-          )}
-          <div className="user-domain-filters" aria-label="Filter users by domain">
+          ) : <div className="user-filter-static"><span>Organization</span><strong>{organizations[0]?.name ?? '—'}</strong></div>}
+          <div className="user-domain-filter-group">
+          <span>Domain</span>
+          {selectedRegionDomains.length > 1 ? <div className="user-domain-filters" aria-label="Filter users by domain">
             <button
               type="button"
               className={selectedDomainId === 'all' ? 'active' : ''}
@@ -476,6 +478,7 @@ export default function PhysiciansView() {
                 {domain.name}
               </button>
             ))}
+          </div> : <strong className="user-domain-static">{selectedRegionDomains[0]?.name ?? '—'}</strong>}
           </div>
         </div>
         <button type="button" className="primary-action" onClick={openCreateModal}>

@@ -617,9 +617,9 @@ export default function ContractsView() {
 
   const loadReferenceData = async () => {
     const [domainsResponse, facilitiesResponse, templatesResponse, physiciansResponse] = await Promise.all([
-      fetch(`${API_BASE}/domains/?active=true`, { credentials: 'include' }),
+      fetch(`${API_BASE}/domains/?active=true&permission=manage_build_workspace`, { credentials: 'include' }),
       fetch(`${API_BASE}/facilities/?active=true`, { credentials: 'include' }),
-      fetch(`${API_BASE}/shift-templates/?active=true`, { credentials: 'include' }),
+      fetch(`${API_BASE}/shift-templates/?active=true&permission=manage_build_workspace`, { credentials: 'include' }),
       fetch(`${API_BASE}/physicians/`, { credentials: 'include' }),
     ])
 
@@ -958,13 +958,13 @@ export default function ContractsView() {
               onChange={(event) => setShowInactive(event.target.checked)}
             />
           </label>
-          {regions.length > 1 && <label className="facility-field contracts-domain-filter">
+          {regions.length > 1 ? <label className="facility-field contracts-domain-filter">
             <span>Region</span>
             <select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>
               {regions.map((region) => <option key={region.id} value={region.id}>{region.name}</option>)}
             </select>
-          </label>}
-          <label className="facility-field contracts-domain-filter">
+          </label> : <div className="context-static-field contracts-domain-filter"><span>Region</span><strong>{regions[0]?.name ?? '—'}</strong></div>}
+          {domainsForRegion.length > 1 ? <label className="facility-field contracts-domain-filter">
             <span>Domain</span>
             <select value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}>
               <option value="">All domains</option>
@@ -974,7 +974,7 @@ export default function ContractsView() {
                 </option>
               ))}
             </select>
-          </label>
+          </label> : <div className="context-static-field contracts-domain-filter"><span>Domain</span><strong>{domainsForRegion[0]?.name ?? '—'}</strong></div>}
           <button type="button" className="primary-action" onClick={openCreateModal}>
             Create Contract
           </button>

@@ -24,6 +24,13 @@ type ScheduleBlock = {
     run_id: number | null
     run_number: number | null
   }>
+  can_manage_build_workspace: boolean
+  can_administer_requests: boolean
+  can_submit_own_requests: boolean
+  can_view_preview: boolean
+  can_open_build_workspace: boolean
+  can_publish_schedule: boolean
+  can_unpublish_schedule: boolean
   my_requests?: Array<{
     id: number
     date: string
@@ -218,6 +225,7 @@ export default function ScheduleBlocksView({
 }: ScheduleBlocksViewProps) {
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
+  const [managedDomainIds, setManagedDomainIds] = useState<Set<number>>(new Set())
   const [selectedRegionId, setSelectedRegionId] = useState<number | null>(() => {
     const stored = Number(window.sessionStorage.getItem(SCHEDULE_BLOCK_REGION_KEY))
     return Number.isInteger(stored) && stored > 0 ? stored : null
@@ -242,9 +250,10 @@ export default function ScheduleBlocksView({
       setIsLoading(true)
       setError(null)
 
-      const [response, domainsResponse] = await Promise.all([
+      const [response, domainsResponse, managedDomainsResponse] = await Promise.all([
         fetch(`${API_BASE}/schedule-blocks/`, { credentials: 'include' }),
-        fetch(`${API_BASE}/domains/`, { credentials: 'include' }),
+        fetch(`${API_BASE}/domains/?active=true&permissions=manage_build_workspace,administer_requests,submit_own_requests,view_preview`, { credentials: 'include' }),
+        fetch(`${API_BASE}/domains/?active=true&permission=manage_build_workspace`, { credentials: 'include' }),
       ])
 
       if (!response.ok) {
@@ -256,11 +265,17 @@ export default function ScheduleBlocksView({
         const parsed = await parseApiResponseError(domainsResponse)
         throw new Error(parsed.message ?? 'Unable to load scheduling Domains.')
       }
+      if (!managedDomainsResponse.ok) {
+        const parsed = await parseApiResponseError(managedDomainsResponse)
+        throw new Error(parsed.message ?? 'Unable to load Build Workspace permissions.')
+      }
 
       const data = await response.json()
       const domainData = await domainsResponse.json()
+      const managedDomainData = await managedDomainsResponse.json()
       setBlocks(data)
       setDomains(domainData.filter((domain: DomainOption) => domain.active))
+      setManagedDomainIds(new Set(managedDomainData.map((domain: DomainOption) => domain.id)))
     } catch (fetchError) {
       console.error(fetchError)
       setError(fetchError instanceof Error ? fetchError.message : 'Unable to load Schedule Blocks right now.')
@@ -664,15 +679,24 @@ export default function ScheduleBlocksView({
                     <td>{formatDateTime(block.request_open_datetime)}</td>
                     <td>{formatDateTime(block.request_close_datetime)}</td>
                     <td>
-                      <button
-                        type="button"
-                        className={`user-request-button ${requestStatus === 'Open' ? 'user-request-button-open' : 'user-request-button-closed'}`}
-                        onClick={() => openRequests(block)}
-                        disabled={requestStatus !== 'Open' || (block.build_status !== 'PRE_BUILD' && block.build_status !== 'BUILD')}
-                        title={requestStatus === 'Open' ? 'Enter schedule requests' : `Request period is ${requestStatus.toLowerCase()}`}
-                      >
-                        Requests
-                      </button>
+                      <div className="facility-actions">
+                        {block.can_submit_own_requests && (
+                          <button
+                            type="button"
+                            className={`user-request-button ${requestStatus === 'Open' ? 'user-request-button-open' : 'user-request-button-closed'}`}
+                            onClick={() => openRequests(block)}
+                            disabled={requestStatus !== 'Open' || (block.build_status !== 'PRE_BUILD' && block.build_status !== 'BUILD')}
+                            title={requestStatus === 'Open' ? 'Enter schedule requests' : `Request period is ${requestStatus.toLowerCase()}`}
+                          >
+                            Requests
+                          </button>
+                        )}
+                        {block.build_status === 'PREVIEW' && block.can_view_preview && (
+                          <button type="button" onClick={() => onOpenBuild?.(block.id)}>
+                            View Preview
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 )
@@ -709,9 +733,11 @@ export default function ScheduleBlocksView({
         <h2>Schedule Blocks</h2>
         <div className="schedule-block-header-actions">
           {schedulingScopeControls}
-          <button type="button" className="primary-action" onClick={openCreateModal} disabled={!selectedDomainId}>
-            Create New
-          </button>
+          {selectedDomainId && managedDomainIds.has(selectedDomainId) && (
+            <button type="button" className="primary-action" onClick={openCreateModal}>
+              Create New
+            </button>
+          )}
         </div>
       </div>
 
@@ -750,30 +776,34 @@ export default function ScheduleBlocksView({
                 </td>
                 <td>
                   <div className="facility-actions">
-                    <button type="button" onClick={() => onOpenBuild?.(block.id)}>
-                      Open
-                    </button>
-                    <button type="button" onClick={() => openRequests(block)}>
-                      Requests
-                    </button>
-                    {(block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
+                    {block.can_open_build_workspace && (
+                      <button type="button" onClick={() => onOpenBuild?.(block.id)}>
+                        Open
+                      </button>
+                    )}
+                    {(block.can_administer_requests || block.can_submit_own_requests) && (
+                      <button type="button" onClick={() => openRequests(block)}>
+                        Requests
+                      </button>
+                    )}
+                    {block.can_manage_build_workspace && (block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
                       <button type="button" onClick={() => onOpenBuild?.(block.id)}>
                         Build Schedule
                       </button>
                     )}
-                    {(block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
+                    {block.can_manage_build_workspace && (block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
                       <>
                         <button type="button" onClick={() => openBlock(block)}>Edit Dates</button>
                         <button type="button" onClick={() => openBlock(block)}>Edit Request Window</button>
                       </>
                     )}
-                    {!block.published_at && (
+                    {block.can_manage_build_workspace && !block.published_at && (
                       <button type="button" onClick={() => deleteBlock(block)}>Delete</button>
                     )}
-                    {block.build_status === 'PREVIEW' && (
+                    {block.can_manage_build_workspace && block.build_status === 'PREVIEW' && (
                       <button type="button" onClick={() => moveBackToBuild(block)}>Move Back to Build</button>
                     )}
-                    {block.build_status === 'ARCHIVE' && block.published_at && (
+                    {block.can_unpublish_schedule && block.build_status === 'ARCHIVE' && block.published_at && (
                       <button type="button" onClick={() => unpublishBlock(block)}>Unpublish / Return to Build</button>
                     )}
                   </div>

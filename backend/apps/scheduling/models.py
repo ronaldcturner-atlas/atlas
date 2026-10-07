@@ -230,6 +230,13 @@ class ScheduleCommentSeries(models.Model):
         ON_DATE = 'ON_DATE', 'End on date'
         AFTER_COUNT = 'AFTER_COUNT', 'End after occurrences'
 
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.CASCADE,
+        related_name='schedule_comment_series',
+        null=True,
+        blank=True,
+    )
     title = models.CharField(max_length=100)
     details = models.TextField(blank=True)
     start_date = models.DateField()
@@ -552,6 +559,14 @@ class ShiftTrade(models.Model):
         APPROVED = 'APPROVED', 'Approved'
         CANCELLED = 'CANCELLED', 'Cancelled'
 
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.PROTECT,
+        related_name='shift_trades',
+        null=True,
+        blank=True,
+    )
+
     offered_assignment = models.ForeignKey(
         ScheduleShiftAssignment, on_delete=models.SET_NULL, related_name='trades_offered',
         null=True, blank=True,
@@ -578,6 +593,13 @@ class ShiftTrade(models.Model):
     reviewed_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, blank=True, related_name='shift_trades_reviewed',
     )
+
+    def save(self, *args, **kwargs):
+        if self.domain_id is None:
+            assignment = self.offered_assignment or self.requested_assignment
+            if assignment is not None:
+                self.domain_id = assignment.shift_instance.schedule_version.domain_id
+        super().save(*args, **kwargs)
 
     class Meta:
         ordering = ['-created_at', '-id']

@@ -15,7 +15,7 @@ from .models import (
 	Region,
 	RoleTemplate,
 )
-from .permissions import DEFAULT_ROLE_DEFINITIONS, has_permission, is_org_admin
+from .permissions import ALL_PERMISSIONS, DEFAULT_ROLE_DEFINITIONS, has_permission, is_org_admin, permitted_domain_ids
 from .serializers import (
 	AuditEventSerializer,
 	DomainMembershipSerializer,
@@ -192,7 +192,20 @@ def regions_list_create(request, organization_id):
 		return Response({'detail': 'Organization access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'GET':
 		regions = organization.regions.annotate(domain_count=Count('domains'))
-		return Response(RegionSerializer(regions, many=True).data)
+		if getattr(request.user, '_atlas_test_access_active', False):
+			regions = regions.filter(id=request.user._atlas_test_domain.region_id)
+		elif not _is_org_admin(request.user, organization):
+			regions = regions.filter(
+				domains__memberships__user=request.user,
+				domains__memberships__active=True,
+			).distinct()
+		payload = RegionSerializer(regions, many=True).data
+		for row in payload:
+			region = next(region for region in regions if region.id == row['id'])
+			row['can_manage_facilities'] = has_permission(
+				request.user, 'manage_regional_facilities', region=region,
+			)
+		return Response(payload)
 	if not _is_org_admin(request.user, organization):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	serializer = RegionSerializer(data=request.data)
@@ -211,6 +224,12 @@ def region_detail(request, region_id):
 	organization = region.organization
 	if not _can_access_organization(request.user, organization):
 		return Response({'detail': 'Organization access is required.'}, status=status.HTTP_403_FORBIDDEN)
+	if request.method == 'GET' and not (
+		_is_org_admin(request.user, organization)
+		or has_permission(request.user, 'view_published_schedules', region=region)
+		or has_permission(request.user, 'manage_regional_facilities', region=region)
+	):
+		return Response({'detail': 'Region access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'GET':
 		region.domain_count = region.domains.count()
 		return Response(RegionSerializer(region).data)
@@ -243,7 +262,33 @@ def domains_list_create(request):
 		domains = Domain.objects.filter(region__organization=organization).select_related('region__organization').annotate(
 			membership_count=Count('memberships'),
 		)
-		if getattr(request.user, '_atlas_test_access_active', False):
+		permission_filter = request.query_params.get('permission')
+		permission_filters = [
+			value.strip()
+			for value in request.query_params.get('permissions', '').split(',')
+			if value.strip()
+		]
+		if permission_filter and permission_filters:
+			return Response(
+				{'permissions': ['Use either permission or permissions, not both.']},
+				status=status.HTTP_400_BAD_REQUEST,
+			)
+		if permission_filter:
+			if permission_filter not in ALL_PERMISSIONS:
+				return Response({'permission': ['Unknown permission.']}, status=status.HTTP_400_BAD_REQUEST)
+			domains = domains.filter(id__in=permitted_domain_ids(request.user, permission_filter))
+		elif permission_filters:
+			unknown_permissions = sorted(set(permission_filters) - ALL_PERMISSIONS)
+			if unknown_permissions:
+				return Response(
+					{'permissions': [f'Unknown permission: {unknown_permissions[0]}.']},
+					status=status.HTTP_400_BAD_REQUEST,
+				)
+			permitted_ids = set()
+			for permission in permission_filters:
+				permitted_ids.update(permitted_domain_ids(request.user, permission))
+			domains = domains.filter(id__in=permitted_ids)
+		elif getattr(request.user, '_atlas_test_access_active', False):
 			domains = domains.filter(id=request.user._atlas_test_domain.id)
 		if request.query_params.get('accessible') == 'true' and not request.user.is_superuser:
 			membership_domain_ids = DomainMembership.objects.filter(

@@ -970,6 +970,10 @@ class ContractSerializer(serializers.ModelSerializer):
             })
 
         next_domain = attrs.get('domain', self.instance.domain if self.instance else None)
+        if self.instance is not None and next_domain.id != self.instance.domain_id:
+            raise serializers.ValidationError({
+                'domain': 'A Contract cannot be moved to another Domain. Copy it instead.',
+            })
         next_facilities = attrs.get('facilities')
         if next_domain and next_facilities is not None:
             invalid_facilities = [
@@ -1352,6 +1356,12 @@ class SharedRuleSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'contract_settings': (
                     'All Shared Rule contracts must use the selected domain.'
+                ),
+            })
+        if any(template.domain_id != domain.id for template in templates):
+            raise serializers.ValidationError({
+                'shift_template_ids': (
+                    'Every selected shift must use the Shared Rule domain.'
                 ),
             })
         if not templates:

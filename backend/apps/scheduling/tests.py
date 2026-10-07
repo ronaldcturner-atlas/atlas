@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group, Permission
+from django.contrib.auth.models import Group
 from django.db.models import Count
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -15,7 +15,8 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain, DomainMembership, Region
+from apps.domains.models import Domain, DomainMembership, Region, RoleTemplate
+from apps.domains.permissions import CLINICAL_DEFAULTS, SCHEDULER_DEFAULTS
 from apps.facilities.models import Facility
 
 from . import api
@@ -505,6 +506,18 @@ class ScheduleBlockApiTests(TestCase):
         self.user.groups.add(scheduler_group)
         self.client.force_authenticate(user=self.user)
         self.domain = Domain.objects.create(name='Schedule Block Domain', active=True)
+        self.scheduler_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Schedule Block Test Scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=self.user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=self.scheduler_role,
+            clinically_active=False,
+        )
 
     def _create_block(self, **overrides):
         defaults = {
@@ -556,6 +569,13 @@ class ScheduleBlockApiTests(TestCase):
             published_at=timezone.now(),
         )
         other_domain = Domain.objects.create(name='Independent Region Schedule', active=True)
+        DomainMembership.objects.create(
+            domain=other_domain,
+            user=self.user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=self.scheduler_role,
+            clinically_active=False,
+        )
 
         response = self.client.post(
             '/api/schedule-blocks/',
@@ -1089,9 +1109,33 @@ class ScheduleRequestApiTests(TestCase):
             request_close_datetime=timezone.now() + timedelta(days=1),
             build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
         )
+        self.scheduler_role = RoleTemplate.objects.create(
+            region=self.block.domain.region,
+            name='Request Test Scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        self.clinical_role = RoleTemplate.objects.create(
+            region=self.block.domain.region,
+            name='Request Test Clinician',
+            permissions=sorted(CLINICAL_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.block.domain,
+            user=self.scheduler_user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=self.scheduler_role,
+            clinically_active=False,
+        )
+        DomainMembership.objects.create(
+            domain=self.block.domain,
+            user=self.physician_user,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+            role_template=self.clinical_role,
+            clinically_active=True,
+        )
 
     def _assign_contract(self, request_settings, facilities=None):
-        domain = Domain.objects.create(name='Emergency Medicine', active=True)
+        domain = self.block.domain
         contract = Contract.objects.create(
             domain=domain,
             name='Request Contract',
@@ -1276,6 +1320,13 @@ class ScheduleRequestApiTests(TestCase):
         app_domain = Domain.objects.create(name='APP Request Domain', active=True)
         self.block.domain = app_domain
         self.block.save(update_fields=['domain', 'updated_at'])
+        DomainMembership.objects.create(
+            domain=app_domain,
+            user=self.scheduler_user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=self.scheduler_role,
+            clinically_active=False,
+        )
 
         self.shift_template.domain = physician_domain
         self.shift_template.save(update_fields=['domain'])
@@ -1440,16 +1491,22 @@ class ScheduleRequestApiTests(TestCase):
             [1, 1, 2, 3],
         )
 
-    def test_request_change_permission_grants_scheduler_context_access(self):
+    def test_domain_request_permission_grants_scheduler_context_access(self):
         permission_user = get_user_model().objects.create_user(
             username='request-manager@example.com',
             email='request-manager@example.com',
         )
-        permission_user.user_permissions.add(
-            Permission.objects.get(
-                content_type__app_label='scheduling',
-                codename='change_schedulerequest',
-            )
+        request_role = RoleTemplate.objects.create(
+            region=self.block.domain.region,
+            name='Request Administrator',
+            permissions=['administer_requests'],
+        )
+        DomainMembership.objects.create(
+            domain=self.block.domain,
+            user=permission_user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=request_role,
+            clinically_active=False,
         )
         self.client.force_authenticate(user=permission_user)
 
@@ -1460,7 +1517,7 @@ class ScheduleRequestApiTests(TestCase):
         self.assertTrue(payload['is_scheduler_or_admin'])
         self.assertEqual(payload['selected_physician_id'], self.physician.id)
 
-    def test_context_returns_200_for_authenticated_user_without_physician(self):
+    def test_context_requires_domain_request_permission(self):
         user_without_physician = get_user_model().objects.create_user(
             username='observer@example.com',
             email='observer@example.com',
@@ -1470,13 +1527,7 @@ class ScheduleRequestApiTests(TestCase):
 
         response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload['schedule_block']['id'], self.block.id)
-        self.assertEqual(payload['can_manage_requests'], False)
-        self.assertEqual(payload['is_scheduler_or_admin'], False)
-        self.assertEqual(payload['selected_physician_id'], None)
-        self.assertEqual(payload['physicians'], [])
+        self.assertEqual(response.status_code, 403)
 
     def test_regular_user_only_sees_latest_published_and_upcoming_request_blocks(self):
         older_published = ScheduleBlock.objects.create(
@@ -2014,6 +2065,13 @@ class ScheduleRequestApiTests(TestCase):
             password='password123',
         )
         second_physician = Physician.objects.create(user=second_user, display_name='Second Physician')
+        DomainMembership.objects.create(
+            domain=self.block.domain,
+            user=second_user,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+            role_template=self.clinical_role,
+            clinically_active=True,
+        )
         self.client.force_authenticate(user=self.scheduler_user)
 
         response = self.client.post(
@@ -2192,6 +2250,23 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.client.force_authenticate(user=self.scheduler_user)
 
         self.domain = Domain.objects.create(name='Physician', active=True)
+        self.scheduler_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Build Workspace Test Scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        self.clinical_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Build Workspace Test Clinician',
+            permissions=sorted(CLINICAL_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=self.scheduler_user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=self.scheduler_role,
+            clinically_active=False,
+        )
         self.facility = Facility.objects.create(
             name='Berkeley Hospital',
             short_name='Berkeley',
@@ -2263,6 +2338,14 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         physician = Physician.objects.create(
             user=user,
             display_name=display_name,
+            active=active,
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=user,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+            role_template=self.clinical_role,
+            clinically_active=active,
             active=active,
         )
         contract = Contract.objects.create(
@@ -3400,10 +3483,22 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(restored_optimizer.status_code, 200)
 
-    def test_authenticated_user_can_view_preview_but_cannot_move_it_to_build(self):
+    def test_view_preview_permission_allows_read_only_preview_workspace(self):
         self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
         self.block.save(update_fields=['build_status', 'updated_at'])
         viewer = get_user_model().objects.create_user(username='preview-viewer')
+        viewer_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Preview Viewer',
+            permissions=['view_preview'],
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=viewer,
+            role=DomainMembership.Role.VIEW_ONLY,
+            role_template=viewer_role,
+            clinically_active=False,
+        )
         self.client.force_authenticate(user=viewer)
 
         context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/')
@@ -3413,7 +3508,19 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
 
         self.assertEqual(context_response.status_code, 200)
         self.assertFalse(context_response.json()['can_manage_build_workspace'])
+        self.assertTrue(context_response.json()['can_view_preview'])
+        self.assertFalse(context_response.json()['can_publish_schedule'])
         self.assertEqual(move_response.status_code, 403)
+
+    def test_authenticated_user_without_preview_permission_cannot_view_preview(self):
+        self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
+        self.block.save(update_fields=['build_status', 'updated_at'])
+        viewer = get_user_model().objects.create_user(username='no-preview-viewer')
+        self.client.force_authenticate(user=viewer)
+
+        response = self.client.get(f'/api/schedule-blocks/{self.block.id}/build/')
+
+        self.assertEqual(response.status_code, 403)
 
     def test_assign_remove_and_refresh_multiple_physicians(self):
         self.client.post(
@@ -10006,6 +10113,18 @@ class ContractApiTests(TestCase):
 
         self.domain = Domain.objects.create(name='Emergency Medicine', active=True)
         self.facility = Facility.objects.create(name='North Hospital', short_name='North')
+        scheduler_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Contract Test Scheduler',
+            permissions=sorted(SCHEDULER_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=self.user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=scheduler_role,
+            clinically_active=False,
+        )
 
         physician_user = get_user_model().objects.create_user(
             username='physician.contract@example.com',
@@ -10015,6 +10134,18 @@ class ContractApiTests(TestCase):
             password='password123',
         )
         self.physician = Physician.objects.create(user=physician_user, display_name='Casey Ng')
+        clinical_role = RoleTemplate.objects.create(
+            region=self.domain.region,
+            name='Contract Test Clinician',
+            permissions=sorted(CLINICAL_DEFAULTS),
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=physician_user,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+            role_template=clinical_role,
+            clinically_active=True,
+        )
 
     def _build_payload(self):
         return {
@@ -10105,11 +10236,12 @@ class ContractApiTests(TestCase):
         self.assertEqual(payload['assigned_users_count'], 1)
 
     def test_contract_assignment_uses_role_in_contract_domain_only(self):
-        DomainMembership.objects.create(
+        membership = DomainMembership.objects.get(
             domain=self.domain,
             user=self.physician.user,
-            role=DomainMembership.Role.APP,
         )
+        membership.role = DomainMembership.Role.APP
+        membership.save(update_fields=['role'])
         other_domain = Domain.objects.create(name='Other Contract Domain', active=True)
         DomainMembership.objects.create(
             domain=other_domain,

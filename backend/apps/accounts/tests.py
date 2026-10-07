@@ -15,6 +15,7 @@ from apps.scheduling.models import (
     ScheduleBlock,
     ScheduleVersion,
 )
+from apps.domains.models import Organization, OrganizationMembership
 from .models import Physician
 
 
@@ -24,6 +25,12 @@ class AccountsTests(TestCase):
             username='manager@example.com',
             email='manager@example.com',
             password='atlas',
+        )
+        organization = Organization.objects.create(name='Account Test Organization')
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=manager,
+            is_org_admin=True,
         )
         self.client.force_login(manager)
 

@@ -105,6 +105,7 @@ class UserSerializer(serializers.ModelSerializer):
     def get_can_manage_schedules(self, obj):
         management_permissions = {
             'manage_build_workspace', 'manage_published_assignments',
+            'administer_requests',
             'manage_shift_templates', 'manage_regional_facilities',
             'manage_domains', 'view_roles', 'create_users',
             'edit_user_profiles', 'manage_domain_access',
