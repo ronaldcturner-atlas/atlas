@@ -14,9 +14,8 @@ from apps.domains.models import DomainMembership, Region
 from apps.domains.permissions import has_permission, is_org_admin
 
 
-class CsrfExemptSessionAuthentication(SessionAuthentication):
-	def enforce_csrf(self, request):
-		return
+class CsrfProtectedSessionAuthentication(SessionAuthentication):
+	"""Session authentication with Django REST Framework's CSRF enforcement."""
 
 
 def _can_view_region(user, region):
@@ -55,7 +54,7 @@ def _accessible_region_ids(user):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facilities_list_create(request):
 	if request.method == 'GET':
@@ -90,7 +89,7 @@ def facilities_list_create(request):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facilities_reorder(request):
 	facility_ids = request.data.get('facility_ids')
@@ -127,7 +126,7 @@ def facilities_reorder(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facility_detail(request, facility_id):
 	facility = get_object_or_404(Facility.objects.select_related('region__organization'), id=facility_id)
@@ -160,7 +159,7 @@ def facility_detail(request, facility_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def facility_disable(request, facility_id):
 	facility = get_object_or_404(Facility.objects.select_related('region__organization'), id=facility_id)

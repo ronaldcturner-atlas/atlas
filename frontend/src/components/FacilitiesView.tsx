@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type Facility = {
   id: number
@@ -26,7 +27,6 @@ type FacilitiesViewProps = {
   onFacilitiesChanged: () => void
 }
 
-const API_BASE = 'http://localhost:8000/api'
 
 const defaultFormState: FacilityFormState = {
   region: '',

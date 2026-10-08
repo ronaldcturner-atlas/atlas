@@ -14,6 +14,7 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db.models import FloatField, Prefetch, Q
 from django.db.models.functions import Cast
 from django.db import transaction, IntegrityError
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
@@ -24,8 +25,13 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain, DomainMembership
-from apps.domains.permissions import has_permission, is_org_admin, permitted_domain_ids
+from apps.domains.models import Domain, DomainMembership, OrganizationMembership
+from apps.domains.permissions import (
+    has_permission,
+    is_clinically_active,
+    is_org_admin,
+    permitted_domain_ids,
+)
 from apps.facilities.models import Facility
 
 from .models import (
@@ -142,17 +148,28 @@ def _shift_template_fingerprint(block, templates):
     return hashlib.sha256(encoded).hexdigest()
 
 
-class CsrfExemptSessionAuthentication(SessionAuthentication):
-    def enforce_csrf(self, request):
-        return
+class CsrfProtectedSessionAuthentication(SessionAuthentication):
+    """Session authentication with Django REST Framework's CSRF enforcement."""
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shifts_list_create(request):
     if request.method == 'GET':
-        shifts = Shift.objects.select_related('facility', 'physician', 'physician__user').all()
+        shifts = Shift.objects.select_related(
+            'facility__region__organization', 'physician', 'physician__user',
+        ).all()
+        if not request.user.is_superuser:
+            administered_organization_ids = OrganizationMembership.objects.filter(
+                user=request.user,
+                active=True,
+                is_org_admin=True,
+            ).values_list('organization_id', flat=True)
+            shifts = shifts.filter(
+                Q(physician__user=request.user)
+                | Q(facility__region__organization_id__in=administered_organization_ids)
+            )
 
         facility_id = request.query_params.get('facility')
         physician_id = request.query_params.get('physician')
@@ -192,8 +209,27 @@ def shifts_list_create(request):
         serializer = ShiftSerializer(shifts.distinct(), many=True)
         return Response(serializer.data)
 
+    facility = get_object_or_404(
+        Facility.objects.select_related('region__organization'),
+        id=request.data.get('facility'),
+    )
+    if not is_org_admin(request.user, facility.region.organization):
+        return Response(
+            {'detail': 'Organization Administrator permission is required to create a legacy Shift.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     serializer = ShiftSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+    physician = serializer.validated_data['physician']
+    if not OrganizationMembership.objects.filter(
+        organization=facility.region.organization,
+        user=physician.user,
+        active=True,
+    ).exists():
+        return Response(
+            {'detail': 'The selected user does not belong to this Facility organization.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     serializer.save()
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -245,7 +281,7 @@ def _published_schedule_authority(domain_ids=None):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule(request):
     """Return the assignments from the current published schedule of record."""
@@ -641,7 +677,7 @@ def _series_configuration(request, start_date):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule_comments(request):
     domains, domain_error = _requested_published_schedule_domains(request)
@@ -760,7 +796,7 @@ def published_schedule_comments(request):
 
 
 @api_view(['PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule_comment_series_occurrence(request, series_id, comment_date):
     series = get_object_or_404(
@@ -900,7 +936,7 @@ def published_schedule_comment_series_occurrence(request, series_id, comment_dat
 
 
 @api_view(['DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def published_schedule_comment_detail(request, comment_date):
     parsed_date = _parse_comment_date(comment_date)
@@ -938,12 +974,66 @@ def published_schedule_comment_detail(request, comment_date):
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _published_run_for_version(version):
+    """Return the one run represented by a published Schedule Version."""
+    return version.published_optimizer_run or version.optimizer_runs.filter(
+        status=OptimizerRun.Status.COMPLETED,
+    ).order_by('-is_active', '-run_number').first()
+
+
+def _is_authoritative_published_instance(instance):
+    block = instance.schedule_block
+    if block.published_at is None:
+        return False
+    authoritative_block_id = ScheduleBlock.objects.filter(
+        domain_id=block.domain_id,
+        published_at__isnull=False,
+        start_date__lte=instance.date,
+        end_date__gte=instance.date,
+    ).order_by('-published_at', '-id').values_list('id', flat=True).first()
+    return authoritative_block_id == block.id
+
+
 def _published_assignment_or_404(assignment_id):
-    return get_object_or_404(
+    assignment = get_object_or_404(
         ScheduleShiftAssignment.objects.select_related(
             'physician__user', 'shift_instance__facility', 'shift_instance__shift_template',
             'shift_instance__schedule_block', 'shift_instance__schedule_version__domain',
+            'shift_instance__schedule_version__published_optimizer_run',
         ), id=assignment_id, shift_instance__schedule_block__published_at__isnull=False,
+    )
+    published_run = _published_run_for_version(assignment.shift_instance.schedule_version)
+    if (
+        published_run is None
+        or assignment.optimizer_run_id != published_run.id
+        or not _is_authoritative_published_instance(assignment.shift_instance)
+    ):
+        raise Http404
+    return assignment
+
+
+def _published_instance_or_404(instance_id, **filters):
+    instance = get_object_or_404(
+        ScheduleShiftInstance.objects.select_related(
+            'facility', 'schedule_block', 'schedule_version__domain',
+            'schedule_version__published_optimizer_run',
+        ),
+        id=instance_id,
+        schedule_block__published_at__isnull=False,
+        **filters,
+    )
+    if (
+        _published_run_for_version(instance.schedule_version) is None
+        or not _is_authoritative_published_instance(instance)
+    ):
+        raise Http404
+    return instance
+
+
+def _physician_is_active_in_domain(physician, domain):
+    return bool(
+        physician.active
+        and is_clinically_active(physician.user, domain)
     )
 
 
@@ -963,16 +1053,19 @@ def _force_requested(request):
 
 
 @api_view(['GET', 'PATCH'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_trade_policy(request):
     policy = ShiftTradePolicy.load()
-    can_manage_policy = bool(
-        permitted_domain_ids(request.user, 'approve_pickups_trades')
-    ) or is_org_admin(request.user)
+    # This remains one application-wide policy. A Domain-scoped approval role
+    # must not be able to change behavior in every other Region and Domain.
+    can_manage_policy = is_org_admin(request.user)
     if request.method == 'PATCH':
         if not can_manage_policy:
-            return Response({'detail': 'Shift pickup and trade approval permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {'detail': 'Only an Organization Administrator can change the organization-wide shift trade policy.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         value = request.data.get('require_scheduler_approval')
         if type(value) is not bool:
             return Response({'detail': 'Provide require_scheduler_approval as true or false.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -983,7 +1076,7 @@ def shift_trade_policy(request):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_posting(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
@@ -1004,7 +1097,7 @@ def schedule_assignment_posting(request, assignment_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_split(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
@@ -1062,7 +1155,7 @@ def schedule_assignment_split(request, assignment_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_unsplit(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
@@ -1121,10 +1214,15 @@ def schedule_assignment_unsplit(request, assignment_id):
                 requires_physician_selection=True,
             )
         selected_physician = get_object_or_404(
-            Physician,
+            Physician.objects.select_related('user'),
             id=selected_physician_id,
             active=True,
         )
+        if not _physician_is_active_in_domain(selected_physician, domain):
+            return Response(
+                {'detail': 'The selected user is not clinically active in this Domain.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not _force_requested(request):
             return _schedule_conflict_warning(
                 f'The split portions have different scheduled users. Recombine them and assign the full shift to {selected_physician}?',
@@ -1252,14 +1350,23 @@ def schedule_assignment_unsplit(request, assignment_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_reassign(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
     domain = assignment.shift_instance.schedule_version.domain
     if not has_permission(request.user, 'manage_published_assignments', domain=domain):
         return Response({'detail': 'Only a scheduler or administrator can change the scheduled user.'}, status=status.HTTP_403_FORBIDDEN)
-    physician = get_object_or_404(Physician, id=request.data.get('physician_id'), active=True)
+    physician = get_object_or_404(
+        Physician.objects.select_related('user'),
+        id=request.data.get('physician_id'),
+        active=True,
+    )
+    if not _physician_is_active_in_domain(physician, domain):
+        return Response(
+            {'detail': 'The selected user is not clinically active in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     valid, reason = _trade_assignment_is_valid(physician, assignment, [assignment.id])
     if not valid and not _force_requested(request):
         return _schedule_conflict_warning(f'{reason} Proceed anyway?')
@@ -1273,7 +1380,7 @@ def schedule_assignment_reassign(request, assignment_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_open(request, assignment_id):
     """Remove one published assignment while retaining its trade audit history."""
@@ -1329,18 +1436,11 @@ def schedule_assignment_open(request, assignment_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_instance_assign(request, instance_id):
     """Assign an explicitly open published shift to a selected user."""
-    instance = get_object_or_404(
-        ScheduleShiftInstance.objects.select_related(
-            'schedule_version__domain', 'schedule_block',
-        ),
-        id=instance_id,
-        schedule_block__published_at__isnull=False,
-        is_locked_open=True,
-    )
+    instance = _published_instance_or_404(instance_id, is_locked_open=True)
     if not has_permission(
         request.user, 'manage_published_assignments', domain=instance.schedule_version.domain,
     ):
@@ -1349,11 +1449,18 @@ def shift_instance_assign(request, instance_id):
             status=status.HTTP_403_FORBIDDEN,
         )
     physician = get_object_or_404(
-        Physician,
+        Physician.objects.select_related('user'),
         id=request.data.get('physician_id'),
         active=True,
     )
-    active_run = _active_optimizer_run(instance.schedule_version)
+    if not _physician_is_active_in_domain(
+        physician, instance.schedule_version.domain,
+    ):
+        return Response(
+            {'detail': 'The selected user is not clinically active in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    active_run = _published_run_for_version(instance.schedule_version)
     if active_run is None:
         return Response(
             {'detail': 'This published schedule does not have an active run.'},
@@ -1413,17 +1520,15 @@ def shift_instance_assign(request, instance_id):
 
 
 @api_view(['PATCH'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_instance_times(request, instance_id):
     """Change one published shift instance without altering its recurring template."""
-    instance = get_object_or_404(
-        ScheduleShiftInstance.objects.select_related('facility', 'schedule_block', 'schedule_version__domain'),
-        id=instance_id, schedule_block__published_at__isnull=False,
-    )
+    instance = _published_instance_or_404(instance_id)
     domain = instance.schedule_version.domain
     owns_shift = ScheduleShiftAssignment.objects.filter(
         shift_instance=instance,
+        optimizer_run=_published_run_for_version(instance.schedule_version),
         physician__user=request.user,
     ).exists()
     if not (
@@ -1449,7 +1554,7 @@ def shift_instance_times(request, instance_id):
     start_at = datetime.combine(instance.date, start_clock, tzinfo=facility_zone)
     end_date = instance.date + timedelta(days=1) if end_clock <= start_clock else instance.date
     end_at = datetime.combine(end_date, end_clock, tzinfo=facility_zone)
-    active_run = _active_optimizer_run(instance.schedule_version)
+    active_run = _published_run_for_version(instance.schedule_version)
     instance_assignments = list(
         ScheduleShiftAssignment.objects.filter(
             shift_instance=instance,
@@ -1559,7 +1664,7 @@ def _trade_queryset():
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_trades(request):
     physician = getattr(request.user, 'physician', None)
@@ -1677,7 +1782,7 @@ def _trade_options_for_assignment(offered, allow_conflicts=False):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_trade_options(request, assignment_id):
     offered = _published_assignment_or_404(assignment_id)
@@ -1696,7 +1801,7 @@ def schedule_assignment_trade_options(request, assignment_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_assignment_swap(request, assignment_id):
     source = _published_assignment_or_404(assignment_id)
@@ -1797,6 +1902,9 @@ def _trade_assignment_is_valid(physician, assignment, excluded_ids):
     instance = assignment.shift_instance
     if not physician.active:
         return False, f'{physician} is not an active physician.'
+    domain = instance.schedule_version.domain
+    if not _physician_is_active_in_domain(physician, domain):
+        return False, f'{physician} is not clinically active in {domain.name}.'
     overlap = ScheduleShiftAssignment.objects.filter(
         physician=physician,
         optimizer_run=assignment.optimizer_run,
@@ -1812,10 +1920,30 @@ def _trade_assignment_is_valid(physician, assignment, excluded_ids):
 def _apply_shift_trade(trade, reviewed_by=None, force=False):
     now = timezone.now()
     with transaction.atomic():
-        target = ScheduleShiftAssignment.objects.select_for_update().select_related('physician', 'shift_instance__schedule_version__domain', 'shift_instance__facility').get(id=trade.offered_assignment_id)
+        target = ScheduleShiftAssignment.objects.select_for_update().select_related(
+            'physician__user', 'shift_instance__schedule_block',
+            'shift_instance__schedule_version__domain',
+            'shift_instance__facility',
+        ).get(id=trade.offered_assignment_id)
         offered = None
         if trade.requested_assignment_id:
-            offered = ScheduleShiftAssignment.objects.select_for_update().select_related('physician', 'shift_instance__schedule_version__domain', 'shift_instance__facility').get(id=trade.requested_assignment_id)
+            offered = ScheduleShiftAssignment.objects.select_for_update().select_related(
+                'physician__user', 'shift_instance__schedule_block',
+                'shift_instance__schedule_version__domain',
+                'shift_instance__facility',
+            ).get(id=trade.requested_assignment_id)
+        assignments = [target] + ([offered] if offered else [])
+        if any(
+            assignment.optimizer_run_id
+            != getattr(
+                _published_run_for_version(assignment.shift_instance.schedule_version),
+                'id',
+                None,
+            )
+            or not _is_authoritative_published_instance(assignment.shift_instance)
+            for assignment in assignments
+        ):
+            return False, 'This request no longer belongs to the current published schedule.'
         if target.physician_id != trade.recipient_id or (offered and offered.physician_id != trade.requester_id):
             return False, 'An assignment changed after this request was created.'
         excluded = [target.id] + ([offered.id] if offered else [])
@@ -1854,7 +1982,7 @@ def _cancel_competing_trades(trade):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_trade_action(request, trade_id, action):
     trade = get_object_or_404(_trade_queryset(), id=trade_id)
@@ -1901,22 +2029,57 @@ def shift_trade_action(request, trade_id, action):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_detail(request, shift_id):
     shift = get_object_or_404(
-        Shift.objects.select_related('facility', 'physician', 'physician__user'),
+        Shift.objects.select_related(
+            'facility__region__organization', 'physician', 'physician__user',
+        ),
         id=shift_id,
     )
 
+    owns_shift = shift.physician.user_id == request.user.id
+    can_administer = is_org_admin(
+        request.user,
+        shift.facility.region.organization,
+    )
+
     if request.method == 'GET':
+        if not owns_shift and not can_administer:
+            return Response(
+                {'detail': 'You do not have permission to view this legacy Shift.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         serializer = ShiftSerializer(shift)
         return Response(serializer.data)
+
+    if not can_administer:
+        return Response(
+            {'detail': 'Organization Administrator permission is required to modify a legacy Shift.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     if request.method in ['PUT', 'PATCH']:
         partial = request.method == 'PATCH'
         serializer = ShiftSerializer(shift, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
+        target_facility = serializer.validated_data.get('facility', shift.facility)
+        target_physician = serializer.validated_data.get('physician', shift.physician)
+        if not is_org_admin(request.user, target_facility.region.organization):
+            return Response(
+                {'detail': 'You cannot move a legacy Shift into another organization.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if not OrganizationMembership.objects.filter(
+            organization=target_facility.region.organization,
+            user=target_physician.user,
+            active=True,
+        ).exists():
+            return Response(
+                {'detail': 'The selected user does not belong to this Facility organization.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         serializer.save()
         return Response(serializer.data)
 
@@ -1925,7 +2088,7 @@ def shift_detail(request, shift_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_templates_list_create(request):
     if request.method == 'GET':
@@ -1989,7 +2152,7 @@ def shift_templates_list_create(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_template_detail(request, template_id):
     template = get_object_or_404(
@@ -2020,12 +2183,15 @@ def shift_template_detail(request, template_id):
     return Response(serializer.data)
 
 
-def _stats_group_payload(group):
+def _stats_group_payload(group, allowed_domain_ids=None):
+    templates = group.shift_templates.order_by('facility__sort_order', 'start_time', 'id')
+    if allowed_domain_ids is not None:
+        templates = templates.filter(domain_id__in=allowed_domain_ids)
     return {
         'id': group.id,
         'name': group.name,
-        'shift_template_ids': list(group.shift_templates.order_by('facility__sort_order', 'start_time', 'id').values_list('id', flat=True)),
-        'domain_ids': list(group.shift_templates.order_by().values_list('domain_id', flat=True).distinct()),
+        'shift_template_ids': list(templates.values_list('id', flat=True)),
+        'domain_ids': list(templates.order_by().values_list('domain_id', flat=True).distinct()),
     }
 
 
@@ -2056,7 +2222,7 @@ def _validate_stats_group_data(data, instance=None):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def stats_groups_list_create(request):
     if request.method == 'GET':
@@ -2064,7 +2230,10 @@ def stats_groups_list_create(request):
         groups = ShiftStatsGroup.objects.filter(
             shift_templates__domain_id__in=allowed_domain_ids,
         ).prefetch_related('shift_templates').distinct()
-        return Response([_stats_group_payload(group) for group in groups])
+        return Response([
+            _stats_group_payload(group, allowed_domain_ids=allowed_domain_ids)
+            for group in groups
+        ])
     name, template_ids, error = _validate_stats_group_data(request.data)
     if error:
         return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
@@ -2082,7 +2251,7 @@ def stats_groups_list_create(request):
 
 
 @api_view(['PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def stats_group_detail(request, group_id):
     group = get_object_or_404(ShiftStatsGroup.objects.prefetch_related('shift_templates'), id=group_id)
@@ -2532,7 +2701,7 @@ def _validate_request_payload(
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_requests_list(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
@@ -2568,7 +2737,7 @@ def schedule_block_requests_list(request, block_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_requests_context(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
@@ -2668,7 +2837,7 @@ def schedule_block_requests_context(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_request_upsert(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
@@ -2834,7 +3003,7 @@ def schedule_block_request_upsert(request, block_id):
 
 
 @api_view(['GET', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_request_detail(request, block_id, request_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
@@ -2887,7 +3056,7 @@ def schedule_block_request_detail(request, block_id, request_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_clear_requests(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
@@ -2921,7 +3090,7 @@ def schedule_block_clear_requests(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_bulk_requests(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
@@ -3275,7 +3444,7 @@ def _facility_timezone(facility):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_build_context(request, block_id):
     block = get_object_or_404(
@@ -3429,7 +3598,7 @@ def schedule_block_build_context(request, block_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_schedule_versions(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -3439,7 +3608,7 @@ def schedule_block_schedule_versions(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_workload_hour_adjustment(request, version_id):
     version = get_object_or_404(
@@ -3497,7 +3666,7 @@ def schedule_version_workload_hour_adjustment(request, version_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_shift_instances(request, block_id, version_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -3781,7 +3950,7 @@ def _optimizer_preflight_response(version, start_mode, source_run):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_optimizer_preflight(request, version_id):
     version = get_object_or_404(
@@ -3886,7 +4055,7 @@ def _run_optimizer_response(request, version):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_stop_optimizer(request, version_id):
     version = get_object_or_404(
@@ -3916,7 +4085,7 @@ def schedule_version_stop_optimizer(request, version_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_optimize(request, block_id, version_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -3931,7 +4100,7 @@ def schedule_version_optimize(request, block_id, version_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_optimizer_runs(request, version_id):
     version = get_object_or_404(ScheduleVersion.objects.select_related('domain'), id=version_id)
@@ -3943,7 +4112,7 @@ def schedule_version_optimizer_runs(request, version_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_run_optimizer(request, version_id):
     version = get_object_or_404(
@@ -4102,7 +4271,7 @@ def schedule_version_run_optimizer(request, version_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_recalculate_score(request, version_id):
     version = get_object_or_404(
@@ -4143,7 +4312,7 @@ def schedule_version_recalculate_score(request, version_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_save_copy(request, run_id):
     source = get_object_or_404(
@@ -4217,7 +4386,7 @@ def optimizer_run_save_copy(request, run_id):
 
 
 @api_view(['GET', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_detail(request, run_id):
     optimizer_run = get_object_or_404(
@@ -4328,7 +4497,7 @@ def optimizer_run_detail(request, run_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_runs_bulk_delete(request, version_id):
     version = get_object_or_404(
@@ -4461,7 +4630,7 @@ def optimizer_runs_bulk_delete(request, version_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_activate(request, run_id):
     optimizer_run = get_object_or_404(
@@ -4550,7 +4719,7 @@ def _published_violation_report(version):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_violation_report(request, version_id):
     version = get_object_or_404(
@@ -4602,7 +4771,7 @@ def schedule_version_violation_report(request, version_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def optimizer_run_violations(request, run_id):
     optimizer_run = get_object_or_404(
@@ -4662,7 +4831,7 @@ def _schedule_version_assignment_summary(version, message, cleared_count=0):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -4728,7 +4897,7 @@ def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_clear_all_assignments(request, block_id, version_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -4945,7 +5114,7 @@ def _assignment_context_payload(shift_instance):
 
 
 @api_view(['GET', 'POST', 'PATCH'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_shift_assignments(request, block_id, shift_instance_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -5068,7 +5237,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
 
 
 @api_view(['PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assignment_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -5159,7 +5328,7 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_version_unlock_physician_assignments(request, version_id, physician_id):
     version = get_object_or_404(
@@ -5212,7 +5381,7 @@ def schedule_version_unlock_physician_assignments(request, version_id, physician
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_generate_shift_instances(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -5372,7 +5541,7 @@ def schedule_block_generate_shift_instances(request, block_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_blocks_list_create(request):
     if request.method == 'GET':
@@ -5443,7 +5612,7 @@ def schedule_blocks_list_create(request):
 
 
 @api_view(['GET', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_detail(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain__region'), id=block_id)
@@ -5482,7 +5651,7 @@ def schedule_block_detail(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_enter_preview(request, block_id):
     block = get_object_or_404(
@@ -5538,7 +5707,7 @@ def schedule_block_enter_preview(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_move_back_to_build(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -5557,7 +5726,7 @@ def schedule_block_move_back_to_build(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_publish(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -5652,7 +5821,7 @@ def schedule_block_publish(request, block_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def schedule_block_unpublish(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
@@ -5688,7 +5857,7 @@ def schedule_block_unpublish(request, block_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contracts_list_create(request):
     if request.method == 'GET':
@@ -5739,7 +5908,7 @@ def _shared_rule_queryset():
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shared_rules_list_create(request):
     if request.method == 'GET':
@@ -5774,7 +5943,7 @@ def shared_rules_list_create(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shared_rule_detail(request, shared_rule_id):
     shared_rule = get_object_or_404(
@@ -5814,7 +5983,7 @@ def shared_rule_detail(request, shared_rule_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shared_rule_duplicate(request, shared_rule_id):
     source = get_object_or_404(
@@ -5865,7 +6034,7 @@ def shared_rule_duplicate(request, shared_rule_id):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_detail(request, contract_id):
     contract = get_object_or_404(
@@ -5923,7 +6092,7 @@ def _build_duplicate_contract_name(source_contract, target_domain=None):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_duplicate(request, contract_id):
     source_contract = get_object_or_404(
@@ -6067,7 +6236,7 @@ def contract_duplicate(request, contract_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_deactivate(request, contract_id):
     contract = get_object_or_404(Contract.objects.select_related('domain'), id=contract_id)
@@ -6080,7 +6249,7 @@ def contract_deactivate(request, contract_id):
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def contract_reactivate(request, contract_id):
     contract = get_object_or_404(Contract.objects.select_related('domain'), id=contract_id)

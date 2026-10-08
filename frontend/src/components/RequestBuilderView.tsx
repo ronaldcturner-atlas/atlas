@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { API_BASE } from '../api'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 type RequestScope = 'USER' | 'ADMIN'
@@ -91,7 +92,6 @@ type Props = {
   physicianId?: number | null
 }
 
-const API_BASE = 'http://localhost:8000/api'
 
 const REQUEST_TYPES: Array<{ value: RequestType; label: string }> = [
   { value: 'NONE', label: 'None' },

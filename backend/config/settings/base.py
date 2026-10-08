@@ -1,13 +1,33 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(BASE_DIR / ".env")
 
+
+def env_bool(name, default=False):
+    return os.environ.get(name, str(default)).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def env_list(name, default=''):
+    return [value.strip() for value in os.environ.get(name, default).split(',') if value.strip()]
+
+
+def env_int(name, default, minimum=None):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ImproperlyConfigured(f'{name} must be a whole number.') from exc
+    if minimum is not None and value < minimum:
+        raise ImproperlyConfigured(f'{name} must be at least {minimum}.')
+    return value
+
+
 SECRET_KEY = os.environ.get("SECRET_KEY", "unsafe-secret-key")
-DEBUG = os.environ.get("DEBUG", "False") == "True"
+DEBUG = env_bool("DEBUG", False)
 
 # Kept at one until run-isolation tests pass; deployment can then explicitly
 # raise it without another schema change.
@@ -15,18 +35,23 @@ OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION = int(
     os.environ.get("OPTIMIZER_MAX_CONCURRENT_RUNS_PER_VERSION", "1")
 )
 OPTIMIZER_ENABLE_PARALLEL_ISOLATION = (
-    os.environ.get("OPTIMIZER_ENABLE_PARALLEL_ISOLATION", "False") == "True"
+    env_bool("OPTIMIZER_ENABLE_PARALLEL_ISOLATION", False)
 )
 ATLAS_V2_ENABLED = (
     os.environ.get(
         "ATLAS_V2_ENABLED",
         os.environ.get("ATLAS_V2_TEST_ENABLED", "False"),
-    ) == "True"
+    ).strip().lower() in {'1', 'true', 'yes', 'on'}
 )
 # Compatibility setting for older deployments during the product transition.
 ATLAS_V2_TEST_ENABLED = ATLAS_V2_ENABLED
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
+
+ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST = env_bool(
+    "ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST",
+    DEBUG,
+)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -49,6 +74,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "apps.common.middleware.RequestObservabilityMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -109,25 +135,24 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # CORS Configuration
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-]
+LOCAL_FRONTEND_ORIGINS = (
+    "http://localhost:5173,http://localhost:5174,"
+    "http://127.0.0.1:5173,http://127.0.0.1:5174"
+)
+CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", LOCAL_FRONTEND_ORIGINS)
 
 # Allow credentials in CORS requests (needed for session auth)
 CORS_ALLOW_CREDENTIALS = True
+CORS_EXPOSE_HEADERS = ["X-Request-ID"]
+
+ATLAS_SLOW_REQUEST_MS = env_int("ATLAS_SLOW_REQUEST_MS", 1000, minimum=1)
+ATLAS_REQUEST_LOGGING = env_bool("ATLAS_REQUEST_LOGGING", False)
 
 # CSRF Configuration - trust these origins for cross-origin requests
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:5174",
-]
+CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", LOCAL_FRONTEND_ORIGINS)
 
 # REST Framework Configuration
 REST_FRAMEWORK = {
@@ -137,4 +162,8 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticatedOrReadOnly",
     ],
+    "DEFAULT_THROTTLE_RATES": {
+        "login_ip": os.environ.get("LOGIN_IP_RATE", "20/min"),
+        "login_account": os.environ.get("LOGIN_ACCOUNT_RATE", "5/min"),
+    },
 }

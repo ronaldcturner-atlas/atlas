@@ -119,7 +119,7 @@ class UserSerializer(serializers.ModelSerializer):
 
     def get_can_test_access(self, obj):
         return bool(
-            settings.DEBUG
+            settings.ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST
             and (
                 getattr(obj, '_atlas_test_actual_org_admin', False)
                 or obj.is_superuser

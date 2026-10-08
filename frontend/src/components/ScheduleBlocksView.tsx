@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import RequestBuilderView from './RequestBuilderView'
+import { API_BASE } from '../api'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 
@@ -63,7 +64,6 @@ type ScheduleBlocksViewProps = {
   onOpenBuild?: (blockId: number) => void
 }
 
-const API_BASE = 'http://localhost:8000/api'
 const SCHEDULE_BLOCK_REGION_KEY = 'atlas.scheduleBlocks.region'
 const SCHEDULE_BLOCK_DOMAIN_KEY = 'atlas.scheduleBlocks.domain'
 

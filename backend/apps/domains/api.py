@@ -1,5 +1,8 @@
+from datetime import timedelta
+
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
@@ -28,9 +31,8 @@ from .serializers import (
 )
 
 
-class CsrfExemptSessionAuthentication(SessionAuthentication):
-	def enforce_csrf(self, request):
-		return
+class CsrfProtectedSessionAuthentication(SessionAuthentication):
+	"""Session authentication with Django REST Framework's CSRF enforcement."""
 
 
 def _ensure_default_organization():
@@ -54,14 +56,59 @@ def _ensure_default_organization():
 def _organizations_for_user(user):
 	if user.is_superuser:
 		return Organization.objects.all()
-	return Organization.objects.filter(memberships__user=user).distinct()
+	return Organization.objects.filter(memberships__user=user, memberships__active=True).distinct()
 
 
 def _can_access_organization(user, organization):
 	return user.is_superuser or OrganizationMembership.objects.filter(
 		organization=organization,
 		user=user,
+		active=True,
 	).exists()
+
+
+def _can_view_domain(user, domain):
+	return bool(
+		_is_org_admin(user, domain.region.organization)
+		or DomainMembership.objects.filter(user=user, domain=domain, active=True).exists()
+	)
+
+
+def _permission_codes_for_region(user, region):
+	if _is_org_admin(user, region.organization):
+		return set(ALL_PERMISSIONS)
+	return {
+		permission
+		for permission in ALL_PERMISSIONS
+		if has_permission(user, permission, region=region)
+	}
+
+
+def _role_permissions_within_actor_scope(user, region, permissions):
+	return set(permissions or []).issubset(_permission_codes_for_region(user, region))
+
+
+def _accessible_domain_ids(user, organization):
+	if user.is_superuser or _is_org_admin(user, organization):
+		return set(Domain.objects.filter(
+			region__organization=organization,
+		).values_list('id', flat=True))
+	domain_ids = set(DomainMembership.objects.filter(
+		user=user,
+		active=True,
+		domain__active=True,
+		domain__region__active=True,
+		domain__region__organization=organization,
+	).values_list('domain_id', flat=True))
+	region_permissions = {
+		'manage_regional_facilities', 'manage_domains', 'suspend_region_users',
+		'view_roles', 'create_roles', 'edit_roles', 'activate_roles',
+		'delete_unused_roles', 'delegate_role_management', 'view_audit_history',
+	}
+	for region in organization.regions.filter(active=True):
+		if any(has_permission(user, permission, region=region) for permission in region_permissions):
+			domain_ids.update(region.domains.values_list('id', flat=True))
+	return domain_ids
 
 
 def _is_org_admin(user, organization):
@@ -132,7 +179,7 @@ def _organization_from_request(request):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def organizations_list_create(request):
 	if request.method == 'GET':
@@ -165,7 +212,7 @@ def organizations_list_create(request):
 
 
 @api_view(['GET', 'PATCH'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def organization_detail(request, organization_id):
 	organization = get_object_or_404(Organization, id=organization_id)
@@ -184,7 +231,7 @@ def organization_detail(request, organization_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def regions_list_create(request, organization_id):
 	organization = get_object_or_404(Organization, id=organization_id)
@@ -217,7 +264,7 @@ def regions_list_create(request, organization_id):
 
 
 @api_view(['GET', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def region_detail(request, region_id):
 	region = get_object_or_404(Region.objects.select_related('organization'), id=region_id)
@@ -251,7 +298,7 @@ def region_detail(request, region_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def domains_list_create(request):
 	if request.method == 'GET':
@@ -290,14 +337,8 @@ def domains_list_create(request):
 			domains = domains.filter(id__in=permitted_ids)
 		elif getattr(request.user, '_atlas_test_access_active', False):
 			domains = domains.filter(id=request.user._atlas_test_domain.id)
-		if request.query_params.get('accessible') == 'true' and not request.user.is_superuser:
-			membership_domain_ids = DomainMembership.objects.filter(
-				user=request.user,
-				domain__region__organization=organization,
-			).values_list('domain_id', flat=True)
-			if membership_domain_ids.exists():
-				domains = domains.filter(id__in=membership_domain_ids)
-
+		elif not _is_org_admin(request.user, organization) and not request.user.is_superuser:
+			domains = domains.filter(id__in=_accessible_domain_ids(request.user, organization))
 		active_filter = request.query_params.get('active')
 		if active_filter in {'true', 'false'}:
 			domains = domains.filter(active=active_filter == 'true')
@@ -323,7 +364,7 @@ def domains_list_create(request):
 
 
 @api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def domain_detail(request, domain_id):
 	domain = get_object_or_404(Domain.objects.select_related('region__organization'), id=domain_id)
@@ -331,6 +372,8 @@ def domain_detail(request, domain_id):
 		return Response({'detail': 'Organization access is required.'}, status=status.HTTP_403_FORBIDDEN)
 
 	if request.method == 'GET':
+		if not _can_view_domain(request.user, domain):
+			return Response({'detail': 'Domain access is required.'}, status=status.HTTP_403_FORBIDDEN)
 		domain.membership_count = domain.memberships.count()
 		serializer = DomainSerializer(domain)
 		return Response(serializer.data)
@@ -368,30 +411,73 @@ def domain_detail(request, domain_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def domain_memberships(request, domain_id):
 	domain = get_object_or_404(Domain.objects.select_related('region__organization'), id=domain_id)
 	if not _can_access_organization(request.user, domain.region.organization):
 		return Response({'detail': 'Organization access is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'GET':
+		if not (
+			_is_org_admin(request.user, domain.region.organization)
+			or has_permission(request.user, 'view_user_directory', domain=domain)
+		):
+			return Response({'detail': 'User directory access is required.'}, status=status.HTTP_403_FORBIDDEN)
 		memberships = domain.memberships.select_related('user', 'domain').all()
-		return Response(DomainMembershipSerializer(memberships, many=True).data)
+		payload = DomainMembershipSerializer(memberships, many=True).data
+		include_email = has_permission(request.user, 'view_email_addresses', domain=domain)
+		if not include_email:
+			for row in payload:
+				if row['user'] != request.user.id:
+					row['user_email'] = None
+		return Response(payload)
+	is_organization_admin = _is_org_admin(request.user, domain.region.organization)
 	if not (
-		_is_org_admin(request.user, domain.region.organization)
+		is_organization_admin
 		or has_permission(request.user, 'manage_domain_access', domain=domain)
 	):
-		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
+		return Response({'detail': 'Domain access management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	user_id = request.data.get('user')
 	if not user_id:
 		return Response({'user': ['This field is required.']}, status=status.HTTP_400_BAD_REQUEST)
-	OrganizationMembership.objects.get_or_create(
+	if not OrganizationMembership.objects.filter(
 		organization=domain.region.organization,
 		user_id=user_id,
-	)
+		active=True,
+	).exists():
+		return Response(
+			{'user': ['The user must already be an active member of this organization.']},
+			status=status.HTTP_400_BAD_REQUEST,
+		)
+	if not is_organization_admin and not has_permission(request.user, 'assign_domain_roles', domain=domain):
+		return Response({'detail': 'Role assignment permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+	if (
+		request.data.get('clinically_active') is not None
+		and not is_organization_admin
+		and not has_permission(request.user, 'change_clinical_status', domain=domain)
+	):
+		return Response({'detail': 'Clinical status permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+	role_template = get_object_or_404(
+		RoleTemplate,
+		id=request.data.get('role_template'),
+		region=domain.region,
+		active=True,
+	) if request.data.get('role_template') else None
+	if not is_organization_admin and role_template is None:
+		return Response(
+			{'role_template': ['Select an active regional Role.']},
+			status=status.HTTP_400_BAD_REQUEST,
+		)
+	if role_template and not is_organization_admin and not _role_permissions_within_actor_scope(
+		request.user, domain.region, role_template.permissions,
+	):
+		return Response({'detail': 'You cannot assign a Role with permissions you do not hold.'}, status=status.HTTP_403_FORBIDDEN)
 	serializer = DomainMembershipSerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
 	membership = serializer.save(domain=domain)
+	if membership.role_template_id and membership.role_template.last_unassigned_at is not None:
+		membership.role_template.last_unassigned_at = None
+		membership.role_template.save(update_fields=['last_unassigned_at', 'updated_at'])
 	_record_audit(
 		request=request,
 		organization=domain.region.organization,
@@ -408,15 +494,16 @@ def domain_memberships(request, domain_id):
 
 
 @api_view(['PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def domain_membership_detail(request, membership_id):
 	membership = get_object_or_404(
 		DomainMembership.objects.select_related('domain__region__organization', 'user'),
 		id=membership_id,
 	)
+	is_organization_admin = _is_org_admin(request.user, membership.domain.region.organization)
 	if not (
-		_is_org_admin(request.user, membership.domain.region.organization)
+		is_organization_admin
 		or has_permission(request.user, 'manage_domain_access', domain=membership.domain)
 	):
 		return Response({'detail': 'Org Admin access is required.'}, status=status.HTTP_403_FORBIDDEN)
@@ -426,8 +513,12 @@ def domain_membership_detail(request, membership_id):
 				{'detail': 'Remove this user from their Contract in this domain before removing domain access.'},
 				status=status.HTTP_409_CONFLICT,
 			)
+		old_role_template = membership.role_template
 		old_details = {'role_template_id': membership.role_template_id, 'clinically_active': membership.clinically_active}
 		membership.delete()
+		if old_role_template and not old_role_template.memberships.exists():
+			old_role_template.last_unassigned_at = timezone.now()
+			old_role_template.save(update_fields=['last_unassigned_at', 'updated_at'])
 		_record_audit(
 			request=request, organization=membership.domain.region.organization,
 			region=membership.domain.region, domain=membership.domain,
@@ -439,14 +530,44 @@ def domain_membership_detail(request, membership_id):
 			{'detail': 'Remove this user from their Contract in this domain before changing them to View Only.'},
 			status=status.HTTP_409_CONFLICT,
 		)
+	if any(field in request.data for field in ('role', 'role_template')):
+		if not is_organization_admin and not has_permission(request.user, 'assign_domain_roles', domain=membership.domain):
+			return Response({'detail': 'Role assignment permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+		role_template_id = request.data.get('role_template')
+		if not is_organization_admin and not role_template_id:
+			return Response(
+				{'role_template': ['Select an active regional Role.']},
+				status=status.HTTP_400_BAD_REQUEST,
+			)
+		if role_template_id:
+			role_template = get_object_or_404(
+				RoleTemplate, id=role_template_id, region=membership.domain.region, active=True,
+			)
+			if not is_organization_admin and not _role_permissions_within_actor_scope(
+				request.user, membership.domain.region, role_template.permissions,
+			):
+				return Response({'detail': 'You cannot assign a Role with permissions you do not hold.'}, status=status.HTTP_403_FORBIDDEN)
+	if (
+		'clinically_active' in request.data
+		and not is_organization_admin
+		and not has_permission(request.user, 'change_clinical_status', domain=membership.domain)
+	):
+		return Response({'detail': 'Clinical status permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	serializer = DomainMembershipSerializer(membership, data=request.data, partial=True)
 	serializer.is_valid(raise_exception=True)
+	old_role_template = membership.role_template
 	old_details = {
 		'role_template_id': membership.role_template_id,
 		'clinically_active': membership.clinically_active,
 		'active': membership.active,
 	}
 	updated_membership = serializer.save()
+	if old_role_template and old_role_template.id != updated_membership.role_template_id and not old_role_template.memberships.exists():
+		old_role_template.last_unassigned_at = timezone.now()
+		old_role_template.save(update_fields=['last_unassigned_at', 'updated_at'])
+	if updated_membership.role_template_id and updated_membership.role_template.last_unassigned_at is not None:
+		updated_membership.role_template.last_unassigned_at = None
+		updated_membership.role_template.save(update_fields=['last_unassigned_at', 'updated_at'])
 	_record_audit(
 		request=request, organization=membership.domain.region.organization,
 		region=membership.domain.region, domain=membership.domain,
@@ -464,7 +585,7 @@ def domain_membership_detail(request, membership_id):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def organization_memberships(request, organization_id):
 	organization = get_object_or_404(Organization, id=organization_id)
@@ -473,14 +594,14 @@ def organization_memberships(request, organization_id):
 	if request.method == 'POST':
 		serializer = OrganizationMembershipSerializer(data=request.data)
 		serializer.is_valid(raise_exception=True)
-		serializer.save(organization=organization)
+		serializer.save(organization=organization, is_org_admin=False)
 		return Response(serializer.data, status=status.HTTP_201_CREATED)
 	memberships = organization.memberships.select_related('user').all()
 	return Response(OrganizationMembershipSerializer(memberships, many=True).data)
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def organization_admins(request, organization_id):
 	"""List and add protected organization-wide Org Admin assignments."""
@@ -522,14 +643,14 @@ def organization_admins(request, organization_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def permission_catalog(request):
 	return Response(permission_catalog_payload())
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def role_templates_list_create(request, region_id):
 	region = get_object_or_404(Region.objects.select_related('organization'), id=region_id)
@@ -553,6 +674,13 @@ def role_templates_list_create(request, region_id):
 		return Response({'detail': 'Role creation permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	serializer = RoleTemplateSerializer(data=request.data)
 	serializer.is_valid(raise_exception=True)
+	if not _is_org_admin(request.user, region.organization) and not _role_permissions_within_actor_scope(
+		request.user, region, serializer.validated_data.get('permissions', []),
+	):
+		return Response(
+			{'permissions': ['You cannot create a Role with permissions you do not hold.']},
+			status=status.HTTP_403_FORBIDDEN,
+		)
 	role = serializer.save(region=region)
 	_record_audit(
 		request=request, organization=region.organization, region=region,
@@ -563,7 +691,7 @@ def role_templates_list_create(request, region_id):
 
 
 @api_view(['GET', 'PATCH', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def role_template_detail(request, role_id):
 	role = get_object_or_404(RoleTemplate.objects.select_related('region__organization'), id=role_id)
@@ -574,14 +702,30 @@ def role_template_detail(request, role_id):
 			return Response({'detail': 'Role viewing permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 		role.assigned_user_count = role.memberships.count()
 		return Response(RoleTemplateSerializer(role).data)
-	required_permission = 'delete_unused_roles' if request.method == 'DELETE' else 'edit_roles'
-	if not (_is_org_admin(request.user, organization) or has_permission(request.user, required_permission, region=role.region)):
+	if request.method == 'DELETE':
+		required_permissions = {'delete_unused_roles'}
+	else:
+		required_permissions = set()
+		if any(field != 'active' for field in request.data):
+			required_permissions.add('edit_roles')
+		if 'active' in request.data:
+			required_permissions.add('activate_roles')
+	if not (
+		_is_org_admin(request.user, organization)
+		or all(has_permission(request.user, permission, region=role.region) for permission in required_permissions)
+	):
 		return Response({'detail': 'Role management permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	if request.method == 'DELETE':
 		if role.memberships.exists():
 			return Response({'detail': 'Reassign all users before deleting this Role.'}, status=status.HTTP_409_CONFLICT)
 		if role.system_key:
 			return Response({'detail': 'Default Roles may be deactivated but not deleted.'}, status=status.HTTP_409_CONFLICT)
+		unused_since = role.last_unassigned_at or role.created_at
+		if unused_since > timezone.now() - timedelta(days=365):
+			return Response(
+				{'detail': 'A Role may be deleted only after it has been unassigned for one year.'},
+				status=status.HTTP_409_CONFLICT,
+			)
 		role.delete()
 		_record_audit(
 			request=request, organization=organization, region=role.region,
@@ -591,6 +735,17 @@ def role_template_detail(request, role_id):
 	old = {'name': role.name, 'permissions': role.permissions, 'active': role.active}
 	serializer = RoleTemplateSerializer(role, data=request.data, partial=True)
 	serializer.is_valid(raise_exception=True)
+	if (
+		'permissions' in serializer.validated_data
+		and not _is_org_admin(request.user, organization)
+		and not _role_permissions_within_actor_scope(
+			request.user, role.region, serializer.validated_data['permissions'],
+		)
+	):
+		return Response(
+			{'permissions': ['You cannot grant permissions you do not hold.']},
+			status=status.HTTP_403_FORBIDDEN,
+		)
 	updated_role = serializer.save()
 	_record_audit(
 		request=request, organization=organization, region=role.region,
@@ -605,22 +760,36 @@ def role_template_detail(request, role_id):
 
 
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def audit_events(request, organization_id):
 	organization = get_object_or_404(Organization, id=organization_id)
-	if not (
-		_is_org_admin(request.user, organization)
-		or has_permission(request.user, 'view_audit_history', organization=organization)
-	):
+	is_organization_admin = _is_org_admin(request.user, organization)
+	allowed_region_ids = {
+		region.id
+		for region in organization.regions.all()
+		if has_permission(request.user, 'view_audit_history', region=region)
+	}
+	if not is_organization_admin and not allowed_region_ids:
 		return Response({'detail': 'Audit permission is required.'}, status=status.HTTP_403_FORBIDDEN)
 	events = AuditEvent.objects.filter(organization=organization).select_related(
 		'actor', 'target_user', 'region', 'domain',
 	)
+	if not is_organization_admin:
+		events = events.filter(region_id__in=allowed_region_ids)
 	region_id = request.query_params.get('region')
 	domain_id = request.query_params.get('domain')
 	if region_id:
+		try:
+			requested_region_id = int(region_id)
+		except (TypeError, ValueError):
+			return Response({'region': ['Select a valid Region.']}, status=status.HTTP_400_BAD_REQUEST)
+		if not is_organization_admin and requested_region_id not in allowed_region_ids:
+			return Response({'detail': 'Audit permission is required for this Region.'}, status=status.HTTP_403_FORBIDDEN)
 		events = events.filter(region_id=region_id)
 	if domain_id:
+		domain = get_object_or_404(Domain, id=domain_id, region__organization=organization)
+		if not is_organization_admin and domain.region_id not in allowed_region_ids:
+			return Response({'detail': 'Audit permission is required for this Domain.'}, status=status.HTTP_403_FORBIDDEN)
 		events = events.filter(domain_id=domain_id)
 	return Response(AuditEventSerializer(events[:500], many=True).data)

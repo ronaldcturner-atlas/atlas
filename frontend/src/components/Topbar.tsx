@@ -1,5 +1,6 @@
 import React from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { API_BASE } from '../api'
 
 type TopbarProps = {
   canSwitchView: boolean
@@ -23,7 +24,7 @@ export default function Topbar({ canSwitchView, userView, onUserViewChange }: To
 
   const openAccessTester = async () => {
     setTestError('')
-    const response = await fetch('http://localhost:8000/api/development/role-test/', { credentials: 'include' })
+    const response = await fetch(`${API_BASE}/development/role-test/`, { credentials: 'include' })
     if (!response.ok) {
       setTestError('Unable to load testing options.')
       setShowAccessTester(true)
@@ -50,7 +51,7 @@ export default function Topbar({ canSwitchView, userView, onUserViewChange }: To
     setTestSaving(true)
     setTestError('')
     try {
-      const response = await fetch('http://localhost:8000/api/development/role-test/', {
+      const response = await fetch(`${API_BASE}/development/role-test/`, {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
@@ -73,7 +74,7 @@ export default function Topbar({ canSwitchView, userView, onUserViewChange }: To
   const exitAccessTest = async () => {
     setTestSaving(true)
     try {
-      await fetch('http://localhost:8000/api/development/role-test/', {
+      await fetch(`${API_BASE}/development/role-test/`, {
         method: 'DELETE',
         credentials: 'include',
       })

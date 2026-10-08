@@ -137,3 +137,14 @@ class GroupStatsScopeTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([row['name'] for row in response.json()], ['Allowed column'])
         self.assertEqual(response.json()[0]['domain_ids'], [self.allowed_domain.id])
+
+    def test_mixed_stats_group_does_not_reveal_denied_domain_templates(self):
+        mixed_group = ShiftStatsGroup.objects.create(name='Mixed column')
+        mixed_group.shift_templates.add(self.allowed_template, self.denied_template)
+
+        response = self.client.get('/api/stats-groups/')
+
+        self.assertEqual(response.status_code, 200)
+        payload = next(row for row in response.json() if row['name'] == 'Mixed column')
+        self.assertEqual(payload['shift_template_ids'], [self.allowed_template.id])
+        self.assertEqual(payload['domain_ids'], [self.allowed_domain.id])

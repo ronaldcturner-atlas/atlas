@@ -1,7 +1,7 @@
 import React from 'react'
 import { readSessionNumber, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
-const API_BASE = 'http://localhost:8000/api'
 
 type Organization = { id: number; name: string }
 type Region = { id: number; organization: number; name: string; active: boolean }

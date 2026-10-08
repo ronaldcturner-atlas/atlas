@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
-const API_BASE = 'http://localhost:8000/api'
 
 type Contract = { id: number; domain: number; domain_name: string; region: number; region_name: string; name: string; active: boolean; facility_ids: number[] }
 type Domain = { id: number; name: string; region: number; region_name: string }

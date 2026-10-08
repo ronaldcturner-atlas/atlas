@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react'
 import { readSessionNumber, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type Organization = { id: number; name: string; active: boolean; region_count: number; domain_count: number }
 type Region = { id: number; organization: number; name: string; active: boolean; domain_count: number }
 type Domain = { id: number; region: number; region_name: string; organization: number; name: string; active: boolean; membership_count: number }
 type OrganizationMembership = { id: number; user: number; user_name: string; user_email: string; is_org_admin: boolean; active: boolean }
 type OrganizationAdminData = { admins: OrganizationMembership[]; candidates: OrganizationMembership[] }
-const API_BASE = 'http://localhost:8000/api'
 
 async function apiError(response: Response) {
   try {

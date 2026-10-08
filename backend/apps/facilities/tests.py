@@ -69,6 +69,32 @@ class FacilitiesTests(TestCase):
         facility.refresh_from_db()
         self.assertTrue(facility.active)
 
+    def test_session_authenticated_facility_changes_require_csrf(self):
+        facility = Facility.objects.create(
+            name='Protected Facility',
+            short_name='Protected',
+        )
+        browser = APIClient(enforce_csrf_checks=True)
+        browser.force_login(self.user)
+
+        rejected = browser.patch(
+            f'/api/facilities/{facility.id}/',
+            {'short_name': 'Rejected'},
+            format='json',
+        )
+        self.assertEqual(rejected.status_code, 403)
+
+        csrf_token = browser.get('/api/csrf/').json()['csrfToken']
+        accepted = browser.patch(
+            f'/api/facilities/{facility.id}/',
+            {'short_name': 'Accepted'},
+            format='json',
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(accepted.status_code, 200)
+        facility.refresh_from_db()
+        self.assertEqual(facility.short_name, 'Accepted')
+
     def test_facilities_list_active_filter(self):
         Facility.objects.create(name='Alpha', short_name='Alpha', active=True)
         Facility.objects.create(name='Beta', short_name='Beta', active=False)

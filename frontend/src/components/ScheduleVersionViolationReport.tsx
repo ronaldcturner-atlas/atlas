@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
+import { API_BASE } from '../api'
 
 type ScheduleVersion = {
   id: number
@@ -185,7 +186,6 @@ const PENALTY_FILTERS: Array<{ key: PenaltyFilter; label: string }> = [
   { key: 'invalid_assignment_score', label: 'Invalid assignment score' },
 ]
 
-const API_BASE = 'http://localhost:8000/api'
 
 function formatDate(value: string) {
   const [year, month, day] = value.split('-').map(Number)

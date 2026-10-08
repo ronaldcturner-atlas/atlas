@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react'
+import { API_BASE, setCsrfToken } from '../api'
 
 interface User {
   id: number
@@ -51,20 +52,6 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
-// Helper function to get CSRF token from cookies
-function getCsrfToken(): string {
-  const name = 'csrftoken='
-  const decodedCookie = decodeURIComponent(document.cookie)
-  const cookieArray = decodedCookie.split(';')
-  for (let cookie of cookieArray) {
-    cookie = cookie.trim()
-    if (cookie.indexOf(name) === 0) {
-      return cookie.substring(name.length)
-    }
-  }
-  return ''
-}
-
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [isLoading, setIsLoading] = useState(true)
@@ -76,7 +63,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const checkAuth = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/me/', {
+      const csrfResponse = await fetch(`${API_BASE}/csrf/`, { credentials: 'include' })
+      if (!csrfResponse.ok) throw new Error('Unable to establish a secure browser session')
+      const csrfData = await csrfResponse.json()
+      setCsrfToken(csrfData.csrfToken || '')
+      const response = await fetch(`${API_BASE}/me/`, {
         method: 'GET',
         credentials: 'include',
         headers: {
@@ -101,22 +92,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = async (username: string, password: string) => {
     setIsLoading(true)
     try {
-      const response = await fetch('http://localhost:8000/api/login/', {
+      const response = await fetch(`${API_BASE}/login/`, {
         method: 'POST',
         credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'X-CSRFToken': getCsrfToken(),
         },
         body: JSON.stringify({ username, password }),
       })
 
       if (!response.ok) {
         const data = await response.json()
-        throw new Error(data.error || 'Login failed')
+        throw new Error(data.error || data.detail || 'Login failed')
       }
 
       const userData = await response.json()
+      setCsrfToken(userData.csrfToken || '')
       setUser(userData)
     } finally {
       setIsLoading(false)
@@ -128,12 +119,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       // Call logout endpoint to clear server-side session
       // Include CSRF token in header for cross-origin POST request
-      const response = await fetch('http://localhost:8000/api/logout/', {
+      const response = await fetch(`${API_BASE}/logout/`, {
         method: 'POST',
         credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
-          'X-CSRFToken': getCsrfToken(),
         },
       })
 

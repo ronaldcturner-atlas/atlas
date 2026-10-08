@@ -78,11 +78,13 @@ export default function Login() {
           </button>
         </form>
 
-        <div className="demo-credentials">
-          <p>Demo Credentials:</p>
-          <p>Email: <code>ron@atlas.local</code></p>
-          <p>Password: <code>atlas</code></p>
-        </div>
+        {import.meta.env.DEV && import.meta.env.VITE_SHOW_DEMO_CREDENTIALS !== 'false' && (
+          <div className="demo-credentials">
+            <p>Demo Credentials:</p>
+            <p>Email: <code>ron@atlas.local</code></p>
+            <p>Password: <code>atlas</code></p>
+          </div>
+        )}
       </div>
     </div>
   )

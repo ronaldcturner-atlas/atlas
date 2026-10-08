@@ -112,6 +112,7 @@ class DomainMembershipSerializer(serializers.ModelSerializer):
         if domain and user and not OrganizationMembership.objects.filter(
             organization=domain.region.organization,
             user=user,
+            active=True,
         ).exists():
             raise serializers.ValidationError({
                 'user': 'User must belong to the organization before joining a domain.',
@@ -146,7 +147,7 @@ class RoleTemplateSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at',
         ]
         read_only_fields = [
-            'id', 'region_name', 'system_key', 'assigned_user_count',
+            'id', 'region', 'region_name', 'system_key', 'assigned_user_count',
             'created_at', 'updated_at',
         ]
 

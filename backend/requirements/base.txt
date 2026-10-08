@@ -4,3 +4,4 @@ Django
  psycopg
  python-dotenv
  ortools==9.14.6206
+gunicorn==23.0.0

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { API_BASE } from '../api'
 
 type APIShift = {
   id: number
@@ -68,8 +69,8 @@ export default function SchedulerView({ facilitiesRefreshToken, shiftsRefreshTok
     const fetchSchedulerData = async () => {
       try {
         const [shiftsResponse, facilitiesResponse] = await Promise.all([
-          fetch('http://localhost:8000/api/shifts/', { credentials: 'include' }),
-          fetch('http://localhost:8000/api/facilities/', { credentials: 'include' }),
+          fetch(`${API_BASE}/shifts/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/facilities/`, { credentials: 'include' }),
         ])
 
         if (!shiftsResponse.ok || !facilitiesResponse.ok) {

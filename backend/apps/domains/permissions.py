@@ -87,7 +87,7 @@ SCHEDULER_DEFAULTS = CLINICAL_DEFAULTS | {
     'approve_pickups_trades', 'send_urgent_shift_notifications',
     'batch_update_published_shifts', 'manage_build_workspace',
     'administer_requests', 'publish_schedule', 'unpublish_schedule',
-    'manage_shift_templates', 'view_audit_history',
+    'manage_shift_templates',
 }
 
 DOMAIN_ADMIN_DEFAULTS = SCHEDULER_DEFAULTS | {
@@ -98,7 +98,7 @@ DOMAIN_ADMIN_DEFAULTS = SCHEDULER_DEFAULTS | {
 REGIONAL_ADMIN_DEFAULTS = DOMAIN_ADMIN_DEFAULTS | {
     'manage_regional_facilities', 'manage_domains', 'suspend_region_users',
     'view_roles', 'create_roles', 'edit_roles', 'activate_roles',
-    'delete_unused_roles', 'delegate_role_management',
+    'delete_unused_roles', 'delegate_role_management', 'view_audit_history',
 }
 
 DEFAULT_ROLE_DEFINITIONS = (

@@ -1,5 +1,6 @@
 import React from 'react'
 import { readSessionNumber, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type DomainOption = { id: number; name: string; region_id: number; region_name: string }
 type DirectoryProfile = {
@@ -30,7 +31,6 @@ type DirectoryResponse = {
   users: DirectoryProfile[]
 }
 
-const API_BASE = 'http://localhost:8000/api'
 
 export default function UserDirectoryView() {
   const [data, setData] = React.useState<DirectoryResponse | null>(null)

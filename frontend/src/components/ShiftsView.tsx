@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type ShiftTemplate = {
   id: number
@@ -53,7 +54,6 @@ type ShiftTemplateFormState = {
   active: boolean
 }
 
-const API_BASE = 'http://localhost:8000/api'
 
 const DAYS_OF_WEEK: DayOfWeek[] = [
   'Sunday',

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { API_BASE } from '../api'
 
 type APIShift = {
   id: number | null
@@ -227,12 +228,12 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       try {
         setLoadError(null)
         const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse] = await Promise.all([
-          fetch('http://localhost:8000/api/published-schedule/', { credentials: 'include' }),
-          fetch('http://localhost:8000/api/physicians/', { credentials: 'include' }),
-          fetch('http://localhost:8000/api/shift-trades/', { credentials: 'include' }),
-          fetch('http://localhost:8000/api/shift-trade-policy/', { credentials: 'include' }),
-          fetch('http://localhost:8000/api/published-schedule-comments/', { credentials: 'include' }),
-          fetch('http://localhost:8000/api/domains/?active=true&accessible=true', { credentials: 'include' }),
+          fetch(`${API_BASE}/published-schedule/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/physicians/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/shift-trades/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/shift-trade-policy/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/published-schedule-comments/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include' }),
         ])
         if (!shiftsResponse.ok || !physiciansResponse.ok || !domainsResponse.ok) {
           throw new Error('Unable to load the schedule filters')
@@ -360,7 +361,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     setUnsplitPhysicianId('')
     setTradeNote('')
     if (!selectedShift?.assignmentId || (selectedShift.physicianId !== myPhysicianId && !canManage)) return
-    fetch(`http://localhost:8000/api/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include' })
+    fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include' })
       .then(async (response) => {
         const data = await response.json()
         if (!response.ok) throw new Error(data.detail ?? 'Unable to load trade options.')
@@ -574,8 +575,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       const existingComment = commentsByDate.get(commentDate)
       const isRecurring = existingComment?.source === 'RECURRING' && existingComment.series_id != null
       const url = isRecurring
-        ? `http://localhost:8000/api/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
-        : 'http://localhost:8000/api/published-schedule-comments/'
+        ? `${API_BASE}/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
+        : `${API_BASE}/published-schedule-comments/`
       const response = await fetch(url, {
         method: isRecurring ? 'PATCH' : 'POST',
         credentials: 'include',
@@ -608,8 +609,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       const existingComment = commentsByDate.get(commentDate)
       const isRecurring = existingComment?.source === 'RECURRING' && existingComment.series_id != null
       const url = isRecurring
-        ? `http://localhost:8000/api/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
-        : `http://localhost:8000/api/published-schedule-comments/${commentDate}/?domain=${selectedDomainIds[0]}`
+        ? `${API_BASE}/published-schedule-comment-series/${existingComment.series_id}/occurrences/${commentDate}/`
+        : `${API_BASE}/published-schedule-comments/${commentDate}/?domain=${selectedDomainIds[0]}`
       const response = await fetch(url, {
         method: 'DELETE',
         credentials: 'include',
@@ -648,7 +649,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       setIsMutating(true)
       setLoadError(null)
       const send = async (payload: Record<string, unknown>) => {
-        const response = await fetch(`http://localhost:8000/api/${url}`, {
+        const response = await fetch(`${API_BASE}/${url}`, {
           method, credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
         })
         const data = await response.json().catch(() => ({}))

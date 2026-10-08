@@ -7,14 +7,14 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain, DomainMembership, OrganizationMembership, RoleTemplate
+from apps.domains.models import Domain, DomainMembership, OrganizationMembership, Region, RoleTemplate
 from apps.domains.permissions import CLINICAL_DEFAULTS, SCHEDULER_DEFAULTS
 from apps.facilities.models import Facility
 from .models import (
     Contract, ContractUserAssignment, OptimizerRun, ScheduleBlock,
     ScheduleCommentSeries, ScheduleCommentSeriesException, ScheduleDateComment,
     ScheduleShiftAssignment, ScheduleShiftInstance, ScheduleVersion,
-    ShiftPosting, ShiftStatsGroup, ShiftTemplate, ShiftTrade, ShiftTradePolicy,
+    Shift, ShiftPosting, ShiftStatsGroup, ShiftTemplate, ShiftTrade, ShiftTradePolicy,
 )
 
 
@@ -81,6 +81,8 @@ class ShiftTradeApiTests(TestCase):
             active_days_of_week=['Tuesday'], weekend_days=[], default_staffing_count=1,
         )
         self.run = OptimizerRun.objects.create(schedule_version=self.version, run_number=1, status=OptimizerRun.Status.COMPLETED, is_active=True)
+        self.version.published_optimizer_run = self.run
+        self.version.save(update_fields=['published_optimizer_run'])
         instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version, schedule_block=self.block, date=date(2026, 9, 1),
             shift_template=self.template, facility=self.facility,
@@ -92,6 +94,68 @@ class ShiftTradeApiTests(TestCase):
             assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER, optimizer_run=self.run,
         )
         self.client = APIClient()
+
+    def _foreign_published_assignment(self):
+        region = Region.objects.create(
+            organization=self.domain.region.organization,
+            name='Other Region',
+        )
+        domain = Domain.objects.create(region=region, name='Other Domain')
+        facility = Facility.objects.create(
+            region=region,
+            name='Other Hospital',
+            short_name='OH',
+        )
+        template = ShiftTemplate.objects.create(
+            domain=domain,
+            facility=facility,
+            name='Other Day',
+            start_time=time(7),
+            end_time=time(16),
+            active_days_of_week=['Tuesday'],
+            weekend_days=[],
+            default_staffing_count=1,
+        )
+        block = ScheduleBlock.objects.create(
+            domain=domain,
+            start_date=date(2026, 10, 1),
+            end_date=date(2026, 10, 31),
+            request_open_datetime=timezone.now(),
+            request_close_datetime=timezone.now(),
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        version = ScheduleVersion.objects.create(
+            schedule_block=block,
+            domain=domain,
+            version_number=1,
+            name='Foreign Published',
+        )
+        run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+        version.published_optimizer_run = run
+        version.save(update_fields=['published_optimizer_run'])
+        instance = ScheduleShiftInstance.objects.create(
+            schedule_version=version,
+            schedule_block=block,
+            date=date(2026, 10, 6),
+            shift_template=template,
+            facility=facility,
+            start_datetime=timezone.make_aware(datetime(2026, 10, 6, 7)),
+            end_datetime=timezone.make_aware(datetime(2026, 10, 6, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=self.owner,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=run,
+        )
+        return domain, instance, assignment
 
     def test_owner_can_post_and_split_shift(self):
         self.client.force_authenticate(self.owner_user)
@@ -109,6 +173,163 @@ class ShiftTradeApiTests(TestCase):
         self.assignment.shift_instance.refresh_from_db()
         self.assertIsNone(self.assignment.shift_instance.segment_start_time)
         self.assertIsNone(self.assignment.shift_instance.segment_end_time)
+
+    def test_legacy_shift_api_does_not_bypass_organization_access(self):
+        legacy_shift = Shift.objects.create(
+            facility=self.facility,
+            physician=self.owner,
+            date=date(2026, 9, 8),
+            start_time=time(7),
+            end_time=time(16),
+        )
+        self.client.force_authenticate(self.scheduler_user)
+        self.assertEqual(
+            self.client.get(f'/api/shifts/{legacy_shift.id}/').status_code,
+            403,
+        )
+        self.assertNotIn(
+            legacy_shift.id,
+            [row['id'] for row in self.client.get('/api/shifts/').json()],
+        )
+        self.client.force_authenticate(self.owner_user)
+        self.assertEqual(
+            self.client.get(f'/api/shifts/{legacy_shift.id}/').status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.patch(
+                f'/api/shifts/{legacy_shift.id}/',
+                {'notes': 'Unauthorized edit'},
+                format='json',
+            ).status_code,
+            403,
+        )
+
+        OrganizationMembership.objects.filter(
+            organization=self.domain.region.organization,
+            user=self.scheduler_user,
+        ).update(is_org_admin=True)
+        self.client.force_authenticate(self.scheduler_user)
+        updated = self.client.patch(
+            f'/api/shifts/{legacy_shift.id}/',
+            {'notes': 'Authorized correction'},
+            format='json',
+        )
+        self.assertEqual(updated.status_code, 200)
+
+    def test_domain_scheduler_cannot_mutate_another_domains_published_schedule(self):
+        domain, instance, assignment = self._foreign_published_assignment()
+        trade = ShiftTrade.objects.create(
+            domain=domain,
+            offered_assignment=assignment,
+            requester=self.requester,
+            recipient=self.owner,
+            trade_type=ShiftTrade.TradeType.PICKUP,
+            status=ShiftTrade.Status.PENDING_SCHEDULER,
+        )
+        self.client.force_authenticate(self.scheduler_user)
+
+        responses = [
+            self.client.post(
+                f'/api/schedule-assignments/{assignment.id}/posting/',
+                {'mode': 'PICKUP'},
+                format='json',
+            ),
+            self.client.post(
+                f'/api/schedule-assignments/{assignment.id}/split/',
+                {'split_time': '12:00'},
+                format='json',
+            ),
+            self.client.post(
+                f'/api/schedule-assignments/{assignment.id}/reassign/',
+                {'physician_id': self.requester.id},
+                format='json',
+            ),
+            self.client.post(
+                f'/api/schedule-assignments/{assignment.id}/open/',
+                {},
+                format='json',
+            ),
+            self.client.patch(
+                f'/api/shift-instances/{instance.id}/times/',
+                {'start_time': '08:00', 'end_time': '17:00'},
+                format='json',
+            ),
+            self.client.get(
+                f'/api/schedule-assignments/{assignment.id}/trade-options/',
+            ),
+            self.client.post(
+                f'/api/schedule-assignments/{assignment.id}/swap/',
+                {'target_assignment_id': self.assignment.id},
+                format='json',
+            ),
+            self.client.post(
+                f'/api/shift-trades/{trade.id}/approve/',
+                {},
+                format='json',
+            ),
+        ]
+
+        self.assertTrue(all(response.status_code == 403 for response in responses))
+        self.assertNotIn(
+            trade.id,
+            [row['id'] for row in self.client.get('/api/shift-trades/').json()],
+        )
+
+    def test_only_the_published_run_can_be_mutated_by_assignment_id(self):
+        other_run = OptimizerRun.objects.create(
+            schedule_version=self.version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+        )
+        other_assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=self.assignment.shift_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=other_run,
+        )
+        self.client.force_authenticate(self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-assignments/{other_assignment.id}/posting/',
+            {'mode': 'PICKUP'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(ShiftPosting.objects.filter(assignment=other_assignment).exists())
+
+    def test_published_assignment_admin_actions_require_clinically_active_target(self):
+        user_model = get_user_model()
+        outsider_user = user_model.objects.create_user('outsider', password='x')
+        outsider = Physician.objects.create(
+            user=outsider_user,
+            display_name='Outsider',
+        )
+        self.client.force_authenticate(self.scheduler_user)
+
+        reassigned = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/reassign/',
+            {'physician_id': outsider.id},
+            format='json',
+        )
+        self.assertEqual(reassigned.status_code, 400)
+        self.assertIn('not clinically active', reassigned.json()['detail'])
+
+        opened = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/open/',
+            {},
+            format='json',
+        )
+        self.assertEqual(opened.status_code, 200)
+        filled = self.client.post(
+            f'/api/shift-instances/{self.assignment.shift_instance_id}/assign/',
+            {'physician_id': outsider.id},
+            format='json',
+        )
+        self.assertEqual(filled.status_code, 400)
+        self.assertIn('not clinically active', filled.json()['detail'])
 
     def test_owner_can_unsplit_after_cancelled_trade_history(self):
         self.client.force_authenticate(self.owner_user)
@@ -391,6 +612,44 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(self.assignment.physician, self.requester)
         self.assertEqual(accepted.json()['status'], 'APPROVED')
 
+    def test_trade_cannot_apply_after_published_run_changes(self):
+        ShiftPosting.objects.create(
+            assignment=self.assignment,
+            posted_by=self.owner_user,
+            mode=ShiftPosting.Mode.PICKUP,
+        )
+        ShiftTradePolicy.objects.create(
+            pk=1,
+            require_scheduler_approval=False,
+        )
+        self.client.force_authenticate(self.requester_user)
+        created = self.client.post(
+            '/api/shift-trades/',
+            {'target_assignment_id': self.assignment.id},
+            format='json',
+        )
+        self.assertEqual(created.status_code, 201)
+        replacement_run = OptimizerRun.objects.create(
+            schedule_version=self.version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+        )
+        self.version.published_optimizer_run = replacement_run
+        self.version.save(update_fields=['published_optimizer_run'])
+
+        self.client.force_authenticate(self.owner_user)
+        accepted = self.client.post(
+            f"/api/shift-trades/{created.json()['id']}/accept/",
+            {},
+            format='json',
+        )
+
+        self.assertEqual(accepted.status_code, 400)
+        self.assertIn('current published schedule', accepted.json()['detail'])
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.physician, self.owner)
+
     def test_published_pickup_is_allowed_at_contract_excluded_facility(self):
         excluded_facility = Facility.objects.create(
             name='Excluded Hospital', short_name='EX',
@@ -439,11 +698,17 @@ class ShiftTradeApiTests(TestCase):
         excluded_assignment.refresh_from_db()
         self.assertEqual(excluded_assignment.physician, self.requester)
 
-    def test_only_scheduler_can_change_approval_policy(self):
+    def test_only_org_admin_can_change_global_approval_policy(self):
         self.client.force_authenticate(self.owner_user)
         denied = self.client.patch('/api/shift-trade-policy/', {'require_scheduler_approval': False}, format='json')
         self.assertEqual(denied.status_code, 403)
         self.client.force_authenticate(self.scheduler_user)
+        denied = self.client.patch('/api/shift-trade-policy/', {'require_scheduler_approval': False}, format='json')
+        self.assertEqual(denied.status_code, 403)
+        OrganizationMembership.objects.filter(
+            organization=self.domain.region.organization,
+            user=self.scheduler_user,
+        ).update(is_org_admin=True)
         updated = self.client.patch('/api/shift-trade-policy/', {'require_scheduler_approval': False}, format='json')
         self.assertEqual(updated.status_code, 200)
         self.assertFalse(updated.json()['require_scheduler_approval'])

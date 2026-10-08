@@ -12,7 +12,7 @@ class DevelopmentRoleTestMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        if settings.DEBUG and request.user.is_authenticated:
+        if settings.ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST and request.user.is_authenticated:
             context = request.session.get(self.session_key)
             if context:
                 actual_org_admin = bool(

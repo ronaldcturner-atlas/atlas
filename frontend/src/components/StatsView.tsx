@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { readSessionNumber, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type PublishedShift = {
   id: number | null
@@ -126,11 +127,11 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
 
   useEffect(() => {
     Promise.all([
-      fetch('http://localhost:8000/api/published-schedule/', { credentials: 'include' }),
-      fetch('http://localhost:8000/api/published-schedule/?purpose=stats', { credentials: 'include' }),
-      fetch('http://localhost:8000/api/stats-groups/', { credentials: 'include' }),
-      fetch('http://localhost:8000/api/shift-templates/', { credentials: 'include' }),
-      fetch('http://localhost:8000/api/domains/?active=true', { credentials: 'include' }),
+      fetch(`${API_BASE}/published-schedule/`, { credentials: 'include' }),
+      fetch(`${API_BASE}/published-schedule/?purpose=stats`, { credentials: 'include' }),
+      fetch(`${API_BASE}/stats-groups/`, { credentials: 'include' }),
+      fetch(`${API_BASE}/shift-templates/`, { credentials: 'include' }),
+      fetch(`${API_BASE}/domains/?active=true`, { credentials: 'include' }),
     ])
       .then(async ([shiftResponse, groupShiftResponse, groupResponse, templateResponse, domainResponse]) => {
         const [shiftData, groupShiftData, groupData, templateData, domainData] = await Promise.all([shiftResponse.json(), groupShiftResponse.json(), groupResponse.json(), templateResponse.json(), domainResponse.json()])
@@ -232,7 +233,7 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
     setIsSavingGroup(true)
     setError(null)
     try {
-      const response = await fetch(`http://localhost:8000/api/stats-groups/${editingGroupId ? `${editingGroupId}/` : ''}`, {
+      const response = await fetch(`${API_BASE}/stats-groups/${editingGroupId ? `${editingGroupId}/` : ''}`, {
         method: editingGroupId ? 'PATCH' : 'POST', credentials: 'include',
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken() },
         body: JSON.stringify({ name: groupName, shift_template_ids: selectedTemplateIds }),
@@ -248,7 +249,7 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
 
   const deleteGroup = async (group: StatsGroup) => {
     if (!window.confirm(`Delete the “${group.name}” Stats group?`)) return
-    const response = await fetch(`http://localhost:8000/api/stats-groups/${group.id}/`, { method: 'DELETE', credentials: 'include', headers: { 'X-CSRFToken': csrfToken() } })
+    const response = await fetch(`${API_BASE}/stats-groups/${group.id}/`, { method: 'DELETE', credentials: 'include', headers: { 'X-CSRFToken': csrfToken() } })
     if (response.ok) { setStatsGroups((current) => current.filter((item) => item.id !== group.id)); if (editingGroupId === group.id) resetGroupForm() }
     else setError('Unable to delete this Stats group.')
   }

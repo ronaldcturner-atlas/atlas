@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { API_BASE } from '../api'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 
@@ -417,7 +418,6 @@ type Props = {
   onBack: () => void
 }
 
-const API_BASE = 'http://localhost:8000/api'
 const DEFAULT_OPTIMIZER_RUNTIME_MINUTES = 120
 const OPTIMIZER_RUNTIME_STORAGE_KEY = 'atlas-optimizer-max-runtime-minutes'
 

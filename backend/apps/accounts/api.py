@@ -1,28 +1,46 @@
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
+from django.middleware.csrf import get_token
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import ensure_csrf_cookie
 from rest_framework.authentication import SessionAuthentication
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
 from rest_framework.response import Response
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated
 from rest_framework import status
 
 from .models import Physician
 from .serializers import PhysicianSerializer, UserSerializer
-from apps.domains.models import Domain, DomainMembership, OrganizationMembership, RoleTemplate
+from .throttles import LoginAccountThrottle, LoginIPThrottle
+from apps.domains.models import Domain, DomainMembership, Organization, OrganizationMembership, RoleTemplate
 from apps.domains.permissions import has_permission, is_org_admin, permitted_domain_ids
+from apps.facilities.models import Facility
 
 
-class CsrfExemptSessionAuthentication(SessionAuthentication):
-    def enforce_csrf(self, request):
-        return
+class CsrfProtectedSessionAuthentication(SessionAuthentication):
+    """Session authentication with Django REST Framework's CSRF enforcement."""
+
+
+class CsrfRequired(BasePermission):
+    """Require a valid CSRF token even before a user has authenticated."""
+
+    def has_permission(self, request, view):
+        SessionAuthentication().enforce_csrf(request)
+        return True
+
+
+@ensure_csrf_cookie
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def csrf_view(request):
+    return Response({'csrfToken': get_token(request)})
 
 
 def _can_use_development_role_test(user):
     return bool(
-        settings.DEBUG
+        settings.ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST
         and user.is_authenticated
         and (
             getattr(user, '_atlas_test_actual_org_admin', False)
@@ -35,7 +53,8 @@ def _can_use_development_role_test(user):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([AllowAny, CsrfRequired])
+@throttle_classes([LoginIPThrottle, LoginAccountThrottle])
 def login_view(request):
     """
     Login endpoint. Expects username and password in request body.
@@ -58,8 +77,9 @@ def login_view(request):
     )
     if user is not None:
         login(request, user)
-        serializer = UserSerializer(user)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        payload = dict(UserSerializer(user).data)
+        payload['csrfToken'] = get_token(request)
+        return Response(payload, status=status.HTTP_200_OK)
     else:
         return Response(
             {'error': 'Invalid username or password'},
@@ -77,10 +97,6 @@ def logout_view(request):
     return Response({'status': 'logged out'}, status=status.HTTP_200_OK)
 
 
-# Apply csrf_exempt to logout_view
-logout_view = csrf_exempt(logout_view)
-
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def me_view(request):
@@ -92,7 +108,7 @@ def me_view(request):
 
 
 @api_view(['GET', 'POST', 'DELETE'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def development_role_test(request):
     """Local-only session role simulation for the Atlas developer."""
@@ -202,8 +218,84 @@ def _directory_profile(physician, *, include_email, include_phone, domain=None):
     }
 
 
+def _physician_organization_ids(physician):
+    return {
+        membership.organization_id
+        for membership in physician.user.organization_memberships.all()
+        if membership.active
+    }
+
+
+def _visible_physician_domain_ids(user, physician):
+    target_domain_ids = {
+        membership.domain_id
+        for membership in physician.user.domain_memberships.all()
+        if membership.active
+    }
+    if user.id == physician.user_id:
+        return target_domain_ids
+    return target_domain_ids & permitted_domain_ids(user, 'view_user_directory')
+
+
+def _serialize_physician_for_user(
+    physician,
+    user,
+    *,
+    visible_domain_ids=None,
+    visible_organization_ids=None,
+    email_domain_ids=None,
+    phone_domain_ids=None,
+):
+    if visible_domain_ids is None:
+        visible_domain_ids = _visible_physician_domain_ids(user, physician)
+    visible_domain_ids = set(visible_domain_ids)
+    data = dict(PhysicianSerializer(physician).data)
+    data['domain_memberships'] = [
+        membership for membership in data['domain_memberships']
+        if membership['domain_id'] in visible_domain_ids
+    ]
+    data['current_contracts'] = [
+        contract for contract in data['current_contracts']
+        if contract['domain_id'] in visible_domain_ids
+    ]
+    if visible_organization_ids is None:
+        visible_organization_ids = set(Domain.objects.filter(
+            id__in=visible_domain_ids,
+        ).values_list('region__organization_id', flat=True))
+    else:
+        visible_organization_ids = set(visible_organization_ids)
+    data['organization_memberships'] = [
+        membership for membership in data['organization_memberships']
+        if membership['organization_id'] in visible_organization_ids
+    ]
+    if user.id != physician.user_id:
+        if email_domain_ids is None:
+            email_domain_ids = permitted_domain_ids(user, 'view_email_addresses')
+        if phone_domain_ids is None:
+            phone_domain_ids = permitted_domain_ids(user, 'view_phone_numbers')
+        if not visible_domain_ids.intersection(email_domain_ids):
+            data['email'] = None
+        if not visible_domain_ids.intersection(phone_domain_ids):
+            data['phone_number'] = None
+    return data
+
+
+def _user_creation_organization_ids(user):
+    if user.is_superuser:
+        return set(Organization.objects.values_list('id', flat=True))
+    organization_ids = set(OrganizationMembership.objects.filter(
+        user=user,
+        active=True,
+        is_org_admin=True,
+    ).values_list('organization_id', flat=True))
+    organization_ids.update(Domain.objects.filter(
+        id__in=permitted_domain_ids(user, 'create_users'),
+    ).values_list('region__organization_id', flat=True))
+    return organization_ids
+
+
 @api_view(['GET'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def user_directory(request):
     """Return the signed-in profile and permitted Domain directory entries."""
@@ -291,77 +383,205 @@ def user_directory(request):
 
 
 @api_view(['GET', 'POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def physicians_list_create(request):
     if request.method == 'GET':
         physicians = Physician.objects.select_related('user', 'primary_facility').prefetch_related(
             'contract_assignments__contract__domain',
             'user__domain_memberships__domain__region__organization',
+            'user__domain_memberships__role_template',
             'user__organization_memberships__organization',
         ).all()
-        if not request.user.is_superuser:
-            organization_ids = OrganizationMembership.objects.filter(
-                user=request.user, active=True,
-            ).values_list('organization_id', flat=True)
+        if request.user.is_superuser:
+            visible_domain_ids = set(Domain.objects.values_list('id', flat=True))
+        else:
+            visible_domain_ids = permitted_domain_ids(request.user, 'view_user_directory')
             physicians = physicians.filter(
-                user__organization_memberships__organization_id__in=organization_ids,
+                user__domain_memberships__domain_id__in=visible_domain_ids,
+                user__domain_memberships__active=True,
             ).distinct()
-        serializer = PhysicianSerializer(physicians, many=True)
-        return Response(serializer.data)
+            own_physician_id = getattr(getattr(request.user, 'physician', None), 'id', None)
+            if own_physician_id:
+                physicians = Physician.objects.filter(
+                    Q(id__in=physicians.values('id')) | Q(id=own_physician_id)
+                ).select_related('user', 'primary_facility').prefetch_related(
+                    'contract_assignments__contract__domain',
+                    'user__domain_memberships__domain__region__organization',
+                    'user__domain_memberships__role_template',
+                    'user__organization_memberships__organization',
+                ).distinct()
+        email_domain_ids = permitted_domain_ids(request.user, 'view_email_addresses')
+        phone_domain_ids = permitted_domain_ids(request.user, 'view_phone_numbers')
+        return Response([
+            _serialize_physician_for_user(physician, request.user, visible_domain_ids=(
+                _visible_physician_domain_ids(request.user, physician)
+                if not request.user.is_superuser else visible_domain_ids
+            ), email_domain_ids=email_domain_ids, phone_domain_ids=phone_domain_ids)
+            for physician in physicians
+        ])
 
-    if not is_org_admin(request.user) and not any(
-        has_permission(request.user, 'create_users', domain=membership.domain)
-        for membership in DomainMembership.objects.filter(user=request.user, active=True).select_related('domain')
-    ):
+    allowed_organization_ids = _user_creation_organization_ids(request.user)
+    if not allowed_organization_ids:
         return Response({'detail': 'User creation permission is required.'}, status=status.HTTP_403_FORBIDDEN)
-    serializer = PhysicianSerializer(data=request.data)
+    raw_organization_id = request.data.get('organization')
+    if raw_organization_id in (None, ''):
+        if len(allowed_organization_ids) != 1:
+            return Response(
+                {'organization': ['Select the organization for this user.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        organization_id = next(iter(allowed_organization_ids))
+    else:
+        try:
+            organization_id = int(raw_organization_id)
+        except (TypeError, ValueError):
+            return Response({'organization': ['Select a valid organization.']}, status=status.HTTP_400_BAD_REQUEST)
+        if organization_id not in allowed_organization_ids:
+            return Response({'detail': 'User creation permission is required for this organization.'}, status=status.HTTP_403_FORBIDDEN)
+    serializer_data = request.data.copy()
+    serializer_data.pop('organization', None)
+    serializer = PhysicianSerializer(data=serializer_data)
     serializer.is_valid(raise_exception=True)
-    serializer.save()
-    return Response(serializer.data, status=status.HTTP_201_CREATED)
+    physician = serializer.save()
+    OrganizationMembership.objects.create(
+        organization_id=organization_id,
+        user=physician.user,
+    )
+    return Response(
+        _serialize_physician_for_user(
+            physician,
+            request.user,
+            visible_domain_ids=set(),
+            visible_organization_ids={organization_id},
+        ),
+        status=status.HTTP_201_CREATED,
+    )
 
 
 @api_view(['GET', 'PUT', 'PATCH'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def physician_detail(request, physician_id):
     physician = get_object_or_404(
         Physician.objects.select_related('user', 'primary_facility').prefetch_related(
             'contract_assignments__contract__domain',
             'user__domain_memberships__domain__region__organization',
+            'user__domain_memberships__role_template',
             'user__organization_memberships__organization',
         ),
         id=physician_id,
     )
 
+    target_organization_ids = _physician_organization_ids(physician)
+    administered_organization_ids = {
+        organization_id
+        for organization_id in target_organization_ids
+        if is_org_admin(request.user, Organization.objects.get(id=organization_id))
+    }
+    has_global_access = request.user.is_superuser
+    visible_domain_ids = _visible_physician_domain_ids(request.user, physician)
+    if administered_organization_ids:
+        visible_domain_ids.update(Domain.objects.filter(
+            region__organization_id__in=administered_organization_ids,
+        ).values_list('id', flat=True))
+    if has_global_access:
+        visible_domain_ids = set(DomainMembership.objects.filter(
+            user=physician.user,
+        ).values_list('domain_id', flat=True))
+    visible_organization_ids = set(Domain.objects.filter(
+        id__in=visible_domain_ids,
+    ).values_list('region__organization_id', flat=True)) | administered_organization_ids
     if request.method == 'GET':
-        serializer = PhysicianSerializer(physician)
-        return Response(serializer.data)
+        if request.user.id != physician.user_id and not visible_domain_ids and not administered_organization_ids and not has_global_access:
+            return Response({'detail': 'User directory access is required.'}, status=status.HTTP_403_FORBIDDEN)
+        return Response(_serialize_physician_for_user(
+            physician,
+            request.user,
+            visible_domain_ids=visible_domain_ids,
+            visible_organization_ids=visible_organization_ids,
+        ))
 
     shared_domains = DomainMembership.objects.filter(
         user=physician.user,
-        domain_id__in=DomainMembership.objects.filter(user=request.user).values('domain_id'),
+        active=True,
+        domain_id__in=permitted_domain_ids(request.user, 'edit_user_profiles'),
     ).select_related('domain')
-    if not is_org_admin(request.user) and not any(
-        has_permission(request.user, 'edit_user_profiles', domain=membership.domain)
-        for membership in shared_domains
-    ):
+    is_self = request.user.id == physician.user_id
+    if not is_self and not shared_domains.exists() and not administered_organization_ids and not has_global_access:
         return Response({'detail': 'User profile editing permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+    serializer_data = request.data.copy()
+    if is_self:
+        allowed_fields = {'first_name', 'last_name', 'email', 'phone_number'}
+        disallowed = set(serializer_data) - allowed_fields
+        if disallowed:
+            return Response({'detail': 'You may only update your own contact profile.'}, status=status.HTTP_403_FORBIDDEN)
+        if (
+            physician.phone_number
+            and 'phone_number' in serializer_data
+            and not str(serializer_data.get('phone_number', '')).strip()
+        ):
+            return Response({'phone_number': ['Phone number cannot be left blank once added.']}, status=status.HTTP_400_BAD_REQUEST)
+    else:
+        serializer_data.pop('role', None)
+        if 'active' in serializer_data:
+            return Response(
+                {'detail': 'Use the protected user deactivation workflow to change account status.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if serializer_data.get('primary_facility') not in (None, ''):
+            facility = get_object_or_404(Facility.objects.select_related('region'), id=serializer_data['primary_facility'])
+            allowed_region_ids = set(shared_domains.values_list('domain__region_id', flat=True))
+            allowed_region_ids.update(Facility.objects.filter(
+                region__organization_id__in=administered_organization_ids,
+            ).values_list('region_id', flat=True))
+            if facility.region_id not in allowed_region_ids:
+                return Response(
+                    {'primary_facility': ['Select a facility within a Region you manage for this user.']},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
     partial = request.method == 'PATCH'
-    serializer = PhysicianSerializer(physician, data=request.data, partial=partial)
+    serializer = PhysicianSerializer(physician, data=serializer_data, partial=partial)
     serializer.is_valid(raise_exception=True)
     serializer.save()
-    return Response(serializer.data)
+    return Response(_serialize_physician_for_user(
+        physician,
+        request.user,
+        visible_domain_ids=visible_domain_ids,
+        visible_organization_ids=visible_organization_ids,
+    ))
 
 
 @api_view(['POST'])
-@authentication_classes([CsrfExemptSessionAuthentication])
+@authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def physician_disable(request, physician_id):
-    physician = get_object_or_404(Physician, id=physician_id)
-    if not is_org_admin(request.user):
+    physician = get_object_or_404(Physician.objects.select_related('user'), id=physician_id)
+    organization_ids = _physician_organization_ids(physician)
+    if not organization_ids or any(
+        not is_org_admin(request.user, organization)
+        for organization in Organization.objects.filter(id__in=organization_ids)
+    ):
         return Response({'detail': 'Org Admin access is required for organization-wide deactivation.'}, status=status.HTTP_403_FORBIDDEN)
+    protected_organization = OrganizationMembership.objects.filter(
+        organization_id__in=organization_ids,
+        user=physician.user,
+        active=True,
+        is_org_admin=True,
+    ).first()
+    if protected_organization and not OrganizationMembership.objects.filter(
+        organization=protected_organization.organization,
+        active=True,
+        is_org_admin=True,
+        user__is_active=True,
+        user__physician__active=True,
+    ).exclude(user=physician.user).exists():
+        return Response(
+            {'detail': 'Assign another active Org Admin before deactivating this user.'},
+            status=status.HTTP_409_CONFLICT,
+        )
     physician.active = False
     physician.save(update_fields=['active'])
-    serializer = PhysicianSerializer(physician)
-    return Response(serializer.data)
+    physician.user.is_active = False
+    physician.user.save(update_fields=['is_active'])
+    return Response(_serialize_physician_for_user(physician, request.user))

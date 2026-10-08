@@ -23,3 +23,9 @@ node_modules/
 frontend/node_modules/
 dist/
 frontend/dist/
+frontend/.vite-*.log
+
+# Database backups contain production data and must never be committed
+*.dump
+*.dump.sha256
+backend/backups/

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { readSessionNumber, readSessionString, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type Physician = {
   id: number
@@ -86,7 +87,6 @@ type PhysicianFormState = {
   active: boolean
 }
 
-const API_BASE = 'http://localhost:8000/api'
 const defaultFormState: PhysicianFormState = {
   first_name: '',
   last_name: '',
@@ -340,6 +340,7 @@ export default function PhysiciansView() {
         },
         credentials: 'include',
         body: JSON.stringify({
+          ...(!isEditing && selectedOrganizationId !== null ? { organization: selectedOrganizationId } : {}),
           first_name: formState.first_name.trim(),
           last_name: formState.last_name.trim(),
           display_name: formState.display_name.trim(),

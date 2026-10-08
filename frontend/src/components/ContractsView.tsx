@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import SharedRulesView from './SharedRulesView'
 import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
+import { API_BASE } from '../api'
 
 type Domain = {
   id: number
@@ -222,7 +223,6 @@ type ContractFormState = {
 
 type ContractTab = 'summary' | 'workload' | 'facilities' | 'shifts' | 'nights' | 'weekends' | 'users'
 
-const API_BASE = 'http://localhost:8000/api'
 
 let idSeed = 0
 function makeId(prefix: string) {
