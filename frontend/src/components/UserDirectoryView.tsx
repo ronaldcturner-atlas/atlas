@@ -1,6 +1,7 @@
 import React from 'react'
 import { readSessionNumber, writeSessionSelection } from '../utils/sessionSelection'
 import { API_BASE } from '../api'
+import ChangePassword from './ChangePassword'
 
 type DomainOption = { id: number; name: string; region_id: number; region_name: string }
 type DirectoryProfile = {
@@ -38,6 +39,7 @@ export default function UserDirectoryView() {
   const [selectedUser, setSelectedUser] = React.useState<DirectoryProfile | null>(null)
   const [error, setError] = React.useState('')
   const [loading, setLoading] = React.useState(true)
+  const [changingPassword, setChangingPassword] = React.useState(false)
 
   const load = React.useCallback(async (nextDomainId?: number | '') => {
     setLoading(true)
@@ -72,7 +74,7 @@ export default function UserDirectoryView() {
   return <div className="user-directory-view">
     {error && <div className="facilities-error">{error}</div>}
     <section className="user-self-profile">
-      <div className="user-self-heading"><div><span>My Profile</span><h2>{profile.name}{profile.is_org_admin && <small className="org-admin-badge">Org Admin</small>}</h2></div><span className="user-profile-type">{profile.clinician_type}</span></div>
+      <div className="user-self-heading"><div><span>My Profile</span><h2>{profile.name}{profile.is_org_admin && <small className="org-admin-badge">Org Admin</small>}</h2></div><div className="user-self-actions"><button type="button" onClick={() => setChangingPassword(true)}>Change password</button><span className="user-profile-type">{profile.clinician_type}</span></div></div>
       <div className="user-self-details">
         <div><span>Email</span><strong>{profile.email || '—'}</strong></div>
         <div><span>Phone</span><strong>{profile.phone_number || 'Not provided'}</strong></div>
@@ -103,5 +105,6 @@ export default function UserDirectoryView() {
       </div>
       <div className="shift-modal-actions"><button type="button" onClick={() => setSelectedUser(null)}>Close</button></div>
     </div></div>}
+    {changingPassword && <div className="shift-modal-overlay" onClick={() => setChangingPassword(false)}><div className="shift-modal user-directory-modal" onClick={(event) => event.stopPropagation()}><div className="shift-modal-header"><h2>Change password</h2></div><div className="shift-modal-body"><ChangePassword onCancel={() => setChangingPassword(false)} onComplete={() => setChangingPassword(false)} /></div></div></div>}
   </div>
 }

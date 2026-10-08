@@ -65,6 +65,18 @@ class DomainSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Domain name is required.')
         return normalized
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if (
+            self.instance is not None
+            and 'region' in attrs
+            and attrs['region'].id != self.instance.region_id
+        ):
+            raise serializers.ValidationError({
+                'region': 'A Domain cannot be moved to another Region.',
+            })
+        return attrs
+
 
 class OrganizationMembershipSerializer(serializers.ModelSerializer):
     user_name = serializers.SerializerMethodField()
@@ -107,6 +119,18 @@ class DomainMembershipSerializer(serializers.ModelSerializer):
         return sorted(membership_permissions(obj))
 
     def validate(self, attrs):
+        if self.instance is not None:
+            if (
+                'domain' in attrs
+                and attrs['domain'].id != self.instance.domain_id
+            ):
+                raise serializers.ValidationError({
+                    'domain': 'Domain access cannot be moved to another Domain. Remove it and create new access instead.',
+                })
+            if 'user' in attrs and attrs['user'].id != self.instance.user_id:
+                raise serializers.ValidationError({
+                    'user': 'Domain access cannot be transferred to another user.',
+                })
         domain = attrs.get('domain') or getattr(self.instance, 'domain', None)
         user = attrs.get('user') or getattr(self.instance, 'user', None)
         if domain and user and not OrganizationMembership.objects.filter(

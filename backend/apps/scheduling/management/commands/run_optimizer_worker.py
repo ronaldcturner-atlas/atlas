@@ -1,5 +1,7 @@
 import time
 import signal
+import os
+import socket
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
@@ -12,17 +14,28 @@ from django.utils import timezone
 from apps.scheduling.models import (
     OptimizerControl,
     OptimizerRun,
-    ScheduleShiftAssignment,
 )
 from apps.scheduling.optimizer import optimize_schedule_version
 from apps.scheduling.optimizer_v2_runner import (
     V2_RUN_KINDS,
+    _failure_configuration_snapshot,
     optimize_schedule_version_v2,
 )
 
 
 DEFAULT_JOB_TIMEOUT_SECONDS = 16 * 60
 _HELD_CONTROL_LOCKS = set()
+
+
+def _code_release_identifier():
+    return next((
+        value for value in (
+            os.environ.get('ATLAS_RELEASE'),
+            os.environ.get('RAILWAY_GIT_COMMIT_SHA'),
+            os.environ.get('SOURCE_VERSION'),
+            os.environ.get('GIT_COMMIT'),
+        ) if value
+    ), 'development')
 
 
 class OptimizerJobTimeout(TimeoutError):
@@ -192,23 +205,57 @@ class Command(BaseCommand):
                     ),
                 )
         except Exception as exc:
-            traceback.print_exc()
-            if (
-                control.optimizer_run.run_kind in V2_RUN_KINDS
-                and control.optimizer_run.start_mode
-                == OptimizerRun.StartMode.FRESH_FILL
-            ):
-                ScheduleShiftAssignment.objects.filter(
-                    optimizer_run_id=control.optimizer_run_id,
-                ).delete()
-            OptimizerRun.objects.filter(
-                id=control.optimizer_run_id,
-                status=OptimizerRun.Status.RUNNING,
-            ).update(
-                status=OptimizerRun.Status.FAILED,
-                is_active=False,
-                notes=f'Background optimizer failed: {type(exc).__name__}: {exc}',
+            failure_traceback = traceback.format_exc()
+            self.stderr.write(failure_traceback)
+            failed_run = OptimizerRun.objects.get(id=control.optimizer_run_id)
+            debug = dict(failed_run.optimizer_debug or {})
+            failure_diagnostic = dict(debug.get('failure_diagnostic') or {})
+            failure_diagnostic.update({
+                'terminal_status': OptimizerRun.Status.FAILED,
+                'failed_at': timezone.now().isoformat(),
+                'runtime_seconds': (
+                    (timezone.now() - control.started_at).total_seconds()
+                    if control.started_at is not None else None
+                ),
+                'exception_type': type(exc).__name__,
+                'exception_message': str(exc),
+                'traceback': failure_traceback,
+                'optimizer_control_id': str(control.pk),
+                'worker_hostname': socket.gethostname(),
+                'worker_process_id': os.getpid(),
+                'code_release': _code_release_identifier(),
+                'last_reported_best_score': (
+                    float(latest_live_score[0])
+                    if latest_live_score[0] is not None else None
+                ),
+            })
+            if 'configuration_snapshot' not in failure_diagnostic:
+                try:
+                    failure_diagnostic['configuration_snapshot'] = (
+                        _failure_configuration_snapshot(
+                            control.schedule_version
+                        )
+                    )
+                except Exception as snapshot_exc:
+                    failure_diagnostic['configuration_snapshot_error'] = {
+                        'exception_type': type(snapshot_exc).__name__,
+                        'exception_message': str(snapshot_exc),
+                    }
+            debug.update({
+                'optimizer_engine': (
+                    'V2' if failed_run.run_kind in V2_RUN_KINDS else 'V1'
+                ),
+                'failure_diagnostic': failure_diagnostic,
+            })
+            failed_run.status = OptimizerRun.Status.FAILED
+            failed_run.is_active = False
+            failed_run.optimizer_debug = debug
+            failed_run.notes = (
+                f'Background optimizer failed: {type(exc).__name__}: {exc}'
             )
+            failed_run.save(update_fields=[
+                'status', 'is_active', 'optimizer_debug', 'notes',
+            ])
             self.stderr.write(self.style.ERROR(
                 f'Optimizer Run {control.optimizer_run_id} failed: {exc}'
             ))

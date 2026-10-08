@@ -9,8 +9,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc libpq-dev postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements/base.txt requirements/development.txt ./
-RUN pip install --upgrade pip && pip install -r development.txt
+COPY requirements/base.txt ./
+RUN pip install --upgrade pip && pip install -r base.txt
 
 COPY . .
 

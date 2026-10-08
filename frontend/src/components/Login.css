@@ -151,3 +151,11 @@
   border-radius: 3px;
   font-family: 'Courier New', monospace;
 }
+
+.password-change-card .login-header { margin-bottom: 20px; }
+.password-change-card .login-header h1 { margin: 0; font-size: 22px; }
+.password-change-form { margin-bottom: 0; }
+.password-change-form small { color: var(--muted); font-size: 11px; }
+.password-change-message { margin: 0; color: var(--sidebar-fg); font-size: 14px; }
+.password-change-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.password-change-actions .login-button { min-width: 150px; }

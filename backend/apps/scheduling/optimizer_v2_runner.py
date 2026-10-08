@@ -7,9 +7,15 @@ from time import monotonic
 
 from django.core.management import call_command
 from django.db import transaction
+from django.utils import timezone
 
 from .initial_schedule import construct_complete_initial_schedule
-from .models import OptimizerRun, ScheduleShiftAssignment
+from .models import (
+    ContractUserAssignment,
+    OptimizerRun,
+    ScheduleRequest,
+    ScheduleShiftAssignment,
+)
 from .optimizer import build_violation_report
 from .optimizer_assignment_snapshot import (
     state_from_assignments,
@@ -28,6 +34,115 @@ LEGACY_V2_TEST_RUN_KIND = 'OPTIMIZER_V2_TEST'
 V2_RUN_KINDS = frozenset({V2_RUN_KIND, LEGACY_V2_TEST_RUN_KIND})
 # Compatibility import for older code and completed-run tests.
 V2_TEST_RUN_KIND = LEGACY_V2_TEST_RUN_KIND
+
+
+def _compact_search_summary(search_result):
+    """Keep useful completed-run metrics without retaining replay evidence."""
+    keys = (
+        'stage', 'wall_seconds', 'stopped_reason', 'total_evaluations',
+        'unique_evaluated_states', 'unique_accepted_states',
+        'accepted_transitions', 'improving_transitions',
+        'diversification_transitions', 'primary_improvements',
+        'proportionality_improvements', 'predicted_final_score',
+        'aggregate_kernel_schedules_per_second', 'restart_count',
+        'search_generation', 'consecutive_unproductive_generations',
+        'consecutive_exhausted_pipeline_epochs', 'distribution_focus',
+    )
+    return {
+        key: search_result[key]
+        for key in keys
+        if key in search_result
+    }
+
+
+def _compact_bootstrap_summary(summary):
+    if not isinstance(summary, dict):
+        return None
+    keys = (
+        'initial_score', 'final_score', 'runtime_seconds', 'stopped_reason',
+        'iterations_run', 'improvement_count', 'assignments_made',
+        'unfilled_shift_count', 'final_overlap_violations',
+    )
+    return {key: summary[key] for key in keys if key in summary}
+
+
+def _failure_configuration_snapshot(schedule_version):
+    """Capture mutable inputs only when a run fails unexpectedly."""
+    block = schedule_version.schedule_block
+    contract_rows = []
+    assignments = (
+        ContractUserAssignment.objects
+        .filter(domain=schedule_version.domain, contract__active=True)
+        .select_related('contract')
+        .prefetch_related('contract__facilities')
+        .order_by('physician_id')
+    )
+    for assignment in assignments:
+        contract = assignment.contract
+        contract_rows.append({
+            'physician_id': assignment.physician_id,
+            'contract_id': contract.id,
+            'contract_name': contract.name,
+            'manual_assignment_only': contract.manual_assignment_only,
+            'facility_ids': list(
+                contract.facilities.order_by('id').values_list('id', flat=True)
+            ),
+            'workload_settings': contract.workload_settings,
+            'shift_settings': contract.shift_settings,
+            'night_settings': contract.night_settings,
+            'weekend_settings': contract.weekend_settings,
+            'request_settings': contract.request_settings,
+            'contract_updated_at': contract.updated_at.isoformat(),
+        })
+    request_rows = []
+    for request in (
+        ScheduleRequest.objects.filter(schedule_block=block)
+        .prefetch_related('shift_templates')
+        .order_by('id')
+    ):
+        request_rows.append({
+            'id': request.id,
+            'physician_id': request.physician_id,
+            'date': request.date.isoformat(),
+            'request_scope': request.request_scope,
+            'request_type': request.request_type,
+            'weight': request.weight,
+            'shift_template_ids': list(
+                request.shift_templates.order_by('id')
+                .values_list('id', flat=True)
+            ),
+            'updated_at': request.updated_at.isoformat(),
+        })
+    instance_rows = list(
+        version_shift_instances_queryset(schedule_version)
+        .order_by('id')
+        .values(
+            'id', 'date', 'shift_template_id', 'facility_id',
+            'start_datetime', 'end_datetime', 'required_staffing',
+            'is_locked_open', 'split_parent_id',
+        )
+    )
+    for row in instance_rows:
+        row['date'] = row['date'].isoformat()
+        row['start_datetime'] = row['start_datetime'].isoformat()
+        row['end_datetime'] = row['end_datetime'].isoformat()
+    return {
+        'captured_at': timezone.now().isoformat(),
+        'schedule_version_id': schedule_version.id,
+        'schedule_block_id': block.id,
+        'domain_id': schedule_version.domain_id,
+        'region_id': schedule_version.domain.region_id,
+        'organization_id': schedule_version.domain.region.organization_id,
+        'block_start_date': block.start_date.isoformat(),
+        'block_end_date': block.end_date.isoformat(),
+        'shift_template_fingerprint': (
+            schedule_version.shift_template_fingerprint
+        ),
+        'workload_hour_overrides': schedule_version.workload_hour_overrides,
+        'contracts': contract_rows,
+        'requests': request_rows,
+        'shift_instances': instance_rows,
+    }
 
 
 def _apply_search_operations(state, operations):
@@ -113,6 +228,61 @@ def _authoritative_search_initial_score(search_result, fallback):
     return Decimal(str(fallback))
 
 
+def _persist_v2_search_failure(
+    *, optimizer_run, schedule_version, initial_score, source_report,
+    diagnostic_state, started_at, exc,
+):
+    diagnostic = dict(diagnostic_state or {})
+    diagnostic.update({
+        'failure_recorded_at': timezone.now().isoformat(),
+        'runtime_seconds': monotonic() - started_at,
+        'exception_type': type(exc).__name__,
+        'exception_message': str(exc),
+        'initial_authoritative_score': float(initial_score),
+        'initial_score_breakdown': source_report.get('score_breakdown') or {},
+    })
+    try:
+        diagnostic['configuration_snapshot'] = (
+            _failure_configuration_snapshot(schedule_version)
+        )
+    except Exception as snapshot_exc:  # Preserve the primary optimizer error.
+        diagnostic['configuration_snapshot_error'] = {
+            'exception_type': type(snapshot_exc).__name__,
+            'exception_message': str(snapshot_exc),
+        }
+    optimizer_run.initial_score = initial_score
+    optimizer_run.score_breakdown = source_report.get('score_breakdown') or {}
+    optimizer_run.optimizer_summary = {
+        'optimizer_engine': 'V2',
+        'optimizer_run_id': optimizer_run.id,
+        'optimizer_run_number': optimizer_run.run_number,
+        'start_mode': optimizer_run.start_mode,
+        'initial_score': float(initial_score),
+        'runtime_seconds': diagnostic['runtime_seconds'],
+        'failure_type': type(exc).__name__,
+        'failure_message': str(exc),
+        'last_verified_score': (
+            (diagnostic.get('last_authoritative_checkpoint') or {}).get(
+                'score'
+            )
+        ),
+        'best_verified_score': (
+            (diagnostic.get('best_authoritative_checkpoint') or {}).get(
+                'score'
+            )
+        ),
+        'predicted_best_score': diagnostic.get('best_predicted_score'),
+    }
+    optimizer_run.optimizer_debug = {
+        'optimizer_engine': 'V2',
+        'failure_diagnostic': diagnostic,
+    }
+    optimizer_run.save(update_fields=[
+        'initial_score', 'score_breakdown', 'optimizer_summary',
+        'optimizer_debug',
+    ])
+
+
 def optimize_schedule_version_v2(
     schedule_version,
     *,
@@ -164,6 +334,15 @@ def optimize_schedule_version_v2(
     )
 
     output = io.StringIO()
+    diagnostic_state = {
+        'run_id': optimizer_run.id,
+        'run_number': optimizer_run.run_number,
+        'seed': optimizer_run.seed,
+        'start_mode': optimizer_run.start_mode,
+        'optimization_focus': optimizer_run.optimization_focus,
+        'maximum_runtime_seconds': optimizer_run.max_runtime_seconds,
+        'search_started_at': timezone.now().isoformat(),
+    }
     remaining_runtime_seconds = max(
         float(optimizer_run.max_runtime_seconds) - (monotonic() - overall_started),
         0.0,
@@ -197,33 +376,46 @@ def optimize_schedule_version_v2(
             'score_checkpoints': [],
         }
     else:
-        call_command(
-            'benchmark_v2_continuous',
-            run_id=source_run.id,
-            target_evaluations=10**15,
-            max_transitions=100_000,
-            max_runtime_seconds=remaining_runtime_seconds,
-            configured_runtime_seconds=float(
-                optimizer_run.max_runtime_seconds
-            ),
-            minimum_rate=0.0,
-            stress_contract_count=0,
-            # The selected transition is always checked authoritatively by the
-            # kernel. Additional sampled candidates are a diagnostic benchmark,
-            # not production work.
-            validate_sample=0,
-            checkpoint_interval=20,
-            starting_score=float(initial_score),
-            search_seed=int(optimizer_run.seed or optimizer_run.id),
-            distribution_focus=(
-                optimizer_run.optimization_focus
-                == OptimizerRun.OptimizationFocus.DISTRIBUTION
-            ),
-            stop_requested=stop_requested,
-            progress_callback=progress_callback,
-            as_json=True,
-            stdout=output,
-        )
+        try:
+            call_command(
+                'benchmark_v2_continuous',
+                run_id=source_run.id,
+                target_evaluations=10**15,
+                max_transitions=100_000,
+                max_runtime_seconds=remaining_runtime_seconds,
+                configured_runtime_seconds=float(
+                    optimizer_run.max_runtime_seconds
+                ),
+                minimum_rate=0.0,
+                stress_contract_count=0,
+                # The selected transition is always checked authoritatively by
+                # the kernel. Additional sampled candidates are a diagnostic
+                # benchmark, not production work.
+                validate_sample=0,
+                checkpoint_interval=20,
+                starting_score=float(initial_score),
+                search_seed=int(optimizer_run.seed or optimizer_run.id),
+                distribution_focus=(
+                    optimizer_run.optimization_focus
+                    == OptimizerRun.OptimizationFocus.DISTRIBUTION
+                ),
+                stop_requested=stop_requested,
+                progress_callback=progress_callback,
+                diagnostic_state=diagnostic_state,
+                as_json=True,
+                stdout=output,
+            )
+        except Exception as exc:
+            _persist_v2_search_failure(
+                optimizer_run=optimizer_run,
+                schedule_version=schedule_version,
+                initial_score=initial_score,
+                source_report=source_report,
+                diagnostic_state=diagnostic_state,
+                started_at=overall_started,
+                exc=exc,
+            )
+            raise
         lines = [line for line in output.getvalue().splitlines() if line.strip()]
         if not lines:
             raise ValueError('Atlas v2 test did not return a search result.')
@@ -314,19 +506,19 @@ def optimize_schedule_version_v2(
             ),
             'assignments_made': len(rows),
             'unfilled_shift_count': unfilled,
-            'v2_search': search_result,
-            'fresh_fill_bootstrap': bootstrap_summary,
+            'v2_search': _compact_search_summary(search_result),
+            'fresh_fill_bootstrap': _compact_bootstrap_summary(
+                bootstrap_summary
+            ),
         }
         optimizer_run.status = OptimizerRun.Status.COMPLETED
         optimizer_run.initial_score = initial_score
         optimizer_run.final_score = final_score
         optimizer_run.score_breakdown = report['score_breakdown']
         optimizer_run.optimizer_summary = summary
-        optimizer_run.optimizer_debug = {
-            'optimizer_engine': 'V2',
-            'search': search_result,
-            'score_audit': report.get('score_audit'),
-        }
+        # Detailed checkpoints and transition replay data are useful only
+        # while a run is active or after an unexpected failure.
+        optimizer_run.optimizer_debug = {}
         optimizer_run.score_is_stale = False
         optimizer_run.is_active = False
         optimizer_run.notes = (

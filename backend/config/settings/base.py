@@ -45,12 +45,27 @@ ATLAS_V2_ENABLED = (
 )
 # Compatibility setting for older deployments during the product transition.
 ATLAS_V2_TEST_ENABLED = ATLAS_V2_ENABLED
+# The legacy V1 runner remains available only to internal development and
+# regression tests while V2 still reuses its proven construction primitives.
+# Production overrides this to False so no consumer request can launch V1.
+ATLAS_LEGACY_V1_LAUNCH_ENABLED = env_bool(
+    "ATLAS_LEGACY_V1_LAUNCH_ENABLED",
+    True,
+)
 
 ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
 
 ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST = env_bool(
     "ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST",
     DEBUG,
+)
+ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP = env_bool(
+    "ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP",
+    DEBUG,
+)
+REJECT_SHARED_TEST_PASSWORD = env_bool(
+    "REJECT_SHARED_TEST_PASSWORD",
+    False,
 )
 
 INSTALLED_APPS = [
@@ -78,6 +93,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "apps.accounts.middleware.PasswordChangeRequiredMiddleware",
     "apps.domains.middleware.DevelopmentRoleTestMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",

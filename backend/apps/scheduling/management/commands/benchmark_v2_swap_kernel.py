@@ -3289,6 +3289,41 @@ class Command(BaseCommand):
                     'predicted_proportionality_delta': (
                         best_selection.proportionality_delta
                     ),
+                    'predicted_component_deltas': {
+                        'workload_score': float(
+                            workload_kernel[
+                                best_left, shift_for_assignment[best_right]
+                            ]
+                            + workload_kernel[
+                                best_right, shift_for_assignment[best_left]
+                            ]
+                        ),
+                        'weekend_score': float(
+                            weekend_kernel[
+                                best_left,
+                                shift_signatures[
+                                    shift_for_assignment[best_right]
+                                ],
+                            ]
+                            + weekend_kernel[
+                                best_right,
+                                shift_signatures[
+                                    shift_for_assignment[best_left]
+                                ],
+                            ]
+                        ),
+                        'night_score': float(night_deltas[best_index]),
+                        'request_score': float(request_deltas[best_index]),
+                        'consecutive_days_score': float(
+                            consecutive_deltas[best_index]
+                        ),
+                        'same_shift_score': float(
+                            same_shift_deltas[best_index]
+                        ),
+                        'shift_rule_score': float(
+                            shift_rule_deltas[best_index]
+                        ),
+                    },
                     'selection_mode': selection_mode,
                 }
 
@@ -3918,6 +3953,7 @@ class Command(BaseCommand):
         structural_reconstruction_attempt = None
         in_process_transition = None
         authoritative_current_score = None
+        authoritative_current_breakdown = None
         if (
             best_vectorized_candidate is not None
             or reassignment_shortlist
@@ -3955,6 +3991,12 @@ class Command(BaseCommand):
                     minimum_rest_by_physician,
                 )
                 authoritative_current_score = float(current_scoring['score'])
+                authoritative_current_breakdown = {
+                    key: float(value)
+                    for key, value in (
+                        current_scoring.get('breakdown') or {}
+                    ).items()
+                }
             instances_by_id = {instance.id: instance for instance in instances}
             locked_open_instance_ids = {
                 instance.id for instance in instances if instance.is_locked_open
@@ -4783,6 +4825,9 @@ class Command(BaseCommand):
             'schedule_version_id': version.id,
             'schedule_fingerprint': engine_context.fingerprint,
             'authoritative_current_score': authoritative_current_score,
+            'authoritative_current_breakdown': (
+                authoritative_current_breakdown
+            ),
             'engine_context_cache_hit': engine_context_cache_hit,
             'engine_context_cache_entries': len(_ENGINE_CONTEXT_CACHE),
             'engine_context_evaluated_schedules': (

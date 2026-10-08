@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { readSessionNumber, readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 import { API_BASE } from '../api'
+import { useAuth } from '../contexts/AuthContext'
 
 type Physician = {
   id: number
@@ -42,6 +43,7 @@ type Physician = {
   clinician_type: 'physician' | 'pa' | 'np'
   fte: string
   active: boolean
+  temporary_password?: string
 }
 
 type FacilityOption = {
@@ -142,6 +144,7 @@ async function getApiErrorMessage(response: Response) {
 }
 
 export default function PhysiciansView() {
+  const { user } = useAuth()
   const [physicians, setPhysicians] = useState<Physician[]>([])
   const [facilities, setFacilities] = useState<FacilityOption[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
@@ -156,6 +159,8 @@ export default function PhysiciansView() {
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [resettingPassword, setResettingPassword] = useState(false)
+  const [issuedCredential, setIssuedCredential] = useState<{ name: string; password: string } | null>(null)
 
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingPhysicianId, setEditingPhysicianId] = useState<number | null>(null)
@@ -407,6 +412,12 @@ export default function PhysiciansView() {
         }
       }
 
+      if (!isEditing && savedUser.temporary_password) {
+        setIssuedCredential({
+          name: `${savedUser.first_name} ${savedUser.last_name}`.trim(),
+          password: savedUser.temporary_password,
+        })
+      }
       await fetchData()
       closeModal()
     } catch (saveError) {
@@ -414,6 +425,29 @@ export default function PhysiciansView() {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save user profile changes.')
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  const resetPassword = async () => {
+    if (!editingUser || !window.confirm(`Issue a new temporary password for ${editingUser.first_name} ${editingUser.last_name}? Their current sessions will be signed out.`)) return
+    try {
+      setResettingPassword(true)
+      setError(null)
+      const response = await fetch(`${API_BASE}/physicians/${editingUser.id}/password-reset/`, {
+        method: 'POST',
+        credentials: 'include',
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail ?? 'Unable to reset password.')
+      setIssuedCredential({
+        name: `${editingUser.first_name} ${editingUser.last_name}`.trim(),
+        password: data.temporary_password,
+      })
+      closeModal()
+    } catch (resetError) {
+      setError(resetError instanceof Error ? resetError.message : 'Unable to reset password.')
+    } finally {
+      setResettingPassword(false)
     }
   }
 
@@ -682,6 +716,7 @@ export default function PhysiciansView() {
               </label>
             </div>
             <div className="shift-modal-actions">
+              {editingUser && user?.is_org_admin && editingUser.user_id !== user.id && <button className="secondary" type="button" onClick={() => void resetPassword()} disabled={resettingPassword}>{resettingPassword ? 'Resetting...' : 'Reset password'}</button>}
               <button className="secondary" type="button" onClick={closeModal}>
                 Cancel
               </button>
@@ -692,6 +727,7 @@ export default function PhysiciansView() {
           </div>
         </div>
       )}
+      {issuedCredential && <div className="shift-modal-overlay"><div className="shift-modal temporary-password-modal"><div className="shift-modal-header"><h2>Temporary password</h2></div><div className="shift-modal-body"><p>Give this password securely to <strong>{issuedCredential.name}</strong>. It is shown only once and must be changed at first login.</p><div className="temporary-password-value"><code>{issuedCredential.password}</code><button type="button" onClick={() => void navigator.clipboard.writeText(issuedCredential.password)}>Copy</button></div></div><div className="shift-modal-actions"><button type="button" onClick={() => setIssuedCredential(null)}>Done</button></div></div></div>}
     </div>
   )
 }

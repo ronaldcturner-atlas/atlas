@@ -1,7 +1,7 @@
-Django
- djangorestframework
- django-cors-headers
- psycopg
- python-dotenv
- ortools==9.14.6206
+Django==6.1.2
+djangorestframework==3.18.3
+django-cors-headers==4.9.0
+psycopg==3.3.6
+python-dotenv==1.2.4
+ortools==9.14.6206
 gunicorn==23.0.0

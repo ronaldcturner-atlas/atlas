@@ -1,7 +1,10 @@
 from django.conf import settings
-from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth import authenticate, login, logout, update_session_auth_hash
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
 from django.middleware.csrf import get_token
+from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -11,7 +14,8 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated
 from rest_framework import status
 
-from .models import Physician
+from .models import AccountSecurityState, Physician
+from .security import issue_temporary_password
 from .serializers import PhysicianSerializer, UserSerializer
 from .throttles import LoginAccountThrottle, LoginIPThrottle
 from apps.domains.models import Domain, DomainMembership, Organization, OrganizationMembership, RoleTemplate
@@ -67,6 +71,11 @@ def login_view(request):
             {'error': 'Username and password are required'},
             status=status.HTTP_400_BAD_REQUEST
         )
+    if settings.REJECT_SHARED_TEST_PASSWORD and password == 'atlas':
+        return Response(
+            {'error': 'Invalid username or password'},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
     
     account = User.objects.filter(email__iexact=username).first()
     authentication_username = account.username if account else username
@@ -105,6 +114,50 @@ def me_view(request):
     """
     serializer = UserSerializer(request.user)
     return Response(serializer.data)
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def change_password(request):
+    current_password = request.data.get('current_password')
+    new_password = request.data.get('new_password')
+    confirm_password = request.data.get('confirm_password')
+    if not current_password or not new_password or not confirm_password:
+        return Response(
+            {'detail': 'Current password, new password, and confirmation are required.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not request.user.check_password(current_password):
+        return Response(
+            {'current_password': ['Current password is incorrect.']},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if new_password != confirm_password:
+        return Response(
+            {'confirm_password': ['New passwords do not match.']},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if request.user.check_password(new_password):
+        return Response(
+            {'new_password': ['Choose a password you have not already been using.']},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        validate_password(new_password, user=request.user)
+    except ValidationError as exc:
+        return Response(
+            {'new_password': list(exc.messages)},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    request.user.set_password(new_password)
+    request.user.save(update_fields=['password'])
+    state, _created = AccountSecurityState.objects.get_or_create(
+        user=request.user,
+    )
+    state.mark_password_changed()
+    update_session_auth_hash(request, request.user)
+    return Response(dict(UserSerializer(request.user).data))
 
 
 @api_view(['GET', 'POST', 'DELETE'])
@@ -443,20 +496,21 @@ def physicians_list_create(request):
     serializer_data.pop('organization', None)
     serializer = PhysicianSerializer(data=serializer_data)
     serializer.is_valid(raise_exception=True)
-    physician = serializer.save()
-    OrganizationMembership.objects.create(
-        organization_id=organization_id,
-        user=physician.user,
-    )
-    return Response(
-        _serialize_physician_for_user(
+    with transaction.atomic():
+        physician = serializer.save()
+        temporary_password = issue_temporary_password(physician.user)
+        OrganizationMembership.objects.create(
+            organization_id=organization_id,
+            user=physician.user,
+        )
+    response_data = _serialize_physician_for_user(
             physician,
             request.user,
             visible_domain_ids=set(),
             visible_organization_ids={organization_id},
-        ),
-        status=status.HTTP_201_CREATED,
-    )
+        )
+    response_data['temporary_password'] = temporary_password
+    return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 @api_view(['GET', 'PUT', 'PATCH'])
@@ -506,10 +560,28 @@ def physician_detail(request, physician_id):
         user=physician.user,
         active=True,
         domain_id__in=permitted_domain_ids(request.user, 'edit_user_profiles'),
-    ).select_related('domain')
+    ).select_related('domain__region')
     is_self = request.user.id == physician.user_id
-    if not is_self and not shared_domains.exists() and not administered_organization_ids and not has_global_access:
-        return Response({'detail': 'User profile editing permission is required.'}, status=status.HTTP_403_FORBIDDEN)
+    editable_organization_ids = administered_organization_ids | set(
+        shared_domains.values_list(
+            'domain__region__organization_id', flat=True,
+        )
+    )
+    if (
+        not is_self
+        and not has_global_access
+        and (
+            not editable_organization_ids
+            or not target_organization_ids
+            or not target_organization_ids.issubset(editable_organization_ids)
+        )
+    ):
+        return Response({
+            'detail': (
+                'User profile editing permission is required in every '
+                'Organization assigned to this user.'
+            ),
+        }, status=status.HTTP_403_FORBIDDEN)
     serializer_data = request.data.copy()
     if is_self:
         allowed_fields = {'first_name', 'last_name', 'email', 'phone_number'}
@@ -585,3 +657,43 @@ def physician_disable(request, physician_id):
     physician.user.is_active = False
     physician.user.save(update_fields=['is_active'])
     return Response(_serialize_physician_for_user(physician, request.user))
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def physician_reset_password(request, physician_id):
+    physician = get_object_or_404(
+        Physician.objects.select_related('user'),
+        id=physician_id,
+    )
+    if physician.user_id == request.user.id:
+        return Response(
+            {'detail': 'Use Change Password to update your own password.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not physician.active or not physician.user.is_active:
+        return Response(
+            {'detail': 'Reactivate this user before resetting their password.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    organization_ids = _physician_organization_ids(physician)
+    if not organization_ids:
+        return Response(
+            {'detail': 'This user is not assigned to an organization.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    if not request.user.is_superuser and any(
+        not is_org_admin(request.user, organization)
+        for organization in Organization.objects.filter(id__in=organization_ids)
+    ):
+        return Response(
+            {'detail': 'Org Admin access is required for every organization assigned to this user.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    temporary_password = issue_temporary_password(physician.user)
+    return Response({
+        'temporary_password': temporary_password,
+        'must_change_password': True,
+        'user_id': physician.user_id,
+    })

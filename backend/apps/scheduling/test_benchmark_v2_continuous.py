@@ -22,6 +22,9 @@ class V2ContinuousCommandTests(SimpleTestCase):
             'meets_stage_one_rate': True,
             'best_candidate_transition_validation': transition,
             'authoritative_current_score': current_score,
+            'authoritative_current_breakdown': {
+                'request_score': current_score,
+            },
         }
 
     @staticmethod
@@ -35,6 +38,7 @@ class V2ContinuousCommandTests(SimpleTestCase):
             'authoritative_improving': True,
             'authoritative_official_delta': -10.0,
             'predicted_official_delta': -10.0,
+            'predicted_component_deltas': {'request_score': -10.0},
         }
 
     @staticmethod
@@ -177,6 +181,83 @@ class V2ContinuousCommandTests(SimpleTestCase):
                 'restart_mode': 'initial',
                 'selection_mode': 'improve',
             }],
+        )
+
+    def test_score_divergence_retains_bounded_replay_diagnostics(self):
+        diagnostic_state = {}
+        results = [
+            self._kernel_result('a', self._transition(0), current_score=100.0),
+            self._kernel_result('b', self._transition(1)),
+            self._kernel_result('c', None, current_score=85.0),
+        ]
+
+        def fake_kernel(_name, **kwargs):
+            kwargs['stdout'].write(json.dumps(results.pop(0)))
+
+        command = Command()
+        command.stdout = io.StringIO()
+        with patch(
+            'apps.scheduling.management.commands.'
+            'benchmark_v2_continuous.call_command',
+            side_effect=fake_kernel,
+        ), self.assertRaisesMessage(
+            CommandError, 'compiled v2 score diverged',
+        ):
+            command.handle(
+                run_number=95, run_id=None, target_evaluations=100,
+                max_transitions=2, max_runtime_seconds=None,
+                minimum_rate=0, stress_contract_count=0,
+                validate_sample=0, checkpoint_interval=2,
+                initial_swap=[], as_json=True, stop_requested=None,
+                progress_callback=None, starting_score=100,
+                distribution_focus=False, soft_restart_moves=3,
+                deep_restart_moves=8,
+                soft_restart_maximum_penalty=5000,
+                deep_restart_maximum_penalty=10000,
+                diagnostic_state=diagnostic_state,
+            )
+
+        self.assertEqual(
+            diagnostic_state['last_authoritative_checkpoint']['score'],
+            100.0,
+        )
+        self.assertEqual(
+            diagnostic_state['best_authoritative_checkpoint']['score'],
+            100.0,
+        )
+        self.assertEqual(
+            diagnostic_state['failure']['kind'],
+            'current_score_divergence',
+        )
+        self.assertEqual(
+            diagnostic_state['failure']['predicted_score'],
+            80.0,
+        )
+        self.assertEqual(
+            diagnostic_state['failure']['authoritative_score'],
+            85.0,
+        )
+        self.assertEqual(
+            diagnostic_state['failure'][
+                'authoritative_component_changes_since_last_checkpoint'
+            ]['request_score'],
+            -15.0,
+        )
+        self.assertEqual(
+            diagnostic_state['failure'][
+                'predicted_component_changes_since_last_checkpoint'
+            ]['request_score'],
+            -20.0,
+        )
+        self.assertEqual(
+            len(diagnostic_state['failure'][
+                'transitions_since_last_checkpoint'
+            ]),
+            2,
+        )
+        self.assertEqual(
+            len(diagnostic_state['failure']['current_operation_chain']),
+            2,
         )
 
     def test_continuous_search_rebases_stale_score_before_first_transition(self):

@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from django.conf import settings
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -162,6 +163,8 @@ def _organization_from_request(request):
 	organization = _organizations_for_user(request.user).order_by('name', 'id').first()
 	if organization:
 		return organization
+	if not settings.ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP:
+		return None
 	organization = _ensure_default_organization()
 	if not organization.memberships.exists():
 		OrganizationMembership.objects.create(organization=organization, user=request.user)
@@ -183,14 +186,18 @@ def _organization_from_request(request):
 @permission_classes([IsAuthenticated])
 def organizations_list_create(request):
 	if request.method == 'GET':
-		_ensure_default_organization()
+		if settings.ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP:
+			_ensure_default_organization()
 		organizations = _organizations_for_user(request.user).annotate(
 			region_count=Count('regions', distinct=True),
 			domain_count=Count('regions__domains', distinct=True),
 		)
 		return Response(OrganizationSerializer(organizations, many=True).data)
 
-	if Organization.objects.exists() and not request.user.is_superuser:
+	if not request.user.is_superuser and (
+		Organization.objects.exists()
+		or not settings.ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP
+	):
 		return Response(
 			{'detail': 'Only a system administrator can create another organization.'},
 			status=status.HTTP_403_FORBIDDEN,
@@ -302,7 +309,8 @@ def region_detail(request, region_id):
 @permission_classes([IsAuthenticated])
 def domains_list_create(request):
 	if request.method == 'GET':
-		_ensure_default_organization()
+		if settings.ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP:
+			_ensure_default_organization()
 		organization = _organization_from_request(request)
 		if organization is None:
 			return Response([])
@@ -525,6 +533,22 @@ def domain_membership_detail(request, membership_id):
 			target_user=membership.user, action='domain_membership.removed', details=old_details,
 		)
 		return Response(status=status.HTTP_204_NO_CONTENT)
+	if (
+		'domain' in request.data
+		and str(request.data.get('domain')) != str(membership.domain_id)
+	):
+		return Response(
+			{'domain': ['Domain access cannot be moved to another Domain. Remove it and create new access instead.']},
+			status=status.HTTP_400_BAD_REQUEST,
+		)
+	if (
+		'user' in request.data
+		and str(request.data.get('user')) != str(membership.user_id)
+	):
+		return Response(
+			{'user': ['Domain access cannot be transferred to another user.']},
+			status=status.HTTP_400_BAD_REQUEST,
+		)
 	if request.data.get('role') == DomainMembership.Role.VIEW_ONLY and _has_domain_contract_assignment(membership):
 		return Response(
 			{'detail': 'Remove this user from their Contract in this domain before changing them to View Only.'},
@@ -646,6 +670,24 @@ def organization_admins(request, organization_id):
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def permission_catalog(request):
+	role_permission_codes = {
+		'view_roles', 'create_roles', 'edit_roles', 'activate_roles',
+		'delete_unused_roles', 'delegate_role_management',
+		'assign_domain_roles', 'manage_domain_access',
+	}
+	can_view_catalog = (
+		request.user.is_superuser
+		or is_org_admin(request.user)
+		or any(
+			permitted_domain_ids(request.user, permission)
+			for permission in role_permission_codes
+		)
+	)
+	if not can_view_catalog:
+		return Response(
+			{'detail': 'Role viewing permission is required.'},
+			status=status.HTTP_403_FORBIDDEN,
+		)
 	return Response(permission_catalog_payload())
 
 

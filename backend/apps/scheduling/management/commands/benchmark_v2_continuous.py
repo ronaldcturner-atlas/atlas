@@ -12,7 +12,10 @@ from apps.scheduling.optimizer import (
 
 
 class Command(BaseCommand):
-    stealth_options = ('stop_requested', 'progress_callback', 'runtime_clock')
+    stealth_options = (
+        'stop_requested', 'progress_callback', 'runtime_clock',
+        'diagnostic_state',
+    )
     help = (
         'Read-only continuous Atlas v2 benchmark. Repeatedly evaluates the '
         'compiled swap neighborhood and follows authoritatively confirmed '
@@ -134,6 +137,62 @@ class Command(BaseCommand):
         generation_start_proportionality = 0
         consecutive_unproductive_generations = 0
         generation_details = []
+        diagnostic_state = options.get('diagnostic_state')
+        rolling_transitions = []
+        best_authoritative_checkpoint = None
+        last_authoritative_checkpoint = None
+        if isinstance(diagnostic_state, dict):
+            diagnostic_state.update({
+                'schema_version': 1,
+                'phase': 'search_initializing',
+                'checkpoint_interval': checkpoint_interval,
+                'starting_score': current_score,
+                'current_predicted_score': current_score,
+                'best_predicted_score': best_score,
+                'accepted_transitions': 0,
+                'total_evaluations': 0,
+                'last_authoritative_checkpoint': None,
+                'best_authoritative_checkpoint': None,
+                'transitions_since_last_checkpoint': rolling_transitions,
+                'current_operation_chain': current_swaps,
+                'best_operation_chain': best_swaps,
+            })
+
+        def update_diagnostic_state(**values):
+            if isinstance(diagnostic_state, dict):
+                diagnostic_state.update(values)
+
+        def transition_diagnostic(transition):
+            if transition is None:
+                return None
+            # Transition payloads contain only bounded scalar identifiers and,
+            # for atomic patches, the exact reassignment list required to
+            # reproduce the move.
+            return dict(transition)
+
+        def checkpoint_component_comparison(current_breakdown):
+            if not last_authoritative_checkpoint:
+                return {}, {}
+            previous_breakdown = (
+                last_authoritative_checkpoint.get('score_breakdown') or {}
+            )
+            authoritative_changes = {
+                key: float(current_breakdown.get(key, 0.0))
+                - float(previous_breakdown.get(key, 0.0))
+                for key in set(previous_breakdown) | set(current_breakdown)
+            }
+            predicted_changes = {}
+            for row in rolling_transitions:
+                component_deltas = (
+                    (row.get('transition') or {}).get(
+                        'predicted_component_deltas'
+                    ) or {}
+                )
+                for key, value in component_deltas.items():
+                    predicted_changes[key] = (
+                        predicted_changes.get(key, 0.0) + float(value)
+                    )
+            return authoritative_changes, predicted_changes
 
         def finish_epoch(trigger):
             nonlocal consecutive_exhausted_epochs
@@ -314,6 +373,25 @@ class Command(BaseCommand):
             })
 
         for neighborhood_index in range(max_transitions + 1):
+            update_diagnostic_state(
+                phase='evaluating_neighborhood',
+                runtime_seconds=float(runtime_clock() - started),
+                neighborhood_index=neighborhood_index,
+                epoch=epoch_number,
+                restart_mode=epoch_kind,
+                selection_mode=(
+                    'diversify' if diversification_remaining > 0
+                    else 'improve'
+                ),
+                search_generation=search_generation,
+                restart_count=restart_count,
+                accepted_transitions=accepted_transition_count,
+                total_evaluations=total_evaluations,
+                current_predicted_score=current_score,
+                best_predicted_score=best_score,
+                current_operation_chain=current_swaps,
+                best_operation_chain=best_swaps,
+            )
             if stop_requested is not None and stop_requested():
                 stopped_reason = 'user_requested'
                 break
@@ -426,11 +504,25 @@ class Command(BaseCommand):
             )
             if checkpoint_score:
                 if authoritative_current is None:
+                    update_diagnostic_state(
+                        phase='checkpoint_failure',
+                        failure={
+                            'kind': 'missing_authoritative_score',
+                            'schedule_fingerprint': fingerprint,
+                        },
+                    )
                     raise CommandError(
                         'The v2 score checkpoint did not return an '
                         'authoritative current score.'
                     )
                 authoritative_current = float(authoritative_current)
+                authoritative_breakdown = (
+                    kernel_result.get('authoritative_current_breakdown') or {}
+                )
+                (
+                    authoritative_component_changes,
+                    predicted_component_changes,
+                ) = checkpoint_component_comparison(authoritative_breakdown)
                 if current_score is not None and abs(
                     authoritative_current - current_score
                 ) > 0.0001:
@@ -443,6 +535,37 @@ class Command(BaseCommand):
                         best_score = authoritative_current
                         best_swaps = list(current_swaps)
                     else:
+                        update_diagnostic_state(
+                            phase='checkpoint_failure',
+                            runtime_seconds=float(runtime_clock() - started),
+                            failure={
+                                'kind': 'current_score_divergence',
+                                'predicted_score': current_score,
+                                'authoritative_score': authoritative_current,
+                                'difference': (
+                                    authoritative_current - current_score
+                                ),
+                                'authoritative_breakdown': kernel_result.get(
+                                    'authoritative_current_breakdown'
+                                ),
+                                'authoritative_component_changes_since_last_checkpoint': (
+                                    authoritative_component_changes
+                                ),
+                                'predicted_component_changes_since_last_checkpoint': (
+                                    predicted_component_changes
+                                ),
+                                'schedule_fingerprint': fingerprint,
+                                'accepted_transitions': (
+                                    accepted_transition_count
+                                ),
+                                'current_operation_chain': list(
+                                    current_swaps
+                                ),
+                                'transitions_since_last_checkpoint': list(
+                                    rolling_transitions
+                                ),
+                            },
+                        )
                         raise CommandError(
                             'The compiled v2 score diverged from the '
                             'authoritative checkpoint.'
@@ -457,6 +580,35 @@ class Command(BaseCommand):
                     'restart_mode': epoch_kind,
                     'selection_mode': selection_mode,
                 })
+                checkpoint_diagnostic = {
+                    'accepted_transitions': accepted_transition_count,
+                    'score': current_score,
+                    'score_breakdown': kernel_result.get(
+                        'authoritative_current_breakdown'
+                    ),
+                    'schedule_fingerprint': fingerprint,
+                    'epoch': epoch_number,
+                    'restart_mode': epoch_kind,
+                    'selection_mode': selection_mode,
+                    'operation_count': len(current_swaps),
+                }
+                if (
+                    best_authoritative_checkpoint is None
+                    or current_score
+                    < best_authoritative_checkpoint['score'] - 0.0001
+                ):
+                    best_authoritative_checkpoint = {
+                        **checkpoint_diagnostic,
+                        'operation_chain': list(current_swaps),
+                    }
+                update_diagnostic_state(
+                    last_authoritative_checkpoint=checkpoint_diagnostic,
+                    best_authoritative_checkpoint=(
+                        best_authoritative_checkpoint
+                    ),
+                )
+                last_authoritative_checkpoint = checkpoint_diagnostic
+                rolling_transitions.clear()
             neighborhoods.append({
                 'index': neighborhood_index,
                 'epoch': epoch_number,
@@ -534,6 +686,28 @@ class Command(BaseCommand):
                 float(transition['authoritative_official_delta'])
                 - predicted_delta
             ) > 0.0001:
+                update_diagnostic_state(
+                    phase='checkpoint_failure',
+                    runtime_seconds=float(runtime_clock() - started),
+                    failure={
+                        'kind': 'transition_delta_divergence',
+                        'predicted_delta': predicted_delta,
+                        'authoritative_delta': float(
+                            transition['authoritative_official_delta']
+                        ),
+                        'difference': (
+                            float(transition['authoritative_official_delta'])
+                            - predicted_delta
+                        ),
+                        'transition': transition_diagnostic(transition),
+                        'schedule_fingerprint': fingerprint,
+                        'accepted_transitions': accepted_transition_count,
+                        'current_operation_chain': list(current_swaps),
+                        'transitions_since_last_checkpoint': list(
+                            rolling_transitions
+                        ),
+                    },
+                )
                 raise CommandError(
                     'The compiled v2 transition delta diverged from the '
                     'authoritative checkpoint.'
@@ -576,6 +750,13 @@ class Command(BaseCommand):
                 )))
             accepted_transition_count += 1
             generation_accepted_transition_count += 1
+            rolling_transitions.append({
+                'sequence': accepted_transition_count,
+                'schedule_fingerprint_before': fingerprint,
+                'transition': transition_diagnostic(transition),
+            })
+            if len(rolling_transitions) > checkpoint_interval:
+                del rolling_transitions[:-checkpoint_interval]
             if current_score is not None:
                 current_score += predicted_delta
             current_proportionality_offset += predicted_proportionality_delta
@@ -615,6 +796,16 @@ class Command(BaseCommand):
                 best_proportionality_offset = current_proportionality_offset
                 best_swaps = list(current_swaps)
                 proportionality_improvements += 1
+            update_diagnostic_state(
+                phase='transition_accepted',
+                runtime_seconds=float(runtime_clock() - started),
+                accepted_transitions=accepted_transition_count,
+                total_evaluations=total_evaluations,
+                current_predicted_score=current_score,
+                best_predicted_score=best_score,
+                current_operation_chain=current_swaps,
+                best_operation_chain=best_swaps,
+            )
             if progress_callback is not None and best_score is not None:
                 progress_callback(best_score)
             if total_evaluations >= target_evaluations:
@@ -640,6 +831,17 @@ class Command(BaseCommand):
                 'best_score': best_score,
             })
         wall_seconds = runtime_clock() - started
+        update_diagnostic_state(
+            phase='completed',
+            runtime_seconds=float(wall_seconds),
+            stopped_reason=stopped_reason,
+            accepted_transitions=accepted_transition_count,
+            total_evaluations=total_evaluations,
+            current_predicted_score=current_score,
+            best_predicted_score=best_score,
+            current_operation_chain=current_swaps,
+            best_operation_chain=best_swaps,
+        )
         aggregate_kernel_rate = (
             total_evaluations / total_kernel_seconds
             if total_kernel_seconds else 0.0

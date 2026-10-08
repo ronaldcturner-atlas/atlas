@@ -7,6 +7,7 @@ from apps.facilities.models import Facility
 from apps.domains.permissions import CLINICAL_PERMISSIONS, membership_permissions, is_org_admin
 
 from .models import Physician
+from .security import user_must_change_password
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -19,6 +20,7 @@ class UserSerializer(serializers.ModelSerializer):
     can_manage_schedules = serializers.SerializerMethodField()
     can_test_access = serializers.SerializerMethodField()
     test_access = serializers.SerializerMethodField()
+    must_change_password = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -28,6 +30,7 @@ class UserSerializer(serializers.ModelSerializer):
             'is_org_admin',
             'permissions', 'domain_access', 'can_manage_schedules',
             'can_test_access', 'test_access',
+            'must_change_password',
         ]
 
     def get_physician_id(self, obj):
@@ -139,6 +142,9 @@ class UserSerializer(serializers.ModelSerializer):
             'role_name': obj._atlas_test_role_template.name,
             'clinically_active': obj._atlas_test_clinically_active,
         }
+
+    def get_must_change_password(self, obj):
+        return user_must_change_password(obj)
 
 
 class PhysicianSerializer(serializers.ModelSerializer):

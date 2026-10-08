@@ -25,7 +25,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain, DomainMembership, OrganizationMembership
+from apps.domains.models import Domain, DomainMembership, Organization, OrganizationMembership
 from apps.domains.permissions import (
     has_permission,
     is_clinically_active,
@@ -689,7 +689,7 @@ def published_schedule_comments(request):
         comments_by_key = {}
         authoritative_dates = sorted({key[1] for key in authoritative_block_by_date})
         series_rows = ScheduleCommentSeries.objects.filter(
-            Q(domain_id__in=domain_ids) | Q(domain__isnull=True),
+            domain_id__in=domain_ids,
         ).prefetch_related('exceptions')
         for series in series_rows:
             exceptions = {row.date: row for row in series.exceptions.all()}
@@ -803,7 +803,9 @@ def published_schedule_comment_series_occurrence(request, series_id, comment_dat
         ScheduleCommentSeries.objects.select_related('domain'), id=series_id,
     )
     if series.domain_id is None:
-        can_manage_series = is_org_admin(request.user)
+        # Old unscoped rows predate Region/Domain isolation. They must never be
+        # exposed as organization-wide data to an arbitrary Org Admin.
+        can_manage_series = request.user.is_superuser
     else:
         can_manage_series = has_permission(
             request.user, 'manage_date_comments', domain=series.domain,
@@ -1059,11 +1061,23 @@ def shift_trade_policy(request):
     policy = ShiftTradePolicy.load()
     # This remains one application-wide policy. A Domain-scoped approval role
     # must not be able to change behavior in every other Region and Domain.
-    can_manage_policy = is_org_admin(request.user)
+    active_organization_count = Organization.objects.filter(active=True).count()
+    can_manage_policy = bool(
+        request.user.is_superuser
+        or (
+            active_organization_count == 1
+            and is_org_admin(request.user)
+        )
+    )
     if request.method == 'PATCH':
         if not can_manage_policy:
             return Response(
-                {'detail': 'Only an Organization Administrator can change the organization-wide shift trade policy.'},
+                {
+                    'detail': (
+                        'This application-wide policy requires a system administrator '
+                        'when more than one Organization exists.'
+                    ),
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
         value = request.data.get('require_scheduler_approval')
@@ -3723,11 +3737,24 @@ def _parse_optimizer_focus(request):
 
 
 def _parse_optimizer_engine(request):
-    value = request.data.get('optimizer_engine', 'V1')
+    legacy_v1_enabled = getattr(
+        settings, 'ATLAS_LEGACY_V1_LAUNCH_ENABLED', False,
+    )
+    # Internal development and regression suites may still exercise V1
+    # explicitly or by omission. Production hard-disables that compatibility
+    # path, making V2 the unavoidable default there.
+    default_engine = 'V1' if legacy_v1_enabled else 'V2'
+    value = request.data.get('optimizer_engine', default_engine)
     if value == 'V2_TEST':
         value = 'V2'
     if value not in ('V1', 'V2'):
-        return None, {'optimizer_engine': 'Use V1 or V2.'}
+        return None, {'optimizer_engine': 'Use V2.'}
+    if value == 'V1' and not legacy_v1_enabled:
+        return None, {
+            'optimizer_engine': (
+                'Atlas V1 is historical and cannot be used for new runs.'
+            ),
+        }
     return value, None
 
 

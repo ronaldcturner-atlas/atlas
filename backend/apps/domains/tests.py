@@ -1,7 +1,7 @@
 from django.contrib.auth.models import User
 from datetime import timedelta
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -23,6 +23,106 @@ class DomainsTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(Domain.objects.filter(name='Physician', active=True).exists())
+
+    @override_settings(ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP=False)
+    def test_empty_production_database_cannot_be_claimed_by_first_user(self):
+        Organization.objects.all().delete()
+        response = self.client.get('/api/domains/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+        self.assertFalse(Organization.objects.exists())
+
+        create = self.client.post(
+            '/api/organizations/',
+            {'name': 'Claimed Organization'},
+            format='json',
+        )
+
+        self.assertEqual(create.status_code, 403)
+        self.assertFalse(Organization.objects.exists())
+
+    def test_domain_region_cannot_be_changed_after_creation(self):
+        organization = Organization.objects.create(name='Immutable Domain Organization')
+        first_region = Region.objects.create(organization=organization, name='First Region')
+        second_region = Region.objects.create(organization=organization, name='Second Region')
+        domain = Domain.objects.create(region=first_region, name='Physician')
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=self.user,
+            is_org_admin=True,
+        )
+
+        response = self.client.patch(
+            f'/api/domains/{domain.id}/',
+            {'region': second_region.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        domain.refresh_from_db()
+        self.assertEqual(domain.region_id, first_region.id)
+
+    def test_domain_membership_identity_cannot_be_retargeted(self):
+        organization = Organization.objects.create(name='Immutable Membership Organization')
+        region = Region.objects.create(organization=organization, name='Membership Region')
+        first_domain = Domain.objects.create(region=region, name='Physician')
+        second_domain = Domain.objects.create(region=region, name='APP')
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=self.user,
+            is_org_admin=True,
+        )
+        first_member = User.objects.create_user('first-member')
+        second_member = User.objects.create_user('second-member')
+        OrganizationMembership.objects.create(organization=organization, user=first_member)
+        OrganizationMembership.objects.create(organization=organization, user=second_member)
+        membership = DomainMembership.objects.create(
+            domain=first_domain,
+            user=first_member,
+            role=DomainMembership.Role.VIEW_ONLY,
+        )
+
+        move_domain = self.client.patch(
+            f'/api/domain-memberships/{membership.id}/',
+            {'domain': second_domain.id},
+            format='json',
+        )
+        move_user = self.client.patch(
+            f'/api/domain-memberships/{membership.id}/',
+            {'user': second_member.id},
+            format='json',
+        )
+
+        self.assertEqual(move_domain.status_code, 400)
+        self.assertEqual(move_user.status_code, 400)
+        membership.refresh_from_db()
+        self.assertEqual(membership.domain_id, first_domain.id)
+        self.assertEqual(membership.user_id, first_member.id)
+
+    def test_permission_catalog_requires_role_management_access(self):
+        denied = self.client.get('/api/permissions/catalog/')
+        self.assertEqual(denied.status_code, 403)
+
+        organization = Organization.objects.create(name='Permission Catalog Organization')
+        region = Region.objects.create(organization=organization, name='Permission Catalog Region')
+        domain = Domain.objects.create(region=region, name='Physician')
+        role = RoleTemplate.objects.create(
+            region=region,
+            name='Role Viewer',
+            permissions=['view_roles'],
+        )
+        OrganizationMembership.objects.create(organization=organization, user=self.user)
+        DomainMembership.objects.create(
+            domain=domain,
+            user=self.user,
+            role=DomainMembership.Role.ADMIN,
+            role_template=role,
+            clinically_active=False,
+        )
+
+        allowed = self.client.get('/api/permissions/catalog/')
+        self.assertEqual(allowed.status_code, 200)
 
     def test_domains_endpoint_active_filter(self):
         Domain.objects.create(name='Emergency Medicine', active=True)

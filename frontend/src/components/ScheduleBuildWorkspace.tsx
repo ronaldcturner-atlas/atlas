@@ -786,8 +786,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [stoppingOptimizerRunIds, setStoppingOptimizerRunIds] = useState<number[]>([])
   const [optimizerClockMs, setOptimizerClockMs] = useState(() => Date.now())
   const [optimizerStartMode, setOptimizerStartMode] = useState<'CURRENT_SCHEDULE' | 'FRESH_FILL'>('FRESH_FILL')
-  const [optimizerEngine, setOptimizerEngine] = useState<'V1' | 'V2'>('V1')
-  const optimizerEngineDefaultedRef = useRef(false)
   const [optimizerSourceRunId, setOptimizerSourceRunId] = useState<number | null>(null)
   const [optimizerPreflight, setOptimizerPreflight] = useState<OptimizerPreflight | null>(null)
   const [isOptimizerPreflightLoading, setIsOptimizerPreflightLoading] = useState(false)
@@ -1019,14 +1017,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         `${API_BASE}/schedule-blocks/${blockId}/build/${query}`,
       )
       setContext(nextContext)
-      if (!optimizerEngineDefaultedRef.current) {
-        setOptimizerEngine(
-          nextContext.atlas_v2_enabled || nextContext.atlas_v2_test_enabled
-            ? 'V2'
-            : 'V1',
-        )
-        optimizerEngineDefaultedRef.current = true
-      }
       setOptimizerSummary(nextContext.optimizer_summary ?? null)
       const completedRuns = (nextContext.optimizer_runs ?? []).filter(isCompletedOptimizerRun)
       setOptimizerSourceRunId((current) => (
@@ -1841,7 +1831,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             start_mode: optimizerStartMode,
             max_runtime_minutes: optimizerMaxRuntimeMinutes,
             optimization_focus: optimizerFocus,
-            optimizer_engine: optimizerEngine,
+            optimizer_engine: 'V2',
             search_token: crypto.randomUUID(),
             background: true,
           }),
@@ -2421,34 +2411,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       )}
 
         <div className="build-workspace-controls">
-          <fieldset className="optimizer-focus-control" disabled={isBuildMutationBusy}>
-            <legend>Optimizer Engine</legend>
-            <label>
-              <input
-                type="radio"
-                name="optimizer-engine"
-                value="V1"
-                checked={optimizerEngine === 'V1'}
-                onChange={() => setOptimizerEngine('V1')}
-              />
-              Atlas v1
-            </label>
-            {(context.atlas_v2_enabled || context.atlas_v2_test_enabled) && (
-              <label>
-                <input
-                  type="radio"
-                  name="optimizer-engine"
-                  value="V2"
-                  checked={optimizerEngine === 'V2'}
-                  onChange={() => {
-                    setOptimizerEngine('V2')
-                  }}
-                />
-                Atlas V2
-              </label>
-            )}
-          </fieldset>
-
         <div className="build-workspace-control-fields">
           <div className="facility-field build-workspace-fixed-domain">
             <span>Schedule Context</span>
@@ -2502,12 +2464,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             )}
             <small>
               {optimizerStartMode === 'CURRENT_SCHEDULE'
-                ? optimizerEngine === 'V2'
-                  ? 'Atlas V2 improves an independent copy of the selected completed run. The source and active schedules are not changed.'
-                  : 'Uses the selected completed run as an independent starting snapshot. It does not need to be viewed or active.'
-                : optimizerEngine === 'V2'
-                  ? 'Builds a new unanchored schedule, then improves it with Atlas V2. Locked edits are still preserved.'
-                  : 'Starts from a fresh assignment fill. Locked edits are still preserved.'}
+                ? 'Improves an independent copy of the selected completed run. The source and active schedules are not changed.'
+                : 'Builds a new unanchored schedule, then improves it. Locked edits are still preserved.'}
             </small>
           </div>
 
@@ -2573,12 +2531,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 : optimizerCapacity.available_slots < 1
                   ? `${optimizerCapacity.limit} Optimizers Running`
                   : optimizerStartMode === 'CURRENT_SCHEDULE'
-                    ? optimizerEngine === 'V2'
-                      ? `Run Atlas V2 from Run ${optimizerSourceRun?.run_number ?? '—'}`
-                      : `Run Optimizer from Run ${optimizerSourceRun?.run_number ?? '—'}`
-                    : optimizerEngine === 'V2'
-                      ? 'Run Atlas V2 from Fresh Fill'
-                      : 'Run Optimizer from Fresh Fill'}
+                    ? `Run Optimizer from Run ${optimizerSourceRun?.run_number ?? '—'}`
+                    : 'Run Optimizer from Fresh Fill'}
             </button>
             <span className="optimizer-capacity-label">
               {optimizerCapacity.running_count} of {optimizerCapacity.limit} optimizer slots in use

@@ -1,0 +1,26 @@
+{
+	admin off
+	persist_config off
+	auto_https off
+}
+
+:{$PORT:3000} {
+	encode gzip
+
+	handle /health {
+		respond "ok" 200
+	}
+
+	handle /api/* {
+		reverse_proxy {$BACKEND_INTERNAL_URL:backend.railway.internal:8000} {
+			header_up Host {http.request.host}
+			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+		}
+	}
+
+	handle {
+		root * /srv/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

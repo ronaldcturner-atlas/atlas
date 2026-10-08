@@ -1,12 +1,14 @@
 import json
+import os
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.sessions.models import Session
 from django.core.cache import cache
-from django.core.management import call_command
-from django.test import Client, TestCase
+from django.core.management import call_command, CommandError
+from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 
 from apps.scheduling.models import (
@@ -25,10 +27,230 @@ from apps.domains.models import (
     Region,
     RoleTemplate,
 )
-from .models import Physician
+from .models import AccountSecurityState, Physician
 
 
 class AccountsTests(TestCase):
+    def test_new_user_receives_unique_temporary_password(self):
+        manager = get_user_model().objects.create_user(
+            username='credential-manager@example.com',
+            email='credential-manager@example.com',
+            password='ManagerPassword!2468',
+        )
+        organization = Organization.objects.create(name='Credential Organization')
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=manager,
+            is_org_admin=True,
+        )
+        self.client.force_login(manager)
+
+        response = self.client.post(
+            '/api/physicians/',
+            data=json.dumps({
+                'organization': organization.id,
+                'first_name': 'Beta',
+                'last_name': 'Tester',
+                'email': 'beta.tester@example.com',
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        temporary_password = response.json()['temporary_password']
+        self.assertGreaterEqual(len(temporary_password), 16)
+        created_user = get_user_model().objects.get(
+            email='beta.tester@example.com',
+        )
+        self.assertTrue(created_user.check_password(temporary_password))
+        self.assertTrue(created_user.account_security.must_change_password)
+
+        second_response = self.client.post(
+            '/api/physicians/',
+            data=json.dumps({
+                'organization': organization.id,
+                'first_name': 'Second',
+                'last_name': 'Tester',
+                'email': 'second.tester@example.com',
+            }),
+            content_type='application/json',
+        )
+        self.assertEqual(second_response.status_code, 201)
+        self.assertNotEqual(
+            temporary_password,
+            second_response.json()['temporary_password'],
+        )
+
+    def test_temporary_password_requires_change_before_application_access(self):
+        manager = get_user_model().objects.create_user(
+            username='force-change-manager@example.com',
+            email='force-change-manager@example.com',
+            password='ManagerPassword!2468',
+        )
+        organization = Organization.objects.create(name='Force Change Organization')
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=manager,
+            is_org_admin=True,
+        )
+        self.client.force_login(manager)
+        created = self.client.post(
+            '/api/physicians/',
+            data=json.dumps({
+                'organization': organization.id,
+                'first_name': 'Forced',
+                'last_name': 'Change',
+                'email': 'forced.change@example.com',
+            }),
+            content_type='application/json',
+        ).json()
+        self.client.logout()
+
+        login_response = self.client.post(
+            '/api/login/',
+            data=json.dumps({
+                'username': 'forced.change@example.com',
+                'password': created['temporary_password'],
+            }),
+            content_type='application/json',
+        )
+        blocked = self.client.get('/api/physicians/')
+        changed = self.client.post(
+            '/api/password/change/',
+            data=json.dumps({
+                'current_password': created['temporary_password'],
+                'new_password': 'PermanentPassword!2468',
+                'confirm_password': 'PermanentPassword!2468',
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(login_response.status_code, 200)
+        self.assertTrue(login_response.json()['must_change_password'])
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(blocked.json()['code'], 'password_change_required')
+        self.assertEqual(changed.status_code, 200)
+        self.assertFalse(changed.json()['must_change_password'])
+        self.assertEqual(self.client.get('/api/physicians/').status_code, 200)
+
+    def test_org_admin_password_reset_invalidates_target_sessions(self):
+        admin = get_user_model().objects.create_user(
+            'reset-admin@example.com', password='AdminPassword!2468',
+        )
+        target = get_user_model().objects.create_user(
+            'reset-target@example.com',
+            email='reset-target@example.com',
+            password='OldPassword!2468',
+        )
+        target_physician = Physician.objects.create(user=target)
+        organization = Organization.objects.create(name='Reset Organization')
+        OrganizationMembership.objects.create(
+            organization=organization, user=admin, is_org_admin=True,
+        )
+        OrganizationMembership.objects.create(
+            organization=organization, user=target,
+        )
+        target_browser = Client()
+        target_browser.force_login(target)
+        self.client.force_login(admin)
+
+        response = self.client.post(
+            f'/api/physicians/{target_physician.id}/password-reset/',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        target.refresh_from_db()
+        self.assertFalse(target.check_password('OldPassword!2468'))
+        self.assertTrue(target.check_password(response.json()['temporary_password']))
+        self.assertTrue(target.account_security.must_change_password)
+        self.assertEqual(target_browser.get('/api/me/').status_code, 403)
+
+    @override_settings(REJECT_SHARED_TEST_PASSWORD=True)
+    def test_production_rejects_shared_development_password(self):
+        get_user_model().objects.create_user(
+            username='shared-password@example.com',
+            email='shared-password@example.com',
+            password='atlas',
+        )
+
+        response = self.client.post(
+            '/api/login/',
+            data=json.dumps({
+                'username': 'shared-password@example.com',
+                'password': 'atlas',
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_bootstrap_org_admin_requires_one_time_environment_password(self):
+        organization = Organization.objects.create(name='Bootstrap Organization')
+        with self.assertRaises(CommandError):
+            call_command(
+                'bootstrap_org_admin',
+                organization_id=organization.id,
+                email='first.admin@example.com',
+            )
+
+        with patch.dict(os.environ, {
+            'INITIAL_ORG_ADMIN_PASSWORD': 'InitialAdminPassword!2468',
+        }):
+            call_command(
+                'bootstrap_org_admin',
+                organization_id=organization.id,
+                email='first.admin@example.com',
+                first_name='First',
+                last_name='Admin',
+                verbosity=0,
+            )
+
+        user = get_user_model().objects.get(email='first.admin@example.com')
+        self.assertTrue(user.check_password('InitialAdminPassword!2468'))
+        self.assertTrue(user.account_security.must_change_password)
+        self.assertTrue(OrganizationMembership.objects.filter(
+            organization=organization,
+            user=user,
+            active=True,
+            is_org_admin=True,
+        ).exists())
+        with patch.dict(os.environ, {
+            'INITIAL_ORG_ADMIN_PASSWORD': 'AnotherAdminPassword!2468',
+        }):
+            with self.assertRaises(CommandError):
+                call_command(
+                    'bootstrap_org_admin',
+                    organization_id=organization.id,
+                    email='second.admin@example.com',
+                    verbosity=0,
+                )
+
+    def test_bootstrap_org_admin_can_initialize_an_empty_deployment(self):
+        with patch.dict(os.environ, {
+            'INITIAL_ORG_ADMIN_PASSWORD': 'InitialAdminPassword!2468',
+        }):
+            call_command(
+                'bootstrap_org_admin',
+                organization_name='Beta Organization',
+                region_name='Beta Region',
+                domain_name='Physician',
+                email='beta.admin@example.com',
+                first_name='Beta',
+                last_name='Admin',
+                verbosity=0,
+            )
+
+        organization = Organization.objects.get(name='Beta Organization')
+        region = organization.regions.get(name='Beta Region')
+        self.assertTrue(region.domains.filter(name='Physician', active=True).exists())
+        self.assertTrue(region.role_templates.filter(active=True).exists())
+        self.assertTrue(OrganizationMembership.objects.filter(
+            organization=organization,
+            user__email='beta.admin@example.com',
+            active=True,
+            is_org_admin=True,
+        ).exists())
+
     def test_physician_email_is_required_username_and_phone_is_optional(self):
         manager = get_user_model().objects.create_user(
             username='manager@example.com',
@@ -355,6 +577,59 @@ class AccountsTests(TestCase):
             403,
         )
         self.assertEqual(self.client.post(f'/api/physicians/{foreign_physician.id}/disable/').status_code, 403)
+        self.assertEqual(self.client.post(f'/api/physicians/{foreign_physician.id}/password-reset/').status_code, 403)
+
+    def test_delegated_manager_cannot_edit_shared_user_without_every_organization(self):
+        manager = get_user_model().objects.create_user('shared-user-manager', password='atlas')
+        target = get_user_model().objects.create_user(
+            'shared@example.com',
+            email='shared@example.com',
+            first_name='Shared',
+            last_name='User',
+        )
+        physician = Physician.objects.create(user=target, phone_number='843-555-0100')
+        first_organization = Organization.objects.create(name='First Shared Organization')
+        second_organization = Organization.objects.create(name='Second Shared Organization')
+        first_region = Region.objects.create(organization=first_organization, name='First Region')
+        second_region = Region.objects.create(organization=second_organization, name='Second Region')
+        first_domain = Domain.objects.create(region=first_region, name='Physician')
+        second_domain = Domain.objects.create(region=second_region, name='Physician')
+        manager_role = RoleTemplate.objects.create(
+            region=first_region,
+            name='Profile Manager',
+            permissions=['edit_user_profiles'],
+        )
+        OrganizationMembership.objects.create(organization=first_organization, user=manager)
+        OrganizationMembership.objects.create(organization=first_organization, user=target)
+        OrganizationMembership.objects.create(organization=second_organization, user=target)
+        DomainMembership.objects.create(
+            domain=first_domain,
+            user=manager,
+            role=DomainMembership.Role.ADMIN,
+            role_template=manager_role,
+            clinically_active=False,
+        )
+        DomainMembership.objects.create(
+            domain=first_domain,
+            user=target,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+        )
+        DomainMembership.objects.create(
+            domain=second_domain,
+            user=target,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+        )
+        self.client.force_login(manager)
+
+        response = self.client.patch(
+            f'/api/physicians/{physician.id}/',
+            data=json.dumps({'phone_number': '843-555-0199'}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 403)
+        physician.refresh_from_db()
+        self.assertEqual(physician.phone_number, '843-555-0100')
 
     def test_profile_contact_fields_follow_domain_permissions(self):
         viewer = get_user_model().objects.create_user('directory-viewer', password='atlas')

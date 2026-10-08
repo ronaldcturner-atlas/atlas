@@ -7,7 +7,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Physician
-from apps.domains.models import Domain, DomainMembership, OrganizationMembership, Region, RoleTemplate
+from apps.domains.models import Domain, DomainMembership, Organization, OrganizationMembership, Region, RoleTemplate
 from apps.domains.permissions import CLINICAL_DEFAULTS, SCHEDULER_DEFAULTS
 from apps.facilities.models import Facility
 from .models import (
@@ -699,6 +699,9 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(excluded_assignment.physician, self.requester)
 
     def test_only_org_admin_can_change_global_approval_policy(self):
+        Organization.objects.exclude(
+            id=self.domain.region.organization_id,
+        ).delete()
         self.client.force_authenticate(self.owner_user)
         denied = self.client.patch('/api/shift-trade-policy/', {'require_scheduler_approval': False}, format='json')
         self.assertEqual(denied.status_code, 403)
@@ -712,6 +715,26 @@ class ShiftTradeApiTests(TestCase):
         updated = self.client.patch('/api/shift-trade-policy/', {'require_scheduler_approval': False}, format='json')
         self.assertEqual(updated.status_code, 200)
         self.assertFalse(updated.json()['require_scheduler_approval'])
+
+        Organization.objects.create(name='Second Active Organization')
+        denied_multi_org = self.client.patch(
+            '/api/shift-trade-policy/',
+            {'require_scheduler_approval': True},
+            format='json',
+        )
+        self.assertEqual(denied_multi_org.status_code, 403)
+
+        system_admin = get_user_model().objects.create_superuser(
+            'system-admin',
+            password='x',
+        )
+        self.client.force_authenticate(system_admin)
+        allowed_multi_org = self.client.patch(
+            '/api/shift-trade-policy/',
+            {'require_scheduler_approval': True},
+            format='json',
+        )
+        self.assertEqual(allowed_multi_org.status_code, 200)
 
     def test_owner_can_propose_direct_trade_from_conflict_free_options(self):
         target_instance = ScheduleShiftInstance.objects.create(
@@ -891,6 +914,43 @@ class ShiftTradeApiTests(TestCase):
         )
         self.assertEqual(deleted.status_code, 204)
         self.assertFalse(ScheduleDateComment.objects.exists())
+
+    def test_unscoped_legacy_comment_series_is_not_exposed_across_organizations(self):
+        legacy_series = ScheduleCommentSeries.objects.create(
+            domain=None,
+            title='Legacy global comment',
+            details='This row predates Domain isolation.',
+            start_date=date(2026, 9, 2),
+            recurrence_type=ScheduleCommentSeries.RecurrenceType.WEEKLY,
+            interval=1,
+            weekday=date(2026, 9, 2).weekday(),
+            end_type=ScheduleCommentSeries.EndType.NEVER,
+            created_by=self.scheduler_user,
+            updated_by=self.scheduler_user,
+        )
+        OrganizationMembership.objects.filter(
+            organization=self.domain.region.organization,
+            user=self.scheduler_user,
+        ).update(is_org_admin=True)
+        self.client.force_authenticate(self.scheduler_user)
+
+        visible = self.client.get('/api/published-schedule-comments/')
+        changed = self.client.patch(
+            f'/api/published-schedule-comment-series/{legacy_series.id}/occurrences/2026-09-02/',
+            {
+                'scope': 'THIS',
+                'title': 'Changed',
+                'details': '',
+            },
+            format='json',
+        )
+
+        self.assertEqual(visible.status_code, 200)
+        self.assertNotIn(
+            legacy_series.id,
+            {row.get('series_id') for row in visible.json()},
+        )
+        self.assertEqual(changed.status_code, 403)
 
     def test_recurring_comment_without_end_appears_only_as_schedules_publish(self):
         self.client.force_authenticate(self.scheduler_user)

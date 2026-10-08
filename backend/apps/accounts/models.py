@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
+from django.utils import timezone
 from apps.facilities.models import Facility
 
 
@@ -39,3 +40,28 @@ class Physician(models.Model):
     
     class Meta:
         ordering = ['user__last_name', 'user__first_name']
+
+
+class AccountSecurityState(models.Model):
+    """Credential state kept separate from scheduling/profile information."""
+
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='account_security',
+    )
+    must_change_password = models.BooleanField(default=False)
+    temporary_password_issued_at = models.DateTimeField(null=True, blank=True)
+    password_changed_at = models.DateTimeField(null=True, blank=True)
+
+    def mark_temporary_password_issued(self):
+        self.must_change_password = True
+        self.temporary_password_issued_at = timezone.now()
+        self.save(update_fields=[
+            'must_change_password', 'temporary_password_issued_at',
+        ])
+
+    def mark_password_changed(self):
+        self.must_change_password = False
+        self.password_changed_at = timezone.now()
+        self.save(update_fields=['must_change_password', 'password_changed_at'])

@@ -53,6 +53,61 @@ Demo credentials render only in a development build. The server-side Role test
 tool is forcibly disabled by production settings, even if a conflicting
 environment variable is supplied.
 
+Production also rejects the shared local-development password `atlas`, even if
+an imported test account still has that password hash. New users and Org Admin
+password resets receive a unique random temporary password that is displayed
+once. The user's existing sessions are revoked, and the temporary password must
+be changed before any application API other than logout and account recovery is
+available.
+
+## First Org Admin and beta-user onboarding
+
+Production disables self-service Organization creation; the first authenticated
+account can never claim an empty deployment. On a new empty database, the
+bootstrap command creates the initial Organization, Region, Domain, default Role
+templates, and Org Admin together.
+
+An organization must always have an active Org Admin. Set a strong one-time
+`INITIAL_ORG_ADMIN_PASSWORD` environment variable and run:
+
+```text
+python manage.py bootstrap_org_admin --organization-name "Example Organization" --region-name "Example Region" --domain-name "Physician" --email admin@example.com --first-name First --last-name Admin
+```
+
+For an Organization that already exists, use `--organization-id` instead. The
+command will not create another Organization after any Organization has an
+active membership. An unused placeholder created by initial migrations does not
+prevent first-time setup.
+
+The command refuses to run when that organization already has an active Org
+Admin. It never prints the password. Remove `INITIAL_ORG_ADMIN_PASSWORD`
+immediately after the command succeeds; the new Org Admin must replace it on
+first login.
+
+Afterward, create the small number of controlled-beta accounts from User
+Management. Copy each generated password at creation and deliver it directly to
+that specific tester through a separate trusted channel. The password is not
+recoverable after its one-time display. If it is lost, an Org Admin can issue a
+new temporary password from that user's profile. Never share one temporary
+password among multiple users.
+
+An Org Admin may reset credentials only for a user whose every Organization is
+administered by that Org Admin. This prevents one Organization from taking over
+a shared user's account. Platform support/superuser intervention remains the
+recovery path when no active Org Admin can sign in.
+
+Region, Domain, Facility, and Domain-access identities are treated as durable
+security boundaries. Editing may rename or deactivate those records, but it
+cannot move them to another Region, Domain, user, or Organization. Remove and
+recreate access deliberately when its scope must change. A user shared across
+Organizations can have their global profile or password changed only by a
+superuser or by an administrator who controls every Organization to which that
+user belongs.
+
+The current shift-trade approval switch remains application-wide. In a deployment
+with more than one active Organization, only a platform superuser may change it;
+an Org Admin cannot alter every other Organization's behavior.
+
 ## Sessions and HTTPS
 
 Production session cookies are always secure and HTTP-only. Atlas uses a
@@ -65,6 +120,11 @@ frontend and API share a site, including sibling subdomains. Use `None` only if
 the frontend truly runs on a different site; secure cookies remain mandatory.
 `Strict` is also supported for a same-site deployment with no external login
 links.
+
+Production users can launch only the current V2 optimizer. Historical V1 runs
+remain readable, while new V1 run requests are rejected. Internal V1-derived
+construction and scoring modules remain in the deployed image because V2 still
+uses those validated components.
 
 Atlas honors Railway's forwarded HTTPS header, redirects direct HTTP requests to
 HTTPS, and begins beta with a one-hour HSTS duration. `SECURE_HSTS_SECONDS` can
@@ -162,3 +222,40 @@ before changing the target. It restores in a single transaction and uses
 and must never be run casually against the live service.
 
 See `backend/.env.production.example` and `frontend/.env.example` for templates.
+
+## Railway service layout
+
+Use one Railway project with these services:
+
+- `postgres`: Railway PostgreSQL with managed backups enabled.
+- `backend`: repository root directory `/backend`, config file
+  `/backend/railway.web.json`, private networking only.
+- `optimizer-worker`: repository root directory `/backend`, config file
+  `/backend/railway.worker.json`, no public domain.
+- `optimizer-worker-2`: the same worker configuration, no public domain.
+- `frontend`: repository root directory `/frontend`, using
+  `/frontend/railway.json`, with the only public domain.
+
+Keep the backend service name exactly `backend`, or set
+`BACKEND_INTERNAL_URL` on the frontend to the backend's Railway private-network
+hostname and port. The frontend proxies `/api` over private networking, so the
+browser uses one origin and `VITE_API_BASE_URL` should remain unset.
+
+Set `ALLOWED_HOSTS` on the backend to the frontend public hostname and set
+`FRONTEND_ORIGINS` to its full HTTPS origin. Give the backend and both workers
+the same `SECRET_KEY`, `DATABASE_URL`, and production optimizer variables.
+Only the frontend receives a public domain.
+
+Deploy the backend first. Its startup applies migrations and `/api/ready/`
+confirms the schema is current. Workers run `migrate --check` and restart rather
+than processing jobs against a pending schema. After the backend is ready,
+deploy the frontend and workers.
+
+Configure watch paths in Railway to avoid unrelated rebuilds:
+
+- Backend and workers: `/backend/**`
+- Frontend: `/frontend/**`
+
+Railway configuration remains an operator-controlled step. Do not create the
+project or expose a public domain until the final pre-deployment checklist and
+backup plan have been reviewed.

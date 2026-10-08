@@ -1301,3 +1301,6 @@ select option {
   background-color: #fff;
   color: #000;
 }
+
+.user-self-actions{display:flex;align-items:center;gap:8px}.user-self-actions>button{padding:6px 9px;border:1px solid var(--border);border-radius:7px;background:rgba(255,255,255,.04);color:var(--sidebar-fg);cursor:pointer}.user-self-actions>button:hover{background:rgba(255,255,255,.09)}
+.temporary-password-modal{width:min(520px,calc(100vw - 28px));max-width:520px}.temporary-password-modal p{margin:0 0 14px;color:var(--sidebar-fg)}.temporary-password-value{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid rgba(240,180,41,.4);border-radius:8px;background:rgba(240,180,41,.08)}.temporary-password-value code{flex:1;color:#ffe18a;font-size:16px;overflow-wrap:anywhere}.temporary-password-value button{padding:7px 10px;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}

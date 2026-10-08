@@ -512,3 +512,28 @@ class DomainAccessBoundaryTests(TestCase):
             403,
         )
         self.assertEqual(self.client.get('/api/contracts/').json(), [])
+
+    def test_facility_cannot_be_moved_to_another_region(self):
+        membership = DomainMembership.objects.get(
+            domain=self.domain_a,
+            user=self.user,
+        )
+        membership.role_template.permissions = [
+            *membership.role_template.permissions,
+            'manage_regional_facilities',
+        ]
+        membership.role_template.save(update_fields=['permissions', 'updated_at'])
+        other_region = Region.objects.create(
+            organization=self.organization,
+            name='Other Region',
+        )
+
+        response = self.client.patch(
+            f'/api/facilities/{self.local_facility.id}/',
+            {'region': other_region.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.local_facility.refresh_from_db()
+        self.assertEqual(self.local_facility.region_id, self.region.id)

@@ -9,6 +9,12 @@ from .base import env_bool, env_list
 
 DEBUG = False
 ATLAS_ENABLE_DEVELOPMENT_ROLE_TEST = False
+ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP = False
+REJECT_SHARED_TEST_PASSWORD = True
+# Historical V1 results remain readable, but production users may only launch
+# the V2 optimizer. V1-derived construction/scoring internals are still shipped
+# because V2 currently reuses those safety-critical components.
+ATLAS_LEGACY_V1_LAUNCH_ENABLED = False
 
 
 def required_environment_value(name):
@@ -23,9 +29,11 @@ if SECRET_KEY == 'unsafe-secret-key' or len(SECRET_KEY) < 50:
     raise ImproperlyConfigured('SECRET_KEY must be a strong, unique value of at least 50 characters.')
 
 railway_public_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '').strip()
+railway_private_domain = os.environ.get('RAILWAY_PRIVATE_DOMAIN', '').strip()
 ALLOWED_HOSTS = env_list('ALLOWED_HOSTS')
-if railway_public_domain and railway_public_domain not in ALLOWED_HOSTS:
-    ALLOWED_HOSTS.append(railway_public_domain)
+for railway_domain in (railway_public_domain, railway_private_domain):
+    if railway_domain and railway_domain not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(railway_domain)
 if not ALLOWED_HOSTS:
     raise ImproperlyConfigured('ALLOWED_HOSTS or RAILWAY_PUBLIC_DOMAIN must be set in production.')
 if '*' in ALLOWED_HOSTS:
@@ -86,6 +94,7 @@ if DATABASES['default']['PASSWORD'] == 'atlas':
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 SECURE_SSL_REDIRECT = True
+SECURE_REDIRECT_EXEMPT = [r'^api/health/$', r'^api/ready/$']
 try:
     SECURE_HSTS_SECONDS = int(os.environ.get('SECURE_HSTS_SECONDS', '3600'))
 except ValueError as exc:

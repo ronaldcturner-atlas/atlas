@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 import { API_BASE, setCsrfToken } from '../api'
 
-interface User {
+export interface User {
   id: number
   username: string
   email: string
@@ -28,6 +28,7 @@ interface User {
     role_name: string
     clinically_active: boolean
   } | null
+  must_change_password: boolean
   domain_access: Array<{
     domain_id: number
     domain_name: string
