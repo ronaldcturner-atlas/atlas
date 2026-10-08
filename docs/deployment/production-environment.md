@@ -228,13 +228,19 @@ See `backend/.env.production.example` and `frontend/.env.example` for templates.
 Use one Railway project with these services:
 
 - `postgres`: Railway PostgreSQL with managed backups enabled.
-- `backend`: repository root directory `/backend`, config file
-  `/backend/railway.web.json`, private networking only.
-- `optimizer-worker`: repository root directory `/backend`, config file
-  `/backend/railway.worker.json`, no public domain.
+- `backend`: repository root directory `/backend`, private networking only.
+  Keep the Dockerfile start command, set health-check path `/api/ready/`, health
+  timeout `120`, and restart on failure with at most 3 retries.
+- `optimizer-worker`: repository root directory `/backend`, no public domain.
+  Override the start command with `sh scripts/start_worker.sh`; restart on
+  failure with at most 10 retries and do not configure an HTTP health check.
 - `optimizer-worker-2`: the same worker configuration, no public domain.
-- `frontend`: repository root directory `/frontend`, using
-  `/frontend/railway.json`, with the only public domain.
+- `frontend`: repository root directory `/frontend`, with the only public
+  domain. Keep the Dockerfile start command, set health-check path `/health`,
+  health timeout `60`, and restart on failure with at most 3 retries.
+
+Enter these settings in Railway's service dashboard. New Railway services no
+longer support opting into legacy `railway.json` Config as Code.
 
 Keep the backend service name exactly `backend`, or set
 `BACKEND_INTERNAL_URL` on the frontend to the backend's Railway private-network
