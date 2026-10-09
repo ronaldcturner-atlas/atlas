@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { API_BASE } from '../api'
 import { useAuth } from '../contexts/AuthContext'
 import './Login.css'
@@ -19,6 +20,7 @@ function errorMessage(data: any) {
 
 export default function ChangePassword({ required = false, onCancel, onComplete }: Props) {
   const { checkAuth, logout } = useAuth()
+  const navigate = useNavigate()
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
@@ -42,6 +44,7 @@ export default function ChangePassword({ required = false, onCancel, onComplete 
       })
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(errorMessage(data))
+      if (required) navigate('/', { replace: true })
       await checkAuth()
       onComplete?.()
     } catch (changeError) {
