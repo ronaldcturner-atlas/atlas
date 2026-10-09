@@ -284,7 +284,7 @@ class Command(BaseCommand):
             nonlocal consecutive_exhausted_epochs
             nonlocal generation_restart_count, generation_seed
             nonlocal generation_accepted_transition_count
-            nonlocal kernel_runtime_cache, reset_engine_context_pending
+            nonlocal reset_engine_context_pending
             nonlocal generation_attempted_focus_families
             nonlocal generation_available_focus_families
 
@@ -320,7 +320,11 @@ class Command(BaseCommand):
             epoch_start_proportionality = proportionality_improvements
             generation_attempted_focus_families = set()
             generation_available_focus_families = set()
-            kernel_runtime_cache = {}
+            # Keep the run's database inputs, contracts, and requests frozen
+            # across search-generation resets. A reset starts a new search
+            # strategy from the best state; it must not adopt edits made while
+            # the optimizer is already running. The compiled engine context is
+            # reset separately below.
             reset_engine_context_pending = True
 
         def launch_restart(restart_mode):

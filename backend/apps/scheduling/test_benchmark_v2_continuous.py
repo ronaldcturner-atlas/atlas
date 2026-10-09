@@ -557,11 +557,13 @@ class V2ContinuousCommandTests(SimpleTestCase):
         selection_modes = []
         reset_engine_context_flags = []
         deep_restart_numbers = []
+        runtime_cache_ids = []
 
         def fake_kernel(_name, **kwargs):
             selection_modes.append(kwargs['selection_mode'])
             reset_engine_context_flags.append(kwargs['reset_engine_context'])
             deep_restart_numbers.append(kwargs['deep_restart_number'])
+            runtime_cache_ids.append(id(kwargs['runtime_cache']))
             kwargs['stdout'].write(json.dumps(results.pop(0)))
 
         command = Command()
@@ -605,6 +607,7 @@ class V2ContinuousCommandTests(SimpleTestCase):
             deep_restart_numbers,
             [0, 0, 1, 2, 0, 0, 1, 2],
         )
+        self.assertEqual(len(set(runtime_cache_ids)), 1)
 
     def test_generation_samples_each_available_structural_family(self):
         results = [
