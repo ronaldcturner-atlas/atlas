@@ -9,6 +9,9 @@ from django.core.management import call_command
 from django.db import transaction
 from django.utils import timezone
 
+from apps.domains.models import DomainMembership
+from apps.facilities.models import Facility
+
 from .initial_schedule import construct_complete_initial_schedule
 from .models import (
     ContractUserAssignment,
@@ -67,7 +70,7 @@ def _compact_bootstrap_summary(summary):
 
 
 def _failure_configuration_snapshot(schedule_version):
-    """Capture mutable inputs only when a run fails unexpectedly."""
+    """Capture the mutable inputs used to launch one optimizer run."""
     block = schedule_version.schedule_block
     contract_rows = []
     assignments = (
@@ -126,6 +129,54 @@ def _failure_configuration_snapshot(schedule_version):
         row['date'] = row['date'].isoformat()
         row['start_datetime'] = row['start_datetime'].isoformat()
         row['end_datetime'] = row['end_datetime'].isoformat()
+    facility_rows = list(
+        Facility.objects.filter(region_id=schedule_version.domain.region_id)
+        .order_by('id')
+        .values(
+            'id', 'name', 'short_name', 'timezone', 'color', 'active',
+            'sort_order',
+        )
+    )
+    template_rows = list(
+        schedule_version.domain.shift_templates.order_by('id').values(
+            'id', 'facility_id', 'name', 'start_time', 'end_time',
+            'active_days_of_week', 'weekend_days', 'night_shift',
+            'default_staffing_count', 'active',
+        )
+    )
+    for row in template_rows:
+        row['start_time'] = row['start_time'].isoformat()
+        row['end_time'] = row['end_time'].isoformat()
+    user_rows = []
+    memberships = (
+        DomainMembership.objects.filter(domain=schedule_version.domain)
+        .select_related('user', 'user__physician', 'role_template')
+        .order_by('user_id')
+    )
+    for membership in memberships:
+        physician = getattr(membership.user, 'physician', None)
+        user_rows.append({
+            'user_id': membership.user_id,
+            'username': membership.user.username,
+            'email': membership.user.email,
+            'first_name': membership.user.first_name,
+            'last_name': membership.user.last_name,
+            'user_active': membership.user.is_active,
+            'membership_id': membership.id,
+            'membership_role': membership.role,
+            'role_template_id': membership.role_template_id,
+            'clinically_active': membership.clinically_active,
+            'membership_active': membership.active,
+            'membership_updated_at': membership.updated_at.isoformat(),
+            'physician_id': physician.id if physician else None,
+            'display_name': physician.display_name if physician else '',
+            'clinician_type': physician.clinician_type if physician else '',
+            'fte': str(physician.fte) if physician else None,
+            'physician_active': physician.active if physician else False,
+            'primary_facility_id': (
+                physician.primary_facility_id if physician else None
+            ),
+        })
     return {
         'captured_at': timezone.now().isoformat(),
         'schedule_version_id': schedule_version.id,
@@ -139,6 +190,9 @@ def _failure_configuration_snapshot(schedule_version):
             schedule_version.shift_template_fingerprint
         ),
         'workload_hour_overrides': schedule_version.workload_hour_overrides,
+        'facilities': facility_rows,
+        'shift_templates': template_rows,
+        'users': user_rows,
         'contracts': contract_rows,
         'requests': request_rows,
         'shift_instances': instance_rows,
@@ -242,9 +296,10 @@ def _persist_v2_search_failure(
         'initial_score_breakdown': source_report.get('score_breakdown') or {},
     })
     try:
-        diagnostic['configuration_snapshot'] = (
-            _failure_configuration_snapshot(schedule_version)
-        )
+        if 'configuration_snapshot' not in diagnostic:
+            diagnostic['configuration_snapshot'] = (
+                _failure_configuration_snapshot(schedule_version)
+            )
     except Exception as snapshot_exc:  # Preserve the primary optimizer error.
         diagnostic['configuration_snapshot_error'] = {
             'exception_type': type(snapshot_exc).__name__,
@@ -327,6 +382,37 @@ def optimize_schedule_version_v2(
         .select_related('shift_instance', 'physician')
         .order_by('shift_instance_id', 'physician_id', 'id')
     )
+    launch_snapshot = _failure_configuration_snapshot(schedule_version)
+    launch_snapshot['source_assignments'] = [
+        {
+            'id': assignment.id,
+            'shift_instance_id': assignment.shift_instance_id,
+            'physician_id': assignment.physician_id,
+            'assignment_source': assignment.assignment_source,
+            'is_locked': assignment.is_locked,
+        }
+        for assignment in source_assignments
+    ]
+    source_rescore = {
+        'source_run_id': source_run.id,
+        'source_run_number': source_run.run_number,
+        'source_stored_score': (
+            float(source_run.final_score)
+            if source_run.final_score is not None else None
+        ),
+        'current_authoritative_score': float(initial_score),
+        'current_score_breakdown': source_report['score_breakdown'],
+    }
+    optimizer_run.initial_score = initial_score
+    optimizer_run.score_breakdown = source_report['score_breakdown']
+    optimizer_run.optimizer_debug = {
+        'optimizer_engine': 'V2',
+        'launch_snapshot': launch_snapshot,
+        'source_rescore': source_rescore,
+    }
+    optimizer_run.save(update_fields=[
+        'initial_score', 'score_breakdown', 'optimizer_debug',
+    ])
     has_movable_assignment = any(
         assignment.assignment_source
         != ScheduleShiftAssignment.AssignmentSource.MANUAL
@@ -342,6 +428,8 @@ def optimize_schedule_version_v2(
         'optimization_focus': optimizer_run.optimization_focus,
         'maximum_runtime_seconds': optimizer_run.max_runtime_seconds,
         'search_started_at': timezone.now().isoformat(),
+        'configuration_snapshot': launch_snapshot,
+        'source_rescore': source_rescore,
     }
     remaining_runtime_seconds = max(
         float(optimizer_run.max_runtime_seconds) - (monotonic() - overall_started),
@@ -494,6 +582,12 @@ def optimize_schedule_version_v2(
             'total_score': float(final_score),
             'score_breakdown': report['score_breakdown'],
             'initial_score_breakdown': source_report['score_breakdown'],
+            'source_run_id': source_rescore['source_run_id'],
+            'source_run_number': source_rescore['source_run_number'],
+            'source_stored_score': source_rescore['source_stored_score'],
+            'source_rescored_score': (
+                source_rescore['current_authoritative_score']
+            ),
             'runtime_seconds': monotonic() - overall_started,
             'timed_out': search_result['stopped_reason'] == 'runtime_limit',
             'stopped_reason': search_result['stopped_reason'],

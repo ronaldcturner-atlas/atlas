@@ -660,7 +660,7 @@ class V2EngineContextTests(SimpleTestCase):
         self.assertEqual(updated.state[30], (1,))
         self.assertEqual(updated.accepted_transitions, 1)
 
-    def test_context_rejects_cycle_and_invalid_evaluation_count(self):
+    def test_context_tracks_revisited_state_and_rejects_invalid_count(self):
         with self.assertRaises(ValueError):
             self.context.record_neighborhood(-1)
         cycled = V2EngineContext(
@@ -670,13 +670,19 @@ class V2EngineContextTests(SimpleTestCase):
                 schedule_fingerprint({10: [2], 20: [1], 30: [3]}),
             )),
         )
-        with self.assertRaises(ValueError):
-            cycled.apply_selection(
-                self.selection,
-                [(10, 2), (20, 1), (30, 3)],
-                [(10, 2), (20, 1)],
-                {
-                    'workload': np.asarray([[100], [200]]),
-                    'weekend': np.asarray([[1000], [2000]]),
-                },
-            )
+        revisited = cycled.apply_selection(
+            self.selection,
+            [(10, 2), (20, 1), (30, 3)],
+            [(10, 2), (20, 1)],
+            {
+                'workload': np.asarray([[100], [200]]),
+                'weekend': np.asarray([[1000], [2000]]),
+            },
+        )
+        self.assertEqual(revisited.state[10], (2,))
+        self.assertEqual(revisited.state[20], (1,))
+        self.assertEqual(revisited.accepted_transitions, 1)
+        self.assertEqual(
+            revisited.seen_fingerprints,
+            cycled.seen_fingerprints,
+        )

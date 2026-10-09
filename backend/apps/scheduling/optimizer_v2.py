@@ -138,7 +138,12 @@ class V2AssignmentRowCache:
 
 @dataclass(frozen=True)
 class V2EngineContext:
-    """Persistent immutable state for one in-process v2 search chain."""
+    """Persistent immutable state for one in-process v2 search chain.
+
+    Revisited fingerprints remain recorded here; the continuous-search
+    controller treats them as normal epoch exhaustion and decides whether to
+    restart. They are not exceptional engine failures.
+    """
 
     state: object
     assignment_rows: V2AssignmentRowCache
@@ -190,8 +195,6 @@ class V2EngineContext:
             raise ValueError('Selected assignment index is outside the cache.') from exc
         new_state = swap_assignments(self.state, left_pair, right_pair)
         fingerprint = schedule_fingerprint(new_state)
-        if fingerprint in self.seen_fingerprints:
-            raise ValueError('The selected transition would revisit a prior state.')
         refreshed_cache = self.assignment_rows.refreshed(
             new_pairs,
             refreshed_pairs,
@@ -225,8 +228,6 @@ class V2EngineContext:
             new_physician_id,
         )
         fingerprint = schedule_fingerprint(new_state)
-        if fingerprint in self.seen_fingerprints:
-            raise ValueError('The selected transition would revisit a prior state.')
         refreshed_cache = self.assignment_rows.refreshed(
             new_pairs,
             refreshed_pairs,
@@ -256,8 +257,6 @@ class V2EngineContext:
             self.state, assignment_pairs, new_physician_ids,
         )
         fingerprint = schedule_fingerprint(new_state)
-        if fingerprint in self.seen_fingerprints:
-            raise ValueError('The selected transition would revisit a prior state.')
         refreshed_cache = self.assignment_rows.refreshed(
             new_pairs, refreshed_pairs, refreshed_tables,
         )
@@ -282,8 +281,6 @@ class V2EngineContext:
         """Apply one atomically validated multi-assignment reconstruction."""
         new_state = reassign_assignments(self.state, reassignments)
         fingerprint = schedule_fingerprint(new_state)
-        if fingerprint in self.seen_fingerprints:
-            raise ValueError('The selected transition would revisit a prior state.')
         refreshed_cache = self.assignment_rows.refreshed(
             new_pairs, refreshed_pairs, refreshed_tables,
         )

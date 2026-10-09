@@ -5025,6 +5025,9 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
         self.assertFalse(v2_run.is_active)
         self.assertEqual(summary['optimizer_engine'], 'V2')
+        self.assertEqual(summary['source_run_id'], source_run.id)
+        self.assertEqual(summary['source_stored_score'], 0.0)
+        self.assertEqual(summary['source_rescored_score'], 0.0)
         self.assertEqual(v2_run.optimizer_debug, {})
         self.assertNotIn('swaps', summary['v2_search'])
         self.assertNotIn('neighborhoods', summary['v2_search'])
@@ -5134,6 +5137,20 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(
             diagnostic['configuration_snapshot']['shift_instances'][0]['id'],
             instance.id,
+        )
+        self.assertEqual(
+            diagnostic['configuration_snapshot']['source_assignments'][0][
+                'physician_id'
+            ],
+            physician.id,
+        )
+        self.assertEqual(
+            diagnostic['source_rescore']['source_stored_score'],
+            100.0,
+        )
+        self.assertEqual(
+            diagnostic['source_rescore']['current_authoritative_score'],
+            0.0,
         )
 
     def test_atlas_v2_test_runner_rejects_and_rolls_back_overlap_result(self):
