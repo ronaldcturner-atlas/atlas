@@ -354,7 +354,7 @@ export default function PhysiciansView() {
           primary_facility: formState.primary_facility ? Number(formState.primary_facility) : null,
           clinician_type: formState.clinician_type,
           fte: formState.fte,
-          active: formState.active,
+          ...(!isEditing ? { active: formState.active } : {}),
         }),
       })
 

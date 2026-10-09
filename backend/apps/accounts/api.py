@@ -597,10 +597,12 @@ def physician_detail(request, physician_id):
     else:
         serializer_data.pop('role', None)
         if 'active' in serializer_data:
-            return Response(
-                {'detail': 'Use the protected user deactivation workflow to change account status.'},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+            requested_active = serializer_data.pop('active')
+            if requested_active != physician.active:
+                return Response(
+                    {'detail': 'Use the protected user deactivation workflow to change account status.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
         if serializer_data.get('primary_facility') not in (None, ''):
             facility = get_object_or_404(Facility.objects.select_related('region'), id=serializer_data['primary_facility'])
             allowed_region_ids = set(shared_domains.values_list('domain__region_id', flat=True))

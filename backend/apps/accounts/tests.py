@@ -324,6 +324,37 @@ class AccountsTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['email'], 'legacy@example.com')
 
+    def test_unchanged_active_value_does_not_block_profile_edit(self):
+        admin = get_user_model().objects.create_user(
+            username='profile-admin@example.com',
+            email='profile-admin@example.com',
+            password='atlas',
+        )
+        target = get_user_model().objects.create_user(
+            username='profile-target@example.com',
+            email='profile-target@example.com',
+        )
+        physician = Physician.objects.create(user=target, display_name='Old Name')
+        organization = Organization.objects.create(name='Profile Edit Organization')
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=admin,
+            is_org_admin=True,
+        )
+        OrganizationMembership.objects.create(organization=organization, user=target)
+        self.client.force_login(admin)
+
+        response = self.client.patch(
+            f'/api/physicians/{physician.id}/',
+            data=json.dumps({'display_name': 'New Name', 'active': True}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        physician.refresh_from_db()
+        self.assertEqual(physician.display_name, 'New Name')
+        self.assertTrue(physician.active)
+
     def test_login_and_logout_require_csrf_tokens_in_a_real_browser_session(self):
         get_user_model().objects.create_user(
             username='csrf-user@example.com',
