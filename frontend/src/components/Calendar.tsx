@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { API_BASE } from '../api'
 
@@ -34,6 +35,16 @@ type DomainOption = {
   region: number
   region_name: string
   active: boolean
+}
+
+type RequestBlockReminder = {
+  id: number
+  name: string
+  domain: number
+  region: number
+  request_open_datetime: string
+  request_close_datetime: string
+  can_submit_own_requests: boolean
 }
 
 type Shift = {
@@ -168,6 +179,7 @@ type CalendarProps = {
 
 export default function Calendar({ shiftsRefreshToken, forceUserView = false }: CalendarProps){
   const { user } = useAuth()
+  const navigate = useNavigate()
   const today = new Date()
   const physicianFilterRef = useRef<HTMLDetailsElement>(null)
   const domainFilterRef = useRef<HTMLDetailsElement>(null)
@@ -177,6 +189,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const [selectedShift, setSelectedShift] = useState<Shift | null>(null)
   const [allShifts, setAllShifts] = useState<APIShift[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
+  const [requestBlocks, setRequestBlocks] = useState<RequestBlockReminder[]>([])
+  const [requestWindowNow, setRequestWindowNow] = useState(() => Date.now())
   const [selectedRegionId, setSelectedRegionId] = useState<number | null>(() => {
     const stored = Number(window.sessionStorage.getItem('atlas.schedule.region'))
     return Number.isInteger(stored) && stored > 0 ? stored : null
@@ -227,24 +241,26 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const fetchShifts = async () => {
       try {
         setLoadError(null)
-        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse] = await Promise.all([
+        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse, requestBlocksResponse] = await Promise.all([
           fetch(`${API_BASE}/published-schedule/`, { credentials: 'include' }),
           fetch(`${API_BASE}/physicians/`, { credentials: 'include' }),
           fetch(`${API_BASE}/shift-trades/`, { credentials: 'include' }),
           fetch(`${API_BASE}/shift-trade-policy/`, { credentials: 'include' }),
           fetch(`${API_BASE}/published-schedule-comments/`, { credentials: 'include' }),
           fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include' }),
+          fetch(`${API_BASE}/schedule-blocks/`, { credentials: 'include' }),
         ])
         if (!shiftsResponse.ok || !physiciansResponse.ok || !domainsResponse.ok) {
           throw new Error('Unable to load the schedule filters')
         }
-        const [shiftsData, physiciansData, tradesData, policyData, commentsData, domainsData] = await Promise.all([
+        const [shiftsData, physiciansData, tradesData, policyData, commentsData, domainsData, requestBlocksData] = await Promise.all([
           shiftsResponse.json(),
           physiciansResponse.json(),
           tradesResponse.ok ? tradesResponse.json() : [],
           policyResponse.ok ? policyResponse.json() : tradePolicy,
           commentsResponse.ok ? commentsResponse.json() : [],
           domainsResponse.json(),
+          requestBlocksResponse.ok ? requestBlocksResponse.json() : [],
         ])
         setAllShifts(shiftsData)
         setPhysicians(physiciansData)
@@ -252,6 +268,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         setTradePolicy(policyData)
         setDateComments(commentsData)
         setDomains(domainsData)
+        setRequestBlocks(requestBlocksData)
       } catch (error) {
         console.error('Error fetching shifts:', error)
         setLoadError(error instanceof Error ? error.message : 'Unable to load the schedule')
@@ -274,6 +291,11 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
 
     document.addEventListener('mousedown', closePhysicianFilter)
     return () => document.removeEventListener('mousedown', closePhysicianFilter)
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setRequestWindowNow(Date.now()), 60_000)
+    return () => window.clearInterval(timer)
   }, [])
 
   const regions = Array.from(new Map(
@@ -306,6 +328,24 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   }, [selectedDomainIds])
 
   const selectedDomainSet = new Set(selectedDomainIds)
+  const clinicallyActiveDomainIds = new Set(
+    user?.domain_access
+      .filter((access) => access.active && access.clinically_active)
+      .map((access) => access.domain_id) ?? [],
+  )
+  const openRequestBlocks = requestBlocks
+    .filter((block) => (
+      block.region === selectedRegionId
+      && selectedDomainSet.has(block.domain)
+      && clinicallyActiveDomainIds.has(block.domain)
+      && block.can_submit_own_requests
+      && new Date(block.request_open_datetime).getTime() <= requestWindowNow
+      && requestWindowNow <= new Date(block.request_close_datetime).getTime()
+    ))
+    .sort((left, right) => (
+      new Date(left.request_close_datetime).getTime() - new Date(right.request_close_datetime).getTime()
+      || left.name.localeCompare(right.name)
+    ))
   const domainVisibleShifts = allShifts.filter((shift) => selectedDomainSet.has(shift.domain))
   const visiblePhysicianIds = new Set(
     domainVisibleShifts.flatMap((shift) => shift.physician == null ? [] : [shift.physician]),
@@ -734,6 +774,22 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
             <strong>{domainsForRegion[0]?.name ?? 'No accessible Domain'}</strong>
           )}
         </div>
+        {openRequestBlocks.length > 0 && (
+          <div className="open-request-reminders" aria-label="Open request periods">
+            {openRequestBlocks.map((block) => (
+              <button
+                key={block.id}
+                type="button"
+                className="open-request-reminder-button"
+                onClick={() => navigate(`/schedule-blocks/${block.id}/requests`)}
+                title={`Enter requests for ${block.name}`}
+              >
+                <span>Requests open</span>
+                <strong>{block.name}</strong>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       <div className="calendar-header">
         <div className="calendar-heading-row">
