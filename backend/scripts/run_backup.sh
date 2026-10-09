@@ -6,6 +6,7 @@ retention_days="${ATLAS_BACKUP_RETENTION_DAYS:-30}"
 
 mkdir -p "$backup_dir"
 python manage.py backup_database
+python manage.py purge_expired_optimizer_runs
 
 # Retain recent successful backups while preventing the Railway volume from
 # filling indefinitely. Partial files are removed after a failed/interrupted run.

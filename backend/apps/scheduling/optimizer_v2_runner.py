@@ -9,6 +9,7 @@ from django.core.management import call_command
 from django.db import transaction
 from django.utils import timezone
 
+from apps.accounts.models import Physician
 from apps.domains.models import DomainMembership
 from apps.facilities.models import Facility
 
@@ -199,6 +200,48 @@ def _failure_configuration_snapshot(schedule_version):
     }
 
 
+def _materialize_original_published_snapshot(
+    schedule_version, optimizer_run, *, created_by=None,
+):
+    """Copy the immutable publication snapshot into an isolated new run."""
+    snapshot_rows = (schedule_version.original_published_snapshot or {}).get(
+        'assignments'
+    )
+    if snapshot_rows is None:
+        raise ValueError('No original published schedule is available.')
+
+    valid_instance_ids = set(
+        version_shift_instances_queryset(schedule_version).values_list('id', flat=True)
+    )
+    physician_ids = {row.get('physician_id') for row in snapshot_rows}
+    valid_physician_ids = set(
+        Physician.objects.filter(id__in=physician_ids).values_list('id', flat=True)
+    )
+    if any(
+        row.get('shift_instance_id') not in valid_instance_ids
+        or row.get('physician_id') not in valid_physician_ids
+        for row in snapshot_rows
+    ):
+        raise ValueError(
+            'The original published schedule references a shift or user that no longer exists.'
+        )
+
+    ScheduleShiftAssignment.objects.bulk_create([
+        ScheduleShiftAssignment(
+            shift_instance_id=row['shift_instance_id'],
+            physician_id=row['physician_id'],
+            created_by=created_by,
+            assignment_source=row.get(
+                'assignment_source',
+                ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            ),
+            optimizer_run=optimizer_run,
+            is_locked=bool(row.get('is_locked', False)),
+        )
+        for row in snapshot_rows
+    ])
+
+
 def _apply_search_operations(state, operations):
     """Replay the ordered V2 transition lineage into an independent state."""
     current = state
@@ -351,7 +394,11 @@ def optimize_schedule_version_v2(
     if optimizer_run.run_kind not in V2_RUN_KINDS:
         raise ValueError('Atlas V2 requires an Atlas V2 run record.')
     fresh_fill = optimizer_run.start_mode == OptimizerRun.StartMode.FRESH_FILL
-    if not fresh_fill:
+    original_published = (
+        optimizer_run.start_mode
+        == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE
+    )
+    if not fresh_fill and not original_published:
         if source_run is None or source_run.status != OptimizerRun.Status.COMPLETED:
             raise ValueError('Atlas v2 test requires a completed previous run.')
         if source_run.schedule_version_id != schedule_version.id:
@@ -366,6 +413,13 @@ def optimize_schedule_version_v2(
             optimizer_run=optimizer_run,
             stop_requested=stop_requested,
             progress_callback=progress_callback,
+        )
+        source_run = optimizer_run
+    elif original_published:
+        _materialize_original_published_snapshot(
+            schedule_version,
+            optimizer_run,
+            created_by=created_by,
         )
         source_run = optimizer_run
 

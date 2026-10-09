@@ -825,6 +825,7 @@ class ScheduleBlockApiTests(TestCase):
         published_run.refresh_from_db()
         self.assertEqual(version.published_optimizer_run_id, published_run.id)
         self.assertTrue(version.published_violation_report)
+        self.assertTrue(version.original_published_snapshot)
         self.assertFalse(version.score_is_stale)
         self.assertFalse(published_run.score_is_stale)
 
@@ -858,8 +859,9 @@ class ScheduleBlockApiTests(TestCase):
         self.assertEqual(unpublish.status_code, 200)
         version.refresh_from_db()
         published_run.refresh_from_db()
-        self.assertIsNone(version.published_optimizer_run_id)
-        self.assertEqual(version.published_violation_report, {})
+        self.assertEqual(version.published_optimizer_run_id, published_run.id)
+        self.assertTrue(version.published_violation_report)
+        self.assertTrue(version.original_published_snapshot)
         self.assertTrue(version.score_is_stale)
         self.assertTrue(published_run.score_is_stale)
         context = self.client.get(f'/api/schedule-blocks/{block.id}/build/').json()
@@ -877,6 +879,54 @@ class ScheduleBlockApiTests(TestCase):
         block.refresh_from_db()
         self.assertEqual(block.build_status, ScheduleBlock.BuildStatus.BUILD)
         self.assertIsNone(block.published_at)
+
+    def test_expired_run_cleanup_preserves_live_run_and_pauses_in_build(self):
+        expired_block = self._create_block(
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now() - timedelta(days=31),
+        )
+        expired_version = ScheduleVersion.objects.create(
+            schedule_block=expired_block,
+            domain=self.domain,
+            version_number=1,
+            name='Expired published schedule',
+        )
+        live_run = OptimizerRun.objects.create(
+            schedule_version=expired_version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+        unused_run = OptimizerRun.objects.create(
+            schedule_version=expired_version,
+            run_number=2,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+        expired_version.published_optimizer_run = live_run
+        expired_version.save(update_fields=['published_optimizer_run'])
+
+        build_block = self._create_block(
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            build_status=ScheduleBlock.BuildStatus.BUILD,
+            published_at=None,
+        )
+        build_version = ScheduleVersion.objects.create(
+            schedule_block=build_block,
+            domain=self.domain,
+            version_number=1,
+            name='Reopened build',
+        )
+        build_run = OptimizerRun.objects.create(
+            schedule_version=build_version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+        )
+
+        call_command('purge_expired_optimizer_runs')
+
+        self.assertTrue(OptimizerRun.objects.filter(id=live_run.id).exists())
+        self.assertFalse(OptimizerRun.objects.filter(id=unused_run.id).exists())
+        self.assertTrue(OptimizerRun.objects.filter(id=build_run.id).exists())
 
     def test_published_schedule_uses_frozen_published_run_assignments(self):
         block = self._create_block(
@@ -2433,6 +2483,88 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(overnight_instance.start_datetime.date(), date(2026, 7, 6))
         self.assertEqual(overnight_instance.end_datetime.date(), date(2026, 7, 7))
         self.assertGreater(overnight_instance.end_datetime, overnight_instance.start_datetime)
+
+    def test_publish_preserves_original_assignments_after_live_schedule_changes(self):
+        version = self._create_build_version()
+        instance = self._create_shift_instance(version, self.day_template, date(2026, 7, 6))
+        original_physician = self._create_assignment_physician(
+            'original-published@example.com', 'Original Published', [self.facility],
+        )
+        replacement_physician = self._create_assignment_physician(
+            'live-replacement@example.com', 'Live Replacement', [self.facility],
+        )
+        run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+        assignment = ScheduleShiftAssignment.objects.create(
+            shift_instance=instance,
+            physician=original_physician,
+            optimizer_run=run,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+        )
+        self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW
+        self.block.preview_optimizer_run = run
+        self.block.save(update_fields=['build_status', 'preview_optimizer_run', 'updated_at'])
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/publish/',
+            data={'optimizer_run_id': run.id},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        version.refresh_from_db()
+        self.assertEqual(
+            version.original_published_snapshot['assignments'][0]['physician_id'],
+            original_physician.id,
+        )
+
+        assignment.physician = replacement_physician
+        assignment.save(update_fields=['physician', 'updated_at'])
+        version.refresh_from_db()
+        self.assertEqual(
+            version.original_published_snapshot['assignments'][0]['physician_id'],
+            original_physician.id,
+        )
+
+    def test_original_published_snapshot_can_seed_an_isolated_run(self):
+        from .optimizer_v2_runner import _materialize_original_published_snapshot
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(version, self.day_template, date(2026, 7, 6))
+        physician = self._create_assignment_physician(
+            'snapshot-seed@example.com', 'Snapshot Seed', [self.facility],
+        )
+        version.original_published_snapshot = {
+            'published_at': timezone.now().isoformat(),
+            'assignments': [{
+                'shift_instance_id': instance.id,
+                'physician_id': physician.id,
+                'assignment_source': ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+                'is_locked': False,
+            }],
+            'locked_open_shift_instance_ids': [],
+        }
+        version.save(update_fields=['original_published_snapshot'])
+        run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE,
+            run_kind='OPTIMIZER_V2',
+        )
+
+        _materialize_original_published_snapshot(
+            version,
+            run,
+            created_by=self.scheduler_user,
+        )
+
+        seeded = ScheduleShiftAssignment.objects.get(optimizer_run=run)
+        self.assertEqual(seeded.shift_instance_id, instance.id)
+        self.assertEqual(seeded.physician_id, physician.id)
 
     def test_generate_uses_only_shift_templates_from_selected_domain(self):
         other_region = Region.objects.create(

@@ -364,6 +364,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
     shift_instance_count = serializers.SerializerMethodField()
     active_optimizer_run = serializers.SerializerMethodField()
     published_optimizer_run = serializers.SerializerMethodField()
+    has_original_published_snapshot = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleVersion
@@ -380,6 +381,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'score_is_stale',
             'active_optimizer_run',
             'published_optimizer_run',
+            'has_original_published_snapshot',
             'shift_instance_count',
             'created_at',
             'updated_at',
@@ -408,12 +410,16 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'final_score': run.final_score,
         }
 
+    def get_has_original_published_snapshot(self, obj):
+        return bool(obj.original_published_snapshot)
+
 
 class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
     """Lightweight version metadata for the Build Workspace header and selector."""
     domain_name = serializers.CharField(source='domain.name', read_only=True)
     shift_instance_count = serializers.SerializerMethodField()
     published_optimizer_run = serializers.SerializerMethodField()
+    has_original_published_snapshot = serializers.SerializerMethodField()
 
     class Meta:
         model = ScheduleVersion
@@ -421,6 +427,7 @@ class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
             'id', 'schedule_block', 'domain', 'domain_name', 'version_number',
             'name', 'status', 'score_is_stale', 'shift_instance_count',
             'published_optimizer_run',
+            'has_original_published_snapshot',
             'created_at', 'updated_at',
         ]
         read_only_fields = fields
@@ -440,6 +447,9 @@ class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
             'run_number': run.run_number,
             'final_score': run.final_score,
         }
+
+    def get_has_original_published_snapshot(self, obj):
+        return bool(obj.original_published_snapshot)
 
 
 class OptimizerRunSerializer(serializers.ModelSerializer):

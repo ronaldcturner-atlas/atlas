@@ -334,6 +334,7 @@ class ScheduleVersion(models.Model):
         blank=True,
     )
     published_violation_report = models.JSONField(default=dict, blank=True)
+    original_published_snapshot = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -360,6 +361,9 @@ class OptimizerRun(models.Model):
 
     class StartMode(models.TextChoices):
         CURRENT_SCHEDULE = 'CURRENT_SCHEDULE', 'Current schedule'
+        ORIGINAL_PUBLISHED_SCHEDULE = (
+            'ORIGINAL_PUBLISHED_SCHEDULE', 'Original published schedule'
+        )
         FRESH_FILL = 'FRESH_FILL', 'Fresh fill'
 
     class OptimizationFocus(models.TextChoices):
@@ -402,7 +406,7 @@ class OptimizerRun(models.Model):
     run_kind = models.CharField(max_length=20, default='OPTIMIZER')
     locked_open_shift_instance_ids = models.JSONField(default=list, blank=True)
     start_mode = models.CharField(
-        max_length=24, choices=StartMode.choices, default=StartMode.FRESH_FILL,
+        max_length=32, choices=StartMode.choices, default=StartMode.FRESH_FILL,
     )
     max_runtime_seconds = models.PositiveIntegerField(default=120 * 60)
     optimization_focus = models.CharField(

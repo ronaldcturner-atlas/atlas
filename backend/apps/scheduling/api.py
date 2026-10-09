@@ -3761,7 +3761,11 @@ def _parse_optimizer_engine(request):
 def _optimizer_start_options(request, version):
     start_mode = request.data.get('start_mode', OptimizerRun.StartMode.FRESH_FILL)
     if start_mode not in OptimizerRun.StartMode.values:
-        return None, None, {'start_mode': 'Use CURRENT_SCHEDULE or FRESH_FILL.'}
+        return None, None, {
+            'start_mode': (
+                'Use CURRENT_SCHEDULE, ORIGINAL_PUBLISHED_SCHEDULE, or FRESH_FILL.'
+            ),
+        }
     if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE:
         run_id = (
             request.data.get('source_run_id')
@@ -3769,9 +3773,16 @@ def _optimizer_start_options(request, version):
             or request.data.get('optimizer_run_id')
         )
         if run_id in (None, ''):
+            default_run = version.published_optimizer_run or _active_optimizer_run(version)
+            run_id = default_run.id if default_run is not None else None
+        if run_id in (None, ''):
+            return None, None, {'source_run_id': 'No current schedule is available.'}
+    elif start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE:
+        if not version.original_published_snapshot:
             return None, None, {
-                'source_run_id': 'Select a completed run in this schedule version.'
+                'start_mode': 'No original published schedule is available.'
             }
+        run_id = None
     else:
         # Fresh Fill does not inherit optimizer assignments from a historical
         # result. The viewed run is accepted only so explicitly locked manual
@@ -3821,10 +3832,34 @@ def _optimizer_authoritative_coverage_preflight(version, start_mode, source_run)
             physician__active=True,
         ).values_list('physician_id', flat=True)
     )
-    raw_assignments = list(
-        assignments_for_viewed_run(version, source_run)
-        .select_related('shift_instance', 'physician__user')
-    )
+    if start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE:
+        snapshot_rows = (version.original_published_snapshot or {}).get('assignments', [])
+        physician_ids = {row.get('physician_id') for row in snapshot_rows}
+        physicians = {
+            physician.id: physician
+            for physician in Physician.objects.filter(id__in=physician_ids).select_related('user')
+        }
+        raw_assignments = [
+            ScheduleShiftAssignment(
+                shift_instance=instance_by_id[row['shift_instance_id']],
+                physician=physicians[row['physician_id']],
+                assignment_source=row.get(
+                    'assignment_source',
+                    ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+                ),
+                is_locked=bool(row.get('is_locked', False)),
+            )
+            for row in snapshot_rows
+            if (
+                row.get('shift_instance_id') in instance_by_id
+                and row.get('physician_id') in physicians
+            )
+        ]
+    else:
+        raw_assignments = list(
+            assignments_for_viewed_run(version, source_run)
+            .select_related('shift_instance', 'physician__user')
+        )
     normalized_assignments, _normalization = canonical_assignment_snapshot(
         raw_assignments,
         instances,
@@ -4011,6 +4046,13 @@ def _run_optimizer_response(request, version):
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
     if (
+        start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE
+        and optimizer_engine != 'V2'
+    ):
+        return Response({
+            'start_mode': 'Original Published Schedule requires Atlas V2.',
+        }, status=status.HTTP_400_BAD_REQUEST)
+    if (
         optimizer_engine == 'V2'
         and not getattr(settings, 'ATLAS_V2_ENABLED', False)
     ):
@@ -4170,6 +4212,13 @@ def schedule_version_run_optimizer(request, version_id):
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
     if (
+        start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE
+        and optimizer_engine != 'V2'
+    ):
+        return Response({
+            'start_mode': 'Original Published Schedule requires Atlas V2.',
+        }, status=status.HTTP_400_BAD_REQUEST)
+    if (
         optimizer_engine == 'V2'
         and not getattr(settings, 'ATLAS_V2_ENABLED', False)
     ):
@@ -4243,14 +4292,21 @@ def schedule_version_run_optimizer(request, version_id):
                 OptimizerRun.objects.filter(schedule_version=locked_version)
                 .order_by('-run_number').values_list('run_number', flat=True).first() or 0
             )
-            locked_open_ids = (
-                list(source_run.locked_open_shift_instance_ids or [])
-                if source_run is not None else list(
-                    ScheduleShiftInstance.objects.filter(
-                        schedule_version=locked_version, is_locked_open=True,
-                    ).values_list('id', flat=True)
+            if start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE:
+                locked_open_ids = list(
+                    (locked_version.original_published_snapshot or {}).get(
+                        'locked_open_shift_instance_ids', [],
+                    )
                 )
-            )
+            else:
+                locked_open_ids = (
+                    list(source_run.locked_open_shift_instance_ids or [])
+                    if source_run is not None else list(
+                        ScheduleShiftInstance.objects.filter(
+                            schedule_version=locked_version, is_locked_open=True,
+                        ).values_list('id', flat=True)
+                    )
+                )
             optimizer_run = OptimizerRun.objects.create(
                 schedule_version=locked_version,
                 run_number=latest_number + 1,
@@ -5826,6 +5882,29 @@ def schedule_block_publish(request, block_id):
     version = published_run.schedule_version
     report = build_violation_report(version, optimizer_run=published_run)
     frozen_report = json.loads(json.dumps(report, cls=DjangoJSONEncoder))
+    published_assignments = assignments_for_viewed_run(version, published_run).order_by(
+        'shift_instance_id', 'physician_id', 'id',
+    )
+    original_published_snapshot = {
+        'published_at': timezone.now().isoformat(),
+        'optimizer_run_id': published_run.id,
+        'optimizer_run_number': published_run.run_number,
+        'assignments': [
+            {
+                'shift_instance_id': assignment.shift_instance_id,
+                'physician_id': assignment.physician_id,
+                'assignment_source': assignment.assignment_source,
+                'is_locked': assignment.is_locked,
+            }
+            for assignment in published_assignments
+        ],
+        'locked_open_shift_instance_ids': list(
+            published_run.locked_open_shift_instance_ids or []
+        ),
+    }
+    frozen_snapshot = json.loads(json.dumps(
+        original_published_snapshot, cls=DjangoJSONEncoder,
+    ))
 
     with transaction.atomic():
         block = ScheduleBlock.objects.select_for_update().get(id=block.id)
@@ -5841,10 +5920,12 @@ def schedule_block_publish(request, block_id):
         ).exclude(id=version.id).update(
             published_optimizer_run=None,
             published_violation_report={},
+            original_published_snapshot={},
         )
         ScheduleVersion.objects.filter(id=version.id).update(
             published_optimizer_run=published_run,
             published_violation_report=frozen_report,
+            original_published_snapshot=frozen_snapshot,
             score_is_stale=False,
         )
         OptimizerRun.objects.filter(id=published_run.id).update(score_is_stale=False)
@@ -5877,8 +5958,6 @@ def schedule_block_unpublish(request, block_id):
         versions = ScheduleVersion.objects.filter(schedule_block=block)
         version_ids = list(versions.values_list('id', flat=True))
         versions.update(
-            published_optimizer_run=None,
-            published_violation_report={},
             score_is_stale=True,
         )
         OptimizerRun.objects.filter(schedule_version_id__in=version_ids).update(
