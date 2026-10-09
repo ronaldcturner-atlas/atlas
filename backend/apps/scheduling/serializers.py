@@ -444,6 +444,7 @@ class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
 
 class OptimizerRunSerializer(serializers.ModelSerializer):
     schedule_version_name = serializers.CharField(source='schedule_version.name', read_only=True)
+    created_by_name = serializers.SerializerMethodField()
     copied_from_run_number = serializers.IntegerField(source='copied_from_run.run_number', read_only=True)
     started_at = serializers.SerializerMethodField()
     live_best_score = serializers.SerializerMethodField()
@@ -466,6 +467,15 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
     def get_is_published(self, obj):
         return obj.schedule_version.published_optimizer_run_id == obj.id
 
+    def get_created_by_name(self, obj):
+        if obj.created_by is None:
+            return None
+        return (
+            obj.created_by.get_full_name().strip()
+            or obj.created_by.email
+            or obj.created_by.username
+        )
+
     class Meta:
         model = OptimizerRun
         fields = [
@@ -477,6 +487,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'started_at',
             'live_best_score',
             'created_by',
+            'created_by_name',
             'status',
             'seed',
             'initial_score',
@@ -510,6 +521,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
     started_at = serializers.SerializerMethodField()
     live_best_score = serializers.SerializerMethodField()
     is_published = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
 
     def get_started_at(self, obj):
         try:
@@ -528,6 +540,15 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
     def get_is_published(self, obj):
         return obj.schedule_version.published_optimizer_run_id == obj.id
 
+    def get_created_by_name(self, obj):
+        if obj.created_by is None:
+            return None
+        return (
+            obj.created_by.get_full_name().strip()
+            or obj.created_by.email
+            or obj.created_by.username
+        )
+
     def get_runtime_seconds(self, obj):
         annotated_runtime = getattr(obj, 'runtime_seconds_value', None)
         if annotated_runtime is not None:
@@ -539,7 +560,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
         model = OptimizerRun
         fields = [
             'id', 'schedule_version', 'run_number', 'created_at', 'started_at',
-            'live_best_score', 'status', 'seed',
+            'live_best_score', 'created_by_name', 'status', 'seed',
             'initial_score', 'final_score', 'is_active', 'is_published', 'score_is_stale',
             'copied_from_run', 'copied_from_run_number', 'run_kind',
             'started_from_run', 'started_from_run_number',

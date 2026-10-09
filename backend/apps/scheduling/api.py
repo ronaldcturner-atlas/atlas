@@ -3575,7 +3575,7 @@ def schedule_block_build_context(request, block_id):
             'optimizer_runs': (
                 OptimizerRunHistorySerializer(
                     selected_version.optimizer_runs
-                    .select_related('copied_from_run', 'control', 'schedule_version')
+                    .select_related('copied_from_run', 'control', 'schedule_version', 'created_by')
                     .annotate(runtime_seconds_value=Cast('optimizer_summary__runtime_seconds', FloatField()))
                     .defer('optimizer_summary', 'optimizer_debug', 'score_breakdown')
                     .order_by('-run_number'),
@@ -4134,7 +4134,11 @@ def schedule_version_optimizer_runs(request, version_id):
     if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
     _cleanup_stale_optimizer_runs(version)
-    runs = OptimizerRun.objects.filter(schedule_version=version).order_by('-run_number')
+    runs = (
+        OptimizerRun.objects.filter(schedule_version=version)
+        .select_related('created_by')
+        .order_by('-run_number')
+    )
     return Response(OptimizerRunSerializer(runs, many=True).data)
 
 

@@ -2245,6 +2245,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.scheduler_user = get_user_model().objects.create_user(
             username='build-scheduler@example.com',
             password='password123',
+            first_name='Build',
+            last_name='Scheduler',
         )
         scheduler_group, _ = Group.objects.get_or_create(name='Scheduler')
         self.scheduler_user.groups.add(scheduler_group)
@@ -4120,6 +4122,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertTrue(any(row['id'] == run.id and row['status'] == 'RUNNING' for row in context['optimizer_runs']))
         running_row = next(row for row in context['optimizer_runs'] if row['id'] == run.id)
         self.assertIsNone(running_row['started_at'])
+        self.assertEqual(running_row['created_by_name'], 'Build Scheduler')
         control.started_at = timezone.now()
         control.live_best_score = Decimal('12345.50')
         control.progress_updated_at = timezone.now()
@@ -4129,6 +4132,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         compact_status = self.client.get(f'/api/optimizer-runs/{run.id}/?compact=1')
         self.assertEqual(compact_status.status_code, 200)
         self.assertEqual(compact_status.json()['status'], 'RUNNING')
+        self.assertEqual(compact_status.json()['created_by_name'], 'Build Scheduler')
         self.assertIsNotNone(compact_status.json()['started_at'])
         self.assertEqual(compact_status.json()['live_best_score'], 12345.5)
         self.assertNotIn('optimizer_summary', compact_status.json())
@@ -5587,6 +5591,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         history = self.client.get(f'/api/schedule-versions/{version.id}/optimizer-runs/')
         self.assertEqual(history.status_code, 200)
         self.assertEqual([row['id'] for row in history.json()[:2]], [copied.id, source.id])
+        self.assertEqual(history.json()[0]['created_by_name'], 'Build Scheduler')
         copied_before_optimize = list(
             ScheduleShiftAssignment.objects.filter(optimizer_run=copied).order_by('id').values_list(
                 'id', 'shift_instance_id', 'physician_id', 'assignment_source', 'is_locked'

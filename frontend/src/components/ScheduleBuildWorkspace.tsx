@@ -190,6 +190,7 @@ type OptimizerRun = {
   schedule_version: number
   run_number: number
   created_at: string
+  created_by_name?: string | null
   started_at?: string | null
   live_best_score?: string | number | null
   status: 'RUNNING' | 'COMPLETED' | 'FAILED'
@@ -3131,6 +3132,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     <strong>Run {run.run_number}</strong>
                     {run.is_published && <strong>Published</strong>}
                     <span>{optimizerRunStatusLabel(run)}</span>
+                    <span>Started by {run.created_by_name || 'Unknown user'}</span>
                     <span>
                       {run.start_mode === 'CURRENT_SCHEDULE'
                         ? run.started_from_run_number
