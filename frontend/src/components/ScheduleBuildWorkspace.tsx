@@ -3085,7 +3085,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             onClick={() => setShowRunHistory((current) => !current)}
             aria-expanded={showRunHistory}
           >
-            {showRunHistory ? 'Hide run history' : `Show run history (${optimizerRuns.length})`}
+            {showRunHistory
+              ? 'Hide run management'
+              : `Manage / delete runs (${optimizerRuns.length})`}
           </button>
           {showRunHistory && (
             <>
