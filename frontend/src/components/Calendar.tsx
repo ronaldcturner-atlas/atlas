@@ -111,6 +111,11 @@ type PhysicianOption = {
   last_name: string
   display_name: string
   active: boolean
+  domain_memberships: Array<{
+    domain_id: number
+    clinically_active: boolean
+    active: boolean
+  }>
 }
 
 type TradeOption = {
@@ -369,6 +374,22 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const rightName = right.display_name || `${right.first_name} ${right.last_name}`
     return leftName.localeCompare(rightName)
   })
+  const assignablePhysicians = selectedShift == null
+    ? []
+    : physicians
+      .filter((physician) => (
+        physician.active
+        && physician.domain_memberships.some((membership) => (
+          membership.domain_id === selectedShift.domainId
+          && membership.active
+          && membership.clinically_active
+        ))
+      ))
+      .sort((left, right) => {
+        const leftName = left.display_name || `${left.first_name} ${left.last_name}`
+        const rightName = right.display_name || `${right.first_name} ${right.last_name}`
+        return leftName.localeCompare(rightName)
+      })
 
   useEffect(() => {
     setSelectedPhysicianIds((current) => current.filter((id) => visiblePhysicianIds.has(id)))
@@ -1023,7 +1044,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                       Recombined shift user if portions differ
                       <select value={unsplitPhysicianId} onChange={(event) => setUnsplitPhysicianId(Number(event.target.value) || '')}>
                         <option value="">Use the current user when all portions match</option>
-                        {sortedPhysicians.filter((physician) => physician.active).map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
+                        {assignablePhysicians.map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
                       </select>
                     </label>
                   )}
@@ -1082,7 +1103,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                   <strong>Change scheduled user</strong>
                   <select value={reassignPhysicianId} onChange={(event) => setReassignPhysicianId(Number(event.target.value) || '')}>
                     <option value="">Choose physician</option>
-                    {sortedPhysicians.filter((physician) => physician.active).map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
+                    {assignablePhysicians.map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
                   </select>
                   <button disabled={isMutating || !reassignPhysicianId} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/reassign/`, { physician_id: reassignPhysicianId })}>Change user</button>
                   <strong>Swap scheduled users</strong>
@@ -1104,7 +1125,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                   <strong>Fill open shift</strong>
                   <select value={openShiftPhysicianId} onChange={(event) => setOpenShiftPhysicianId(Number(event.target.value) || '')}>
                     <option value="">Choose physician</option>
-                    {sortedPhysicians.filter((physician) => physician.active).map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
+                    {assignablePhysicians.map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
                   </select>
                   <button disabled={isMutating || !openShiftPhysicianId} onClick={() => mutate(`shift-instances/${selectedShift.instanceId}/assign/`, { physician_id: openShiftPhysicianId })}>Assign user</button>
                 </div>
