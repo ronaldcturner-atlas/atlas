@@ -4,6 +4,7 @@ import { API_BASE } from '../api'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 type OptimizerStartMode = 'CURRENT_SCHEDULE' | 'ORIGINAL_PUBLISHED_SCHEDULE' | 'FRESH_FILL'
+type OptimizerStartSelection = OptimizerStartMode | 'PREVIOUS_OPTIMIZER_RUN'
 
 type ScheduleBlock = {
   id: number
@@ -535,7 +536,9 @@ function optimizerRunScoreLabel(run: OptimizerRun) {
 function optimizerRunLabel(run: OptimizerRun) {
   const copyLabel = run.copied_from_run_number ? ` - Copy of Run ${run.copied_from_run_number}` : ''
   const startLabel = run.start_mode === 'CURRENT_SCHEDULE'
-    ? 'Started from current live schedule'
+    ? run.started_from_run_number
+      ? `Started from Run ${run.started_from_run_number}`
+      : 'Started from a saved schedule'
     : run.start_mode === 'ORIGINAL_PUBLISHED_SCHEDULE'
       ? 'Started from original published schedule'
       : 'Fresh fill'
@@ -788,7 +791,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [isLaunchingOptimizer, setIsLaunchingOptimizer] = useState(false)
   const [stoppingOptimizerRunIds, setStoppingOptimizerRunIds] = useState<number[]>([])
   const [optimizerClockMs, setOptimizerClockMs] = useState(() => Date.now())
-  const [optimizerStartMode, setOptimizerStartMode] = useState<OptimizerStartMode>('FRESH_FILL')
+  const [optimizerStartMode, setOptimizerStartMode] = useState<OptimizerStartSelection>('FRESH_FILL')
   const [optimizerSourceRunId, setOptimizerSourceRunId] = useState<number | null>(null)
   const [optimizerPreflight, setOptimizerPreflight] = useState<OptimizerPreflight | null>(null)
   const [isOptimizerPreflightLoading, setIsOptimizerPreflightLoading] = useState(false)
@@ -1129,6 +1132,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
     let cancelled = false
     const sourceRunId = optimizerStartMode === 'CURRENT_SCHEDULE'
+      || optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
       ? optimizerSourceRunId
       : optimizerStartMode === 'FRESH_FILL'
         ? context.selected_optimizer_run?.id ?? null
@@ -1140,8 +1144,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          start_mode: optimizerStartMode,
-          source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE' ? sourceRunId : null,
+          start_mode: optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+            ? 'CURRENT_SCHEDULE'
+            : optimizerStartMode,
+          source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE'
+            || optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+            ? sourceRunId
+            : null,
           currently_viewed_run_id: optimizerStartMode === 'FRESH_FILL' ? sourceRunId : null,
         }),
       })
@@ -1514,11 +1523,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   }, [optimizerSummary?.optimizer_run_id, optimizerSummary?.seed])
 
   useEffect(() => {
-    const currentRunId = context?.selected_version?.published_optimizer_run?.id
-      ?? context?.run_state?.active_run_id
-      ?? null
-    setOptimizerStartMode(currentRunId ? 'CURRENT_SCHEDULE' : 'FRESH_FILL')
-    setOptimizerSourceRunId(currentRunId)
+    const liveRunId = context?.selected_version?.published_optimizer_run?.id ?? null
+    const activeRunId = context?.run_state?.active_run_id ?? null
+    setOptimizerStartMode(
+      liveRunId
+        ? 'CURRENT_SCHEDULE'
+        : activeRunId
+          ? 'PREVIOUS_OPTIMIZER_RUN'
+          : 'FRESH_FILL',
+    )
+    setOptimizerSourceRunId(liveRunId ?? activeRunId)
   }, [
     context?.run_state?.active_run_id,
     context?.selected_version?.id,
@@ -1798,9 +1812,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     const sourceRun = (context.optimizer_runs ?? []).find(
       (run) => run.id === optimizerSourceRunId && isCompletedOptimizerRun(run),
     ) ?? null
-    if (optimizerStartMode === 'CURRENT_SCHEDULE') {
+    if (
+      optimizerStartMode === 'CURRENT_SCHEDULE'
+      || optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+    ) {
       if (!sourceRun) {
-        setError('No current live schedule is available.')
+        setError(
+          optimizerStartMode === 'CURRENT_SCHEDULE'
+            ? 'No current live schedule is available.'
+            : 'Select a completed optimizer run to use as the starting schedule.',
+        )
         return
       }
       const sourceScore = Number(sourceRun.final_score)
@@ -1840,8 +1861,13 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           body: JSON.stringify({
             schedule_version_id: versionId,
             currently_viewed_run_id: viewedRun?.id ?? null,
-            source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE' ? sourceRun?.id ?? null : null,
-            start_mode: optimizerStartMode,
+            source_run_id: optimizerStartMode === 'CURRENT_SCHEDULE'
+              || optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+              ? sourceRun?.id ?? null
+              : null,
+            start_mode: optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+              ? 'CURRENT_SCHEDULE'
+              : optimizerStartMode,
             max_runtime_minutes: optimizerMaxRuntimeMinutes,
             optimization_focus: optimizerFocus,
             optimizer_engine: 'V2',
@@ -2266,16 +2292,22 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     && context.selected_version?.status === 'BUILD'
     && context.shift_instances.length > 0
   const sourceScore = Number(optimizerSourceRun?.final_score)
-  const currentScheduleIsZero = optimizerStartMode === 'CURRENT_SCHEDULE'
+  const sourceScheduleIsZero = (
+    optimizerStartMode === 'CURRENT_SCHEDULE'
+    || optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+  )
     && Number.isFinite(sourceScore) && sourceScore === 0
   const optimizerUnavailableReason = optimizerPreflight?.has_conflicts
     ? optimizerPreflight.detail
-    : currentScheduleIsZero
+    : sourceScheduleIsZero
     ? 'This schedule already has score 0. No optimizer run will be started.'
     : !canOptimizeBuild
       ? 'Run Optimizer is available only while the Schedule Block and Schedule Version are in BUILD with generated shifts.'
-      : optimizerStartMode === 'CURRENT_SCHEDULE' && !optimizerSourceRun
-        ? 'No current live schedule is available.'
+      : (
+          optimizerStartMode === 'CURRENT_SCHEDULE'
+          || optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+        ) && !optimizerSourceRun
+        ? 'Select a completed optimizer run to use as the starting schedule.'
         : optimizerStartMode === 'ORIGINAL_PUBLISHED_SCHEDULE'
           && !context.selected_version?.has_original_published_snapshot
           ? 'No original published schedule is available.'
@@ -2436,15 +2468,55 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           <div className="optimizer-start-control">
             <label className="facility-field">
               <span>Optimizer Start</span>
-              <select value={optimizerStartMode} onChange={(event) => setOptimizerStartMode(event.target.value as OptimizerStartMode)} disabled={isBuildMutationBusy}>
-                <option value="CURRENT_SCHEDULE">Current Live Schedule</option>
+              <select
+                value={optimizerStartMode}
+                onChange={(event) => {
+                  const selection = event.target.value as OptimizerStartSelection
+                  setOptimizerStartMode(selection)
+                  if (selection === 'CURRENT_SCHEDULE') {
+                    setOptimizerSourceRunId(
+                      context.selected_version?.published_optimizer_run?.id ?? null,
+                    )
+                  } else if (selection === 'PREVIOUS_OPTIMIZER_RUN') {
+                    setOptimizerSourceRunId(
+                      context.run_state?.active_run_id
+                      ?? completedOptimizerRuns[0]?.id
+                      ?? null,
+                    )
+                  }
+                }}
+                disabled={isBuildMutationBusy}
+              >
+                <option value="PREVIOUS_OPTIMIZER_RUN">Previous Optimizer Run</option>
+                {context.selected_version?.published_optimizer_run && (
+                  <option value="CURRENT_SCHEDULE">Current Live Schedule</option>
+                )}
                 <option value="ORIGINAL_PUBLISHED_SCHEDULE" disabled={!context.selected_version?.has_original_published_snapshot}>Original Published Schedule</option>
                 <option value="FRESH_FILL">Fresh Fill</option>
               </select>
             </label>
+            {optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN' && (
+              <label className="facility-field">
+                <span>Starting Run</span>
+                <select
+                  value={optimizerSourceRunId ?? ''}
+                  onChange={(event) => setOptimizerSourceRunId(Number(event.target.value))}
+                  disabled={isBuildMutationBusy || completedOptimizerRuns.length === 0}
+                >
+                  {!completedOptimizerRuns.length && <option value="">No completed runs</option>}
+                  {completedOptimizerRuns.map((run) => (
+                    <option key={run.id} value={run.id}>
+                      Run {run.run_number} · penalty {formatScore(run.final_score)}{run.is_active ? ' · Active' : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <small>
               {optimizerStartMode === 'CURRENT_SCHEDULE'
                 ? 'Starts from the current schedule, including approved trades, posts, pickups, and scheduler edits.'
+                : optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+                  ? 'Starts from the selected completed optimizer run without changing that saved run.'
                 : optimizerStartMode === 'ORIGINAL_PUBLISHED_SCHEDULE'
                   ? 'Starts from the unchanged schedule captured at the most recent publication.'
                   : 'Builds a new unanchored schedule, then improves it. Locked edits are still preserved.'}
@@ -2514,6 +2586,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   ? `${optimizerCapacity.limit} Optimizers Running`
                   : optimizerStartMode === 'CURRENT_SCHEDULE'
                     ? 'Run Optimizer from Current Live Schedule'
+                    : optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN'
+                      ? `Run Optimizer from Run ${optimizerSourceRun?.run_number ?? '—'}`
                     : optimizerStartMode === 'ORIGINAL_PUBLISHED_SCHEDULE'
                       ? 'Run Optimizer from Original Published Schedule'
                       : 'Run Optimizer from Fresh Fill'}
@@ -2548,7 +2622,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       ? 'Fresh Fill'
                       : run.start_mode === 'ORIGINAL_PUBLISHED_SCHEDULE'
                         ? 'Original Published Schedule'
-                        : 'Current Live Schedule'}</span>
+                        : `From Run ${run.started_from_run_number ?? '—'}`}</span>
                     {(run.run_kind === 'OPTIMIZER_V2' || run.run_kind === 'OPTIMIZER_V2_TEST') && <span>Atlas V2</span>}
                     {run.optimization_focus === 'DISTRIBUTION' && <span>Facility/Shift distribution focus</span>}
                   </div>
@@ -3124,7 +3198,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     <span>Started by {run.created_by_name || 'Unknown user'}</span>
                     <span>
                       {run.start_mode === 'CURRENT_SCHEDULE'
-                        ? 'Started from current live schedule'
+                        ? run.started_from_run_number
+                          ? `Started from Run ${run.started_from_run_number}`
+                          : 'Started from a saved schedule'
                         : run.start_mode === 'ORIGINAL_PUBLISHED_SCHEDULE'
                           ? 'Started from original published schedule'
                           : 'Fresh fill'}

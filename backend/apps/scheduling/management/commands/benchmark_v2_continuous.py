@@ -108,6 +108,7 @@ class Command(BaseCommand):
         generation_accepted_transition_count = 0
         improving_transition_count = 0
         diversification_transition_count = 0
+        authoritative_candidate_rejections = 0
         primary_improvements = 0
         proportionality_improvements = 0
         epoch_start_primary = 0
@@ -497,12 +498,41 @@ class Command(BaseCommand):
             transition = kernel_result.get(
                 'best_candidate_transition_validation'
             )
+            rejected_transition = None
+            rejection_reason = None
             if repeated_state:
                 # A repeated state is a local search exhaustion signal, not a
                 # reason to discard the complete schedule. Ignore any move
                 # proposed from the duplicate state and advance through the
                 # normal improvement/restart workflow below.
                 transition = None
+            elif transition is not None:
+                if not transition.get('authoritative_legal'):
+                    rejection_reason = 'authoritative_illegal'
+                elif (
+                    selection_mode == 'improve'
+                    and not transition.get('authoritative_improving')
+                ):
+                    rejection_reason = 'authoritative_not_improving'
+                elif (
+                    selection_mode == 'diversify'
+                    and not transition.get('accepted_for_diversification')
+                ):
+                    rejection_reason = 'outside_diversification_bounds'
+                if rejection_reason is not None:
+                    authoritative_candidate_rejections += 1
+                    rejected_transition = {
+                        'reason': rejection_reason,
+                        'transition': transition_diagnostic(transition),
+                    }
+                    update_diagnostic_state(
+                        phase='candidate_rejected',
+                        authoritative_candidate_rejections=(
+                            authoritative_candidate_rejections
+                        ),
+                        last_rejected_candidate=rejected_transition,
+                    )
+                    transition = None
             authoritative_current = kernel_result.get(
                 'authoritative_current_score'
             )
@@ -653,6 +683,7 @@ class Command(BaseCommand):
                     kernel_result['meets_stage_one_rate']
                 ),
                 'transition': transition,
+                'rejected_transition': rejected_transition,
             })
             if transition is None:
                 if selection_mode == 'diversify' and diversification_applied:
@@ -867,6 +898,9 @@ class Command(BaseCommand):
             'accepted_transitions': accepted_transition_count,
             'improving_transitions': improving_transition_count,
             'diversification_transitions': diversification_transition_count,
+            'authoritative_candidate_rejections': (
+                authoritative_candidate_rejections
+            ),
             'primary_improvements': primary_improvements,
             'proportionality_improvements': proportionality_improvements,
             'predicted_final_score': best_score,
