@@ -17,4 +17,15 @@ describe('Schedule Block request overview', () => {
     expect(requestBuilderSource).toContain("left.request_scope === 'USER' ? 0 : 1")
     expect(requestBuilderSource).toContain("right.request_scope === 'USER' ? 0 : 1")
   })
+
+  it('only offers Fixed priority for permitted Admin requests', () => {
+    expect(requestBuilderSource).toContain("option.value !== 'FIXED' || (selectedScope === 'ADMIN' && canManageFixedRequests)")
+    expect(requestBuilderSource).toContain("option.value !== 'FIXED' || (bulkScope === 'ADMIN' && canManageFixedRequests)")
+    expect(requestBuilderSource).toContain('Fixed (permission required)')
+  })
+
+  it('does not expose Admin requests while using the User request view', () => {
+    expect(requestBuilderSource).toContain("data.requests.filter((item) => item.request_scope === 'USER')")
+    expect(requestBuilderSource).toContain("data.visible_requests.filter((item) => item.request_scope === 'USER')")
+  })
 })

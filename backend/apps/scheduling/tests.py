@@ -1236,6 +1236,148 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(admin_response.status_code, 200)
         self.assertEqual(ScheduleRequest.objects.filter(schedule_block=self.block).count(), 2)
 
+    def test_fixed_priority_is_not_available_for_user_requests(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'high_request_limit': '5',
+                'medium_request_limit': '5',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'FIXED',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('only available for Admin requests', response.json()['weight'])
+        self.assertFalse(ScheduleRequest.objects.exists())
+
+    def test_fixed_admin_requests_require_separate_permission(self):
+        self.scheduler_role.permissions = ['administer_requests']
+        self.scheduler_role.save(update_fields=['permissions', 'updated_at'])
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+        fixed_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'ADMIN',
+                'request_type': 'DAY_OFF',
+                'weight': 'FIXED',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+        high_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-02',
+                'request_scope': 'ADMIN',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(context_response.status_code, 200)
+        self.assertFalse(context_response.json()['can_manage_fixed_requests'])
+        self.assertEqual(fixed_response.status_code, 403)
+        self.assertEqual(high_response.status_code, 200)
+        self.assertEqual(ScheduleRequest.objects.count(), 1)
+
+    def test_fixed_request_cannot_be_overwritten_without_separate_permission(self):
+        fixed_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.ADMIN,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.FIXED,
+            created_by=self.scheduler_user,
+        )
+        self.scheduler_role.permissions = ['administer_requests']
+        self.scheduler_role.save(update_fields=['permissions', 'updated_at'])
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'ADMIN',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 403)
+        fixed_request.refresh_from_db()
+        self.assertEqual(fixed_request.weight, ScheduleRequest.Weight.FIXED)
+
+    def test_non_admin_cannot_view_admin_requests(self):
+        self._assign_contract({'allow_day_off': True, 'low_request_unlimited': True})
+        user_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.LOW,
+            created_by=self.physician_user,
+        )
+        admin_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 2),
+            request_scope=ScheduleRequest.RequestScope.ADMIN,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.FIXED,
+            created_by=self.scheduler_user,
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        list_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/')
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+        detail_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/{admin_request.id}/'
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual([item['id'] for item in list_response.json()], [user_request.id])
+        self.assertEqual(context_response.status_code, 200)
+        self.assertEqual(
+            [item['id'] for item in context_response.json()['requests']],
+            [user_request.id],
+        )
+        self.assertEqual(
+            [item['id'] for item in context_response.json()['visible_requests']],
+            [user_request.id],
+        )
+        self.assertEqual(context_response.json()['request_totals']['ADMIN']['FIXED'], 0)
+        self.assertEqual(detail_response.status_code, 403)
+
     def test_preview_block_rejects_request_writes(self):
         self.client.force_authenticate(user=self.scheduler_user)
         self.block.build_status = ScheduleBlock.BuildStatus.PREVIEW

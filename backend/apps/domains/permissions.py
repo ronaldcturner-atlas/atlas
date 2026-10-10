@@ -32,6 +32,7 @@ PERMISSION_GROUPS = OrderedDict([
     ('Build and publication', OrderedDict([
         ('manage_build_workspace', 'Manage Build Workspace'),
         ('administer_requests', 'Review and administer requests in Build Workspace'),
+        ('manage_fixed_requests', 'Create, edit, or remove Fixed requests in Build Workspace'),
         ('publish_schedule', 'Publish schedules'),
         ('unpublish_schedule', 'Unpublish schedules'),
     ])),
@@ -86,7 +87,7 @@ SCHEDULER_DEFAULTS = CLINICAL_DEFAULTS | {
     'manage_any_shift_posting', 'manage_user_offers_trades',
     'approve_pickups_trades', 'send_urgent_shift_notifications',
     'batch_update_published_shifts', 'manage_build_workspace',
-    'administer_requests', 'publish_schedule', 'unpublish_schedule',
+    'administer_requests', 'manage_fixed_requests', 'publish_schedule', 'unpublish_schedule',
     'manage_shift_templates',
 }
 

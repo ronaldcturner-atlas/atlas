@@ -52,6 +52,7 @@ type ShiftTemplateOption = {
 type RequestContextResponse = {
   schedule_block: ScheduleBlockSummary
   can_manage_requests: boolean
+  can_manage_fixed_requests: boolean
   is_scheduler_or_admin: boolean
   selected_physician_id: number | null
   physicians: PhysicianChoice[]
@@ -359,6 +360,8 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
 
   const canEdit = block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD'
   const isSchedulerMode = Boolean(contextData?.is_scheduler_or_admin && !forceUserView)
+  const canManageFixedRequests = Boolean(contextData?.can_manage_fixed_requests && !forceUserView)
+  const fixedRequestIsReadOnly = weight === 'FIXED' && !canManageFixedRequests
 
   const fetchContext = async (requestedPhysicianId?: number) => {
     const requestId = contextRequestId.current + 1
@@ -397,6 +400,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
         data.physicians = []
         data.requests = []
         data.visible_requests = []
+      } else if (forceUserView) {
+        data.requests = data.requests.filter((item) => item.request_scope === 'USER')
+        data.visible_requests = data.visible_requests.filter((item) => item.request_scope === 'USER')
       }
       setContextData(data)
       setSelectedPhysicianId(data.selected_physician_id ?? (data.physicians[0]?.id ?? null))
@@ -1146,14 +1152,20 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
               <button
                 type="button"
                 className={selectedScope === 'USER' ? 'active' : ''}
-                onClick={() => setSelectedScope('USER')}
+                onClick={() => {
+                  setSelectedScope('USER')
+                  if (weight === 'FIXED') setWeight('MEDIUM')
+                }}
               >
                 Edit as User
               </button>
               <button
                 type="button"
                 className={selectedScope === 'ADMIN' ? 'active' : ''}
-                onClick={() => setSelectedScope('ADMIN')}
+                onClick={() => {
+                  setSelectedScope('ADMIN')
+                  setWeight(canManageFixedRequests ? 'FIXED' : 'MEDIUM')
+                }}
               >
                 Edit as Admin
               </button>
@@ -1238,7 +1250,10 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
               <label className="facility-field">
                 <span>Weight</span>
                 <select value={weight} onChange={(event) => setWeight(event.target.value as Weight)} disabled={!canEdit}>
-                  {WEIGHTS.map((option) => (
+                  {fixedRequestIsReadOnly && <option value="FIXED">Fixed (permission required)</option>}
+                  {WEIGHTS.filter((option) => (
+                    option.value !== 'FIXED' || (selectedScope === 'ADMIN' && canManageFixedRequests)
+                  )).map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -1246,7 +1261,11 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                 </select>
               </label>
               {weight === 'FIXED' && (
-                <div className="request-existing-note">Fixed is a high-penalty preference, not a hard constraint.</div>
+                <div className="request-existing-note">
+                  {fixedRequestIsReadOnly
+                    ? 'You may view this Fixed request, but separate Fixed request permission is required to change or remove it.'
+                    : 'Fixed is a high-penalty preference, not a hard constraint.'}
+                </div>
               )}
             </>
           )}
@@ -1254,7 +1273,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
           {requestLimitMessage && <div className="facilities-error">{requestLimitMessage}</div>}
 
           <div className="request-editor-actions">
-            <button type="button" onClick={saveRequest} disabled={!canEdit || isSaving || Boolean(requestLimitMessage)}>
+            <button type="button" onClick={saveRequest} disabled={!canEdit || isSaving || Boolean(requestLimitMessage) || fixedRequestIsReadOnly}>
               {isSaving ? 'Saving...' : 'Save'}
             </button>
           </div>
@@ -1332,7 +1351,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                   const nextScope = event.target.value as RequestScope
                   setBulkScope(nextScope)
                   if (nextScope === 'ADMIN') {
-                    setBulkWeight('FIXED')
+                    setBulkWeight(canManageFixedRequests ? 'FIXED' : 'MEDIUM')
+                  } else if (bulkWeight === 'FIXED') {
+                    setBulkWeight('MEDIUM')
                   }
                 }}
                 disabled={!canEdit}
@@ -1395,7 +1416,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
             <label className="facility-field">
               <span>Weight</span>
               <select value={bulkWeight} onChange={(event) => setBulkWeight(event.target.value as Weight)} disabled={!canEdit}>
-                {WEIGHTS.map((option) => (
+                {WEIGHTS.filter((option) => (
+                  option.value !== 'FIXED' || (bulkScope === 'ADMIN' && canManageFixedRequests)
+                )).map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>

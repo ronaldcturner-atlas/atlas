@@ -2412,6 +2412,14 @@ def _can_manage_requests(user, domain=None):
     )
 
 
+def _can_manage_fixed_requests(user, domain=None):
+    return (
+        has_permission(user, 'manage_fixed_requests', domain=domain)
+        if domain is not None
+        else bool(permitted_domain_ids(user, 'manage_fixed_requests'))
+    )
+
+
 def _can_submit_own_requests(user, domain=None):
     return (
         has_permission(user, 'submit_own_requests', domain=domain)
@@ -2912,6 +2920,7 @@ def schedule_block_requests_list(request, block_id):
 def schedule_block_requests_context(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
     can_manage = _can_manage_requests(request.user, block.domain)
+    can_manage_fixed = _can_manage_fixed_requests(request.user, block.domain)
     can_submit_own = _can_submit_own_requests(request.user, block.domain)
     if not can_manage and not can_submit_own:
         return Response(
@@ -2993,6 +3002,7 @@ def schedule_block_requests_context(request, block_id):
         {
             'schedule_block': ScheduleBlockSerializer(block).data,
             'can_manage_requests': can_manage,
+            'can_manage_fixed_requests': can_manage_fixed,
             'can_submit_own_requests': can_submit_own,
             'is_scheduler_or_admin': can_manage,
             'selected_physician_id': selected_physician_id,
@@ -3019,6 +3029,7 @@ def schedule_block_request_upsert(request, block_id):
         )
 
     can_manage = _can_manage_requests(request.user, block.domain)
+    can_manage_fixed = _can_manage_fixed_requests(request.user, block.domain)
     self_physician = _resolve_self_physician(request.user)
     if not can_manage and not has_permission(request.user, 'submit_own_requests', domain=block.domain):
         return Response(
@@ -3072,14 +3083,25 @@ def schedule_block_request_upsert(request, block_id):
     if request_scope == ScheduleRequest.RequestScope.ADMIN and not can_manage:
         return Response({'detail': 'Only admin/scheduler users can create admin requests.'}, status=status.HTTP_403_FORBIDDEN)
 
+    existing_request = ScheduleRequest.objects.filter(
+        schedule_block=block,
+        physician=physician,
+        date=parsed_date,
+        request_scope=request_scope,
+    ).first()
+    if (
+        existing_request
+        and existing_request.weight == ScheduleRequest.Weight.FIXED
+        and not can_manage_fixed
+    ):
+        return Response(
+            {'detail': 'Fixed request management permission is required.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     request_type = str(request.data.get('request_type') or '').upper()
     if request_type == 'NONE':
-        deleted, _ = ScheduleRequest.objects.filter(
-            schedule_block=block,
-            physician=physician,
-            date=parsed_date,
-            request_scope=request_scope,
-        ).delete()
+        deleted, _ = ScheduleRequest.objects.filter(id=getattr(existing_request, 'id', None)).delete()
         return Response({'deleted': bool(deleted)})
 
     if not can_manage and request_type not in policy['allowed_request_types']:
@@ -3089,6 +3111,17 @@ def schedule_block_request_upsert(request, block_id):
         )
 
     weight = str(request.data.get('weight') or '').upper()
+    if weight == ScheduleRequest.Weight.FIXED:
+        if request_scope != ScheduleRequest.RequestScope.ADMIN:
+            return Response(
+                {'weight': 'Fixed priority is only available for Admin requests.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not can_manage_fixed:
+            return Response(
+                {'detail': 'Fixed request management permission is required.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
     raw_shift_template_ids = request.data.get('shift_template_ids') or []
     if not isinstance(raw_shift_template_ids, list):
@@ -3128,12 +3161,6 @@ def schedule_block_request_upsert(request, block_id):
     applicable_selected_templates = [
         template for template in available_templates if template.id in shift_template_ids
     ]
-    existing_request = ScheduleRequest.objects.filter(
-        schedule_block=block,
-        physician=physician,
-        date=parsed_date,
-        request_scope=request_scope,
-    ).first()
     limit_error = _prospective_request_limit_error(
         block,
         physician,
@@ -3204,6 +3231,15 @@ def schedule_block_request_detail(request, block_id, request_id):
     if request.method == 'GET':
         return Response(ScheduleRequestSerializer(schedule_request).data)
 
+    if (
+        schedule_request.weight == ScheduleRequest.Weight.FIXED
+        and not _can_manage_fixed_requests(request.user, block.domain)
+    ):
+        return Response(
+            {'detail': 'Fixed request management permission is required.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     if not can_manage and not can_submit_own:
         return Response(
             {'detail': 'Request submission permission is required for this Domain.'},
@@ -3253,10 +3289,19 @@ def schedule_block_clear_requests(request, block_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    deleted_count, _ = ScheduleRequest.objects.filter(
+    requests_to_delete = ScheduleRequest.objects.filter(
         schedule_block=block,
         request_scope=request_scope,
-    ).delete()
+    )
+    if (
+        requests_to_delete.filter(weight=ScheduleRequest.Weight.FIXED).exists()
+        and not _can_manage_fixed_requests(request.user, block.domain)
+    ):
+        return Response(
+            {'detail': 'Fixed request management permission is required.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    deleted_count, _ = requests_to_delete.delete()
     return Response({'deleted_count': deleted_count, 'request_scope': request_scope})
 
 
@@ -3284,6 +3329,17 @@ def schedule_block_bulk_requests(request, block_id):
         return Response({'request_type': 'Bulk action does not support NONE.'}, status=status.HTTP_400_BAD_REQUEST)
 
     weight = str(request.data.get('weight') or '').upper()
+    if weight == ScheduleRequest.Weight.FIXED:
+        if request_scope != ScheduleRequest.RequestScope.ADMIN:
+            return Response(
+                {'weight': 'Fixed priority is only available for Admin requests.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not _can_manage_fixed_requests(request.user, block.domain):
+            return Response(
+                {'detail': 'Fixed request management permission is required.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
     physician_ids = request.data.get('physician_ids') or []
     if not isinstance(physician_ids, list) or not physician_ids:
@@ -3315,6 +3371,21 @@ def schedule_block_bulk_requests(request, block_id):
         parsed_dates.append(parsed_date)
 
     parsed_dates = sorted(set(parsed_dates))
+
+    if (
+        not _can_manage_fixed_requests(request.user, block.domain)
+        and ScheduleRequest.objects.filter(
+            schedule_block=block,
+            physician_id__in=physician_ids,
+            date__in=parsed_dates,
+            request_scope=request_scope,
+            weight=ScheduleRequest.Weight.FIXED,
+        ).exists()
+    ):
+        return Response(
+            {'detail': 'Fixed request management permission is required.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     raw_shift_template_ids = request.data.get('shift_template_ids') or []
     if not isinstance(raw_shift_template_ids, list):
