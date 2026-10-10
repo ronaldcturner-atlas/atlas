@@ -459,6 +459,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
     started_at = serializers.SerializerMethodField()
     live_best_score = serializers.SerializerMethodField()
     is_published = serializers.SerializerMethodField()
+    has_pending_manual_changes = serializers.SerializerMethodField()
 
     def get_started_at(self, obj):
         try:
@@ -476,6 +477,9 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
 
     def get_is_published(self, obj):
         return obj.schedule_version.published_optimizer_run_id == obj.id
+
+    def get_has_pending_manual_changes(self, obj):
+        return bool(obj.manual_edit_snapshot)
 
     def get_created_by_name(self, obj):
         if obj.created_by is None:
@@ -518,6 +522,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'start_mode',
             'max_runtime_seconds',
             'optimization_focus',
+            'has_pending_manual_changes',
         ]
         read_only_fields = fields
 
@@ -532,6 +537,10 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
     live_best_score = serializers.SerializerMethodField()
     is_published = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
+    has_pending_manual_changes = serializers.SerializerMethodField()
+
+    def get_has_pending_manual_changes(self, obj):
+        return bool(obj.manual_edit_snapshot)
 
     def get_started_at(self, obj):
         try:
@@ -579,6 +588,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
             'optimization_focus',
             'runtime_seconds',
             'notes',
+            'has_pending_manual_changes',
         ]
         read_only_fields = fields
 

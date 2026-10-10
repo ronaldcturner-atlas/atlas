@@ -58,7 +58,11 @@ class AccountsTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         temporary_password = response.json()['temporary_password']
-        self.assertGreaterEqual(len(temporary_password), 16)
+        self.assertEqual(len(temporary_password), 8)
+        self.assertEqual(sum(not character.isalnum() for character in temporary_password), 1)
+        self.assertTrue(any(character.isupper() for character in temporary_password))
+        self.assertTrue(any(character.islower() for character in temporary_password))
+        self.assertTrue(any(character.isdigit() for character in temporary_password))
         created_user = get_user_model().objects.get(
             email='beta.tester@example.com',
         )
@@ -609,6 +613,67 @@ class AccountsTests(TestCase):
         )
         self.assertEqual(self.client.post(f'/api/physicians/{foreign_physician.id}/disable/').status_code, 403)
         self.assertEqual(self.client.post(f'/api/physicians/{foreign_physician.id}/password-reset/').status_code, 403)
+
+    def test_org_admin_can_update_own_profile_and_clinical_status(self):
+        admin = get_user_model().objects.create_user(
+            'self-admin@example.com',
+            email='self-admin@example.com',
+            first_name='Self',
+            last_name='Admin',
+            password='AdminPassword!2468',
+        )
+        physician = Physician.objects.create(user=admin, display_name='Self Admin')
+        organization = Organization.objects.create(name='Self Admin Organization')
+        region = Region.objects.create(organization=organization, name='Self Admin Region')
+        domain = Domain.objects.create(region=region, name='APP')
+        role = RoleTemplate.objects.create(
+            region=region,
+            name='APP',
+            permissions=['view_published_schedules'],
+        )
+        OrganizationMembership.objects.create(
+            organization=organization,
+            user=admin,
+            is_org_admin=True,
+        )
+        membership = DomainMembership.objects.create(
+            domain=domain,
+            user=admin,
+            role=DomainMembership.Role.APP,
+            role_template=role,
+            clinically_active=True,
+        )
+        self.client.force_login(admin)
+
+        profile_response = self.client.patch(
+            f'/api/physicians/{physician.id}/',
+            data=json.dumps({
+                'first_name': 'Self',
+                'last_name': 'Admin',
+                'display_name': 'Ron Turner',
+                'email': 'self-admin@example.com',
+                'phone_number': '',
+                'primary_facility': None,
+                'clinician_type': 'physician',
+                'fte': '1.00',
+            }),
+            content_type='application/json',
+        )
+        clinical_response = self.client.patch(
+            f'/api/domain-memberships/{membership.id}/',
+            data=json.dumps({
+                'role_template': role.id,
+                'clinically_active': False,
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(profile_response.status_code, 200)
+        self.assertEqual(clinical_response.status_code, 200)
+        physician.refresh_from_db()
+        membership.refresh_from_db()
+        self.assertEqual(physician.display_name, 'Ron Turner')
+        self.assertFalse(membership.clinically_active)
 
     def test_delegated_manager_cannot_edit_shared_user_without_every_organization(self):
         manager = get_user_model().objects.create_user('shared-user-manager', password='atlas')

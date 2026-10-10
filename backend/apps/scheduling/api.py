@@ -3390,6 +3390,73 @@ def _requested_editable_run(request, version):
     return context.viewed_run, None
 
 
+def _ensure_manual_edit_snapshot(optimizer_run):
+    """Preserve a run before its first manual assignment edit."""
+    if optimizer_run is None or optimizer_run.manual_edit_snapshot:
+        return
+    assignments = ScheduleShiftAssignment.objects.filter(
+        optimizer_run=optimizer_run,
+        shift_instance__schedule_version=optimizer_run.schedule_version,
+    ).values(
+        'shift_instance_id', 'physician_id', 'created_by_id',
+        'assignment_source', 'is_locked',
+    )
+    optimizer_run.manual_edit_snapshot = {
+        'assignments': list(assignments),
+        'locked_open_shift_instance_ids': list(
+            optimizer_run.locked_open_shift_instance_ids or []
+        ),
+        'initial_score': (
+            str(optimizer_run.initial_score)
+            if optimizer_run.initial_score is not None else None
+        ),
+        'final_score': (
+            str(optimizer_run.final_score)
+            if optimizer_run.final_score is not None else None
+        ),
+        'score_breakdown': copy.deepcopy(optimizer_run.score_breakdown or {}),
+        'optimizer_summary': copy.deepcopy(optimizer_run.optimizer_summary or {}),
+        'optimizer_debug': copy.deepcopy(optimizer_run.optimizer_debug or {}),
+        'notes': optimizer_run.notes,
+        'score_is_stale': optimizer_run.score_is_stale,
+    }
+    optimizer_run.save(update_fields=['manual_edit_snapshot'])
+
+
+def _restore_run_from_manual_edit_snapshot(optimizer_run, snapshot):
+    ScheduleShiftAssignment.objects.filter(
+        optimizer_run=optimizer_run,
+        shift_instance__schedule_version=optimizer_run.schedule_version,
+    ).delete()
+    ScheduleShiftAssignment.objects.bulk_create([
+        ScheduleShiftAssignment(
+            shift_instance_id=row['shift_instance_id'],
+            physician_id=row['physician_id'],
+            created_by_id=row.get('created_by_id'),
+            assignment_source=row['assignment_source'],
+            optimizer_run=optimizer_run,
+            is_locked=bool(row.get('is_locked', False)),
+        )
+        for row in snapshot.get('assignments', [])
+    ])
+    optimizer_run.initial_score = snapshot.get('initial_score')
+    optimizer_run.final_score = snapshot.get('final_score')
+    optimizer_run.score_breakdown = snapshot.get('score_breakdown', {})
+    optimizer_run.optimizer_summary = snapshot.get('optimizer_summary', {})
+    optimizer_run.optimizer_debug = snapshot.get('optimizer_debug', {})
+    optimizer_run.notes = snapshot.get('notes', '')
+    optimizer_run.score_is_stale = bool(snapshot.get('score_is_stale', False))
+    optimizer_run.locked_open_shift_instance_ids = snapshot.get(
+        'locked_open_shift_instance_ids', []
+    )
+    optimizer_run.manual_edit_snapshot = {}
+    optimizer_run.save(update_fields=[
+        'initial_score', 'final_score', 'score_breakdown', 'optimizer_summary',
+        'optimizer_debug', 'notes', 'score_is_stale',
+        'locked_open_shift_instance_ids', 'manual_edit_snapshot',
+    ])
+
+
 def _set_active_run_locked_open(instance, is_locked_open):
     active_run = _active_optimizer_run(instance.schedule_version)
     if active_run is None:
@@ -4472,6 +4539,158 @@ def optimizer_run_save_copy(request, run_id):
     return Response(OptimizerRunSerializer(copied).data, status=status.HTTP_201_CREATED)
 
 
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def optimizer_run_save_manual_changes(request, run_id):
+    optimizer_run = get_object_or_404(
+        OptimizerRun.objects.select_related(
+            'schedule_version__schedule_block', 'schedule_version__domain'
+        ),
+        id=run_id,
+        status=OptimizerRun.Status.COMPLETED,
+    )
+    version = optimizer_run.schedule_version
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
+    if (
+        version.status != ScheduleVersion.Status.BUILD
+        or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
+    ):
+        return Response(
+            {'detail': 'Manual changes can only be saved while the schedule is in BUILD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not optimizer_run.is_active or not optimizer_run.manual_edit_snapshot:
+        return Response(
+            {'detail': 'This run has no unsaved manual changes.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    preflight_response = _optimizer_preflight_response(
+        version, OptimizerRun.StartMode.CURRENT_SCHEDULE, optimizer_run,
+    )
+    if preflight_response is not None:
+        return preflight_response
+    summary, report = recalculate_schedule_version_score(version, optimizer_run)
+    optimizer_run.refresh_from_db()
+    optimizer_run.manual_edit_snapshot = {}
+    optimizer_run.save(update_fields=['manual_edit_snapshot'])
+    return Response({
+        'optimizer_summary': summary,
+        'optimizer_run': OptimizerRunSerializer(optimizer_run).data,
+        'violation_report': report,
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def optimizer_run_save_manual_changes_as_new(request, run_id):
+    source = get_object_or_404(
+        OptimizerRun.objects.select_related(
+            'schedule_version__schedule_block', 'schedule_version__domain'
+        ),
+        id=run_id,
+        status=OptimizerRun.Status.COMPLETED,
+    )
+    version = source.schedule_version
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
+    if (
+        version.status != ScheduleVersion.Status.BUILD
+        or version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
+    ):
+        return Response(
+            {'detail': 'Manual changes can only be saved while the schedule is in BUILD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not source.is_active or not source.manual_edit_snapshot:
+        return Response(
+            {'detail': 'This run has no unsaved manual changes.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    preflight_response = _optimizer_preflight_response(
+        version, OptimizerRun.StartMode.CURRENT_SCHEDULE, source,
+    )
+    if preflight_response is not None:
+        return preflight_response
+
+    with transaction.atomic():
+        version = ScheduleVersion.objects.select_for_update().get(id=version.id)
+        source = OptimizerRun.objects.select_for_update().get(id=source.id)
+        snapshot = copy.deepcopy(source.manual_edit_snapshot)
+        if not source.is_active or not snapshot:
+            return Response(
+                {'detail': 'This run has no unsaved manual changes.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        edited_assignments = list(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=source,
+                shift_instance__schedule_version=version,
+            ).values(
+                'shift_instance_id', 'physician_id', 'created_by_id',
+                'assignment_source', 'is_locked',
+            )
+        )
+        edited_locked_open_ids = list(source.locked_open_shift_instance_ids or [])
+        latest_number = (
+            OptimizerRun.objects.filter(schedule_version=version)
+            .order_by('-run_number')
+            .values_list('run_number', flat=True)
+            .first() or 0
+        )
+        source.is_active = False
+        source.save(update_fields=['is_active'])
+        saved = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=latest_number + 1,
+            created_by=request.user,
+            status=OptimizerRun.Status.COMPLETED,
+            seed=source.seed,
+            initial_score=source.initial_score,
+            final_score=source.final_score,
+            score_breakdown=copy.deepcopy(source.score_breakdown or {}),
+            optimizer_summary=copy.deepcopy(source.optimizer_summary or {}),
+            optimizer_debug=copy.deepcopy(source.optimizer_debug or {}),
+            notes=f'Manual changes saved from Run {source.run_number}',
+            is_active=True,
+            score_is_stale=True,
+            copied_from_run=source,
+            run_kind='COPY',
+            locked_open_shift_instance_ids=edited_locked_open_ids,
+            start_mode=source.start_mode,
+            optimization_focus=source.optimization_focus,
+        )
+        ScheduleShiftAssignment.objects.bulk_create([
+            ScheduleShiftAssignment(
+                shift_instance_id=row['shift_instance_id'],
+                physician_id=row['physician_id'],
+                created_by_id=row.get('created_by_id'),
+                assignment_source=row['assignment_source'],
+                optimizer_run=saved,
+                is_locked=bool(row.get('is_locked', False)),
+            )
+            for row in edited_assignments
+        ])
+        _restore_run_from_manual_edit_snapshot(source, snapshot)
+        ScheduleShiftInstance.objects.filter(schedule_version=version).update(
+            is_locked_open=False
+        )
+        ScheduleShiftInstance.objects.filter(
+            schedule_version=version,
+            id__in=edited_locked_open_ids,
+        ).update(is_locked_open=True)
+        summary, report = recalculate_schedule_version_score(version, saved)
+
+    saved.refresh_from_db()
+    return Response({
+        'optimizer_summary': summary,
+        'optimizer_run': OptimizerRunSerializer(saved).data,
+        'violation_report': report,
+    }, status=status.HTTP_201_CREATED)
+
+
 @api_view(['GET', 'DELETE'])
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -5236,6 +5455,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
         with transaction.atomic():
             locked_instance = ScheduleShiftInstance.objects.select_for_update().get(id=shift_instance.id)
             active_run = _active_optimizer_run(locked_instance.schedule_version)
+            _ensure_manual_edit_snapshot(active_run)
             locked_instance.assignments.filter(visible_assignment_filter(active_run)).delete()
             locked_instance.is_locked_open = bool(request.data.get('is_locked_open', False))
             locked_instance.save(update_fields=['is_locked_open', 'updated_at'])
@@ -5302,6 +5522,7 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        _ensure_manual_edit_snapshot(active_run)
         ScheduleShiftAssignment.objects.create(
             shift_instance=locked_instance,
             physician=physician,
@@ -5396,6 +5617,7 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
                     {'physician_id': _overlapping_assignment_message(physician, overlapping_assignment)},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            _ensure_manual_edit_snapshot(active_run)
             locked_assignment.physician = physician
             locked_assignment.assignment_source = ScheduleShiftAssignment.AssignmentSource.MANUAL
             locked_assignment.optimizer_run = active_run
@@ -5408,9 +5630,11 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
                 _set_active_run_locked_open(shift_instance, False)
             _mark_schedule_score_stale(shift_instance.schedule_version, viewed_run)
         return Response(_assignment_context_payload(shift_instance))
-    assignment.delete()
-    _sync_shift_instance_status(shift_instance)
-    _mark_schedule_score_stale(shift_instance.schedule_version, viewed_run)
+    with transaction.atomic():
+        _ensure_manual_edit_snapshot(viewed_run)
+        assignment.delete()
+        _sync_shift_instance_status(shift_instance)
+        _mark_schedule_score_stale(shift_instance.schedule_version, viewed_run)
     return Response(_assignment_context_payload(shift_instance))
 
 
@@ -5448,6 +5672,8 @@ def schedule_version_unlock_physician_assignments(request, version_id, physician
             physician=physician,
             is_locked=True,
         )
+        if locked_assignments.exists():
+            _ensure_manual_edit_snapshot(viewed_run)
         unlocked_count = locked_assignments.update(
             is_locked=False,
             updated_at=timezone.now(),

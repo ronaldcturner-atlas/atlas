@@ -5755,6 +5755,99 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             copied_before_optimize,
         )
 
+    def test_manual_changes_can_replace_current_run_or_save_as_new_run(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id}, format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        physicians = [
+            self._create_assignment_physician(
+                f'manualsave{index}@example.com', f'Manual Save {index}',
+                facilities=[self.facility],
+            )
+            for index in range(4)
+        ]
+        optimized = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/', format='json',
+        )
+        self.assertEqual(optimized.status_code, 200)
+        source = OptimizerRun.objects.get(id=optimized.json()['optimizer_run_id'])
+        day = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
+        assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/shift-instances/'
+            f'{day.id}/assignments/'
+        )
+        original = ScheduleShiftAssignment.objects.filter(
+            optimizer_run=source, shift_instance=day,
+        ).order_by('id').first()
+        original_physician_id = original.physician_id
+        used_ids = set(ScheduleShiftAssignment.objects.filter(
+            optimizer_run=source, shift_instance=day,
+        ).values_list('physician_id', flat=True))
+        replacement = next(row for row in physicians if row.id not in used_ids)
+
+        edited = self.client.patch(
+            f'{assignment_url}{original.id}/',
+            data={'physician_id': replacement.id, 'is_locked': original.is_locked},
+            format='json',
+        )
+        self.assertEqual(edited.status_code, 200)
+        source.refresh_from_db()
+        self.assertTrue(source.manual_edit_snapshot)
+        history = self.client.get(
+            f'/api/schedule-versions/{version.id}/optimizer-runs/'
+        )
+        self.assertTrue(history.json()[0]['has_pending_manual_changes'])
+
+        saved_response = self.client.post(
+            f'/api/optimizer-runs/{source.id}/save-manual-changes-as-new/',
+            format='json',
+        )
+        self.assertEqual(saved_response.status_code, 201)
+        saved = OptimizerRun.objects.get(
+            id=saved_response.json()['optimizer_run']['id']
+        )
+        source.refresh_from_db()
+        self.assertEqual(saved.run_number, source.run_number + 1)
+        self.assertTrue(saved.is_active)
+        self.assertFalse(source.is_active)
+        self.assertFalse(source.manual_edit_snapshot)
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(
+            optimizer_run=source,
+            shift_instance=day,
+            physician_id=original_physician_id,
+        ).exists())
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(
+            optimizer_run=saved,
+            shift_instance=day,
+            physician=replacement,
+        ).exists())
+
+        saved_assignment = ScheduleShiftAssignment.objects.filter(
+            optimizer_run=saved, shift_instance=day,
+        ).order_by('id').first()
+        current_save_edit = self.client.patch(
+            f'{assignment_url}{saved_assignment.id}/',
+            data={
+                'physician_id': saved_assignment.physician_id,
+                'is_locked': not saved_assignment.is_locked,
+            },
+            format='json',
+        )
+        self.assertEqual(current_save_edit.status_code, 200)
+        current_save = self.client.post(
+            f'/api/optimizer-runs/{saved.id}/save-manual-changes/',
+            format='json',
+        )
+        self.assertEqual(current_save.status_code, 200)
+        saved.refresh_from_db()
+        self.assertFalse(saved.manual_edit_snapshot)
+        self.assertFalse(saved.score_is_stale)
+        self.assertEqual(
+            OptimizerRun.objects.filter(schedule_version=version).count(), 2,
+        )
+
     def test_optimizer_start_modes_create_new_runs_and_preserve_viewed_source(self):
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',

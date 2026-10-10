@@ -391,6 +391,7 @@ class OptimizerRun(models.Model):
     score_breakdown = models.JSONField(default=dict, blank=True)
     optimizer_summary = models.JSONField(default=dict, blank=True)
     optimizer_debug = models.JSONField(default=dict, blank=True)
+    manual_edit_snapshot = models.JSONField(default=dict, blank=True)
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=False)
     score_is_stale = models.BooleanField(default=False)

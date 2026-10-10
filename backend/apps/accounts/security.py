@@ -7,18 +7,19 @@ from django.utils import timezone
 from .models import AccountSecurityState
 
 
-TEMPORARY_PASSWORD_LENGTH = 18
+TEMPORARY_PASSWORD_LENGTH = 8
+TEMPORARY_PASSWORD_SPECIAL_CHARACTERS = '!@#$%^&*'
 
 
 def generate_temporary_password():
-    """Return a strong random password containing every common character class."""
+    """Return an eight-character temporary password with one special character."""
     required = [
         secrets.choice(string.ascii_uppercase),
         secrets.choice(string.ascii_lowercase),
         secrets.choice(string.digits),
-        secrets.choice('!@#$%^&*-_=+'),
+        secrets.choice(TEMPORARY_PASSWORD_SPECIAL_CHARACTERS),
     ]
-    alphabet = string.ascii_letters + string.digits + '!@#$%^&*-_=+'
+    alphabet = string.ascii_letters + string.digits
     required.extend(
         secrets.choice(alphabet)
         for _ in range(TEMPORARY_PASSWORD_LENGTH - len(required))

@@ -562,6 +562,13 @@ def physician_detail(request, physician_id):
         domain_id__in=permitted_domain_ids(request.user, 'edit_user_profiles'),
     ).select_related('domain__region')
     is_self = request.user.id == physician.user_id
+    can_administer_profile = bool(
+        has_global_access
+        or (
+            target_organization_ids
+            and target_organization_ids.issubset(administered_organization_ids)
+        )
+    )
     editable_organization_ids = administered_organization_ids | set(
         shared_domains.values_list(
             'domain__region__organization_id', flat=True,
@@ -583,7 +590,7 @@ def physician_detail(request, physician_id):
             ),
         }, status=status.HTTP_403_FORBIDDEN)
     serializer_data = request.data.copy()
-    if is_self:
+    if is_self and not can_administer_profile:
         allowed_fields = {'first_name', 'last_name', 'email', 'phone_number'}
         disallowed = set(serializer_data) - allowed_fields
         if disallowed:

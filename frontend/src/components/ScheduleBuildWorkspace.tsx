@@ -216,6 +216,7 @@ type OptimizerRun = {
   optimizer_summary?: OptimizerSummary
   optimizer_debug?: OptimizerSummary['debug']
   notes?: string | null
+  has_pending_manual_changes: boolean
 }
 
 type CalendarViolation = {
@@ -798,7 +799,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [optimizerMaxRuntimeMinutes, setOptimizerMaxRuntimeMinutes] = useState(storedOptimizerRuntimeMinutes)
   const [optimizerFocus, setOptimizerFocus] = useState<'STANDARD' | 'DISTRIBUTION'>('STANDARD')
   const [isRecalculatingScore, setIsRecalculatingScore] = useState(false)
-  const [isSavingCopy, setIsSavingCopy] = useState(false)
+  const [manualSaveAction, setManualSaveAction] = useState<'current' | 'new' | null>(null)
   const [isPreviewingRunId, setIsPreviewingRunId] = useState<number | null>(null)
   const [isPublishingRunId, setIsPublishingRunId] = useState<number | null>(null)
   const [isMovingBackToBuild, setIsMovingBackToBuild] = useState(false)
@@ -1229,8 +1230,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
   const runDeleteProtectionReason = (run: OptimizerRun) => {
     if (run.is_published) return 'Unpublish this Schedule Block before changing its published run.'
-    if (run.is_active) return 'Activate another run before deleting the active run.'
-    if (run.id === viewedOptimizerRunId) return 'View another run before deleting this run.'
+    if (run.is_active) return 'Select another run before deleting the active run.'
+    if (run.id === viewedOptimizerRunId) return 'Select another run before deleting this run.'
     if (run.status === 'RUNNING') return 'Running optimizer runs cannot be deleted.'
     if (optimizerCapacity.protected_source_run_ids.includes(run.id)) {
       return 'This run is the starting schedule for an optimizer currently in progress.'
@@ -1283,42 +1284,38 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     if (!isCompletedOptimizerRun(run)) {
       return
     }
-    try {
-      closeAssignments()
-      setSelectedOptimizerRunId(run.id)
-      updateOptimizerRunUrl(run.id)
-      setError(null)
-      setNotice(null)
-      await fetchContext(run.schedule_version, { optimizerRunId: run.id, quiet: true })
-      setNotice(`Viewing Run ${run.run_number}.`)
-    } catch (viewError) {
-      setError(viewError instanceof Error ? viewError.message : 'Unable to view optimizer run.')
-    }
-  }
-
-  const activateOptimizerRun = async (runId: number) => {
-    const versionId = context?.selected_version?.id
-    if (!versionId) {
+    if (
+      selectedRunForActions?.has_pending_manual_changes
+      && selectedRunForActions.id !== run.id
+    ) {
+      setError('Save the manual changes to the current run before selecting another run.')
       return
     }
     try {
       closeAssignments()
       setError(null)
       setNotice(null)
-      const response = await fetch(`${API_BASE}/optimizer-runs/${runId}/activate/`, {
-        method: 'POST',
-        credentials: 'include',
-      })
-      const data = await response.json().catch(() => null)
-      if (!response.ok) {
-        throw new Error(apiError(data, 'Unable to activate optimizer run.'))
+      if (
+        context?.schedule_block.build_status === 'BUILD'
+        && context.selected_version?.status === 'BUILD'
+        && context.can_manage_build_workspace
+        && !run.is_active
+      ) {
+        const response = await fetch(`${API_BASE}/optimizer-runs/${run.id}/activate/`, {
+          method: 'POST',
+          credentials: 'include',
+        })
+        const data = await response.json().catch(() => null)
+        if (!response.ok) {
+          throw new Error(apiError(data, 'Unable to select optimizer run.'))
+        }
       }
-      setNotice(`Run ${(data as OptimizerRun).run_number} is active.`)
-      setSelectedOptimizerRunId(runId)
-      updateOptimizerRunUrl(runId)
-      await fetchContext(versionId, { optimizerRunId: runId, quiet: true })
-    } catch (activateError) {
-      setError(activateError instanceof Error ? activateError.message : 'Unable to activate optimizer run.')
+      setSelectedOptimizerRunId(run.id)
+      updateOptimizerRunUrl(run.id)
+      await fetchContext(run.schedule_version, { optimizerRunId: run.id, quiet: true })
+      setNotice(`Run ${run.run_number} selected.`)
+    } catch (viewError) {
+      setError(viewError instanceof Error ? viewError.message : 'Unable to select optimizer run.')
     }
   }
 
@@ -1809,6 +1806,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       return
     }
     const viewedRun = context.selected_optimizer_run ?? null
+    if (viewedRun?.has_pending_manual_changes) {
+      setError('Save the manual changes to the selected run before starting the optimizer.')
+      return
+    }
     const sourceRun = (context.optimizer_runs ?? []).find(
       (run) => run.id === optimizerSourceRunId && isCompletedOptimizerRun(run),
     ) ?? null
@@ -1950,32 +1951,39 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
-  const saveRunCopy = async () => {
+  const saveManualChanges = async (mode: 'current' | 'new') => {
     const source = selectedRunForActions
     if (!source) return
     try {
-      setIsSavingCopy(true)
+      setManualSaveAction(mode)
       setError(null)
       setNotice(null)
-      const response = await fetch(`${API_BASE}/optimizer-runs/${source.id}/save-copy/`, {
+      const endpoint = mode === 'new'
+        ? 'save-manual-changes-as-new'
+        : 'save-manual-changes'
+      const response = await fetch(`${API_BASE}/optimizer-runs/${source.id}/${endpoint}/`, {
         method: 'POST', credentials: 'include',
       })
       const data = await response.json().catch(() => null)
-      if (!response.ok) throw new Error(apiError(data, 'Unable to save a copy of this run.'))
-      const copied = data as OptimizerRun
-      setSelectedOptimizerRunId(copied.id)
-      updateOptimizerRunUrl(copied.id)
-      await fetchContext(copied.schedule_version, { optimizerRunId: copied.id, quiet: true })
-      setNotice(`Viewing Run ${copied.run_number} — Copy of Run ${source.run_number}.`)
-    } catch (copyError) {
-      setError(copyError instanceof Error ? copyError.message : 'Unable to save a copy of this run.')
+      if (!response.ok) throw new Error(apiError(data, 'Unable to save manual changes.'))
+      const saved = data.optimizer_run as OptimizerRun
+      setSelectedOptimizerRunId(saved.id)
+      updateOptimizerRunUrl(saved.id)
+      await fetchContext(saved.schedule_version, { optimizerRunId: saved.id, quiet: true })
+      setNotice(
+        mode === 'new'
+          ? `Manual changes saved as Run ${saved.run_number}; Run ${source.run_number} remains unchanged.`
+          : `Manual changes and the recalculated score were saved to Run ${saved.run_number}.`,
+      )
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Unable to save manual changes.')
     } finally {
-      setIsSavingCopy(false)
+      setManualSaveAction(null)
     }
   }
 
   const clearScheduleAssignments = async (clearType: 'optimizer' | 'all') => {
-    const versionId = context.selected_version?.id
+    const versionId = context?.selected_version?.id
     if (!versionId) {
       setError('Select a BUILD Schedule Version before clearing assignments.')
       return
@@ -2322,15 +2330,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const canManageRunActions = context.can_manage_build_workspace
     && context.schedule_block.build_status === 'BUILD'
     && context.selected_version?.status === 'BUILD'
-  const selectedRunCanCopy = context.run_state
-    ? context.run_state.viewed_run_can_copy
-    : Boolean(selectedRunForActions && isCompletedOptimizerRun(selectedRunForActions))
-  const selectedRunCanActivate = context.run_state
-    ? context.run_state.viewed_run_can_activate
-    : Boolean(selectedRunForActions && !selectedRunForActions.is_active)
-  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || isSavingCopy || isPreviewingRunId !== null || isPublishingRunId !== null || isMovingBackToBuild || isApplyingWorkloadAdjustment || isUnlockingPhysicianShifts || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isBuildMutationBusy = isGenerating || isLaunchingOptimizer || isRecalculatingScore || manualSaveAction !== null || isPreviewingRunId !== null || isPublishingRunId !== null || isMovingBackToBuild || isApplyingWorkloadAdjustment || isUnlockingPhysicianShifts || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const isMutatingBuild = isBuildMutationBusy || isOptimizing
-  const isRunDeletionBusy = isGenerating || isRecalculatingScore || isSavingCopy || isPreviewingRunId !== null || isPublishingRunId !== null || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
+  const isRunDeletionBusy = isGenerating || isRecalculatingScore || manualSaveAction !== null || isPreviewingRunId !== null || isPublishingRunId !== null || isMovingBackToBuild || isApplyingWorkloadAdjustment || clearingAction !== null || deletingRunId !== null || isBulkDeletingRuns
   const nightFeasibility = context?.workload_feasibility?.night_feasibility
   const requestOffFeasibility = context?.workload_feasibility?.request_off_feasibility
   const weekendFeasibility = context?.workload_feasibility?.weekend_feasibility
@@ -2578,7 +2580,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               type="button"
               className="primary-action"
               onClick={runOptimizer}
-              disabled={!canOptimize || !canOptimizeBuild || isBuildMutationBusy || isOptimizerPreflightLoading || Boolean(optimizerPreflight?.has_conflicts) || optimizerCapacity.available_slots < 1}
+              disabled={!canOptimize || !canOptimizeBuild || isBuildMutationBusy || isOptimizerPreflightLoading || Boolean(optimizerPreflight?.has_conflicts) || Boolean(selectedRunForActions?.has_pending_manual_changes) || optimizerCapacity.available_slots < 1}
             >
               {isLaunchingOptimizer
                 ? 'Starting...'
@@ -2600,7 +2602,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
             type="button"
             className="secondary"
             onClick={() => void recalculateScore()}
-            disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild || isOptimizerPreflightLoading || Boolean(optimizerPreflight?.has_conflicts)}
+            disabled={!selectedRunForActions || !canEditAssignments || isMutatingBuild || isOptimizerPreflightLoading || Boolean(optimizerPreflight?.has_conflicts) || selectedRunForActions.has_pending_manual_changes}
           >
             {isRecalculatingScore ? 'Recalculating...' : 'Recalculate Score'}
           </button>
@@ -3049,7 +3051,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           {selectedRunForActions && completedOptimizerRuns.length > 0 && (
             <div className="optimizer-run-selector-main">
               <label className="facility-field optimizer-run-select">
-                <span>Viewing optimizer run</span>
+                <span>Selected optimizer run</span>
                 <select
                   value={selectedRunForActions.id}
                   onChange={(event) => {
@@ -3073,9 +3075,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     type="button"
                     className="primary-action"
                     onClick={() => void previewOptimizerRun(selectedRunForActions)}
-                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions)}
+                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions) || selectedRunForActions.has_pending_manual_changes}
                   >
-                    {isPreviewingRunId === selectedRunForActions.id ? 'Opening Preview...' : `Preview Run ${selectedRunForActions.run_number}`}
+                    {isPreviewingRunId === selectedRunForActions.id ? 'Changing status...' : 'Change status to Preview'}
                   </button>
                 )}
                 {context.schedule_block.build_status === 'PREVIEW'
@@ -3095,22 +3097,26 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     Previewing Run {context.schedule_block.preview_run_number ?? '-'}
                   </button>
                 )}
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => void saveRunCopy()}
-                  disabled={!canManageRunActions || !selectedRunCanCopy || isMutatingBuild}
-                >
-                  {isSavingCopy ? 'Saving...' : 'Save Copy'}
-                </button>
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => void activateOptimizerRun(selectedRunForActions.id)}
-                  disabled={!canManageRunActions || !selectedRunCanActivate || isMutatingBuild}
-                >
-                  Activate
-                </button>
+                {selectedRunForActions.has_pending_manual_changes && (
+                  <>
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void saveManualChanges('new')}
+                      disabled={!canManageRunActions || isMutatingBuild}
+                    >
+                      {manualSaveAction === 'new' ? 'Saving...' : 'Save as New Run'}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void saveManualChanges('current')}
+                      disabled={!canManageRunActions || isMutatingBuild}
+                    >
+                      {manualSaveAction === 'current' ? 'Saving...' : 'Save Current Run'}
+                    </button>
+                  </>
+                )}
                 {context.schedule_block.published_at && !selectedRunForActions.is_published ? (
                   <button type="button" className="secondary" disabled title="Only the frozen published-run report is available for a published schedule.">
                     Violations
@@ -3221,15 +3227,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       onClick={() => void selectOptimizerRun(run)}
                       disabled={isMutatingBuild || !isCompletedOptimizerRun(run) || selectedOptimizerRunId === run.id}
                     >
-                      View
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary"
-                      onClick={() => void activateOptimizerRun(run.id)}
-                      disabled={!canManageRunActions || isMutatingBuild || !isCompletedOptimizerRun(run) || run.is_active}
-                    >
-                      Activate
+                      Select
                     </button>
                     {isCompletedOptimizerRun(run) && (!context.schedule_block.published_at || run.is_published) ? (
                       <Link
