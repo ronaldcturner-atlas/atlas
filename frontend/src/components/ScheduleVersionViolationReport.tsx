@@ -389,7 +389,8 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
     (filter) => filter.key === activePenaltyFilter,
   )?.label ?? 'Total score'
   const visibleRuleSummary = report.rule_summary.filter((row) => (
-    row.score_component !== 'coverage_score'
+    row.total_penalty > 0
+    && row.score_component !== 'coverage_score'
     && row.score_component !== 'overlap_score'
   ))
   return (

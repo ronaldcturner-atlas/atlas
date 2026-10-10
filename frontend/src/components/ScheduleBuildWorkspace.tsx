@@ -3395,14 +3395,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <strong>{optimizerSummary.night_violations_count ?? 0}</strong>
               </div>
               <div>
-                <span>Total night shifts</span>
-                <strong>{optimizerSummary.total_night_shifts ?? 0}</strong>
-              </div>
-              <div>
-                <span>Max nights assigned</span>
-                <strong>{optimizerSummary.max_nights_assigned_to_one_physician ?? 0}</strong>
-              </div>
-              <div>
                 <span>Night fixes kept</span>
                 <strong>{optimizerSummary.night_fix_improvements ?? 0}</strong>
               </div>
