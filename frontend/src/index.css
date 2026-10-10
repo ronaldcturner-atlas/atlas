@@ -72,6 +72,10 @@ select option:checked{
 .main-area{width:calc(100% - 250px);min-width:0;margin-left:250px;display:flex;flex-direction:column;transition:width .2s ease,margin-left .2s ease}
 .sidebar.sidebar-collapsed + .main-area{width:calc(100% - 76px);margin-left:76px}
 .topbar{height:64px;background:#202d41;display:flex;align-items:center;padding:0 20px;border-bottom:1px solid var(--border)}
+.topbar-spacer{flex:1}
+.topbar-actions{display:flex;align-items:center;gap:12px}
+.topbar-compact{flex:1;min-width:0;height:auto;padding:0;border:0;background:transparent}
+.topbar-compact .topbar-actions{width:100%;justify-content:flex-end}
 .view-mode-toggle{display:flex;padding:3px;border:1px solid rgba(255,255,255,.15);border-radius:9px;background:rgba(0,0,0,.16)}
 .view-mode-toggle button{padding:6px 10px;border:0;border-radius:6px;background:transparent;color:#cbd5e1;font-size:12px;font-weight:700;cursor:pointer}
 .view-mode-toggle button.active{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(79,70,229,.28)}
@@ -82,7 +86,11 @@ select option:checked{
 .user-request-button-closed,.user-request-button:disabled{border:1px solid #475569;background:#293548;color:#94a3b8;box-shadow:none;cursor:not-allowed;opacity:.72}
 .content{padding:20px}
 .page-title{margin:0 0 16px 0;font-size:20px}
+.schedule-page-content{padding-top:0}
+.schedule-page-heading{position:sticky;top:0;z-index:35;display:flex;align-items:center;gap:20px;min-height:52px;background:var(--app-bg)}
+.schedule-page-heading .page-title{flex:0 0 auto;margin:0}
 .calendar-card{background:var(--surface);padding:16px;border-radius:8px;min-height:520px}
+.calendar-sticky-controls{position:sticky;top:52px;z-index:30;padding-top:1px;background:var(--surface);box-shadow:0 8px 12px -12px rgba(0,0,0,.8)}
 .schedule-scope-toolbar{display:flex;align-items:flex-end;gap:12px;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.09)}
 .schedule-scope-field{display:grid;gap:4px;min-width:min(280px,100%);color:var(--muted);font-size:11px}
 .schedule-scope-field>strong{display:flex;align-items:center;min-height:34px;color:var(--sidebar-fg);font-size:13px}

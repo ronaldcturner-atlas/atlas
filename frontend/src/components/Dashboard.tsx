@@ -162,13 +162,27 @@ export default function Dashboard() {
         canManageContracts={canManageContracts}
       />
       <div className="main-area">
-        <Topbar
-          canSwitchView={canManageSchedules}
-          userView={effectiveUserView}
-          onUserViewChange={changeUserView}
-        />
-        <main className="content">
-          <h1 className="page-title">{pageTitle}</h1>
+        {activeView !== 'my-schedule' && (
+          <Topbar
+            canSwitchView={canManageSchedules}
+            userView={effectiveUserView}
+            onUserViewChange={changeUserView}
+          />
+        )}
+        <main className={`content${activeView === 'my-schedule' ? ' schedule-page-content' : ''}`}>
+          {activeView === 'my-schedule' ? (
+            <div className="schedule-page-heading">
+              <h1 className="page-title">{pageTitle}</h1>
+              <Topbar
+                compact
+                canSwitchView={canManageSchedules}
+                userView={effectiveUserView}
+                onUserViewChange={changeUserView}
+              />
+            </div>
+          ) : (
+            <h1 className="page-title">{pageTitle}</h1>
+          )}
           {activeView === 'my-schedule' && <Calendar shiftsRefreshToken={shiftsRefreshToken} forceUserView={effectiveUserView} />}
           {activeView === 'stats' && <StatsView limitedToHours={effectiveUserView} />}
           {!effectiveUserView && canManageShiftTemplates && activeView === 'shift-builder' && <ShiftsView />}

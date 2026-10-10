@@ -832,6 +832,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
 
   return (
     <div className="calendar-card">
+      <div className="calendar-sticky-controls">
       <div className="schedule-scope-toolbar">
         <div className="schedule-scope-field">
           <span>Region</span>
@@ -1015,6 +1016,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         {['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map((weekday) => (
           <span key={weekday}>{weekday}</span>
         ))}
+      </div>
       </div>
       <div className="grid">
         {days.map((day) => (

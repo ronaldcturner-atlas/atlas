@@ -43,6 +43,12 @@ describe('desktop calendar controls', () => {
     expect(calendarSource).toContain('isVisibleInAvailableShifts')
     expect(calendarStyles).toMatch(/\.schedule-view-button:hover,\.schedule-view-button\.selected/)
   })
+
+  it('keeps the Schedule controls and weekday labels visible while scrolling', () => {
+    expect(calendarSource).toContain('calendar-sticky-controls')
+    expect(calendarStyles).toMatch(/\.calendar-sticky-controls\{[^}]*position:sticky;[^}]*top:52px;/)
+    expect(calendarStyles).toMatch(/\.schedule-page-heading\{[^}]*position:sticky;[^}]*top:0;/)
+  })
 })
 
 describe('calendar highlight styling', () => {

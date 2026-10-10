@@ -6,9 +6,10 @@ type TopbarProps = {
   canSwitchView: boolean
   userView: boolean
   onUserViewChange: (userView: boolean) => void
+  compact?: boolean
 }
 
-export default function Topbar({ canSwitchView, userView, onUserViewChange }: TopbarProps) {
+export default function Topbar({ canSwitchView, userView, onUserViewChange, compact = false }: TopbarProps) {
   const { user, logout, isLoading, checkAuth } = useAuth()
   const [showAccessTester, setShowAccessTester] = React.useState(false)
   const [testOptions, setTestOptions] = React.useState<{ domains: Array<{ id: number; name: string; region_id: number; region_name: string; organization_name: string }>; roles: Array<{ id: number; name: string; region_id: number }> } | null>(null)
@@ -85,9 +86,9 @@ export default function Topbar({ canSwitchView, userView, onUserViewChange }: To
   }
 
   return (
-    <header className="topbar">
-      <div style={{ flex: 1 }} />
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+    <header className={`topbar${compact ? ' topbar-compact' : ''}`}>
+      {!compact && <div className="topbar-spacer" />}
+      <div className="topbar-actions">
         {user && (
           <>
             {user.test_access ? (
