@@ -60,9 +60,11 @@ type RequestContextResponse = {
   shift_templates: ShiftTemplateOption[]
   request_policy: RequestPolicy | null
   request_counters: Record<RequestCounterKey, RequestCounter>
+  request_totals?: Record<RequestScope, Record<RequestTotalKey, number>>
 }
 
 type RequestCounterKey = 'HIGH' | 'MEDIUM' | 'LOW' | 'WEEKEND'
+type RequestTotalKey = Weight | 'WEEKEND'
 
 type RequestCounter = {
   used: number
@@ -472,6 +474,10 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
 
     for (const requests of map.values()) {
       requests.sort((left, right) => {
+        const scopeDifference = (left.request_scope === 'USER' ? 0 : 1) - (right.request_scope === 'USER' ? 0 : 1)
+        if (scopeDifference !== 0) {
+          return scopeDifference
+        }
         const weightDifference = WEIGHT_SORT_ORDER[left.weight] - WEIGHT_SORT_ORDER[right.weight]
         if (weightDifference !== 0) {
           return weightDifference
@@ -998,6 +1004,24 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
           )
         })}
       </div>
+
+      {isSchedulerMode && (
+        <section className="request-total-summary" aria-label="Schedule Block request totals">
+          <h3>Schedule Block Request Totals</h3>
+          {(['USER', 'ADMIN'] as RequestScope[]).map((scope) => (
+            <div className="request-total-row" key={scope}>
+              <strong>{scope === 'USER' ? 'User requests' : 'Admin requests'}</strong>
+              {(['FIXED', 'HIGH', 'MEDIUM', 'LOW', 'WEEKEND'] as RequestTotalKey[]).map((key) => (
+                <div className="request-total-card" key={key}>
+                  <span>{key.charAt(0)}{key.slice(1).toLowerCase()}</span>
+                  <b>{contextData.request_totals?.[scope]?.[key] ?? 0}</b>
+                </div>
+              ))}
+            </div>
+          ))}
+          <small>Weekend totals include every designated weekend request, regardless of priority.</small>
+        </section>
+      )}
 
       <div className="request-builder-toolbar">
         <div className="request-builder-physician">

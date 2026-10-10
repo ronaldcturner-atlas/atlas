@@ -2698,6 +2698,59 @@ def _build_request_counters(block, physician, policy, exclude_request_ids=None):
     }
 
 
+def _build_schedule_block_request_totals(block, requests):
+    """Summarize User and Admin requests without conflating priority and weekend use."""
+    request_items = list(requests)
+    counter_keys = ('FIXED', 'HIGH', 'MEDIUM', 'LOW', 'WEEKEND')
+    totals = {
+        scope: {key: 0 for key in counter_keys}
+        for scope in (ScheduleRequest.RequestScope.USER, ScheduleRequest.RequestScope.ADMIN)
+    }
+    if not request_items:
+        return totals
+
+    physician_ids = {item.physician_id for item in request_items}
+    eligible_facilities_by_physician = {
+        assignment.physician_id: {facility.id for facility in assignment.contract.facilities.all()}
+        for assignment in ContractUserAssignment.objects.filter(
+            domain=block.domain,
+            physician_id__in=physician_ids,
+            contract__active=True,
+        ).select_related('contract').prefetch_related('contract__facilities')
+    }
+    domain_templates = list(
+        ShiftTemplate.objects.filter(active=True, domain=block.domain).only(
+            'id', 'facility_id', 'active_days_of_week', 'weekend_days',
+        )
+    )
+
+    for schedule_request in request_items:
+        scope_totals = totals[schedule_request.request_scope]
+        if schedule_request.weight in scope_totals:
+            scope_totals[schedule_request.weight] += 1
+
+        day_name = schedule_request.date.strftime('%A')
+        is_weekend_request = False
+        if schedule_request.request_type == ScheduleRequest.RequestType.DAY_OFF:
+            eligible_facility_ids = eligible_facilities_by_physician.get(schedule_request.physician_id)
+            is_weekend_request = any(
+                day_name in (template.active_days_of_week or [])
+                and day_name in (template.weekend_days or [])
+                and (eligible_facility_ids is None or template.facility_id in eligible_facility_ids)
+                for template in domain_templates
+            )
+        elif schedule_request.request_type == ScheduleRequest.RequestType.SHIFT_OFF:
+            is_weekend_request = any(
+                day_name in (template.weekend_days or [])
+                for template in schedule_request.shift_templates.all()
+            )
+
+        if is_weekend_request:
+            scope_totals['WEEKEND'] += 1
+
+    return totals
+
+
 def _request_counter_increments(request_date, request_type, weight, selected_templates, policy):
     increments = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'WEEKEND': 0}
     if weight in increments:
@@ -2949,6 +3002,7 @@ def schedule_block_requests_context(request, block_id):
             'shift_templates': serialized_templates,
             'request_policy': policy,
             'request_counters': counters,
+            'request_totals': _build_schedule_block_request_totals(block, visible_requests),
         }
     )
 

@@ -348,6 +348,14 @@ select option:checked{
 .request-counter-card{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 9px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:rgba(255,255,255,0.025)}
 .request-counter-card span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em}
 .request-counter-card strong{font-size:13px}
+.request-total-summary{display:grid;gap:6px;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:9px;background:rgba(255,255,255,.02)}
+.request-total-summary h3{margin:0;font-size:12px}
+.request-total-summary>small{color:var(--muted);font-size:10px}
+.request-total-row{display:grid;grid-template-columns:minmax(110px,1.25fr) repeat(5,minmax(70px,.7fr));gap:6px;align-items:center}
+.request-total-row>strong{font-size:11px}
+.request-total-card{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:4px 7px;border-radius:6px;background:rgba(255,255,255,.04)}
+.request-total-card span{color:var(--muted);font-size:9px;font-weight:700;text-transform:uppercase}
+.request-total-card b{font-size:12px}
 .request-builder-month-nav{display:flex;align-items:center;gap:8px}
 .request-builder-month-nav button{padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .request-builder-month-nav button:disabled{opacity:0.5;cursor:not-allowed}
@@ -413,6 +421,8 @@ select option:checked{
 
 @media (max-width: 700px){
   .request-counter-row{grid-template-columns:repeat(2,minmax(120px,1fr))}
+  .request-total-row{grid-template-columns:repeat(3,minmax(70px,1fr))}
+  .request-total-row>strong{grid-column:1/-1}
 }
 
 .build-workspace{display:grid;gap:10px}

@@ -1325,6 +1325,44 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(context_response.json()['request_counters']['MEDIUM']['used'], 1)
         self.assertEqual(context_response.json()['request_counters']['HIGH']['used'], 0)
 
+    def test_request_context_separates_scope_totals_and_counts_weekends_independent_of_priority(self):
+        self.shift_template.active_days_of_week = ['Friday']
+        self.shift_template.weekend_days = ['Friday']
+        self.shift_template.save(update_fields=['active_days_of_week', 'weekend_days'])
+        self._assign_contract({'allow_day_off': True, 'allow_shift_off': True})
+        user_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 3),
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.HIGH,
+            created_by=self.scheduler_user,
+        )
+        admin_request = ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 3),
+            request_scope=ScheduleRequest.RequestScope.ADMIN,
+            request_type=ScheduleRequest.RequestType.SHIFT_OFF,
+            weight=ScheduleRequest.Weight.FIXED,
+            created_by=self.scheduler_user,
+        )
+        admin_request.shift_templates.add(self.shift_template)
+        self.client.force_authenticate(user=self.scheduler_user)
+
+        response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/?physician_id={self.physician.id}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        totals = response.json()['request_totals']
+        self.assertEqual(totals['USER']['HIGH'], 1)
+        self.assertEqual(totals['USER']['WEEKEND'], 1)
+        self.assertEqual(totals['ADMIN']['FIXED'], 1)
+        self.assertEqual(totals['ADMIN']['WEEKEND'], 1)
+        self.assertEqual(totals['USER']['MEDIUM'], 0)
+
     def test_stale_request_outside_schedule_block_is_not_available_by_detail(self):
         stale_request = ScheduleRequest.objects.create(
             schedule_block=self.block,
