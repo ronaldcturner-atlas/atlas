@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { API_BASE } from '../api'
+import { penaltyContributingRows } from '../utils/regressionRules'
 
 type ScheduleVersion = {
   id: number
@@ -388,11 +389,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
   const activePenaltyLabel = PENALTY_FILTERS.find(
     (filter) => filter.key === activePenaltyFilter,
   )?.label ?? 'Total score'
-  const visibleRuleSummary = report.rule_summary.filter((row) => (
-    row.total_penalty > 0
-    && row.score_component !== 'coverage_score'
-    && row.score_component !== 'overlap_score'
-  ))
+  const visibleRuleSummary = penaltyContributingRows(report.rule_summary)
   return (
     <div className="violation-report-page">
       <div className="build-workspace-header">

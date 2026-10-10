@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { API_BASE } from '../api'
 import { useAuth } from '../contexts/AuthContext'
+import { DEFAULT_AUTHENTICATED_PATH } from '../utils/regressionRules'
 import './Login.css'
 
 type Props = {
@@ -44,7 +45,7 @@ export default function ChangePassword({ required = false, onCancel, onComplete 
       })
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(errorMessage(data))
-      if (required) navigate('/', { replace: true })
+      if (required) navigate(DEFAULT_AUTHENTICATED_PATH, { replace: true })
       await checkAuth()
       onComplete?.()
     } catch (changeError) {

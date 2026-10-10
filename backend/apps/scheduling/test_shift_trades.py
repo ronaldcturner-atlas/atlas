@@ -1,4 +1,4 @@
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
@@ -71,7 +71,7 @@ class ShiftTradeApiTests(TestCase):
         ContractUserAssignment.objects.create(contract=contract, physician=self.requester)
         self.block = ScheduleBlock.objects.create(
             domain=self.domain,
-            start_date=date(2026, 9, 1), end_date=date(2026, 9, 30),
+            start_date=date(2036, 9, 1), end_date=date(2036, 9, 30),
             request_open_datetime=timezone.now(), request_close_datetime=timezone.now(),
             build_status=ScheduleBlock.BuildStatus.ARCHIVE, published_at=timezone.now(),
         )
@@ -84,10 +84,10 @@ class ShiftTradeApiTests(TestCase):
         self.version.published_optimizer_run = self.run
         self.version.save(update_fields=['published_optimizer_run'])
         instance = ScheduleShiftInstance.objects.create(
-            schedule_version=self.version, schedule_block=self.block, date=date(2026, 9, 1),
+            schedule_version=self.version, schedule_block=self.block, date=date(2036, 9, 1),
             shift_template=self.template, facility=self.facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 1, 7)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 1, 16)), status=ScheduleShiftInstance.Status.ASSIGNED,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 1, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 1, 16)), status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         self.assignment = ScheduleShiftAssignment.objects.create(
             shift_instance=instance, physician=self.owner,
@@ -118,8 +118,8 @@ class ShiftTradeApiTests(TestCase):
         )
         block = ScheduleBlock.objects.create(
             domain=domain,
-            start_date=date(2026, 10, 1),
-            end_date=date(2026, 10, 31),
+            start_date=date(2036, 10, 1),
+            end_date=date(2036, 10, 31),
             request_open_datetime=timezone.now(),
             request_close_datetime=timezone.now(),
             build_status=ScheduleBlock.BuildStatus.ARCHIVE,
@@ -142,11 +142,11 @@ class ShiftTradeApiTests(TestCase):
         instance = ScheduleShiftInstance.objects.create(
             schedule_version=version,
             schedule_block=block,
-            date=date(2026, 10, 6),
+            date=date(2036, 10, 6),
             shift_template=template,
             facility=facility,
-            start_datetime=timezone.make_aware(datetime(2026, 10, 6, 7)),
-            end_datetime=timezone.make_aware(datetime(2026, 10, 6, 16)),
+            start_datetime=timezone.make_aware(datetime(2036, 10, 6, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 10, 6, 16)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         assignment = ScheduleShiftAssignment.objects.create(
@@ -174,11 +174,56 @@ class ShiftTradeApiTests(TestCase):
         self.assertIsNone(self.assignment.shift_instance.segment_start_time)
         self.assertIsNone(self.assignment.shift_instance.segment_end_time)
 
+    def test_shift_cannot_be_posted_at_or_after_its_start_time(self):
+        now = timezone.now()
+        self.assignment.shift_instance.start_datetime = now
+        self.assignment.shift_instance.save(update_fields=['start_datetime'])
+        self.client.force_authenticate(self.owner_user)
+
+        response = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/posting/',
+            {'mode': 'PICKUP'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('start time', response.json()['detail'])
+        self.assertFalse(ShiftPosting.objects.filter(assignment=self.assignment, active=True).exists())
+
+    def test_pending_trade_and_posting_expire_when_either_shift_starts(self):
+        now = timezone.now()
+        self.assignment.shift_instance.start_datetime = now - timedelta(seconds=1)
+        self.assignment.shift_instance.save(update_fields=['start_datetime'])
+        posting = ShiftPosting.objects.create(
+            assignment=self.assignment,
+            posted_by=self.owner_user,
+            mode=ShiftPosting.Mode.PICKUP,
+        )
+        trade = ShiftTrade.objects.create(
+            domain=self.domain,
+            offered_assignment=self.assignment,
+            offered_assignment_snapshot={},
+            requester=self.requester,
+            recipient=self.owner,
+            trade_type=ShiftTrade.TradeType.PICKUP,
+            status=ShiftTrade.Status.PENDING_RECIPIENT,
+        )
+        self.client.force_authenticate(self.requester_user)
+
+        response = self.client.get('/api/shift-trades/')
+
+        self.assertEqual(response.status_code, 200)
+        trade.refresh_from_db()
+        posting.refresh_from_db()
+        self.assertEqual(trade.status, ShiftTrade.Status.EXPIRED)
+        self.assertFalse(posting.active)
+        self.assertEqual(response.json()[0]['status_display'], 'Expired')
+
     def test_legacy_shift_api_does_not_bypass_organization_access(self):
         legacy_shift = Shift.objects.create(
             facility=self.facility,
             physician=self.owner,
-            date=date(2026, 9, 8),
+            date=date(2036, 9, 8),
             start_time=time(7),
             end_time=time(16),
         )
@@ -421,11 +466,11 @@ class ShiftTradeApiTests(TestCase):
         overlap_instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version,
             schedule_block=self.block,
-            date=date(2026, 9, 1),
+            date=date(2036, 9, 1),
             shift_template=self.template,
             facility=self.facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 1, 8)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 1, 12)),
+            start_datetime=timezone.make_aware(datetime(2036, 9, 1, 8)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 1, 12)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         ScheduleShiftAssignment.objects.create(
@@ -497,11 +542,11 @@ class ShiftTradeApiTests(TestCase):
         overlap_instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version,
             schedule_block=self.block,
-            date=date(2026, 9, 1),
+            date=date(2036, 9, 1),
             shift_template=self.template,
             facility=self.facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 1, 8)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 1, 12)),
+            start_datetime=timezone.make_aware(datetime(2036, 9, 1, 8)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 1, 12)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         ScheduleShiftAssignment.objects.create(
@@ -545,11 +590,11 @@ class ShiftTradeApiTests(TestCase):
         target_instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version,
             schedule_block=self.block,
-            date=date(2026, 9, 2),
+            date=date(2036, 9, 2),
             shift_template=self.template,
             facility=self.facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)),
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         target = ScheduleShiftAssignment.objects.create(
@@ -561,11 +606,11 @@ class ShiftTradeApiTests(TestCase):
         owner_overlap_instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version,
             schedule_block=self.block,
-            date=date(2026, 9, 2),
+            date=date(2036, 9, 2),
             shift_template=self.template,
             facility=self.facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 8)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 12)),
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 8)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 12)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         ScheduleShiftAssignment.objects.create(
@@ -599,6 +644,36 @@ class ShiftTradeApiTests(TestCase):
             reviewed_by=self.scheduler_user,
         ).exists())
 
+    def test_scheduler_cannot_directly_swap_after_either_shift_starts(self):
+        target_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2036, 9, 2),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        target = ScheduleShiftAssignment.objects.create(
+            shift_instance=target_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=self.run,
+        )
+        self.assignment.shift_instance.start_datetime = timezone.now()
+        self.assignment.shift_instance.save(update_fields=['start_datetime'])
+        self.client.force_authenticate(self.scheduler_user)
+
+        response = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/swap/',
+            {'target_assignment_id': target.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('once either shift has started', response.json()['detail'])
+
     def test_pickup_auto_approves_after_owner_accepts(self):
         ShiftPosting.objects.create(assignment=self.assignment, posted_by=self.owner_user, mode=ShiftPosting.Mode.PICKUP)
         ShiftTradePolicy.objects.create(pk=1, require_scheduler_approval=False)
@@ -611,6 +686,52 @@ class ShiftTradeApiTests(TestCase):
         self.assignment.refresh_from_db()
         self.assertEqual(self.assignment.physician, self.requester)
         self.assertEqual(accepted.json()['status'], 'APPROVED')
+
+    def test_trade_auto_approval_swaps_both_published_assignments(self):
+        target_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2036, 9, 2),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        target = ScheduleShiftAssignment.objects.create(
+            shift_instance=target_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=self.run,
+        )
+        ShiftTradePolicy.objects.create(pk=1, require_scheduler_approval=False)
+        self.client.force_authenticate(self.owner_user)
+        created = self.client.post('/api/shift-trades/', {
+            'offered_assignment_id': self.assignment.id,
+            'target_assignment_id': target.id,
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+
+        self.client.force_authenticate(self.requester_user)
+        accepted = self.client.post(
+            f"/api/shift-trades/{created.json()['id']}/accept/",
+            {},
+            format='json',
+        )
+
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()['status'], ShiftTrade.Status.APPROVED)
+        self.assignment.refresh_from_db()
+        target.refresh_from_db()
+        self.assertEqual(self.assignment.physician, self.requester)
+        self.assertEqual(target.physician, self.owner)
+
+        published = self.client.get('/api/published-schedule/')
+        self.assertEqual(published.status_code, 200)
+        self.assertIn('no-store', published['Cache-Control'])
+        owners = {row['id']: row['physician'] for row in published.json()}
+        self.assertEqual(owners[self.assignment.id], self.requester.id)
+        self.assertEqual(owners[target.id], self.owner.id)
 
     def test_trade_cannot_apply_after_published_run_changes(self):
         ShiftPosting.objects.create(
@@ -662,10 +783,10 @@ class ShiftTradeApiTests(TestCase):
         )
         excluded_instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version, schedule_block=self.block,
-            date=date(2026, 9, 2), shift_template=excluded_template,
+            date=date(2036, 9, 2), shift_template=excluded_template,
             facility=excluded_facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)),
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         excluded_assignment = ScheduleShiftAssignment.objects.create(
@@ -738,10 +859,10 @@ class ShiftTradeApiTests(TestCase):
 
     def test_owner_can_propose_direct_trade_from_conflict_free_options(self):
         target_instance = ScheduleShiftInstance.objects.create(
-            schedule_version=self.version, schedule_block=self.block, date=date(2026, 9, 2),
+            schedule_version=self.version, schedule_block=self.block, date=date(2036, 9, 2),
             shift_template=self.template, facility=self.facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)), status=ScheduleShiftInstance.Status.ASSIGNED,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)), status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         target = ScheduleShiftAssignment.objects.create(
             shift_instance=target_instance, physician=self.requester,
@@ -772,10 +893,10 @@ class ShiftTradeApiTests(TestCase):
         )
         target_instance = ScheduleShiftInstance.objects.create(
             schedule_version=self.version, schedule_block=self.block,
-            date=date(2026, 9, 2), shift_template=excluded_template,
+            date=date(2036, 9, 2), shift_template=excluded_template,
             facility=excluded_facility,
-            start_datetime=timezone.make_aware(datetime(2026, 9, 2, 7)),
-            end_datetime=timezone.make_aware(datetime(2026, 9, 2, 16)),
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
             status=ScheduleShiftInstance.Status.ASSIGNED,
         )
         target = ScheduleShiftAssignment.objects.create(
@@ -794,6 +915,55 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(options.status_code, 200)
         self.assertEqual([option['id'] for option in options.json()], [target.id])
 
+    def test_incoming_trade_remains_unseen_until_recipient_opens_trade_requests(self):
+        target_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version,
+            schedule_block=self.block,
+            date=date(2036, 9, 2),
+            shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        target = ScheduleShiftAssignment.objects.create(
+            shift_instance=target_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=self.run,
+        )
+        self.client.force_authenticate(self.owner_user)
+        created = self.client.post('/api/shift-trades/', {
+            'offered_assignment_id': self.assignment.id,
+            'target_assignment_id': target.id,
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+        trade_id = created.json()['id']
+
+        sender_trade = next(
+            trade for trade in self.client.get('/api/shift-trades/').json()
+            if trade['id'] == trade_id
+        )
+        self.assertTrue(sender_trade['can_cancel'])
+        self.assertFalse(sender_trade['is_unseen'])
+
+        self.client.force_authenticate(self.requester_user)
+        received_trade = next(
+            trade for trade in self.client.get('/api/shift-trades/').json()
+            if trade['id'] == trade_id
+        )
+        self.assertTrue(received_trade['can_accept'])
+        self.assertTrue(received_trade['is_unseen'])
+
+        marked_seen = self.client.post('/api/shift-trades/mark-seen/', {}, format='json')
+        self.assertEqual(marked_seen.status_code, 200)
+        self.assertIn(trade_id, marked_seen.json()['seen_trade_ids'])
+        viewed_trade = next(
+            trade for trade in self.client.get('/api/shift-trades/').json()
+            if trade['id'] == trade_id
+        )
+        self.assertFalse(viewed_trade['is_unseen'])
+
     def test_accepting_trade_cancels_competing_offers_for_same_shift(self):
         User = get_user_model()
         second_user = User.objects.create_user('second', password='x')
@@ -804,10 +974,10 @@ class ShiftTradeApiTests(TestCase):
         targets = []
         for day, physician in ((2, self.requester), (3, second)):
             instance = ScheduleShiftInstance.objects.create(
-                schedule_version=self.version, schedule_block=self.block, date=date(2026, 9, day),
+                schedule_version=self.version, schedule_block=self.block, date=date(2036, 9, day),
                 shift_template=self.template, facility=self.facility,
-                start_datetime=timezone.make_aware(datetime(2026, 9, day, 7)),
-                end_datetime=timezone.make_aware(datetime(2026, 9, day, 16)),
+                start_datetime=timezone.make_aware(datetime(2036, 9, day, 7)),
+                end_datetime=timezone.make_aware(datetime(2036, 9, day, 16)),
                 status=ScheduleShiftInstance.Status.ASSIGNED,
             )
             targets.append(ScheduleShiftAssignment.objects.create(
@@ -877,7 +1047,7 @@ class ShiftTradeApiTests(TestCase):
         self.assertFalse(ShiftStatsGroup.objects.filter(id=group_id).exists())
 
     def test_scheduler_manages_published_date_comments_and_users_can_view_them(self):
-        comment_date = '2026-09-21'
+        comment_date = '2036-09-21'
         self.client.force_authenticate(self.owner_user)
         denied = self.client.post('/api/published-schedule-comments/', {
             'date': comment_date,
@@ -920,10 +1090,10 @@ class ShiftTradeApiTests(TestCase):
             domain=None,
             title='Legacy global comment',
             details='This row predates Domain isolation.',
-            start_date=date(2026, 9, 2),
+            start_date=date(2036, 9, 2),
             recurrence_type=ScheduleCommentSeries.RecurrenceType.WEEKLY,
             interval=1,
-            weekday=date(2026, 9, 2).weekday(),
+            weekday=date(2036, 9, 2).weekday(),
             end_type=ScheduleCommentSeries.EndType.NEVER,
             created_by=self.scheduler_user,
             updated_by=self.scheduler_user,
@@ -936,7 +1106,7 @@ class ShiftTradeApiTests(TestCase):
 
         visible = self.client.get('/api/published-schedule-comments/')
         changed = self.client.patch(
-            f'/api/published-schedule-comment-series/{legacy_series.id}/occurrences/2026-09-02/',
+            f'/api/published-schedule-comment-series/{legacy_series.id}/occurrences/2036-09-02/',
             {
                 'scope': 'THIS',
                 'title': 'Changed',
@@ -955,7 +1125,7 @@ class ShiftTradeApiTests(TestCase):
     def test_recurring_comment_without_end_appears_only_as_schedules_publish(self):
         self.client.force_authenticate(self.scheduler_user)
         created = self.client.post('/api/published-schedule-comments/', {
-            'date': '2026-09-02',
+            'date': '2036-09-02',
             'title': 'Operations meeting',
             'details': 'Main conference room.',
             'recurrence_type': 'WEEKLY',
@@ -969,22 +1139,22 @@ class ShiftTradeApiTests(TestCase):
         september = self.client.get('/api/published-schedule-comments/').json()
         self.assertEqual(
             [row['date'] for row in september],
-            ['2026-09-02', '2026-09-23'],
+            ['2036-09-02', '2036-09-23'],
         )
 
         October_block = ScheduleBlock.objects.create(
-            start_date=date(2026, 10, 1),
-            end_date=date(2026, 10, 31),
+            start_date=date(2036, 10, 1),
+            end_date=date(2036, 10, 31),
             request_open_datetime=timezone.now(),
             request_close_datetime=timezone.now(),
             build_status=ScheduleBlock.BuildStatus.ARCHIVE,
             published_at=timezone.now(),
         )
         october = self.client.get('/api/published-schedule-comments/').json()
-        self.assertIn('2026-10-14', [row['date'] for row in october])
+        self.assertIn('2036-10-14', [row['date'] for row in october])
 
         changed = self.client.patch(
-            f'/api/published-schedule-comment-series/{series_id}/occurrences/2026-09-23/',
+            f'/api/published-schedule-comment-series/{series_id}/occurrences/2036-09-23/',
             {
                 'scope': 'THIS',
                 'title': 'Meeting moved',
@@ -995,12 +1165,12 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(changed.status_code, 200)
         self.assertTrue(ScheduleCommentSeriesException.objects.filter(
             series_id=series_id,
-            date=date(2026, 9, 23),
+            date=date(2036, 9, 23),
             title='Meeting moved',
         ).exists())
 
         removed = self.client.delete(
-            f'/api/published-schedule-comment-series/{series_id}/occurrences/2026-09-23/',
+            f'/api/published-schedule-comment-series/{series_id}/occurrences/2036-09-23/',
             {'scope': 'THIS'},
             format='json',
         )
@@ -1009,12 +1179,12 @@ class ShiftTradeApiTests(TestCase):
             row['date']
             for row in self.client.get('/api/published-schedule-comments/').json()
         ]
-        self.assertNotIn('2026-09-23', dates)
+        self.assertNotIn('2036-09-23', dates)
 
     def test_recurring_comment_can_change_this_and_future_occurrences(self):
         self.client.force_authenticate(self.scheduler_user)
         created = self.client.post('/api/published-schedule-comments/', {
-            'date': '2026-09-02',
+            'date': '2036-09-02',
             'title': 'Weekly huddle',
             'details': '',
             'recurrence_type': 'WEEKLY',
@@ -1025,7 +1195,7 @@ class ShiftTradeApiTests(TestCase):
         original_series_id = created.json()['series_id']
 
         changed = self.client.patch(
-            f'/api/published-schedule-comment-series/{original_series_id}/occurrences/2026-09-16/',
+            f'/api/published-schedule-comment-series/{original_series_id}/occurrences/2036-09-16/',
             {
                 'scope': 'FUTURE',
                 'title': 'Clinical huddle',
@@ -1039,9 +1209,9 @@ class ShiftTradeApiTests(TestCase):
             row['date']: row
             for row in self.client.get('/api/published-schedule-comments/').json()
         }
-        self.assertEqual(comments['2026-09-09']['title'], 'Weekly huddle')
-        self.assertEqual(comments['2026-09-16']['title'], 'Clinical huddle')
-        self.assertEqual(comments['2026-09-23']['title'], 'Clinical huddle')
+        self.assertEqual(comments['2036-09-09']['title'], 'Weekly huddle')
+        self.assertEqual(comments['2036-09-16']['title'], 'Clinical huddle')
+        self.assertEqual(comments['2036-09-23']['title'], 'Clinical huddle')
 
     def test_scheduler_changes_actual_instance_times_without_changing_template(self):
         self.client.force_authenticate(self.owner_user)

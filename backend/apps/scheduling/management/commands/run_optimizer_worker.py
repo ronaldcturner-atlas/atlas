@@ -21,6 +21,7 @@ from apps.scheduling.optimizer_v2_runner import (
     _failure_configuration_snapshot,
     optimize_schedule_version_v2,
 )
+from apps.scheduling.trade_lifecycle import expire_started_trade_activity
 
 
 DEFAULT_JOB_TIMEOUT_SECONDS = 16 * 60
@@ -269,7 +270,12 @@ class Command(BaseCommand):
             OptimizerControl.objects.filter(pk=control_id).delete()
 
     def handle(self, *args, **options):
+        next_trade_cleanup = 0.0
         while True:
+            now = monotonic()
+            if now >= next_trade_cleanup:
+                expire_started_trade_activity()
+                next_trade_cleanup = now + 30.0
             control_id = self._claim_next()
             if control_id is not None:
                 self.stdout.write(f'Running or resuming optimizer job {control_id}')

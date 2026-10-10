@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { API_BASE } from '../api'
+import { calendarYearOptions, pendingTradeHighlights, shiftHasStarted, tradeRequestAttention } from '../utils/regressionRules'
 
 type APIShift = {
   id: number | null
@@ -15,6 +16,7 @@ type APIShift = {
   role: string
   role_display: string
   date: string
+  start_datetime: string
   start_time: string
   end_time: string
   status: string
@@ -57,6 +59,7 @@ type Shift = {
   role: string
   physician_name: string
   date: string
+  startDateTime: string
   status: string
   postingMode: 'PICKUP' | 'TRADE_ONLY' | null
   startTime: string
@@ -97,12 +100,15 @@ type Trade = {
   id: number
   trade_type: 'PICKUP' | 'TRADE'
   status_display: string
-  status: 'PENDING_RECIPIENT' | 'PENDING_SCHEDULER' | 'DECLINED' | 'APPROVED' | 'CANCELLED'
+  status: 'PENDING_RECIPIENT' | 'PENDING_SCHEDULER' | 'DECLINED' | 'APPROVED' | 'CANCELLED' | 'EXPIRED'
+  requester_id: number
+  recipient_id: number | null
   offered_assignment: { id: number; physician_name: string; date: string; facility: string; start_time: string; end_time: string }
   requested_assignment: { id: number; physician_name: string; date: string; facility: string; start_time: string; end_time: string } | null
   can_accept: boolean
   can_cancel: boolean
   can_review: boolean
+  is_unseen: boolean
 }
 
 type PhysicianOption = {
@@ -247,9 +253,9 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       try {
         setLoadError(null)
         const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse, requestBlocksResponse] = await Promise.all([
-          fetch(`${API_BASE}/published-schedule/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
           fetch(`${API_BASE}/physicians/`, { credentials: 'include' }),
-          fetch(`${API_BASE}/shift-trades/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/shift-trades/`, { credentials: 'include', cache: 'no-store' }),
           fetch(`${API_BASE}/shift-trade-policy/`, { credentials: 'include' }),
           fetch(`${API_BASE}/published-schedule-comments/`, { credentials: 'include' }),
           fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include' }),
@@ -302,6 +308,19 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const timer = window.setInterval(() => setRequestWindowNow(Date.now()), 60_000)
     return () => window.clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    const now = Date.now()
+    const nextStart = Math.min(...allShifts
+      .map((shift) => new Date(shift.start_datetime).getTime())
+      .filter((startAt) => Number.isFinite(startAt) && startAt > now))
+    if (!Number.isFinite(nextStart)) return
+    const timer = window.setTimeout(() => {
+      setRequestWindowNow(Date.now())
+      setLocalRefreshToken((current) => current + 1)
+    }, Math.min(nextStart - now + 50, 2_147_000_000))
+    return () => window.clearTimeout(timer)
+  }, [allShifts])
 
   const regions = Array.from(new Map(
     domains.map((domain) => [domain.region, { id: domain.region, name: domain.region_name }]),
@@ -421,7 +440,11 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     setOpenShiftPhysicianId('')
     setUnsplitPhysicianId('')
     setTradeNote('')
-    if (!selectedShift?.assignmentId || (selectedShift.physicianId !== myPhysicianId && !canManage)) return
+    if (
+      !selectedShift?.assignmentId
+      || (selectedShift.physicianId !== myPhysicianId && !canManage)
+      || shiftHasStarted(selectedShift.startDateTime)
+    ) return
     fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include' })
       .then(async (response) => {
         const data = await response.json()
@@ -429,7 +452,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         setTradeOptions(data)
       })
       .catch((error) => setLoadError(error instanceof Error ? error.message : 'Unable to load trade options.'))
-  }, [selectedShift?.assignmentId, selectedShift?.physicianId, myPhysicianId, canManage])
+  }, [selectedShift?.assignmentId, selectedShift?.physicianId, selectedShift?.startDateTime, myPhysicianId, canManage])
 
   const selectedPhysicianSet = new Set(selectedPhysicianIds)
   const isGroupSchedule = selectedPhysicianIds.length === 0
@@ -521,6 +544,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         role: apiShift.role_display,
         physician_name: apiShift.physician_name,
         date: dateStr,
+        startDateTime: apiShift.start_datetime,
         status: statusCapitalized,
         postingMode: apiShift.posting_mode,
         startTime: apiShift.start_time,
@@ -557,7 +581,13 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
 
   const goPrev = () => setViewDate(d => new Date(d.getFullYear(), d.getMonth() - 1, 1))
   const goNext = () => setViewDate(d => new Date(d.getFullYear(), d.getMonth() + 1, 1))
-  const goToday = () => setViewDate(new Date(today.getFullYear(), today.getMonth(), 1))
+  const goCurrentMonth = () => setViewDate(new Date(today.getFullYear(), today.getMonth(), 1))
+  const isViewingCurrentMonth = year === today.getFullYear() && month === today.getMonth()
+  const yearOptions = calendarYearOptions(
+    allShifts.map((shift) => shift.date),
+    today.getFullYear(),
+    year,
+  )
   const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate())
   const dayCellClassName = (day: typeof days[number]) => {
     const classes = ['day-cell']
@@ -566,17 +596,18 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     else if (day.date < todayStart) classes.push('day-cell-past')
     return classes.join(' ')
   }
-  const myAssignments = domainVisibleShifts.filter((shift) => shift.physician === myPhysicianId)
-  const pendingTradeCount = trades.filter((trade) => trade.can_accept || trade.can_review).length
+  const myAssignments = domainVisibleShifts.filter((shift) => (
+    shift.physician === myPhysicianId
+    && !shiftHasStarted(shift.start_datetime, requestWindowNow)
+  ))
+  const { pendingCount: pendingTradeCount, hasUnseenIncoming } = tradeRequestAttention(trades, myPhysicianId)
   const pendingTrades = trades.filter((trade) => ['PENDING_RECIPIENT', 'PENDING_SCHEDULER'].includes(trade.status))
-  const pendingAssignmentIds = new Set(pendingTrades.flatMap((trade) => [
-    trade.offered_assignment.id,
-    ...(trade.requested_assignment ? [trade.requested_assignment.id] : []),
-  ]))
+  const { sentAssignmentIds, receivedAssignmentIds } = pendingTradeHighlights(trades, myPhysicianId)
   const statusClassForShift = (shift: Shift) => {
     if (shift.status.toLowerCase() === 'open') return 'shift-status-open'
     const isOwn = shift.physicianId === myPhysicianId
-    if (isOwn && shift.assignmentId != null && pendingAssignmentIds.has(shift.assignmentId)) return 'shift-status-own-pending'
+    if (shift.assignmentId != null && sentAssignmentIds.has(shift.assignmentId)) return 'shift-status-trade-sent'
+    if (shift.assignmentId != null && receivedAssignmentIds.has(shift.assignmentId)) return 'shift-status-trade-received'
     if (isOwn && shift.postingMode) return 'shift-status-own-posted'
     if (!isOwn && shift.postingMode) return 'shift-status-posted-other'
     if (isOwn) return 'shift-status-own'
@@ -588,6 +619,9 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const selectedPartnerShifts = tradePartnerId === ''
     ? []
     : tradeOptions.filter((option) => option.physician_id === tradePartnerId)
+  const selectedShiftHasStarted = selectedShift
+    ? shiftHasStarted(selectedShift.startDateTime, requestWindowNow)
+    : false
 
   const openCommentEditor = (date: string) => {
     if (!canManage) return
@@ -726,6 +760,13 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         ({ response, data } = await send({ ...body, force: true }))
       }
       if (!response.ok) throw new Error(data.detail ?? 'Unable to complete that action.')
+      const [scheduleResponse, tradesResponse] = await Promise.all([
+        fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
+        fetch(`${API_BASE}/shift-trades/`, { credentials: 'include', cache: 'no-store' }),
+      ])
+      if (!scheduleResponse.ok) throw new Error('The action completed, but the updated schedule could not be loaded.')
+      setAllShifts(await scheduleResponse.json())
+      if (tradesResponse.ok) setTrades(await tradesResponse.json())
       setSelectedShift(null)
       setLocalRefreshToken((current) => current + 1)
     } catch (error) {
@@ -733,6 +774,26 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     } finally {
       setIsMutating(false)
     }
+  }
+
+  const openTradeRequests = () => {
+    setShowTrades(true)
+    if (!hasUnseenIncoming) return
+    setTrades((current) => current.map((trade) => ({ ...trade, is_unseen: false })))
+    void fetch(`${API_BASE}/shift-trades/mark-seen/`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }).then(async (response) => {
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.detail ?? 'Unable to mark trade requests as viewed.')
+      }
+    }).catch((error) => {
+      setLoadError(error instanceof Error ? error.message : 'Unable to mark trade requests as viewed.')
+      setLocalRefreshToken((current) => current + 1)
+    })
   }
 
   const allRegionDomainsSelected = domainsForRegion.length > 0
@@ -815,20 +876,57 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       <div className="calendar-header">
         <div className="calendar-heading-row">
           <div className="calendar-month-navigation">
+            <button
+              type="button"
+              className="return-current-month"
+              onClick={goCurrentMonth}
+              disabled={isViewingCurrentMonth}
+              title="Return to the current month"
+              aria-label="Return calendar to the current month"
+            >
+              <span aria-hidden="true">▦</span>
+              <span>This Month</span>
+            </button>
             <button onClick={goPrev} aria-label="Previous month">◀</button>
-            <div className="month-label">{viewDate.toLocaleString(undefined, { month: 'long', year: 'numeric' })}</div>
+            <div className="month-label">
+              <select
+                aria-label="Calendar month"
+                value={month}
+                onChange={(event) => setViewDate(new Date(year, Number(event.target.value), 1))}
+              >
+                {Array.from({ length: 12 }, (_, monthIndex) => (
+                  <option key={monthIndex} value={monthIndex}>
+                    {new Date(2000, monthIndex, 1).toLocaleString(undefined, { month: 'long' })}
+                  </option>
+                ))}
+              </select>
+              <select
+                aria-label="Calendar year"
+                value={year}
+                onChange={(event) => setViewDate(new Date(Number(event.target.value), month, 1))}
+              >
+                {yearOptions.map((optionYear) => (
+                  <option key={optionYear} value={optionYear}>{optionYear}</option>
+                ))}
+              </select>
+            </div>
             <button onClick={goNext} aria-label="Next month">▶</button>
           </div>
           <div className="schedule-status-legend" aria-label="Schedule highlight legend">
             <span className="shift-status-own">My shifts</span>
             <span className="shift-status-posted-other">Posted by another user</span>
             <span className="shift-status-own-posted">Your posted shift</span>
-            <span className="shift-status-own-pending">Your pending trade</span>
+            <span className="shift-status-trade-sent">Sent Trades</span>
+            <span className="shift-status-trade-received">Received Trades</span>
             <span className="shift-status-open">Open shift</span>
           </div>
         </div>
         <div className="schedule-toolbar">
-          <button type="button" className="trade-center-button" onClick={() => setShowTrades(true)}>
+          <button
+            type="button"
+            className={`trade-center-button${hasUnseenIncoming ? ' trade-center-button-unseen' : ''}`}
+            onClick={openTradeRequests}
+          >
             Trade requests{pendingTradeCount ? ` (${pendingTradeCount})` : ''}
           </button>
           <label className={`my-schedule-filter ${isMySchedule ? 'selected' : ''} ${myPhysicianId == null ? 'disabled' : ''}`}>
@@ -869,10 +967,6 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
               </div>
             </div>
           </details>
-          <div className="controls">
-          <button onClick={goToday}>Today</button>
-          <button className="primary">Month</button>
-          </div>
         </div>
       </div>
 
@@ -1028,15 +1122,16 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
               <div className="detail-row"><span>Role</span><span>{selectedShift.role}</span></div>
               <div className="detail-row"><span>Date</span><span>{selectedShift.date}</span></div>
               <div className="detail-row"><span>Time</span><span>{selectedShift.shift}</span></div>
+              {selectedShiftHasStarted && <div className="detail-row"><span>Trade status</span><span>Shift has started</span></div>}
               {selectedShift.postingMode && <div className="detail-row"><span>Posted</span><span>{selectedShift.postingMode === 'PICKUP' ? 'Available for pickup' : 'Trade only'}</span></div>}
               {selectedShift.assignmentId != null && (selectedShift.physicianId === myPhysicianId || canManage) && (
                 <div className="schedule-shift-actions">
-                  <div className="shift-post-controls">
+                  {!selectedShiftHasStarted && <div className="shift-post-controls">
                     <strong>Post this shift</strong>
                     <label><input type="radio" checked={tradeOnlyPosting} onClick={() => setTradeOnlyPosting((current) => !current)} readOnly /> Trade only</label>
                     <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/posting/`, { mode: tradeOnlyPosting ? 'TRADE_ONLY' : 'PICKUP' })}>Post</button>
                     {selectedShift.postingMode && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/posting/`, { mode: 'CLOSE' })}>Remove posting</button>}
-                  </div>
+                  </div>}
                   <strong>Split shift</strong>
                   <div><input type="time" value={splitTime} onChange={(event) => setSplitTime(event.target.value)} /><button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/split/`, { split_time: splitTime })}>Split</button></div>
                   {selectedShift.isSplit && canManage && (
@@ -1049,7 +1144,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                     </label>
                   )}
                   {selectedShift.isSplit && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/unsplit/`, { physician_id: unsplitPhysicianId || null })}>Unsplit shift</button>}
-                  {selectedShift.physicianId === myPhysicianId && (
+                  {selectedShift.physicianId === myPhysicianId && !selectedShiftHasStarted && (
                     <div className="propose-trade-controls">
                       <strong>Propose a trade</strong>
                       <label>
@@ -1080,7 +1175,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                   )}
                 </div>
               )}
-              {selectedShift.assignmentId != null && selectedShift.physicianId !== myPhysicianId && selectedShift.postingMode && myPhysicianId != null && (
+              {selectedShift.assignmentId != null && !selectedShiftHasStarted && selectedShift.physicianId !== myPhysicianId && selectedShift.postingMode && myPhysicianId != null && (
                 <div className="schedule-shift-actions">
                   <strong>{selectedShift.postingMode === 'PICKUP' ? 'Request pickup' : 'Offer a trade'}</strong>
                   {selectedShift.postingMode === 'TRADE_ONLY' && (

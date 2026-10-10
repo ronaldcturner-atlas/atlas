@@ -52,6 +52,7 @@ from .models import (
     ShiftStatsGroup,
     ShiftTrade,
     ShiftTradePolicy,
+    ShiftTradeView,
     ShiftTemplate,
     SharedRule,
     SharedRuleContract,
@@ -89,6 +90,7 @@ from .shared_rules import (
     sync_shared_rule_contract_settings,
 )
 from .workload_feasibility import build_workload_feasibility
+from .trade_lifecycle import expire_started_trade_activity, shift_has_started
 
 
 STALE_OPTIMIZER_RUN_MINUTES = 10
@@ -285,6 +287,7 @@ def _published_schedule_authority(domain_ids=None):
 @permission_classes([IsAuthenticated])
 def published_schedule(request):
     """Return the assignments from the current published schedule of record."""
+    expire_started_trade_activity()
     permission = (
         'view_domain_statistics'
         if request.query_params.get('purpose') == 'stats'
@@ -406,6 +409,7 @@ def published_schedule(request):
             'role': assignment['shift_instance__shift_template__name'],
             'role_display': assignment['shift_instance__shift_template__name'],
             'date': assignment_date.isoformat(),
+            'start_datetime': assignment['shift_instance__start_datetime'].isoformat(),
             'start_time': start_time.isoformat(),
             'end_time': end_time.isoformat(),
             'is_night': assignment['shift_instance__shift_template__night_shift'],
@@ -449,6 +453,7 @@ def published_schedule(request):
             'role': instance.shift_template.name,
             'role_display': instance.shift_template.name,
             'date': instance.date.isoformat(),
+            'start_datetime': instance.start_datetime.isoformat(),
             'start_time': start_time.isoformat(),
             'end_time': end_time.isoformat(),
             'is_night': instance.shift_template.night_shift,
@@ -470,7 +475,10 @@ def published_schedule(request):
         row['date'], row['facility_sort_order'], row['facility_name'],
         row['start_time'], row['physician_name'], row['id'],
     ))
-    return Response(rows)
+    response = Response(rows)
+    response['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response['Pragma'] = 'no-cache'
+    return response
 
 
 def _schedule_date_comment_payload(comment):
@@ -1094,6 +1102,7 @@ def shift_trade_policy(request):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_posting(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
+    expire_started_trade_activity()
     domain = assignment.shift_instance.schedule_version.domain
     owns_shift = assignment.physician.user_id == request.user.id
     permission = 'post_own_shifts' if owns_shift else 'manage_any_shift_posting'
@@ -1103,6 +1112,11 @@ def schedule_assignment_posting(request, assignment_id):
     if mode == 'CLOSE':
         ShiftPosting.objects.filter(assignment=assignment).update(active=False)
     elif mode in (ShiftPosting.Mode.PICKUP, ShiftPosting.Mode.TRADE_ONLY):
+        if shift_has_started(assignment):
+            return Response(
+                {'detail': 'A shift cannot be posted after its start time.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         ShiftPosting.objects.update_or_create(assignment=assignment, defaults={'mode': mode, 'active': True, 'posted_by': request.user})
     else:
         return Response({'detail': 'Choose pickup, trade only, or close.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1627,12 +1641,30 @@ def _trade_assignment_payload(assignment, snapshot=None):
     }
 
 
-def _trade_payload(trade, user):
+def _trade_payload(trade, user, viewed_trade_ids=None):
     domain_assignment = trade.offered_assignment or trade.requested_assignment
     trade_domain = trade.domain or (
         domain_assignment.shift_instance.schedule_version.domain
         if domain_assignment is not None else None
     )
+    can_accept = (
+        trade.status == ShiftTrade.Status.PENDING_RECIPIENT
+        and trade.recipient
+        and trade.recipient.user_id == user.id
+    )
+    can_review = (
+        trade.status == ShiftTrade.Status.PENDING_SCHEDULER
+        and trade_domain is not None
+        and has_permission(user, 'approve_pickups_trades', domain=trade_domain)
+    )
+    is_incoming = can_accept or can_review
+    if viewed_trade_ids is None:
+        has_been_viewed = is_incoming and ShiftTradeView.objects.filter(
+            trade=trade,
+            user=user,
+        ).exists()
+    else:
+        has_been_viewed = trade.id in viewed_trade_ids
     return {
         'id': trade.id,
         'status': trade.status,
@@ -1650,13 +1682,10 @@ def _trade_payload(trade, user):
             trade.requested_assignment_snapshot,
         ),
         'created_at': trade.created_at.isoformat(),
-        'can_accept': trade.status == ShiftTrade.Status.PENDING_RECIPIENT and trade.recipient and trade.recipient.user_id == user.id,
+        'can_accept': can_accept,
         'can_cancel': trade.status in (ShiftTrade.Status.PENDING_RECIPIENT, ShiftTrade.Status.PENDING_SCHEDULER) and trade.requester.user_id == user.id,
-        'can_review': (
-            trade.status == ShiftTrade.Status.PENDING_SCHEDULER
-            and trade_domain is not None
-            and has_permission(user, 'approve_pickups_trades', domain=trade_domain)
-        ),
+        'can_review': can_review,
+        'is_unseen': is_incoming and not has_been_viewed,
     }
 
 
@@ -1681,6 +1710,7 @@ def _trade_queryset():
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_trades(request):
+    expire_started_trade_activity()
     physician = getattr(request.user, 'physician', None)
     managed_domain_ids = (
         permitted_domain_ids(request.user, 'manage_user_offers_trades')
@@ -1691,12 +1721,24 @@ def shift_trades(request):
         access_filter = Q(domain_id__in=managed_domain_ids)
         if physician is not None:
             access_filter |= Q(requester=physician) | Q(recipient=physician)
-        trades = trades.filter(access_filter).distinct()
-        return Response([_trade_payload(trade, request.user) for trade in trades[:200]])
+        trades = list(trades.filter(access_filter).distinct()[:200])
+        viewed_trade_ids = set(ShiftTradeView.objects.filter(
+            user=request.user,
+            trade_id__in=[trade.id for trade in trades],
+        ).values_list('trade_id', flat=True))
+        return Response([
+            _trade_payload(trade, request.user, viewed_trade_ids)
+            for trade in trades
+        ])
 
     if physician is None:
         return Response({'detail': 'Your user account is not linked to a physician.'}, status=status.HTTP_403_FORBIDDEN)
     target = _published_assignment_or_404(request.data.get('target_assignment_id'))
+    if shift_has_started(target):
+        return Response(
+            {'detail': 'This shift is no longer eligible because its start time has passed.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     domain = target.shift_instance.schedule_version.domain
     posting = ShiftPosting.objects.filter(assignment=target, active=True).first()
     offered_id = request.data.get('offered_assignment_id')
@@ -1708,6 +1750,11 @@ def shift_trades(request):
         if not has_permission(request.user, 'propose_trade', domain=domain):
             return Response({'detail': 'You do not have permission to propose a trade in this Domain.'}, status=status.HTTP_403_FORBIDDEN)
         offered = _published_assignment_or_404(offered_id)
+        if shift_has_started(offered):
+            return Response(
+                {'detail': 'Your offered shift is no longer eligible because its start time has passed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         trade_type = ShiftTrade.TradeType.TRADE
         if offered.physician_id != physician.id:
             return Response({'detail': 'You may only offer one of your own shifts.'}, status=status.HTTP_403_FORBIDDEN)
@@ -1738,12 +1785,42 @@ def shift_trades(request):
     return Response(_trade_payload(_trade_queryset().get(id=trade.id), request.user), status=status.HTTP_201_CREATED)
 
 
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_trades_mark_seen(request):
+    expire_started_trade_activity()
+    incoming_filter = Q(pk__in=[])
+    physician = getattr(request.user, 'physician', None)
+    if physician is not None:
+        incoming_filter |= Q(
+            status=ShiftTrade.Status.PENDING_RECIPIENT,
+            recipient=physician,
+        )
+    review_domain_ids = permitted_domain_ids(
+        request.user,
+        'approve_pickups_trades',
+    )
+    if review_domain_ids:
+        incoming_filter |= Q(
+            status=ShiftTrade.Status.PENDING_SCHEDULER,
+            domain_id__in=review_domain_ids,
+        )
+    trade_ids = list(ShiftTrade.objects.filter(incoming_filter).values_list('id', flat=True))
+    ShiftTradeView.objects.bulk_create([
+        ShiftTradeView(trade_id=trade_id, user=request.user)
+        for trade_id in trade_ids
+    ], ignore_conflicts=True)
+    return Response({'seen_trade_ids': trade_ids})
+
+
 def _trade_options_for_assignment(offered, allow_conflicts=False):
     proposer = offered.physician
     run = offered.optimizer_run
     block = offered.shift_instance.schedule_block
     cohort = ScheduleShiftAssignment.objects.filter(
         shift_instance__schedule_block=block,
+        shift_instance__start_datetime__gt=timezone.now(),
         optimizer_run=run,
         physician__active=True,
     )
@@ -1800,6 +1877,12 @@ def _trade_options_for_assignment(offered, allow_conflicts=False):
 @permission_classes([IsAuthenticated])
 def schedule_assignment_trade_options(request, assignment_id):
     offered = _published_assignment_or_404(assignment_id)
+    expire_started_trade_activity()
+    if shift_has_started(offered):
+        return Response(
+            {'detail': 'This shift is no longer eligible because its start time has passed.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     domain = offered.shift_instance.schedule_version.domain
     can_manage = has_permission(request.user, 'manage_user_offers_trades', domain=domain)
     if offered.physician.user_id != request.user.id and not can_manage:
@@ -1826,6 +1909,11 @@ def schedule_assignment_swap(request, assignment_id):
             status=status.HTTP_403_FORBIDDEN,
         )
     target = _published_assignment_or_404(request.data.get('target_assignment_id'))
+    if shift_has_started(source) or shift_has_started(target):
+        return Response(
+            {'detail': 'A shift cannot be traded once either shift has started.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     if source.id == target.id or source.physician_id == target.physician_id:
         return Response(
             {'detail': 'Choose a shift assigned to a different user.'},
@@ -1871,6 +1959,11 @@ def schedule_assignment_swap(request, assignment_id):
         }
         locked_source = locked[source.id]
         locked_target = locked[target.id]
+        if shift_has_started(locked_source) or shift_has_started(locked_target):
+            return Response(
+                {'detail': 'A shift cannot be traded once either shift has started.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         source_physician = locked_source.physician
         target_physician = locked_target.physician
         ShiftTrade.objects.filter(
@@ -1947,6 +2040,10 @@ def _apply_shift_trade(trade, reviewed_by=None, force=False):
                 'shift_instance__facility',
             ).get(id=trade.requested_assignment_id)
         assignments = [target] + ([offered] if offered else [])
+        if any(shift_has_started(assignment, now=now) for assignment in assignments):
+            trade.status = ShiftTrade.Status.EXPIRED
+            trade.save(update_fields=['status', 'updated_at'])
+            return False, 'This trade expired because one of its shifts has started.'
         if any(
             assignment.optimizer_run_id
             != getattr(
@@ -1999,8 +2096,14 @@ def _cancel_competing_trades(trade):
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
 def shift_trade_action(request, trade_id, action):
+    expire_started_trade_activity()
     trade = get_object_or_404(_trade_queryset(), id=trade_id)
     now = timezone.now()
+    if trade.status == ShiftTrade.Status.EXPIRED:
+        return Response(
+            {'detail': 'This trade expired because one of its shifts has started.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     if action in ('accept', 'decline'):
         if trade.recipient.user_id != request.user.id or trade.status != ShiftTrade.Status.PENDING_RECIPIENT:
             return Response({'detail': 'This trade is not awaiting your response.'}, status=status.HTTP_403_FORBIDDEN)

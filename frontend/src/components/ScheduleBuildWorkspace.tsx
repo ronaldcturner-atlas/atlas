@@ -1,10 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { API_BASE } from '../api'
+import {
+  assignablePhysicians,
+  optimizerStartOptions,
+  type OptimizerStartSelection,
+} from '../utils/regressionRules'
 
 type BuildStatus = 'PRE_BUILD' | 'BUILD' | 'PREVIEW' | 'ARCHIVE'
 type OptimizerStartMode = 'CURRENT_SCHEDULE' | 'ORIGINAL_PUBLISHED_SCHEDULE' | 'FRESH_FILL'
-type OptimizerStartSelection = OptimizerStartMode | 'PREVIOUS_OPTIMIZER_RUN'
 
 type ScheduleBlock = {
   id: number
@@ -2368,9 +2372,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       ? 0
       : period.remaining_night_shifts - period.remaining_maximum_night_shifts
   )) ?? [0]))
-  const eligiblePhysicians = assignmentContext?.eligible_physicians.filter(
-    (physician) => physician.can_assign && !physician.already_assigned,
-  ) ?? []
+  const eligiblePhysicians = assignablePhysicians(
+    assignmentContext?.eligible_physicians ?? [],
+  )
   const filteredPhysicians = sortedPhysicianMatches(
     eligiblePhysicians,
     physicianSearch,
@@ -2489,12 +2493,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 }}
                 disabled={isBuildMutationBusy}
               >
-                <option value="PREVIOUS_OPTIMIZER_RUN">Previous Optimizer Run</option>
-                {context.selected_version?.published_optimizer_run && (
-                  <option value="CURRENT_SCHEDULE">Current Live Schedule</option>
-                )}
-                <option value="ORIGINAL_PUBLISHED_SCHEDULE" disabled={!context.selected_version?.has_original_published_snapshot}>Original Published Schedule</option>
-                <option value="FRESH_FILL">Fresh Fill</option>
+                {optimizerStartOptions({
+                  hasCurrentLiveSchedule: Boolean(context.selected_version?.published_optimizer_run),
+                  hasOriginalPublishedSnapshot: Boolean(context.selected_version?.has_original_published_snapshot),
+                }).map((option) => (
+                  <option key={option.value} value={option.value} disabled={option.disabled}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
             {optimizerStartMode === 'PREVIOUS_OPTIMIZER_RUN' && (

@@ -27,6 +27,7 @@ urlpatterns = [
     path("shift-instances/<int:instance_id>/assign/", api.shift_instance_assign, name="shift_instance_assign"),
     path("shift-instances/<int:instance_id>/times/", api.shift_instance_times, name="shift_instance_times"),
     path("shift-trades/", api.shift_trades, name="shift_trades"),
+    path("shift-trades/mark-seen/", api.shift_trades_mark_seen, name="shift_trades_mark_seen"),
     path("shift-trades/<int:trade_id>/<str:action>/", api.shift_trade_action, name="shift_trade_action"),
     path("shifts/<int:shift_id>/", api.shift_detail, name="shift_detail"),
     path("shift-templates/", api.shift_templates_list_create, name="shift_templates_list_create"),

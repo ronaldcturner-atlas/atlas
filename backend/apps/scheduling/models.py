@@ -563,6 +563,7 @@ class ShiftTrade(models.Model):
         DECLINED = 'DECLINED', 'Declined'
         APPROVED = 'APPROVED', 'Approved'
         CANCELLED = 'CANCELLED', 'Cancelled'
+        EXPIRED = 'EXPIRED', 'Expired'
 
     domain = models.ForeignKey(
         Domain,
@@ -608,6 +609,24 @@ class ShiftTrade(models.Model):
 
     class Meta:
         ordering = ['-created_at', '-id']
+
+
+class ShiftTradeView(models.Model):
+    trade = models.ForeignKey(
+        ShiftTrade, on_delete=models.CASCADE, related_name='user_views',
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='viewed_shift_trades',
+    )
+    viewed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['trade', 'user'],
+                name='unique_shift_trade_view_per_user',
+            ),
+        ]
 
 
 class ShiftPosting(models.Model):
