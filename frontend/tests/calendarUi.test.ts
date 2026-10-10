@@ -29,6 +29,12 @@ describe('desktop calendar controls', () => {
     expect(calendarSource).toContain('shift-trades/mark-seen/')
     expect(calendarStyles).toMatch(/\.trade-center-button-unseen\{[^}]*border-color:#f6c344;/)
   })
+
+  it('offers an Available Shifts view beside My Schedule', () => {
+    expect(calendarSource).toContain('Available Shifts')
+    expect(calendarSource).toContain('Showing your schedule and all future posted or open shifts.')
+    expect(calendarSource).toContain('isVisibleInAvailableShifts')
+  })
 })
 
 describe('calendar highlight styling', () => {

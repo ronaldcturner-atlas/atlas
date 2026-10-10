@@ -3,6 +3,7 @@ import {
   DEFAULT_AUTHENTICATED_PATH,
   assignablePhysicians,
   calendarYearOptions,
+  isVisibleInAvailableShifts,
   optimizerStartOptions,
   penaltyContributingRows,
   pendingTradeHighlights,
@@ -156,5 +157,26 @@ describe('shift start-time cutoff', () => {
   it('keeps later shifts on the same date eligible', () => {
     expect(shiftHasStarted('2026-10-10T12:00:01-04:00', noon)).toBe(false)
     expect(shiftHasStarted('2026-10-10T19:00:00-04:00', noon)).toBe(false)
+  })
+})
+
+describe('available shifts filter', () => {
+  const noon = new Date('2026-10-10T12:00:00-04:00').getTime()
+
+  it('always includes the user\'s own schedule', () => {
+    expect(isVisibleInAvailableShifts({
+      physician: 10,
+      start_datetime: '2026-10-09T07:00:00-04:00',
+      posting_mode: null,
+      status: 'scheduled',
+    }, 10, noon)).toBe(true)
+  })
+
+  it('includes future posted and open shifts but excludes ordinary shifts and past availability', () => {
+    const future = '2026-10-10T13:00:00-04:00'
+    expect(isVisibleInAvailableShifts({ physician: 20, start_datetime: future, posting_mode: 'PICKUP', status: 'scheduled' }, 10, noon)).toBe(true)
+    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: future, posting_mode: null, status: 'open' }, 10, noon)).toBe(true)
+    expect(isVisibleInAvailableShifts({ physician: 20, start_datetime: future, posting_mode: null, status: 'scheduled' }, 10, noon)).toBe(false)
+    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: '2026-10-10T12:00:00-04:00', posting_mode: null, status: 'open' }, 10, noon)).toBe(false)
   })
 })

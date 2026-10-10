@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { API_BASE } from '../api'
-import { calendarYearOptions, pendingTradeHighlights, shiftHasStarted, tradeRequestAttention } from '../utils/regressionRules'
+import { calendarYearOptions, isVisibleInAvailableShifts, pendingTradeHighlights, shiftHasStarted, tradeRequestAttention } from '../utils/regressionRules'
 
 type APIShift = {
   id: number | null
@@ -216,6 +216,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   })
   const [physicians, setPhysicians] = useState<PhysicianOption[]>([])
   const [selectedPhysicianIds, setSelectedPhysicianIds] = useState<number[]>([])
+  const [showAvailableShifts, setShowAvailableShifts] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [trades, setTrades] = useState<Trade[]>([])
@@ -455,19 +456,32 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   }, [selectedShift?.assignmentId, selectedShift?.physicianId, selectedShift?.startDateTime, myPhysicianId, canManage])
 
   const selectedPhysicianSet = new Set(selectedPhysicianIds)
-  const isGroupSchedule = selectedPhysicianIds.length === 0
-  const isMySchedule = myPhysicianId != null
+  const isGroupSchedule = !showAvailableShifts && selectedPhysicianIds.length === 0
+  const isMySchedule = !showAvailableShifts && myPhysicianId != null
     && selectedPhysicianIds.length === 1
     && selectedPhysicianIds[0] === myPhysicianId
+
+  const returnToGroupSchedule = () => {
+    setShowAvailableShifts(false)
+    setSelectedPhysicianIds([])
+  }
 
   const toggleMySchedule = () => {
     if (myPhysicianId == null) {
       return
     }
+    setShowAvailableShifts(false)
     setSelectedPhysicianIds(isMySchedule ? [] : [myPhysicianId])
   }
 
+  const toggleAvailableShifts = () => {
+    if (myPhysicianId == null) return
+    setShowAvailableShifts((current) => !current)
+    setSelectedPhysicianIds([])
+  }
+
   const togglePhysician = (physicianId: number) => {
+    setShowAvailableShifts(false)
     setSelectedPhysicianIds((current) => (
       current.includes(physicianId)
         ? current.filter((id) => id !== physicianId)
@@ -513,7 +527,14 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   // Convert API shifts to calendar format
   const shifts: Record<string, Shift[]> = {}
   domainVisibleShifts.forEach((apiShift) => {
-    if (!isGroupSchedule && !selectedPhysicianSet.has(apiShift.physician)) {
+    if (
+      showAvailableShifts
+      && myPhysicianId != null
+      && !isVisibleInAvailableShifts(apiShift, myPhysicianId, requestWindowNow)
+    ) {
+      return
+    }
+    if (!showAvailableShifts && !isGroupSchedule && !selectedPhysicianSet.has(apiShift.physician)) {
       return
     }
     const startDate = parseDateTime(apiShift.date, apiShift.start_time)
@@ -938,16 +959,27 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
             />
             My Schedule
           </label>
+          <label className={`my-schedule-filter ${showAvailableShifts ? 'selected' : ''} ${myPhysicianId == null ? 'disabled' : ''}`}>
+            <input
+              type="checkbox"
+              checked={showAvailableShifts}
+              disabled={myPhysicianId == null}
+              onChange={toggleAvailableShifts}
+            />
+            Available Shifts
+          </label>
           <details ref={physicianFilterRef} className="physician-filter-menu">
             <summary>
-              {isGroupSchedule
+              {showAvailableShifts
+                ? 'Available Shifts'
+                : isGroupSchedule
                 ? 'All Users'
                 : `${selectedPhysicianIds.length} physician${selectedPhysicianIds.length === 1 ? '' : 's'}`}
             </summary>
             <div className="physician-filter-popover">
               <div className="physician-filter-heading">
                 <strong>Show schedules</strong>
-                <button type="button" onClick={() => setSelectedPhysicianIds([])} disabled={isGroupSchedule}>Clear</button>
+                <button type="button" onClick={returnToGroupSchedule} disabled={isGroupSchedule}>Clear</button>
               </div>
               <div className="physician-filter-list">
                 {sortedPhysicians.map((physician) => {
@@ -973,8 +1005,10 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       {loadError && <div className="schedule-filter-error">{loadError}</div>}
       {!isGroupSchedule && (
         <div className="schedule-filter-status">
-          Showing {selectedPhysicianIds.length} selected physician{selectedPhysicianIds.length === 1 ? '' : 's'}.
-          <button type="button" onClick={() => setSelectedPhysicianIds([])}>Return to group schedule</button>
+          {showAvailableShifts
+            ? 'Showing your schedule and all future posted or open shifts.'
+            : `Showing ${selectedPhysicianIds.length} selected physician${selectedPhysicianIds.length === 1 ? '' : 's'}.`}
+          <button type="button" onClick={returnToGroupSchedule}>Return to group schedule</button>
         </div>
       )}
 
@@ -1049,7 +1083,13 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
 
       {!isLoading && !hasShifts && (
         <div style={{marginTop:16}}>
-          <div className="empty-state">{isGroupSchedule ? 'No shifts scheduled' : 'No scheduled shifts for the selected physicians'}</div>
+          <div className="empty-state">{
+            showAvailableShifts
+              ? 'No personal or available shifts for this month'
+              : isGroupSchedule
+                ? 'No shifts scheduled'
+                : 'No scheduled shifts for the selected physicians'
+          }</div>
         </div>
       )}
 

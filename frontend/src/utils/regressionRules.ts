@@ -122,3 +122,18 @@ export function shiftHasStarted(startDateTime: string, nowMs = Date.now()) {
   const startMs = new Date(startDateTime).getTime()
   return Number.isFinite(startMs) && startMs <= nowMs
 }
+
+export function isVisibleInAvailableShifts(
+  shift: {
+    physician: number | null
+    start_datetime: string
+    posting_mode: 'PICKUP' | 'TRADE_ONLY' | null
+    status: string
+  },
+  physicianId: number,
+  nowMs = Date.now(),
+) {
+  if (shift.physician === physicianId) return true
+  if (shiftHasStarted(shift.start_datetime, nowMs)) return false
+  return shift.posting_mode !== null || shift.status.toLowerCase() === 'open'
+}
