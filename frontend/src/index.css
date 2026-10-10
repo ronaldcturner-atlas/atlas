@@ -90,10 +90,11 @@ select option:checked{
 .month-label{display:flex;align-items:center;gap:3px;font-weight:600;white-space:nowrap}
 .month-label select{height:28px;padding:0 20px 0 7px;border:1px solid rgba(255,255,255,.14);border-radius:6px;background:#fff;color:#111827;font:inherit;cursor:pointer}
 .schedule-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
-.my-schedule-filter{height:34px;display:inline-flex;align-items:center;gap:7px;padding:0 10px;border:1px solid rgba(255,255,255,0.14);border-radius:7px;background:rgba(255,255,255,0.03);font-size:13px;cursor:pointer}
-.my-schedule-filter:hover,.my-schedule-filter.selected{background:rgba(79,70,229,0.2);border-color:rgba(129,140,248,0.65)}
-.my-schedule-filter.disabled{opacity:0.5;cursor:not-allowed}
-.my-schedule-filter input,.physician-filter-list input{accent-color:var(--accent)}
+.schedule-view-button{height:34px;padding:0 10px;border:1px solid rgba(255,255,255,0.14);border-radius:7px;background:rgba(255,255,255,0.03);color:inherit;font-size:13px;cursor:pointer}
+.schedule-view-button:hover,.schedule-view-button.selected{background:rgba(79,70,229,0.2);border-color:rgba(129,140,248,0.65)}
+.schedule-view-button:disabled{opacity:0.5;cursor:not-allowed}
+.physician-filter-list input{accent-color:var(--accent)}
+.schedule-view-banner{justify-content:flex-start}
 .physician-filter-menu{position:relative}
 .physician-filter-menu summary{height:34px;min-width:140px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 10px;border:1px solid rgba(255,255,255,0.14);border-radius:7px;background:rgba(255,255,255,0.03);font-size:13px;cursor:pointer;list-style:none}
 .physician-filter-menu summary::-webkit-details-marker{display:none}

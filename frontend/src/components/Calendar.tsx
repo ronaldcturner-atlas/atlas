@@ -471,12 +471,12 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       return
     }
     setShowAvailableShifts(false)
-    setSelectedPhysicianIds(isMySchedule ? [] : [myPhysicianId])
+    setSelectedPhysicianIds([myPhysicianId])
   }
 
   const toggleAvailableShifts = () => {
     if (myPhysicianId == null) return
-    setShowAvailableShifts((current) => !current)
+    setShowAvailableShifts(true)
     setSelectedPhysicianIds([])
   }
 
@@ -822,6 +822,13 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const selectedDomainSummary = allRegionDomainsSelected
     ? 'All domains'
     : `${selectedDomainIds.length} domain${selectedDomainIds.length === 1 ? '' : 's'}`
+  const scheduleViewLabel = showAvailableShifts
+    ? 'Mine & Available Shifts'
+    : isMySchedule
+      ? 'My Schedule'
+      : isGroupSchedule
+        ? 'Group Schedule'
+        : `${selectedPhysicianIds.length} Selected User Schedule${selectedPhysicianIds.length === 1 ? '' : 's'}`
 
   return (
     <div className="calendar-card">
@@ -950,28 +957,33 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
           >
             Trade requests{pendingTradeCount ? ` (${pendingTradeCount})` : ''}
           </button>
-          <label className={`my-schedule-filter ${isMySchedule ? 'selected' : ''} ${myPhysicianId == null ? 'disabled' : ''}`}>
-            <input
-              type="checkbox"
-              checked={isMySchedule}
-              disabled={myPhysicianId == null}
-              onChange={toggleMySchedule}
-            />
+          <button
+            type="button"
+            className={`schedule-view-button ${isMySchedule ? 'selected' : ''}`}
+            disabled={myPhysicianId == null}
+            onClick={toggleMySchedule}
+          >
             My Schedule
-          </label>
-          <label className={`my-schedule-filter ${showAvailableShifts ? 'selected' : ''} ${myPhysicianId == null ? 'disabled' : ''}`}>
-            <input
-              type="checkbox"
-              checked={showAvailableShifts}
-              disabled={myPhysicianId == null}
-              onChange={toggleAvailableShifts}
-            />
-            Available Shifts
-          </label>
+          </button>
+          <button
+            type="button"
+            className={`schedule-view-button ${showAvailableShifts ? 'selected' : ''}`}
+            disabled={myPhysicianId == null}
+            onClick={toggleAvailableShifts}
+          >
+            Mine &amp; Available Shifts
+          </button>
+          <button
+            type="button"
+            className={`schedule-view-button ${isGroupSchedule ? 'selected' : ''}`}
+            onClick={returnToGroupSchedule}
+          >
+            Group Schedule
+          </button>
           <details ref={physicianFilterRef} className="physician-filter-menu">
             <summary>
               {showAvailableShifts
-                ? 'Available Shifts'
+                ? 'Mine & Available Shifts'
                 : isGroupSchedule
                 ? 'All Users'
                 : `${selectedPhysicianIds.length} physician${selectedPhysicianIds.length === 1 ? '' : 's'}`}
@@ -1003,14 +1015,9 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
       </div>
 
       {loadError && <div className="schedule-filter-error">{loadError}</div>}
-      {!isGroupSchedule && (
-        <div className="schedule-filter-status">
-          {showAvailableShifts
-            ? 'Showing your schedule and all future posted or open shifts.'
-            : `Showing ${selectedPhysicianIds.length} selected physician${selectedPhysicianIds.length === 1 ? '' : 's'}.`}
-          <button type="button" onClick={returnToGroupSchedule}>Return to group schedule</button>
-        </div>
-      )}
+      <div className="schedule-filter-status schedule-view-banner">
+        <strong>{scheduleViewLabel}</strong>
+      </div>
 
       <div className="calendar-weekday-banner" aria-hidden="true">
         {['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map((weekday) => (

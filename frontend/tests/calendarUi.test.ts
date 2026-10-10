@@ -30,10 +30,14 @@ describe('desktop calendar controls', () => {
     expect(calendarStyles).toMatch(/\.trade-center-button-unseen\{[^}]*border-color:#f6c344;/)
   })
 
-  it('offers an Available Shifts view beside My Schedule', () => {
-    expect(calendarSource).toContain('Available Shifts')
-    expect(calendarSource).toContain('Showing your schedule and all future posted or open shifts.')
+  it('offers three highlighted calendar-view buttons and a view-name banner', () => {
+    expect(calendarSource).toContain('Mine &amp; Available Shifts')
+    expect(calendarSource).toContain('Group Schedule')
+    expect(calendarSource).toContain('schedule-view-button')
+    expect(calendarSource).toContain('scheduleViewLabel')
+    expect(calendarSource).not.toContain('Return to group schedule')
     expect(calendarSource).toContain('isVisibleInAvailableShifts')
+    expect(calendarStyles).toMatch(/\.schedule-view-button:hover,\.schedule-view-button\.selected/)
   })
 })
 
