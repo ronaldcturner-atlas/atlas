@@ -940,14 +940,6 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
             </div>
             <button onClick={goNext} aria-label="Next month">▶</button>
           </div>
-          <div className="schedule-status-legend" aria-label="Schedule highlight legend">
-            <span className="shift-status-own">My shifts</span>
-            <span className="shift-status-posted-other">Posted by another user</span>
-            <span className="shift-status-own-posted">Your posted shift</span>
-            <span className="shift-status-trade-sent">Sent Trades</span>
-            <span className="shift-status-trade-received">Received Trades</span>
-            <span className="shift-status-open">Open shift</span>
-          </div>
         </div>
         <div className="schedule-toolbar">
           <button

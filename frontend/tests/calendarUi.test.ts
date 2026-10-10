@@ -9,6 +9,10 @@ const calendarStyles = readFileSync(
   new URL('../src/index.css', import.meta.url),
   'utf8',
 )
+const sidebarSource = readFileSync(
+  new URL('../src/components/Sidebar.tsx', import.meta.url),
+  'utf8',
+)
 
 describe('desktop calendar controls', () => {
   it('uses the compact current-month action without the obsolete Today and Month buttons', () => {
@@ -53,7 +57,17 @@ describe('calendar highlight styling', () => {
     expect(calendarStyles).toMatch(new RegExp(`\\.${className}\\{[^}]*--shift-hover:`))
   })
 
-  it('renders the My shifts legend swatch without an outline', () => {
-    expect(calendarStyles).toMatch(/\.schedule-status-legend \.shift-status-own\{[^}]*border:0;[^}]*box-shadow:none;/)
+  it('shows a passive legend in the sidebar only on the Schedule page', () => {
+    expect(calendarSource).not.toContain('schedule-status-legend')
+    expect(sidebarSource).toContain("activeView === 'my-schedule'")
+    expect(sidebarSource).toContain('sidebar-shift-legend')
+    expect(sidebarSource).toContain('Available pickup')
+    expect(calendarStyles).toMatch(/\.sidebar-shift-legend\{[^}]*border-top:/)
+  })
+
+  it('keeps the shared sidebar fixed while the page content scrolls', () => {
+    expect(calendarStyles).toMatch(/\.sidebar\{[^}]*position:fixed;[^}]*height:100vh;/)
+    expect(calendarStyles).toMatch(/\.main-area\{[^}]*margin-left:250px;/)
+    expect(calendarStyles).toMatch(/\.sidebar\.sidebar-collapsed \+ \.main-area\{[^}]*margin-left:76px/)
   })
 })
