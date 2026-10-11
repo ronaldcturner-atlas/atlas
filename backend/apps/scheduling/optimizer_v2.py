@@ -65,7 +65,41 @@ def published_boundary_conflict_matrix(
         raise ValueError(
             'Minimum-rest seconds must contain one value per physician.'
         )
-    result = np.zeros((len(physician_ids), len(starts)), dtype=np.bool_)
+    overlap_counts, rest_counts = published_boundary_conflict_count_matrices(
+        physician_ids,
+        starts,
+        ends,
+        boundary_context,
+        rest,
+    )
+    return (overlap_counts + rest_counts) > 0
+
+
+def published_boundary_conflict_count_matrices(
+    physician_ids,
+    shift_starts,
+    shift_ends,
+    boundary_context,
+    minimum_rest_seconds,
+):
+    """Return overlap and rest-conflict counts against published context.
+
+    The boolean conflict matrix is sufficient for feasibility screening, but
+    the incremental scorer also needs exact counts when a move removes a
+    pre-existing boundary violation.  Computing both matrices shares the same
+    small, vectorized preparation pass and avoids an authoritative re-score per
+    candidate.
+    """
+    starts = np.asarray(shift_starts, dtype=np.float64)
+    ends = np.asarray(shift_ends, dtype=np.float64)
+    rest = np.asarray(minimum_rest_seconds, dtype=np.float64)
+    if rest.shape != (len(physician_ids),):
+        raise ValueError(
+            'Minimum-rest seconds must contain one value per physician.'
+        )
+    shape = (len(physician_ids), len(starts))
+    overlap_counts = np.zeros(shape, dtype=np.int16)
+    rest_counts = np.zeros(shape, dtype=np.int16)
     for physician_index, physician_id in enumerate(physician_ids):
         prior = tuple(boundary_context.get(int(physician_id), ()))
         if not prior:
@@ -79,12 +113,64 @@ def published_boundary_conflict_matrix(
             dtype=np.float64,
         )
         required_rest = max(float(rest[physician_index]), 0.0)
-        result[physician_index] = np.any(
-            (starts[:, None] < prior_ends[None, :] + required_rest)
-            & (ends[:, None] > prior_starts[None, :] - required_rest),
-            axis=1,
+        overlaps = (
+            (starts[:, None] < prior_ends[None, :])
+            & (ends[:, None] > prior_starts[None, :])
         )
-    return result
+        conflicts = (
+            (starts[:, None] < prior_ends[None, :] + required_rest)
+            & (ends[:, None] > prior_starts[None, :] - required_rest)
+        )
+        overlap_counts[physician_index] = overlaps.sum(
+            axis=1, dtype=np.int16,
+        )
+        rest_counts[physician_index] = (conflicts & ~overlaps).sum(
+            axis=1, dtype=np.int16,
+        )
+    return overlap_counts, rest_counts
+
+
+def internal_conflict_count_matrices(
+    occupancy,
+    shift_starts,
+    shift_ends,
+    minimum_rest_seconds,
+):
+    """Return per-physician overlap and rest counts for every target shift."""
+    occupied = np.asarray(occupancy, dtype=np.bool_)
+    starts = np.asarray(shift_starts, dtype=np.float64)
+    ends = np.asarray(shift_ends, dtype=np.float64)
+    rest = np.asarray(minimum_rest_seconds, dtype=np.float64)
+    if occupied.ndim != 2 or occupied.shape[1] != len(starts):
+        raise ValueError('Occupancy must contain one column per shift.')
+    if ends.shape != starts.shape:
+        raise ValueError('Shift starts and ends must have matching shapes.')
+    if rest.shape != (occupied.shape[0],):
+        raise ValueError(
+            'Minimum-rest seconds must contain one value per physician.'
+        )
+    overlap_counts = np.zeros(occupied.shape, dtype=np.int16)
+    rest_counts = np.zeros(occupied.shape, dtype=np.int16)
+    for physician_index in range(occupied.shape[0]):
+        owned = np.flatnonzero(occupied[physician_index])
+        if not owned.size:
+            continue
+        required_rest = max(float(rest[physician_index]), 0.0)
+        overlaps = (
+            (starts[:, None] < ends[owned][None, :])
+            & (ends[:, None] > starts[owned][None, :])
+        )
+        conflicts = (
+            (starts[:, None] < ends[owned][None, :] + required_rest)
+            & (ends[:, None] > starts[owned][None, :] - required_rest)
+        )
+        overlap_counts[physician_index] = overlaps.sum(
+            axis=1, dtype=np.int16,
+        )
+        rest_counts[physician_index] = (conflicts & ~overlaps).sum(
+            axis=1, dtype=np.int16,
+        )
+    return overlap_counts, rest_counts
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,7 @@ from django.test import SimpleTestCase
 
 from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     Command as SwapKernelCommand,
+    _pair_validation_penalty_deltas,
     _request_reassignment_deltas,
 )
 from apps.scheduling.optimizer_v2 import (
@@ -14,8 +15,10 @@ from apps.scheduling.optimizer_v2 import (
     V2CandidateSelection,
     V2EngineContext,
     legal_reassignment_candidates,
+    internal_conflict_count_matrices,
     merge_assignment_rows,
     merge_physician_rows,
+    published_boundary_conflict_count_matrices,
     published_boundary_conflict_matrix,
     published_boundary_overlap_matrix,
     schedule_fingerprint,
@@ -34,6 +37,35 @@ from apps.scheduling.optimizer_v2_runner import (
 
 
 class V2SwapKernelCommandTests(SimpleTestCase):
+    def test_pair_delta_credits_removed_rest_conflict_without_rescoring(self):
+        occupancy = np.asarray([
+            [True, True, False],
+            [False, False, True],
+        ])
+        starts = np.asarray([0, 12, 30], dtype=np.float64) * 3600
+        ends = np.asarray([8, 20, 38], dtype=np.float64) * 3600
+        overlap_counts, rest_counts = internal_conflict_count_matrices(
+            occupancy,
+            starts,
+            ends,
+            np.asarray([10, 10], dtype=np.float64) * 3600,
+        )
+        empty_boundary_counts = np.zeros_like(overlap_counts)
+
+        overlap_deltas, rest_deltas = _pair_validation_penalty_deltas(
+            overlap_counts,
+            rest_counts,
+            empty_boundary_counts,
+            empty_boundary_counts,
+            shift_for_assignment=np.asarray([0, 1, 2]),
+            physician_for_assignment=np.asarray([0, 0, 1]),
+            left_assignment_indexes=np.asarray([0]),
+            right_assignment_indexes=np.asarray([2]),
+        )
+
+        np.testing.assert_array_equal(overlap_deltas, np.asarray([0.0]))
+        np.testing.assert_array_equal(rest_deltas, np.asarray([-10000.0]))
+
     def test_request_reassignment_delta_removes_and_adds_request_cost(self):
         kernel = {
             'off_cost': np.asarray([[100.0], [0.0]]),
@@ -244,6 +276,43 @@ class PublishedBoundaryOverlapMatrixTests(SimpleTestCase):
                 [False, False],
             ]),
         )
+
+    def test_boundary_counts_keep_overlap_and_rest_components_separate(self):
+        boundary_context = {
+            101: (
+                SimpleNamespace(
+                    start_datetime=datetime(
+                        2027, 1, 31, 22, 0, tzinfo=timezone.utc,
+                    ),
+                    end_datetime=datetime(
+                        2027, 2, 1, 6, 0, tzinfo=timezone.utc,
+                    ),
+                ),
+            ),
+        }
+
+        overlap_counts, rest_counts = (
+            published_boundary_conflict_count_matrices(
+                physician_ids=[101],
+                shift_starts=np.asarray([
+                    self._timestamp(5, 30),
+                    self._timestamp(10),
+                    self._timestamp(16),
+                ]),
+                shift_ends=np.asarray([
+                    self._timestamp(14),
+                    self._timestamp(18),
+                    datetime(
+                        2027, 2, 2, 0, 0, tzinfo=timezone.utc,
+                    ).timestamp(),
+                ]),
+                boundary_context=boundary_context,
+                minimum_rest_seconds=np.asarray([10 * 3600]),
+            )
+        )
+
+        np.testing.assert_array_equal(overlap_counts, np.asarray([[1, 0, 0]]))
+        np.testing.assert_array_equal(rest_counts, np.asarray([[0, 1, 0]]))
 
     def test_boundary_conflict_requires_one_rest_value_per_physician(self):
         with self.assertRaisesMessage(

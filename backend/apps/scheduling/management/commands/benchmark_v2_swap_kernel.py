@@ -17,6 +17,8 @@ from apps.scheduling.models import (
 from apps.scheduling.optimizer import (
     DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT,
     DEFAULT_TIME_PROPORTIONALITY_WEIGHT,
+    OVERLAP_VIOLATION_PENALTY,
+    REST_VIOLATION_PENALTY,
     _copy_state,
     _adaptive_violation_focuses,
     _attach_published_boundary_context,
@@ -50,9 +52,10 @@ from apps.scheduling.optimizer import (
 from apps.scheduling.run_state import assignments_for_viewed_run
 from apps.scheduling.optimizer_v2 import (
     V2EngineContext,
+    internal_conflict_count_matrices,
     legal_reassignment_candidates,
     merge_assignment_rows,
-    published_boundary_conflict_matrix,
+    published_boundary_conflict_count_matrices,
     schedule_fingerprint,
     select_best_candidate,
     select_diversification_candidate,
@@ -70,6 +73,56 @@ TIME_BANDS = ('BEFORE_9_AM', '9_AM_TO_9_59_AM', '10_AM_TO_1_59_PM', '2_PM_OR_LAT
 # The lineage in the key prevents a context from a different search chain from
 # contributing cycle history or cached scoring rows to the current chain.
 _ENGINE_CONTEXT_CACHE = {}
+
+
+def _pair_validation_penalty_deltas(
+    internal_overlap_counts,
+    internal_rest_counts,
+    boundary_overlap_counts,
+    boundary_rest_counts,
+    shift_for_assignment,
+    physician_for_assignment,
+    left_assignment_indexes,
+    right_assignment_indexes,
+):
+    """Return exact overlap/rest deltas for hard-feasible pair swaps.
+
+    Candidate screening guarantees the incoming assignments introduce no
+    overlap or rest conflicts.  A swap can still remove conflicts already
+    present on either outgoing assignment, so those credits must be included
+    in the incremental score.  This is an O(candidate-count) vector lookup,
+    not an authoritative schedule re-score.
+    """
+    left = np.asarray(left_assignment_indexes, dtype=np.int32)
+    right = np.asarray(right_assignment_indexes, dtype=np.int32)
+    if left.shape != right.shape:
+        raise ValueError('Pairwise assignment indexes must have matching shapes.')
+    left_shifts = shift_for_assignment[left]
+    right_shifts = shift_for_assignment[right]
+    left_physicians = physician_for_assignment[left]
+    right_physicians = physician_for_assignment[right]
+
+    # Each occupied shift overlaps itself in the internal overlap table.  It is
+    # not a violation, so remove that one diagonal entry before charging the
+    # conflicts eliminated with the outgoing assignment.
+    removed_overlaps = (
+        internal_overlap_counts[left_physicians, left_shifts] - 1
+        + boundary_overlap_counts[left_physicians, left_shifts]
+        + internal_overlap_counts[right_physicians, right_shifts] - 1
+        + boundary_overlap_counts[right_physicians, right_shifts]
+    )
+    removed_rest_conflicts = (
+        internal_rest_counts[left_physicians, left_shifts]
+        + boundary_rest_counts[left_physicians, left_shifts]
+        + internal_rest_counts[right_physicians, right_shifts]
+        + boundary_rest_counts[right_physicians, right_shifts]
+    )
+    return (
+        -removed_overlaps.astype(np.float64)
+        * float(OVERLAP_VIOLATION_PENALTY),
+        -removed_rest_conflicts.astype(np.float64)
+        * float(REST_VIOLATION_PENALTY),
+    )
 
 
 def _structural_focus_family(violation_type):
@@ -2632,24 +2685,24 @@ class Command(BaseCommand):
                     np.fromiter(template_ids, dtype=np.int32),
                 )
 
-        conflict_counts = np.zeros((physician_count, shift_count), dtype=np.int16)
-        for physician_idx in range(physician_count):
-            owned = np.flatnonzero(occupancy[physician_idx])
-            if not owned.size:
-                continue
-            rest = rest_seconds[physician_idx]
-            conflicts = (
-                (shift_end[owned][None, :] + rest > shift_start[:, None])
-                & (shift_end[:, None] + rest > shift_start[owned][None, :])
+        internal_overlap_counts, internal_rest_counts = (
+            internal_conflict_count_matrices(
+                occupancy, shift_start, shift_end, rest_seconds,
             )
-            conflict_counts[physician_idx] = conflicts.sum(axis=1, dtype=np.int16)
-        boundary_conflict = published_boundary_conflict_matrix(
-            physician_ids,
-            shift_start,
-            shift_end,
-            _published_boundary_context(instances),
-            rest_seconds,
         )
+        conflict_counts = internal_overlap_counts + internal_rest_counts
+        boundary_overlap_counts, boundary_rest_counts = (
+            published_boundary_conflict_count_matrices(
+                physician_ids,
+                shift_start,
+                shift_end,
+                _published_boundary_context(instances),
+                rest_seconds,
+            )
+        )
+        boundary_conflict = (
+            boundary_overlap_counts + boundary_rest_counts
+        ) > 0
 
         manual_only_occupants = np.zeros(shift_count, dtype=np.int16)
         for instance_id, owners in state.items():
@@ -3004,6 +3057,8 @@ class Command(BaseCommand):
         night_right_assignment_batches = []
         night_priority_batches = []
         night_partial_penalty_batches = []
+        overlap_delta_batches = []
+        rest_delta_batches = []
         validation_pool = []
         validation_sample_limit = max(int(options['validate_sample']), 0)
         assignment_count = len(movable_pairs)
@@ -3058,6 +3113,18 @@ class Command(BaseCommand):
             scored_states += int(selected.size)
             selected_right_physician = right_physician[selected]
             selected_right_shift = right_shift[selected]
+            selected_right_indexes = right_index[selected]
+
+            overlap_deltas, rest_deltas = _pair_validation_penalty_deltas(
+                internal_overlap_counts,
+                internal_rest_counts,
+                boundary_overlap_counts,
+                boundary_rest_counts,
+                shift_for_assignment,
+                physician_for_assignment,
+                np.full(selected.size, left_index, dtype=np.int32),
+                selected_right_indexes,
+            )
 
             workload_delta = (
                 workload_kernel[left_index, selected_right_shift]
@@ -3073,7 +3140,6 @@ class Command(BaseCommand):
             )
             weekend_neutral = np.abs(weekend_delta) <= 1e-9
             weekend_neutral_states += int(np.count_nonzero(weekend_neutral))
-            selected_right_indexes = right_index[selected]
             facility_delta = (
                 facility_proportionality_kernel['score_delta'][
                     left_index, selected_right_shift
@@ -3133,7 +3199,11 @@ class Command(BaseCommand):
             )
             night_right_assignment_batches.append(right_index[selected])
             night_priority_batches.append(priority_delta)
-            night_partial_penalty_batches.append(workload_delta + weekend_delta)
+            night_partial_penalty_batches.append(
+                workload_delta + weekend_delta + overlap_deltas + rest_deltas
+            )
+            overlap_delta_batches.append(overlap_deltas)
+            rest_delta_batches.append(rest_deltas)
             # Retain one legal candidate per left assignment across the entire
             # neighborhood, not only proportionality improvements. The final
             # seeded draw therefore validates improving, worsening, and neutral
@@ -3151,6 +3221,10 @@ class Command(BaseCommand):
                 'predicted_priority_delta': float(priority_delta[sample_index]),
                 'predicted_workload_delta': float(workload_delta[sample_index]),
                 'predicted_weekend_delta': float(weekend_delta[sample_index]),
+                'predicted_overlap_delta': float(
+                    overlap_deltas[sample_index]
+                ),
+                'predicted_rest_delta': float(rest_deltas[sample_index]),
                 'left_assignment_index': left_index,
                 'right_assignment_index': sample_right_index,
             })
@@ -3202,6 +3276,8 @@ class Command(BaseCommand):
             )
             night_priorities = np.concatenate(night_priority_batches)
             night_partial_penalties = np.concatenate(night_partial_penalty_batches)
+            overlap_deltas = np.concatenate(overlap_delta_batches)
+            rest_deltas = np.concatenate(rest_delta_batches)
             night_neutral_states = int(np.count_nonzero(
                 np.abs(night_deltas) <= 1e-9
             ))
@@ -3323,6 +3399,8 @@ class Command(BaseCommand):
                         'shift_rule_score': float(
                             shift_rule_deltas[best_index]
                         ),
+                        'overlap_score': float(overlap_deltas[best_index]),
+                        'rest_score': float(rest_deltas[best_index]),
                     },
                     'selection_mode': selection_mode,
                 }
@@ -3938,6 +4016,8 @@ class Command(BaseCommand):
         consecutive_delta_mismatches = 0
         same_shift_delta_mismatches = 0
         shift_rule_delta_mismatches = 0
+        overlap_delta_mismatches = 0
+        rest_delta_mismatches = 0
         official_delta_mismatches = 0
         excluded_component_nonzero_candidates = 0
         component_delta_stats = defaultdict(lambda: {
@@ -4582,6 +4662,16 @@ class Command(BaseCommand):
                     - sample['predicted_shift_rule_delta']
                 ) > 0.0001:
                     shift_rule_delta_mismatches += 1
+                if abs(
+                    component_deltas['overlap_score']
+                    - sample['predicted_overlap_delta']
+                ) > 0.0001:
+                    overlap_delta_mismatches += 1
+                if abs(
+                    component_deltas['rest_score']
+                    - sample['predicted_rest_delta']
+                ) > 0.0001:
+                    rest_delta_mismatches += 1
                 predicted_official_delta = sum((
                     sample['predicted_workload_delta'],
                     sample['predicted_weekend_delta'],
@@ -4590,6 +4680,8 @@ class Command(BaseCommand):
                     sample['predicted_consecutive_delta'],
                     sample['predicted_same_shift_delta'],
                     sample['predicted_shift_rule_delta'],
+                    sample['predicted_overlap_delta'],
+                    sample['predicted_rest_delta'],
                 ))
                 if abs(predicted_official_delta - float(score_delta)) > 0.0001:
                     official_delta_mismatches += 1
@@ -4885,6 +4977,8 @@ class Command(BaseCommand):
                 'consecutive_delta_mismatches': consecutive_delta_mismatches,
                 'same_shift_delta_mismatches': same_shift_delta_mismatches,
                 'shift_rule_delta_mismatches': shift_rule_delta_mismatches,
+                'overlap_delta_mismatches': overlap_delta_mismatches,
+                'rest_delta_mismatches': rest_delta_mismatches,
                 'official_delta_mismatches': official_delta_mismatches,
                 'excluded_component_nonzero_candidates': (
                     excluded_component_nonzero_candidates
