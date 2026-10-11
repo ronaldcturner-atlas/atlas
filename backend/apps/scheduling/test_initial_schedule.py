@@ -7,6 +7,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from apps.scheduling.initial_schedule import (
+    complete_initial_schedule_from_source,
     construct_complete_initial_schedule,
 )
 from apps.scheduling.management.commands.verify_initial_schedule_equivalence import (
@@ -16,6 +17,7 @@ from apps.scheduling.management.commands.verify_initial_schedule_equivalence imp
 from apps.scheduling.models import OptimizerRun
 from apps.scheduling.optimizer import optimize_schedule_version
 from apps.scheduling.optimizer_v1_constructor import (
+    complete_schedule_from_source,
     construct_complete_fresh_fill_schedule,
 )
 
@@ -108,6 +110,58 @@ class InitialScheduleConstructorTests(SimpleTestCase):
             construction_only=True,
         )
 
+    def test_source_completion_adapter_preserves_selected_schedule(self):
+        run = self._run()
+        source = SimpleNamespace(id=41)
+        expected = {
+            'unfilled_shift_count': 0,
+            'final_overlap_violations': 0,
+        }
+
+        with patch(
+            'apps.scheduling.optimizer.optimize_schedule_version',
+            return_value=expected,
+        ) as optimizer:
+            result = complete_schedule_from_source(
+                'schedule-version',
+                optimizer_run=run,
+                source_run=source,
+                created_by='scheduler',
+            )
+
+        self.assertIs(result, expected)
+        optimizer.assert_called_once_with(
+            'schedule-version',
+            created_by='scheduler',
+            optimizer_run=run,
+            seed=9183,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            source_run=source,
+            max_runtime_seconds=7200,
+            optimization_focus=OptimizerRun.OptimizationFocus.STANDARD,
+            adaptive_runtime=True,
+            stop_requested=None,
+            progress_callback=None,
+            isolated_run=True,
+            finalize_run=False,
+            construction_only=True,
+        )
+
+    def test_source_completion_rejects_unfilled_result(self):
+        with patch(
+            'apps.scheduling.initial_schedule.complete_schedule_from_source',
+            return_value={
+                'unfilled_shift_count': 1,
+                'final_overlap_violations': 0,
+            },
+        ):
+            with self.assertRaisesMessage(ValueError, 'newly open shifts'):
+                complete_initial_schedule_from_source(
+                    'schedule-version',
+                    optimizer_run=self._run(),
+                    source_run=SimpleNamespace(id=41),
+                )
+
     def test_user_stop_is_visible_before_construction_completes(self):
         run = self._run()
 
@@ -129,10 +183,10 @@ class InitialScheduleConstructorTests(SimpleTestCase):
             )
 
     def test_construction_only_mode_rejects_unsafe_invocations(self):
-        with self.assertRaisesMessage(ValueError, 'requires a Fresh Fill'):
+        with self.assertRaisesMessage(ValueError, 'current-schedule start'):
             optimize_schedule_version(
                 None,
-                start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+                start_mode=OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE,
                 construction_only=True,
                 finalize_run=False,
             )

@@ -4,7 +4,12 @@ from django.contrib.auth.models import User
 from django.db.models import Q
 
 from apps.facilities.models import Facility
-from apps.domains.permissions import CLINICAL_PERMISSIONS, membership_permissions, is_org_admin
+from apps.domains.permissions import (
+    CLINICAL_PERMISSIONS,
+    CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS,
+    is_org_admin,
+    membership_permissions,
+)
 
 from .models import Physician
 from .security import user_must_change_password
@@ -59,7 +64,9 @@ class UserSerializer(serializers.ModelSerializer):
     def get_permissions(self, obj):
         if getattr(obj, '_atlas_test_access_active', False):
             permissions = set(obj._atlas_test_role_template.permissions or [])
-            if not obj._atlas_test_clinically_active:
+            if obj._atlas_test_clinically_active:
+                permissions.update(CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS)
+            else:
                 permissions.difference_update(CLINICAL_PERMISSIONS)
             return sorted(permissions)
         if is_org_admin(obj):
@@ -75,7 +82,9 @@ class UserSerializer(serializers.ModelSerializer):
             domain = obj._atlas_test_domain
             role = obj._atlas_test_role_template
             permissions = set(role.permissions or [])
-            if not obj._atlas_test_clinically_active:
+            if obj._atlas_test_clinically_active:
+                permissions.update(CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS)
+            else:
                 permissions.difference_update(CLINICAL_PERMISSIONS)
             return [{
                 'domain_id': domain.id,

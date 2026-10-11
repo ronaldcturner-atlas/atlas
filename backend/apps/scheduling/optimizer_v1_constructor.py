@@ -40,6 +40,36 @@ def construct_complete_fresh_fill_schedule(
     )
 
 
+def complete_schedule_from_source(
+    schedule_version,
+    *,
+    optimizer_run,
+    source_run,
+    created_by=None,
+    stop_requested=None,
+    progress_callback=None,
+):
+    """Fill newly open slots while preserving the selected source schedule."""
+    from .optimizer import optimize_schedule_version
+
+    return optimize_schedule_version(
+        schedule_version,
+        created_by=created_by,
+        optimizer_run=optimizer_run,
+        seed=optimizer_run.seed,
+        start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+        source_run=source_run,
+        max_runtime_seconds=optimizer_run.max_runtime_seconds,
+        optimization_focus=optimizer_run.optimization_focus,
+        adaptive_runtime=True,
+        stop_requested=stop_requested,
+        progress_callback=progress_callback,
+        isolated_run=True,
+        finalize_run=False,
+        construction_only=True,
+    )
+
+
 def fill_open_instances(context, ordered_instances, phase):
     """Apply the proven candidate ranking to one ordered placement phase.
 

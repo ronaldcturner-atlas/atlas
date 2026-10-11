@@ -56,6 +56,11 @@ describe('desktop calendar controls', () => {
     expect(calendarStyles).toMatch(/\.calendar-shift-label\{[^}]*flex-wrap:wrap;[^}]*column-gap:1\.5em;/)
     expect(calendarStyles).toMatch(/\.calendar-shift-name,[^{]*\.calendar-shift-user\{[^}]*white-space:nowrap;[^}]*text-overflow:clip/)
   })
+
+  it('uses effective schedule-management permissions instead of legacy groups', () => {
+    expect(calendarSource).toContain('Boolean(user?.can_manage_schedules)')
+    expect(calendarSource).not.toContain("groups.some((group) => ['admin', 'scheduler']")
+  })
 })
 
 describe('calendar highlight styling', () => {

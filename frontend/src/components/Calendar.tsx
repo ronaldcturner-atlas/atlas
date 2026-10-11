@@ -432,7 +432,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const myPhysicianId = user?.physician_id
     ?? exactNamePhysician?.id
     ?? (lastNameMatches.length === 1 ? lastNameMatches[0].id : null)
-  const canManage = !forceUserView && Boolean(user?.is_staff || user?.is_superuser || user?.groups.some((group) => ['admin', 'scheduler'].includes(group.toLowerCase())))
+  const canManage = !forceUserView && Boolean(user?.can_manage_schedules)
 
   useEffect(() => {
     setTradeOptions([])

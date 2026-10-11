@@ -5055,6 +5055,92 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             [(instance.id, physician.id)],
         )
 
+    def test_atlas_v2_current_schedule_fills_new_shift_before_search(self):
+        from apps.scheduling.optimizer import build_violation_report
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        first_instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        second_instance = self._create_shift_instance(
+            version,
+            self.day_template,
+            self.block.start_date + timedelta(days=1),
+        )
+        first_physician = self._create_assignment_physician(
+            'v2.current.first@example.com', 'V2 Current First',
+            facilities=[self.facility],
+        )
+        self._create_assignment_physician(
+            'v2.current.second@example.com', 'V2 Current Second',
+            facilities=[self.facility],
+        )
+        source_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            final_score=1000,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=first_instance,
+            physician=first_physician,
+            optimizer_run=source_run,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.CURRENT_SCHEDULE,
+            started_from_run=source_run,
+            run_kind='OPTIMIZER_V2_TEST',
+            max_runtime_seconds=60,
+            seed=9185,
+        )
+
+        def return_search(_command_name, **kwargs):
+            report = build_violation_report(version, optimizer_run=v2_run)
+            kwargs['stdout'].write(json.dumps({
+                'swaps': [],
+                'wall_seconds': 0.25,
+                'stopped_reason': 'local_optimum',
+                'total_evaluations': 1,
+                'accepted_transitions': 0,
+                'predicted_final_score': float(report['total_score']),
+                'score_checkpoints': [{
+                    'accepted_transitions': 0,
+                    'score': float(report['total_score']),
+                }],
+            }))
+
+        with patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+            side_effect=return_search,
+        ):
+            summary = optimize_schedule_version_v2_test(
+                version,
+                optimizer_run=v2_run,
+                source_run=source_run,
+                created_by=self.scheduler_user,
+            )
+
+        self.assertEqual(summary['unfilled_shift_count'], 0)
+        self.assertIsNotNone(summary['source_completion_bootstrap'])
+        self.assertEqual(
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=v2_run,
+                shift_instance=second_instance,
+            ).count(),
+            1,
+        )
+
     def test_atlas_v2_completes_zero_score_fixed_manual_schedule_without_search(self):
         from apps.scheduling.optimizer_v2_runner import (
             optimize_schedule_version_v2_test,

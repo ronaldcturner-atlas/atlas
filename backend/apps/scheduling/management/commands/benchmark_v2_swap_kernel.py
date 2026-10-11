@@ -75,6 +75,14 @@ TIME_BANDS = ('BEFORE_9_AM', '9_AM_TO_9_59_AM', '10_AM_TO_1_59_PM', '2_PM_OR_LAT
 _ENGINE_CONTEXT_CACHE = {}
 
 
+def _state_with_all_instances(state, instances):
+    """Copy a source state and retain explicit rows for newly open shifts."""
+    complete = _copy_state(state)
+    for instance in instances:
+        complete[instance.id]
+    return complete
+
+
 def _pair_validation_penalty_deltas(
     internal_overlap_counts,
     internal_rest_counts,
@@ -2213,7 +2221,11 @@ class Command(BaseCommand):
                 )
         else:
             base_state, manual_pairs = cached_base_state
-        state = _copy_state(base_state)
+        state = _state_with_all_instances(base_state, instances)
+        # A source run can predate newly added shift instances. Represent every
+        # current instance once, up front, so accepted V2 transitions cannot
+        # turn the defaultdict into a plain mapping that later raises KeyError
+        # while authoritatively scoring a newly open shift.
         applied_in_memory_swaps = []
         for raw_swap in options['in_memory_swap']:
             if str(raw_swap).startswith('C:'):

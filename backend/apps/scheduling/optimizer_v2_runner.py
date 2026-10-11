@@ -13,7 +13,10 @@ from apps.accounts.models import Physician
 from apps.domains.models import DomainMembership
 from apps.facilities.models import Facility
 
-from .initial_schedule import construct_complete_initial_schedule
+from .initial_schedule import (
+    complete_initial_schedule_from_source,
+    construct_complete_initial_schedule,
+)
 from .models import (
     ContractUserAssignment,
     OptimizerRun,
@@ -427,9 +430,33 @@ def optimize_schedule_version_v2(
         schedule_version,
         optimizer_run=source_run,
     )
+    selected_source_run = source_run
     initial_score = Decimal(str(source_report['total_score']))
+    source_initial_score = initial_score
+    source_initial_breakdown = source_report['score_breakdown']
     if progress_callback is not None:
         progress_callback(initial_score, force=True)
+
+    source_completion_summary = None
+    if (
+        optimizer_run.start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
+        and Decimal(str(source_report['score_breakdown'].get('coverage_score', 0)))
+        > 0
+    ):
+        source_completion_summary = complete_initial_schedule_from_source(
+            schedule_version,
+            optimizer_run=optimizer_run,
+            source_run=source_run,
+            created_by=created_by,
+            stop_requested=stop_requested,
+            progress_callback=progress_callback,
+        )
+        source_run = optimizer_run
+        source_report = build_violation_report(
+            schedule_version,
+            optimizer_run=source_run,
+        )
+        initial_score = Decimal(str(source_report['total_score']))
 
     source_assignments = list(
         assignments_for_viewed_run(schedule_version, source_run)
@@ -448,17 +475,17 @@ def optimize_schedule_version_v2(
         for assignment in source_assignments
     ]
     source_rescore = {
-        'source_run_id': source_run.id,
-        'source_run_number': source_run.run_number,
+        'source_run_id': selected_source_run.id,
+        'source_run_number': selected_source_run.run_number,
         'source_stored_score': (
-            float(source_run.final_score)
-            if source_run.final_score is not None else None
+            float(selected_source_run.final_score)
+            if selected_source_run.final_score is not None else None
         ),
-        'current_authoritative_score': float(initial_score),
-        'current_score_breakdown': source_report['score_breakdown'],
+        'current_authoritative_score': float(source_initial_score),
+        'current_score_breakdown': source_initial_breakdown,
     }
-    optimizer_run.initial_score = initial_score
-    optimizer_run.score_breakdown = source_report['score_breakdown']
+    optimizer_run.initial_score = source_initial_score
+    optimizer_run.score_breakdown = source_initial_breakdown
     optimizer_run.optimizer_debug = {
         'optimizer_engine': 'V2',
         'launch_snapshot': launch_snapshot,
@@ -611,7 +638,7 @@ def optimize_schedule_version_v2(
         final_score = Decimal(str(report['total_score']))
         _require_matching_final_score(final_score, search_result)
         _require_hard_valid_final_report(report)
-        if final_score > initial_score + Decimal('0.0001'):
+        if final_score > source_initial_score + Decimal('0.0001'):
             raise ValueError(
                 'Atlas v2 test result worsened the authoritative penalty; '
                 'the isolated result was not saved.'
@@ -631,11 +658,11 @@ def optimize_schedule_version_v2(
             'optimizer_run_id': optimizer_run.id,
             'optimizer_run_number': optimizer_run.run_number,
             'start_mode': optimizer_run.start_mode,
-            'initial_score': float(initial_score),
+            'initial_score': float(source_initial_score),
             'final_score': float(final_score),
             'total_score': float(final_score),
             'score_breakdown': report['score_breakdown'],
-            'initial_score_breakdown': source_report['score_breakdown'],
+            'initial_score_breakdown': source_initial_breakdown,
             'source_run_id': source_rescore['source_run_id'],
             'source_run_number': source_rescore['source_run_number'],
             'source_stored_score': source_rescore['source_stored_score'],
@@ -658,9 +685,12 @@ def optimize_schedule_version_v2(
             'fresh_fill_bootstrap': _compact_bootstrap_summary(
                 bootstrap_summary
             ),
+            'source_completion_bootstrap': _compact_bootstrap_summary(
+                source_completion_summary
+            ),
         }
         optimizer_run.status = OptimizerRun.Status.COMPLETED
-        optimizer_run.initial_score = initial_score
+        optimizer_run.initial_score = source_initial_score
         optimizer_run.final_score = final_score
         optimizer_run.score_breakdown = report['score_breakdown']
         optimizer_run.optimizer_summary = summary

@@ -9,6 +9,7 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     Command as SwapKernelCommand,
     _pair_validation_penalty_deltas,
     _request_reassignment_deltas,
+    _state_with_all_instances,
 )
 from apps.scheduling.optimizer_v2 import (
     V2AssignmentRowCache,
@@ -37,6 +38,20 @@ from apps.scheduling.optimizer_v2_runner import (
 
 
 class V2SwapKernelCommandTests(SimpleTestCase):
+    def test_newly_open_shift_survives_plain_dict_transition(self):
+        state = _state_with_all_instances(
+            {10: [1], 20: [2]},
+            [
+                SimpleNamespace(id=10),
+                SimpleNamespace(id=20),
+                SimpleNamespace(id=30),
+            ],
+        )
+
+        transitioned = swap_assignments(state, (10, 1), (20, 2))
+
+        self.assertEqual(transitioned[30], [])
+
     def test_pair_delta_credits_removed_rest_conflict_without_rescoring(self):
         occupancy = np.asarray([
             [True, True, False],

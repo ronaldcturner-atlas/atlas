@@ -8,6 +8,12 @@ from rest_framework.test import APIClient
 from apps.accounts.models import Physician
 from apps.scheduling.models import Contract, ContractUserAssignment
 from .models import Domain, DomainMembership, Organization, OrganizationMembership, Region, RoleTemplate
+from .permissions import (
+    CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS,
+    has_permission,
+    membership_permissions,
+    permitted_domain_ids,
+)
 
 
 class DomainsTests(TestCase):
@@ -23,6 +29,60 @@ class DomainsTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(Domain.objects.filter(name='Physician', active=True).exists())
+
+    def test_clinically_active_admin_role_keeps_standard_clinician_workflow(self):
+        domain = Domain.objects.create(name='Clinical Admin Domain')
+        OrganizationMembership.objects.create(
+            organization=domain.region.organization,
+            user=self.user,
+        )
+        admin_role = RoleTemplate.objects.create(
+            region=domain.region,
+            name='Administrative Scheduler',
+            permissions=['manage_published_assignments'],
+        )
+        membership = DomainMembership.objects.create(
+            domain=domain,
+            user=self.user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=admin_role,
+            clinically_active=True,
+        )
+
+        effective = membership_permissions(membership)
+        self.assertTrue(CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS.issubset(effective))
+        self.assertTrue(has_permission(
+            self.user, 'manage_published_assignments', domain=domain,
+        ))
+        for permission in CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS:
+            self.assertTrue(has_permission(self.user, permission, domain=domain))
+            self.assertIn(domain.id, permitted_domain_ids(self.user, permission))
+
+    def test_clinically_inactive_admin_role_does_not_gain_clinician_workflow(self):
+        domain = Domain.objects.create(name='Nonclinical Admin Domain')
+        OrganizationMembership.objects.create(
+            organization=domain.region.organization,
+            user=self.user,
+        )
+        admin_role = RoleTemplate.objects.create(
+            region=domain.region,
+            name='Nonclinical Scheduler',
+            permissions=['manage_published_assignments'],
+        )
+        DomainMembership.objects.create(
+            domain=domain,
+            user=self.user,
+            role=DomainMembership.Role.SCHEDULER,
+            role_template=admin_role,
+            clinically_active=False,
+        )
+
+        self.assertTrue(has_permission(
+            self.user, 'manage_published_assignments', domain=domain,
+        ))
+        for permission in CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS:
+            self.assertFalse(has_permission(self.user, permission, domain=domain))
+            self.assertNotIn(domain.id, permitted_domain_ids(self.user, permission))
 
     @override_settings(ATLAS_ALLOW_SELF_SERVICE_ORGANIZATION_BOOTSTRAP=False)
     def test_empty_production_database_cannot_be_claimed_by_first_user(self):

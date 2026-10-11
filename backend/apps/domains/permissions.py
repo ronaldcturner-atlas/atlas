@@ -81,6 +81,13 @@ CLINICAL_DEFAULTS = {
     'pick_up_shifts', 'submit_own_requests',
 }
 
+# These are participation capabilities, not administrative authority. Every
+# active Domain membership marked clinically active keeps the ordinary
+# clinician workflow even when its Role is primarily administrative.
+CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS = frozenset(
+    CLINICAL_DEFAULTS & CLINICAL_PERMISSIONS
+)
+
 SCHEDULER_DEFAULTS = CLINICAL_DEFAULTS | {
     'manage_date_comments', 'manage_published_assignments',
     'split_any_published_shift', 'modify_any_published_shift_times',
@@ -150,8 +157,12 @@ def membership_permissions(membership):
     if not membership or not membership.active:
         return set()
     if membership.role_template_id:
-        return set(membership.role_template.permissions or [])
-    return set(LEGACY_ROLE_DEFAULTS.get(membership.role, set()))
+        permissions = set(membership.role_template.permissions or [])
+    else:
+        permissions = set(LEGACY_ROLE_DEFAULTS.get(membership.role, set()))
+    if membership.clinically_active:
+        permissions.update(CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS)
+    return permissions
 
 
 def has_permission(user, permission, *, domain=None, region=None, organization=None):
@@ -167,7 +178,10 @@ def has_permission(user, permission, *, domain=None, region=None, organization=N
             return False
         if domain is None and region is None and organization is None:
             return False
-        allowed = permission in set(user._atlas_test_role_template.permissions or [])
+        allowed_permissions = set(user._atlas_test_role_template.permissions or [])
+        if user._atlas_test_clinically_active:
+            allowed_permissions.update(CLINICALLY_ACTIVE_WORKFLOW_PERMISSIONS)
+        allowed = permission in allowed_permissions
         if permission in CLINICAL_PERMISSIONS and not user._atlas_test_clinically_active:
             return False
         return allowed

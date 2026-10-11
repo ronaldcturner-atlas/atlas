@@ -10665,8 +10665,13 @@ def optimize_schedule_version(
         raise ValueError('Maximum optimizer runtime cannot exceed 240 minutes.')
     if optimization_focus not in OptimizerRun.OptimizationFocus.values:
         raise ValueError('Invalid optimizer focus.')
-    if construction_only and start_mode != OptimizerRun.StartMode.FRESH_FILL:
-        raise ValueError('Construction-only mode requires a Fresh Fill start.')
+    if construction_only and start_mode not in (
+        OptimizerRun.StartMode.FRESH_FILL,
+        OptimizerRun.StartMode.CURRENT_SCHEDULE,
+    ):
+        raise ValueError(
+            'Construction-only mode requires a Fresh Fill or current-schedule start.'
+        )
     if construction_only and finalize_run:
         raise ValueError(
             'Construction-only mode must leave the optimizer run open.'
