@@ -21,6 +21,7 @@ from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -427,6 +428,11 @@ def published_schedule(request):
         if published_run is not None:
             active_runs[version.id] = published_run
     active_run_ids = [published_run.id for published_run in active_runs.values()]
+    suppressed_instance_ids = {
+        instance_id
+        for published_run in active_runs.values()
+        for instance_id in (published_run.suppressed_shift_instance_ids or [])
+    }
     published_assignments = (
         ScheduleShiftAssignment.objects.filter(
             shift_instance__schedule_block__in=published_blocks,
@@ -500,6 +506,8 @@ def published_schedule(request):
         start_time = assignment['shift_instance__segment_start_time'] or assignment['shift_instance__shift_template__start_time']
         end_time = assignment['shift_instance__segment_end_time'] or assignment['shift_instance__shift_template__end_time']
         instance_id = assignment['shift_instance__id']
+        if instance_id in suppressed_instance_ids:
+            continue
         split_parent_id = assignment['shift_instance__split_parent_id']
         split_group_id = split_parent_id or (instance_id if instance_id in split_root_ids else None)
         split_group_start_time = None
@@ -543,7 +551,7 @@ def published_schedule(request):
         schedule_block__in=published_blocks,
         schedule_version_id__in=active_runs.keys(),
         is_locked_open=True,
-    ).select_related(
+    ).exclude(id__in=suppressed_instance_ids).select_related(
         'facility', 'shift_template', 'schedule_block',
         'schedule_version__domain__region',
     )
@@ -1128,6 +1136,9 @@ def _published_assignment_or_404(assignment_id):
     if (
         published_run is None
         or assignment.optimizer_run_id != published_run.id
+        or assignment.shift_instance_id in set(
+            published_run.suppressed_shift_instance_ids or []
+        )
         or not _is_authoritative_published_instance(assignment.shift_instance)
     ):
         raise Http404
@@ -1144,8 +1155,10 @@ def _published_instance_or_404(instance_id, **filters):
         schedule_block__published_at__isnull=False,
         **filters,
     )
+    published_run = _published_run_for_version(instance.schedule_version)
     if (
-        _published_run_for_version(instance.schedule_version) is None
+        published_run is None
+        or instance.id in set(published_run.suppressed_shift_instance_ids or [])
         or not _is_authoritative_published_instance(instance)
     ):
         raise Http404
@@ -4772,6 +4785,12 @@ def schedule_version_run_optimizer(request, version_id):
                         ).values_list('id', flat=True)
                     )
                 )
+            suppressed_ids = (
+                []
+                if start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE
+                else list(source_run.suppressed_shift_instance_ids or [])
+                if source_run is not None else []
+            )
             optimizer_run = OptimizerRun.objects.create(
                 schedule_version=locked_version,
                 shift_configuration_revision=locked_version.shift_configuration_revision,
@@ -4805,6 +4824,7 @@ def schedule_version_run_optimizer(request, version_id):
                     else 'OPTIMIZER'
                 ),
                 locked_open_shift_instance_ids=locked_open_ids,
+                suppressed_shift_instance_ids=suppressed_ids,
             )
             OptimizerControl.objects.create(
                 token=token,
@@ -4908,6 +4928,7 @@ def optimizer_run_save_copy(request, run_id):
             copied_from_run=source,
             run_kind='COPY',
             locked_open_shift_instance_ids=locked_open_ids,
+            suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
             start_mode=source.start_mode,
             optimization_focus=source.optimization_focus,
         )
@@ -5063,6 +5084,7 @@ def optimizer_run_save_manual_changes_as_new(request, run_id):
             copied_from_run=source,
             run_kind='COPY',
             locked_open_shift_instance_ids=edited_locked_open_ids,
+            suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
             start_mode=source.start_mode,
             optimization_focus=source.optimization_focus,
         )
@@ -6841,13 +6863,11 @@ def _parse_backdate_request(block, data):
         ShiftTemplate.objects.filter(
             id__in=template_ids,
             domain=block.domain,
-            active=True,
-            facility__active=True,
         ).select_related('facility').order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
     )
     if len(templates) != len(template_ids):
         return None, Response(
-            {'shift_template_ids': 'Select active Shifts from this Domain.'},
+            {'shift_template_ids': 'Select Shifts from this Domain.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
     start_date = _parse_request_date(data.get('start_date'))
@@ -6901,6 +6921,118 @@ def _backdate_shift_label(facility, start_time, end_time):
     return f'{facility.short_name} {_format_template_time(start_time)}-{_format_template_time(end_time)}'
 
 
+def _actionable_backdate_templates(
+    block,
+    templates,
+    *,
+    blocks_by_id,
+    authority,
+    start_date,
+    end_date,
+):
+    """Return only templates that differ from the current published schedule.
+
+    This comparison intentionally uses the dated published instances rather
+    than the change log. It therefore remains accurate for schedules and Shift
+    Builder edits created before revision tracking was introduced, and removes
+    a template from the picker immediately after its changes are applied.
+    """
+    templates = list(templates)
+    if not templates or start_date is None or end_date is None:
+        return []
+
+    version_run_by_block = {}
+    relevant_dates = []
+    current_date = start_date
+    while current_date <= end_date:
+        authoritative_block_id = authority.get((block.domain_id, current_date))
+        authoritative_block = blocks_by_id.get(authoritative_block_id)
+        if authoritative_block is not None:
+            if authoritative_block.id not in version_run_by_block:
+                version_run_by_block[authoritative_block.id] = _published_version_and_run(
+                    authoritative_block,
+                )
+            version, published_run = version_run_by_block[authoritative_block.id]
+            if version is not None and published_run is not None:
+                relevant_dates.append((current_date, version))
+        current_date += timedelta(days=1)
+
+    version_ids = {version.id for _candidate_date, version in relevant_dates}
+    instances_by_key = {}
+    if version_ids:
+        instances = (
+            ScheduleShiftInstance.objects.filter(
+                schedule_version_id__in=version_ids,
+                date__gte=start_date,
+                date__lte=end_date,
+                shift_template_id__in=[template.id for template in templates],
+                split_parent__isnull=True,
+            )
+            .select_related('facility')
+            .prefetch_related('split_segments')
+            .order_by('id')
+        )
+        for instance in instances:
+            instances_by_key.setdefault(
+                (instance.schedule_version_id, instance.date, instance.shift_template_id),
+                [],
+            ).append(instance)
+
+    actionable_ids = set()
+    now = timezone.now()
+    for candidate_date, version in relevant_dates:
+        day_name = candidate_date.strftime('%A')
+        for template in templates:
+            if template.id in actionable_ids:
+                continue
+            zone = _facility_timezone(template.facility)
+            proposed_end_date = (
+                candidate_date + timedelta(days=1)
+                if template.end_time <= template.start_time
+                else candidate_date
+            )
+            proposed_start = datetime.combine(candidate_date, template.start_time, tzinfo=zone)
+            proposed_end = datetime.combine(proposed_end_date, template.end_time, tzinfo=zone)
+            if proposed_start <= now:
+                continue
+            matches = instances_by_key.get(
+                (version.id, candidate_date, template.id),
+                [],
+            )
+            suppressed_ids = set(
+                version_run_by_block[version.schedule_block_id][1].suppressed_shift_instance_ids
+                or []
+            )
+            visible_matches = [match for match in matches if match.id not in suppressed_ids]
+            should_exist = bool(
+                template.active
+                and template.facility.active
+                and day_name in (template.active_days_of_week or [])
+            )
+            if not should_exist:
+                if visible_matches:
+                    actionable_ids.add(template.id)
+                continue
+            matches = visible_matches
+            if not matches:
+                actionable_ids.add(template.id)
+                continue
+            # Split or duplicate occurrences require the dedicated published
+            # schedule tools and are not valid Backdate Shift choices.
+            if len(matches) != 1 or matches[0].split_segments.all():
+                continue
+            instance = matches[0]
+            if any((
+                instance.facility_id != template.facility_id,
+                instance.start_datetime != proposed_start,
+                instance.end_datetime != proposed_end,
+                instance.required_staffing != template.default_staffing_count,
+            )):
+                actionable_ids.add(template.id)
+
+    return [template for template in templates if template.id in actionable_ids]
+
+
 def _build_backdate_plan(block, parsed):
     plan = []
     warnings = []
@@ -6922,8 +7054,6 @@ def _build_backdate_plan(block, parsed):
             continue
         day_name = current_date.strftime('%A')
         for template in parsed['templates']:
-            if day_name not in (template.active_days_of_week or []):
-                continue
             zone = _facility_timezone(template.facility)
             end_date = current_date + timedelta(days=1) if template.end_time <= template.start_time else current_date
             proposed_start = datetime.combine(current_date, template.start_time, tzinfo=zone)
@@ -6941,6 +7071,19 @@ def _build_backdate_plan(block, parsed):
                 shift_template=template,
                 split_parent__isnull=True,
             ).select_related('facility', 'shift_template').order_by('id'))
+            suppressed_ids = set(published_run.suppressed_shift_instance_ids or [])
+            visible_instances = [instance for instance in instances if instance.id not in suppressed_ids]
+            should_exist = bool(
+                template.active
+                and template.facility.active
+                and day_name in (template.active_days_of_week or [])
+            )
+            if not should_exist and not visible_instances:
+                continue
+            if should_exist and not visible_instances and instances:
+                # A previously removed occurrence is being restored.
+                visible_instances = [instances[0]]
+            instances = visible_instances
             if len(instances) > 1 or any(instance.split_segments.exists() for instance in instances):
                 warnings.append(
                     f'{current_date.isoformat()} {template.generated_name()} is split or duplicated and must be corrected through the published schedule tools.'
@@ -6970,6 +7113,21 @@ def _build_backdate_plan(block, parsed):
                     ),
                     'assigned_users': [_physician_display_name(row.physician) for row in assignment_rows],
                 }
+            if not should_exist:
+                plan.append({
+                    'action': 'REMOVE',
+                    'date': current_date.isoformat(),
+                    'shift_template_id': template.id,
+                    'schedule_block_id': authoritative_block.id,
+                    'schedule_version_id': version.id,
+                    'published_run_id': published_run.id,
+                    'shift_instance_id': instance.id,
+                    'before': before,
+                    'after': None,
+                    'replacement_options': [],
+                    'suggested_replacement_shift_template_id': None,
+                })
+                continue
             after = {
                 'facility_id': template.facility_id,
                 'facility_name': template.facility.name,
@@ -7004,6 +7162,34 @@ def _build_backdate_plan(block, parsed):
                 'after': after,
             })
         current_date += timedelta(days=1)
+    additions_by_date = {}
+    for item in plan:
+        if item['action'] == 'ADD':
+            additions_by_date.setdefault(item['date'], []).append(item)
+    for item in plan:
+        if item['action'] != 'REMOVE':
+            continue
+        assigned_count = len((item.get('before') or {}).get('assigned_users') or [])
+        options = []
+        for candidate in additions_by_date.get(item['date'], []):
+            after = candidate['after']
+            if after['required_staffing'] < assigned_count:
+                continue
+            options.append({
+                'shift_template_id': candidate['shift_template_id'],
+                'label': after['label'],
+                'facility_id': after['facility_id'],
+                'required_staffing': after['required_staffing'],
+            })
+        same_facility = [
+            option for option in options
+            if option['facility_id'] == item['before']['facility_id']
+        ]
+        suggested = same_facility[0] if len(same_facility) == 1 else None
+        item['replacement_options'] = options
+        item['suggested_replacement_shift_template_id'] = (
+            suggested['shift_template_id'] if suggested else None
+        )
     return plan, warnings, skipped_started
 
 
@@ -7022,20 +7208,30 @@ def schedule_block_backdate_context(request, block_id):
             {'detail': 'Backdate Shifts is available from a published historical schedule.'},
             status=status.HTTP_409_CONFLICT,
         )
-    _blocks, _authority, authoritative_dates = _published_backdate_authority(block)
+    blocks_by_id, authority, authoritative_dates = _published_backdate_authority(block)
     today = timezone.localdate()
     future_dates = [candidate for candidate in authoritative_dates if candidate >= today]
+    published_end_date = max(future_dates) if future_dates else None
+    templates = list(
+        _ordered_shift_templates().filter(
+            domain=block.domain,
+        )
+    )
+    actionable_templates = _actionable_backdate_templates(
+        block,
+        templates,
+        blocks_by_id=blocks_by_id,
+        authority=authority,
+        start_date=today,
+        end_date=published_end_date,
+    )
     return Response({
         'domain_id': block.domain_id,
         'domain_name': block.domain.name,
         'earliest_date': today.isoformat(),
-        'published_end_date': max(future_dates).isoformat() if future_dates else None,
+        'published_end_date': published_end_date.isoformat() if published_end_date else None,
         'shift_templates': ShiftTemplateSerializer(
-            _ordered_shift_templates().filter(
-                domain=block.domain,
-                active=True,
-                facility__active=True,
-            ),
+            actionable_templates,
             many=True,
         ).data,
     })
@@ -7077,12 +7273,47 @@ def schedule_block_backdate_shifts(request, block_id):
         )
     cancelled_trade_ids = []
     applied_changes = []
+    raw_transfers = request.data.get('assignment_transfers') or {}
+    if not isinstance(raw_transfers, dict):
+        return Response(
+            {'assignment_transfers': 'Assignment transfers must be keyed by the removed shift occurrence.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    transfer_choices = {}
+    for source_id, target_template_id in raw_transfers.items():
+        try:
+            transfer_choices[int(source_id)] = int(target_template_id)
+        except (TypeError, ValueError):
+            return Response(
+                {'assignment_transfers': 'One or more assignment transfer choices are invalid.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
     with transaction.atomic():
         # Rebuild the plan inside the transaction so confirmation never applies a stale preview.
         plan, warnings, skipped_started = _build_backdate_plan(block, parsed)
-        for item in plan:
+        remove_items = {
+            item['shift_instance_id']: item for item in plan if item['action'] == 'REMOVE'
+        }
+        for source_id, target_template_id in transfer_choices.items():
+            remove_item = remove_items.get(source_id)
+            valid_targets = {
+                option['shift_template_id']
+                for option in (remove_item or {}).get('replacement_options', [])
+            }
+            if target_template_id not in valid_targets:
+                return Response(
+                    {'assignment_transfers': 'A selected replacement is no longer available. Review the preview again.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        created_by_key = {}
+        # Create or update replacement occurrences before processing removals,
+        # so a whole batch can transfer assignments in one confirmation.
+        for item in sorted(plan, key=lambda row: row['action'] == 'REMOVE'):
             template = ShiftTemplate.objects.select_related('facility').get(id=item['shift_template_id'])
             published_run = OptimizerRun.objects.select_for_update().get(id=item['published_run_id'])
+            if item['action'] == 'REMOVE':
+                continue
             if item['shift_instance_id'] is None:
                 proposed_start = datetime.fromisoformat(item['after']['start_datetime'])
                 proposed_end = datetime.fromisoformat(item['after']['end_datetime'])
@@ -7138,6 +7369,119 @@ def schedule_block_backdate_shifts(request, block_id):
                     'facility', 'start_datetime', 'end_datetime',
                     'required_staffing', 'updated_at',
                 ])
+                suppressed_ids = set(published_run.suppressed_shift_instance_ids or [])
+                if instance.id in suppressed_ids:
+                    suppressed_ids.discard(instance.id)
+                    published_run.suppressed_shift_instance_ids = sorted(suppressed_ids)
+                    published_run.save(update_fields=['suppressed_shift_instance_ids'])
+            created_by_key[(item['date'], item['shift_template_id'], item['published_run_id'])] = instance
+            applied_changes.append(item)
+
+        for item in [row for row in plan if row['action'] == 'REMOVE']:
+            published_run = OptimizerRun.objects.select_for_update().get(id=item['published_run_id'])
+            instance = ScheduleShiftInstance.objects.select_for_update().select_related(
+                'schedule_version__domain', 'facility', 'shift_template',
+            ).get(id=item['shift_instance_id'])
+            assignment_rows = list(assignments_for_viewed_run(
+                instance.schedule_version, published_run,
+            ).filter(shift_instance=instance).select_related('physician__user'))
+            assignment_ids = [assignment.id for assignment in assignment_rows]
+            trades = list(ShiftTrade.objects.filter(
+                Q(offered_assignment_id__in=assignment_ids)
+                | Q(requested_assignment_id__in=assignment_ids),
+                status__in=[
+                    ShiftTrade.Status.PENDING_RECIPIENT,
+                    ShiftTrade.Status.PENDING_SCHEDULER,
+                ],
+            ).select_related('requester__user'))
+            trade_ids = [trade.id for trade in trades]
+            cancelled_trade_ids.extend(trade_ids)
+            ShiftTrade.objects.filter(id__in=trade_ids).update(
+                status=ShiftTrade.Status.CANCELLED,
+                note=BACKDATE_TRADE_CANCEL_NOTE,
+                updated_at=timezone.now(),
+            )
+            for trade in trades:
+                ShiftTradeView.objects.filter(
+                    trade_id=trade.id,
+                    user_id=trade.requester.user_id,
+                ).delete()
+            ShiftPosting.objects.filter(assignment_id__in=assignment_ids).delete()
+
+            target_template_id = transfer_choices.get(instance.id)
+            transferred_users = []
+            if target_template_id is not None:
+                target = created_by_key.get((item['date'], target_template_id, item['published_run_id']))
+                if target is None:
+                    raise ValidationError({
+                        'assignment_transfers': 'The selected replacement shift was not created.',
+                    })
+                existing_count = assignments_for_viewed_run(
+                    target.schedule_version, published_run,
+                ).filter(shift_instance=target).count()
+                if existing_count + len(assignment_rows) > target.required_staffing:
+                    raise ValidationError({
+                        'assignment_transfers': f'{target.shift_template.generated_name()} no longer has enough positions.',
+                    })
+                suppressed_ids = set(published_run.suppressed_shift_instance_ids or [])
+                for source_assignment in assignment_rows:
+                    physician = source_assignment.physician
+                    if not _physician_is_active_in_domain(physician, target.schedule_version.domain):
+                        raise ValidationError({
+                            'assignment_transfers': f'{_physician_display_name(physician)} is not clinically active in this Domain.',
+                        })
+                    overlap = assignments_for_viewed_run(
+                        target.schedule_version, published_run,
+                    ).filter(
+                        physician=physician,
+                        shift_instance__start_datetime__lt=target.end_datetime,
+                        shift_instance__end_datetime__gt=target.start_datetime,
+                    ).exclude(shift_instance=instance).exclude(
+                        shift_instance_id__in=suppressed_ids,
+                    ).exists()
+                    if overlap:
+                        raise ValidationError({
+                            'assignment_transfers': f'{_physician_display_name(physician)} has an overlapping assignment.',
+                        })
+                    ScheduleShiftAssignment.objects.get_or_create(
+                        shift_instance=target,
+                        physician=physician,
+                        optimizer_run=published_run,
+                        defaults={
+                            'assignment_source': ScheduleShiftAssignment.AssignmentSource.MANUAL,
+                            'created_by': request.user,
+                            'is_locked': True,
+                        },
+                    )
+                    transferred_users.append(_physician_display_name(physician))
+                assigned_count = assignments_for_viewed_run(
+                    target.schedule_version, published_run,
+                ).filter(shift_instance=target).count()
+                remains_open = assigned_count < target.required_staffing
+                target.is_locked_open = remains_open
+                target.status = (
+                    ScheduleShiftInstance.Status.OPEN
+                    if remains_open else ScheduleShiftInstance.Status.ASSIGNED
+                )
+                target.save(update_fields=['is_locked_open', 'status', 'updated_at'])
+                locked_ids = set(published_run.locked_open_shift_instance_ids or [])
+                if remains_open:
+                    locked_ids.add(target.id)
+                else:
+                    locked_ids.discard(target.id)
+                published_run.locked_open_shift_instance_ids = sorted(locked_ids)
+
+            suppressed_ids = set(published_run.suppressed_shift_instance_ids or [])
+            suppressed_ids.add(instance.id)
+            locked_ids = set(published_run.locked_open_shift_instance_ids or [])
+            locked_ids.discard(instance.id)
+            published_run.suppressed_shift_instance_ids = sorted(suppressed_ids)
+            published_run.locked_open_shift_instance_ids = sorted(locked_ids)
+            published_run.save(update_fields=[
+                'suppressed_shift_instance_ids', 'locked_open_shift_instance_ids',
+            ])
+            item['transferred_users'] = transferred_users
+            item['replacement_shift_template_id'] = target_template_id
             applied_changes.append(item)
         audit = PublishedShiftBackdate.objects.create(
             domain=block.domain,

@@ -10705,6 +10705,7 @@ def optimize_schedule_version(
         source_run = prepared_run.source_run
         optimizer_run = prepared_run.optimizer_run
         source_locked_open_ids = prepared_run.source_locked_open_ids
+        source_suppressed_ids = prepared_run.source_suppressed_ids
         runtime_limit_seconds = prepared_run.runtime_limit_seconds
         optimization_focus = prepared_run.optimization_focus
         seed = prepared_run.seed
@@ -10729,6 +10730,7 @@ def optimize_schedule_version(
             optimizer_run=optimizer_run,
             start_mode=start_mode,
             source_locked_open_ids=source_locked_open_ids,
+            source_suppressed_ids=source_suppressed_ids,
             isolated_run=isolated_run,
             created_by=created_by,
         )

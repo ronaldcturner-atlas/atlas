@@ -590,6 +590,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
             'copied_from_run', 'copied_from_run_number', 'run_kind',
             'started_from_run', 'started_from_run_number',
             'locked_open_shift_instance_ids', 'start_mode',
+            'suppressed_shift_instance_ids',
             'max_runtime_seconds',
             'optimization_focus',
             'runtime_seconds',

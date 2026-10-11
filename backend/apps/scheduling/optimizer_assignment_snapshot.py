@@ -138,6 +138,7 @@ def prepare_assignment_snapshot(
     optimizer_run,
     start_mode,
     source_locked_open_ids,
+    source_suppressed_ids,
     isolated_run,
     created_by,
 ):
@@ -156,7 +157,9 @@ def prepare_assignment_snapshot(
             schedule_version=version,
             id__in=source_locked_open_ids,
         ).update(is_locked_open=True)
-    instances_queryset = version_shift_instances_queryset(version)
+    instances_queryset = version_shift_instances_queryset(version).exclude(
+        id__in=source_suppressed_ids,
+    )
     if not isolated_run:
         instances_queryset = instances_queryset.select_for_update()
     instances = list(
@@ -170,6 +173,7 @@ def prepare_assignment_snapshot(
             instance.is_locked_open = instance.id in source_locked_open_id_set
     raw_source_assignments = list(
         assignments_for_viewed_run(version, source_run)
+        .exclude(shift_instance_id__in=source_suppressed_ids)
         .select_related('shift_instance', 'physician__user')
     )
     manual_assignment_only_physician_ids = set(

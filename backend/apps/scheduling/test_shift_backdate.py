@@ -113,14 +113,9 @@ class ShiftBackdateWorkflowTests(TestCase):
         )
         version.published_optimizer_run = run
         version.save(update_fields=['published_optimizer_run'])
-        start_at = timezone.make_aware(
-            datetime.combine(self.future_date, time(7)),
-            timezone=timezone.get_current_timezone(),
-        )
-        end_at = timezone.make_aware(
-            datetime.combine(self.future_date, time(15)),
-            timezone=timezone.get_current_timezone(),
-        )
+        facility_zone = ZoneInfo(self.facility.timezone)
+        start_at = datetime.combine(self.future_date, time(7), tzinfo=facility_zone)
+        end_at = datetime.combine(self.future_date, time(15), tzinfo=facility_zone)
         instance = ScheduleShiftInstance.objects.create(
             schedule_version=version,
             schedule_block=block,
@@ -281,6 +276,162 @@ class ShiftBackdateWorkflowTests(TestCase):
         self.assertTrue(created.is_locked_open)
         self.assertIn(created.id, run.locked_open_shift_instance_ids)
         self.assertFalse(created.assignments.exists())
+
+    def test_removed_weekday_is_hidden_and_assignment_can_transfer_to_replacement(self):
+        block, version, run, old_instance, old_assignment = self._published_schedule()
+        block.end_date = self.future_date
+        block.save(update_fields=['end_date'])
+        removed_day = self.future_date.strftime('%A')
+        self.template.active_days_of_week = []
+        self.template.save(update_fields=['active_days_of_week'])
+        replacement = ShiftTemplate.objects.create(
+            domain=self.domain,
+            facility=self.facility,
+            name='Generated',
+            start_time=time(12),
+            end_time=time(20),
+            active_days_of_week=[removed_day],
+            weekend_days=[],
+            default_staffing_count=1,
+        )
+        payload = {
+            'shift_template_ids': [self.template.id, replacement.id],
+            'start_date': self.future_date.isoformat(),
+            'end_date': self.future_date.isoformat(),
+        }
+
+        context = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertEqual(context.status_code, 200)
+        self.assertEqual(
+            {row['id'] for row in context.json()['shift_templates']},
+            {self.template.id, replacement.id},
+        )
+
+        preview = self.client.post(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/', payload, format='json',
+        )
+        self.assertEqual(preview.status_code, 200)
+        removal = next(row for row in preview.json()['changes'] if row['action'] == 'REMOVE')
+        addition = next(row for row in preview.json()['changes'] if row['action'] == 'ADD')
+        self.assertEqual(removal['shift_instance_id'], old_instance.id)
+        self.assertEqual(
+            removal['suggested_replacement_shift_template_id'], replacement.id,
+        )
+        self.assertEqual(
+            [row['shift_template_id'] for row in removal['replacement_options']],
+            [replacement.id],
+        )
+
+        applied = self.client.post(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/',
+            {
+                **payload,
+                'apply': True,
+                'assignment_transfers': {str(old_instance.id): replacement.id},
+            },
+            format='json',
+        )
+        self.assertEqual(applied.status_code, 200)
+        run.refresh_from_db()
+        self.assertIn(old_instance.id, run.suppressed_shift_instance_ids)
+        self.assertTrue(ScheduleShiftInstance.objects.filter(id=old_instance.id).exists())
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(id=old_assignment.id).exists())
+        new_instance = ScheduleShiftInstance.objects.get(
+            schedule_version=version,
+            date=self.future_date,
+            shift_template=replacement,
+        )
+        self.assertTrue(ScheduleShiftAssignment.objects.filter(
+            shift_instance=new_instance,
+            optimizer_run=run,
+            physician=self.owner,
+        ).exists())
+        self.assertFalse(new_instance.is_locked_open)
+
+        published = self.client.get(
+            f'/api/published-schedule/?domain={self.domain.id}',
+        )
+        self.assertEqual(published.status_code, 200)
+        rows = published.json()
+        self.assertFalse(any(row['shift_instance_id'] == old_instance.id for row in rows))
+        replacement_row = next(
+            row for row in rows if row['shift_instance_id'] == new_instance.id
+        )
+        self.assertEqual(replacement_row['physician'], self.owner.id)
+
+        refreshed_context = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertEqual(refreshed_context.status_code, 200)
+        refreshed_ids = {row['id'] for row in refreshed_context.json()['shift_templates']}
+        self.assertNotIn(self.template.id, refreshed_ids)
+        self.assertNotIn(replacement.id, refreshed_ids)
+
+    def test_backdate_picker_only_lists_modified_or_new_shifts(self):
+        block, _version, _run, _instance, _assignment = self._published_schedule()
+        block.end_date = self.future_date
+        block.save(update_fields=['end_date'])
+        unchanged_template = ShiftTemplate.objects.create(
+            domain=self.domain,
+            facility=self.facility,
+            name='Generated',
+            start_time=time(9),
+            end_time=time(17),
+            active_days_of_week=[self.future_date.strftime('%A')],
+            weekend_days=[],
+            default_staffing_count=1,
+        )
+        unchanged_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=_version,
+            schedule_block=block,
+            date=self.future_date,
+            shift_template=unchanged_template,
+            facility=self.facility,
+            start_datetime=datetime.combine(
+                self.future_date,
+                time(9),
+                tzinfo=ZoneInfo(self.facility.timezone),
+            ),
+            end_datetime=datetime.combine(
+                self.future_date,
+                time(17),
+                tzinfo=ZoneInfo(self.facility.timezone),
+            ),
+            required_staffing=1,
+        )
+        new_template = ShiftTemplate.objects.create(
+            domain=self.domain,
+            facility=self.facility,
+            name='Generated',
+            start_time=time(18),
+            end_time=time(23),
+            active_days_of_week=[self.future_date.strftime('%A')],
+            weekend_days=[],
+            default_staffing_count=1,
+        )
+
+        initial = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertEqual(initial.status_code, 200)
+        initial_ids = {row['id'] for row in initial.json()['shift_templates']}
+        self.assertNotIn(self.template.id, initial_ids)
+        self.assertNotIn(unchanged_template.id, initial_ids)
+        self.assertIn(new_template.id, initial_ids)
+
+        self.template.end_time = time(17)
+        self.template.save(update_fields=['end_time'])
+        modified = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        modified_ids = {row['id'] for row in modified.json()['shift_templates']}
+        self.assertIn(self.template.id, modified_ids)
+        self.assertNotIn(unchanged_template.id, modified_ids)
+        self.assertIn(new_template.id, modified_ids)
+
+        unchanged_instance.delete()
 
     def test_new_shift_template_notifies_only_existing_build_blocks(self):
         existing_block = self._block()

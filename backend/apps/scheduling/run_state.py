@@ -95,12 +95,17 @@ def visible_assignment_filter(viewed_run):
 
 def assignments_for_viewed_run(version, viewed_run=None):
     """Return the authoritative in-range assignment set for a viewed run."""
-    return ScheduleShiftAssignment.objects.filter(
+    queryset = ScheduleShiftAssignment.objects.filter(
         visible_assignment_filter(viewed_run),
         shift_instance__schedule_version=version,
         shift_instance__date__gte=version.schedule_block.start_date,
         shift_instance__date__lte=version.schedule_block.end_date,
     )
+    if viewed_run is not None:
+        queryset = queryset.exclude(
+            shift_instance_id__in=viewed_run.suppressed_shift_instance_ids or [],
+        )
+    return queryset
 
 
 def locked_open_ids(viewed_run):

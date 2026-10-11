@@ -74,11 +74,14 @@ type BackdatePreview = {
   end_date: string
   published_end_date: string
   changes: Array<{
-    action: 'ADD' | 'UPDATE'
+    action: 'ADD' | 'UPDATE' | 'REMOVE'
     date: string
     shift_template_id: number
+    shift_instance_id: number | null
     before: null | { label: string; assigned_users: string[]; required_staffing: number }
-    after: { label: string; assigned_users: string[]; required_staffing: number; open: boolean }
+    after: null | { label: string; assigned_users: string[]; required_staffing: number; open: boolean }
+    replacement_options?: Array<{ shift_template_id: number; label: string; required_staffing: number }>
+    suggested_replacement_shift_template_id?: number | null
   }>
   warnings: string[]
   skipped_started_shifts: Array<{ date: string; shift: string }>
@@ -279,6 +282,7 @@ export default function ScheduleBlocksView({
   const [backdateStartDate, setBackdateStartDate] = useState('')
   const [backdateEndDate, setBackdateEndDate] = useState('')
   const [backdatePreview, setBackdatePreview] = useState<BackdatePreview | null>(null)
+  const [backdateTransfers, setBackdateTransfers] = useState<Record<number, number | null>>({})
   const [isBackdateLoading, setIsBackdateLoading] = useState(false)
 
   const fetchBlocks = async () => {
@@ -692,6 +696,7 @@ export default function ScheduleBlocksView({
     setBackdateStartDate('')
     setBackdateEndDate('')
     setBackdatePreview(null)
+    setBackdateTransfers({})
   }
 
   const openBackdate = async (block: ScheduleBlock) => {
@@ -733,6 +738,9 @@ export default function ScheduleBlocksView({
           shift_template_ids: backdateTemplateIds,
           start_date: backdateStartDate,
           end_date: backdateEndDate || null,
+          assignment_transfers: Object.fromEntries(
+            Object.entries(backdateTransfers).filter(([, targetId]) => targetId !== null),
+          ),
           apply,
         }),
       })
@@ -745,7 +753,16 @@ export default function ScheduleBlocksView({
         await fetchBlocks()
         window.alert(data.detail ?? 'Published shifts were updated.')
       } else {
-        setBackdatePreview(data as BackdatePreview)
+        const preview = data as BackdatePreview
+        setBackdatePreview(preview)
+        setBackdateTransfers(Object.fromEntries(
+          preview.changes
+            .filter((change) => change.action === 'REMOVE' && change.shift_instance_id !== null)
+            .map((change) => [
+              change.shift_instance_id as number,
+              change.suggested_replacement_shift_template_id ?? null,
+            ]),
+        ))
       }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Unable to backdate these shifts.')
@@ -931,7 +948,7 @@ export default function ScheduleBlocksView({
           <div className="shift-modal shift-modal-wide backdate-shifts-modal" onClick={(event) => event.stopPropagation()}>
             <div className="shift-modal-header">
               <h2>Backdate Shifts</h2>
-              <p>Targeted corrections or additions to the current published schedule. Existing assignments are retained; newly added shifts are open.</p>
+              <p>Targeted corrections or additions to the current published schedule. Review all changes together before applying them.</p>
             </div>
             <div className="shift-modal-body">
               {!backdatePreview ? (
@@ -961,6 +978,9 @@ export default function ScheduleBlocksView({
                   </div>
                   <fieldset className="backdate-shift-picker">
                     <legend>Select updated or newly added Shifts</legend>
+                    {!backdateContext.shift_templates.length && (
+                      <div className="empty-state">No modified or newly created Shifts need to be backdated.</div>
+                    )}
                     {backdateContext.shift_templates.map((template) => (
                       <label key={template.id}>
                         <input
@@ -992,9 +1012,32 @@ export default function ScheduleBlocksView({
                   <div className="backdate-change-list">
                     {backdatePreview.changes.map((change, index) => (
                       <article key={`${change.date}-${change.shift_template_id}-${index}`}>
-                        <header><strong>{formatDate(change.date)}</strong><span>{change.action === 'ADD' ? 'New open shift' : 'Modified shift'}</span></header>
+                        <header><strong>{formatDate(change.date)}</strong><span>{change.action === 'ADD' ? 'New open shift' : change.action === 'REMOVE' ? 'Removed shift' : 'Modified shift'}</span></header>
                         <div><span>Current</span><strong>{change.before?.label ?? 'No shift'}</strong><small>{change.before?.assigned_users.join(', ') || 'Unassigned'}</small></div>
-                        <div><span>Proposed</span><strong>{change.after.label}</strong><small>{change.after.assigned_users.join(', ') || 'Open shift'}</small></div>
+                        <div>
+                          <span>Proposed</span>
+                          <strong>{change.after?.label ?? 'Remove from published schedule'}</strong>
+                          <small>{change.after?.assigned_users.join(', ') || (change.action === 'REMOVE' ? 'No longer shown' : 'Open shift')}</small>
+                          {change.action === 'REMOVE' && change.shift_instance_id !== null && !!change.before?.assigned_users.length && (
+                            <label className="backdate-transfer-choice">
+                              <span>Assignment handling</span>
+                              <select
+                                value={backdateTransfers[change.shift_instance_id] ?? ''}
+                                onChange={(event) => setBackdateTransfers((current) => ({
+                                  ...current,
+                                  [change.shift_instance_id as number]: event.target.value ? Number(event.target.value) : null,
+                                }))}
+                              >
+                                <option value="">Leave replacement shift open</option>
+                                {(change.replacement_options ?? []).map((option) => (
+                                  <option key={option.shift_template_id} value={option.shift_template_id}>
+                                    Transfer to {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+                        </div>
                       </article>
                     ))}
                     {!backdatePreview.changes.length && <div className="empty-state">No future published shifts would change.</div>}

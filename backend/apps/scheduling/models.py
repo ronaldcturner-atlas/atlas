@@ -409,6 +409,9 @@ class OptimizerRun(models.Model):
     started_from_run_number = models.PositiveIntegerField(null=True, blank=True)
     run_kind = models.CharField(max_length=20, default='OPTIMIZER')
     locked_open_shift_instance_ids = models.JSONField(default=list, blank=True)
+    # Published backdates may remove an occurrence from the live schedule while
+    # retaining the original instance and assignments for run history/audit.
+    suppressed_shift_instance_ids = models.JSONField(default=list, blank=True)
     start_mode = models.CharField(
         max_length=32, choices=StartMode.choices, default=StartMode.FRESH_FILL,
     )
