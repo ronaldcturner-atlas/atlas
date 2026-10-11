@@ -94,6 +94,9 @@ def clone_optimizer_run_canonical(*, version, source_run):
             suppressed_shift_instance_ids=list(
                 locked_source.suppressed_shift_instance_ids or []
             ),
+            backdated_shift_template_revisions=dict(
+                locked_source.backdated_shift_template_revisions or {}
+            ),
             start_mode=locked_source.start_mode,
             optimization_focus=locked_source.optimization_focus,
         )

@@ -412,6 +412,10 @@ class OptimizerRun(models.Model):
     # Published backdates may remove an occurrence from the live schedule while
     # retaining the original instance and assignments for run history/audit.
     suppressed_shift_instance_ids = models.JSONField(default=list, blank=True)
+    # Latest Shift Builder revision applied to each published date/template.
+    # Keys are ``YYYY-MM-DD:template_id`` so limited-window backdates do not
+    # incorrectly acknowledge the same change across the whole schedule.
+    backdated_shift_template_revisions = models.JSONField(default=dict, blank=True)
     start_mode = models.CharField(
         max_length=32, choices=StartMode.choices, default=StartMode.FRESH_FILL,
     )

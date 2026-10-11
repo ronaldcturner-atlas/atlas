@@ -1060,8 +1060,9 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                           setActualEndTime(shift.endTime.slice(0, 5))
                         }}
                       >
-                        <span>
-                          {shift.facility} {shift.shift} {shift.physician_name}
+                        <span className="calendar-shift-label">
+                          <span className="calendar-shift-name">{shift.facility} {shift.shift}</span>
+                          <span className="calendar-shift-user">{shift.physician_name}</span>
                         </span>
                       </div>
                       ))}

@@ -74,13 +74,13 @@ type BackdatePreview = {
   end_date: string
   published_end_date: string
   changes: Array<{
-    action: 'ADD' | 'UPDATE' | 'REMOVE'
+    action: 'ADD' | 'UPDATE' | 'REMOVE' | 'RESTORE'
     date: string
     shift_template_id: number
     shift_instance_id: number | null
     before: null | { label: string; assigned_users: string[]; required_staffing: number }
     after: null | { label: string; assigned_users: string[]; required_staffing: number; open: boolean }
-    replacement_options?: Array<{ shift_template_id: number; label: string; required_staffing: number }>
+    replacement_options?: Array<{ shift_template_id: number; label: string; required_staffing: number; recommendation_reason?: string }>
     suggested_replacement_shift_template_id?: number | null
   }>
   warnings: string[]
@@ -1009,10 +1009,43 @@ export default function ScheduleBlocksView({
                       {backdatePreview.skipped_started_shifts.length} shift occurrence(s) already started and will not be changed.
                     </div>
                   )}
+                  {backdatePreview.changes.some((change) => (
+                    change.action === 'REMOVE' && !!change.before?.assigned_users.length
+                  )) && (
+                    <div className="backdate-batch-actions">
+                      <span>Assignment handling</span>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={!backdatePreview.changes.some((change) => change.suggested_replacement_shift_template_id)}
+                        onClick={() => setBackdateTransfers(Object.fromEntries(
+                          backdatePreview.changes
+                            .filter((change) => change.action === 'REMOVE' && change.shift_instance_id !== null)
+                            .map((change) => [
+                              change.shift_instance_id as number,
+                              change.suggested_replacement_shift_template_id ?? null,
+                            ]),
+                        ))}
+                      >
+                        Accept All Proposed Switches
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={() => setBackdateTransfers(Object.fromEntries(
+                          backdatePreview.changes
+                            .filter((change) => change.action === 'REMOVE' && change.shift_instance_id !== null)
+                            .map((change) => [change.shift_instance_id as number, null]),
+                        ))}
+                      >
+                        Leave All Open
+                      </button>
+                    </div>
+                  )}
                   <div className="backdate-change-list">
                     {backdatePreview.changes.map((change, index) => (
                       <article key={`${change.date}-${change.shift_template_id}-${index}`}>
-                        <header><strong>{formatDate(change.date)}</strong><span>{change.action === 'ADD' ? 'New open shift' : change.action === 'REMOVE' ? 'Removed shift' : 'Modified shift'}</span></header>
+                        <header><strong>{formatDate(change.date)}</strong><span>{change.action === 'ADD' ? 'New open shift' : change.action === 'REMOVE' ? 'Removed shift' : change.action === 'RESTORE' ? 'Restored shift' : 'Modified shift'}</span></header>
                         <div><span>Current</span><strong>{change.before?.label ?? 'No shift'}</strong><small>{change.before?.assigned_users.join(', ') || 'Unassigned'}</small></div>
                         <div>
                           <span>Proposed</span>
@@ -1031,7 +1064,7 @@ export default function ScheduleBlocksView({
                                 <option value="">Leave replacement shift open</option>
                                 {(change.replacement_options ?? []).map((option) => (
                                   <option key={option.shift_template_id} value={option.shift_template_id}>
-                                    Transfer to {option.label}
+                                    Transfer to {option.label}{option.recommendation_reason ? ` — ${option.recommendation_reason}` : ''}
                                   </option>
                                 ))}
                               </select>

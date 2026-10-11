@@ -4791,6 +4791,12 @@ def schedule_version_run_optimizer(request, version_id):
                 else list(source_run.suppressed_shift_instance_ids or [])
                 if source_run is not None else []
             )
+            backdated_revisions = (
+                {}
+                if start_mode == OptimizerRun.StartMode.ORIGINAL_PUBLISHED_SCHEDULE
+                else dict(source_run.backdated_shift_template_revisions or {})
+                if source_run is not None else {}
+            )
             optimizer_run = OptimizerRun.objects.create(
                 schedule_version=locked_version,
                 shift_configuration_revision=locked_version.shift_configuration_revision,
@@ -4825,6 +4831,7 @@ def schedule_version_run_optimizer(request, version_id):
                 ),
                 locked_open_shift_instance_ids=locked_open_ids,
                 suppressed_shift_instance_ids=suppressed_ids,
+                backdated_shift_template_revisions=backdated_revisions,
             )
             OptimizerControl.objects.create(
                 token=token,
@@ -4929,6 +4936,7 @@ def optimizer_run_save_copy(request, run_id):
             run_kind='COPY',
             locked_open_shift_instance_ids=locked_open_ids,
             suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
+            backdated_shift_template_revisions=dict(source.backdated_shift_template_revisions or {}),
             start_mode=source.start_mode,
             optimization_focus=source.optimization_focus,
         )
@@ -5085,6 +5093,7 @@ def optimizer_run_save_manual_changes_as_new(request, run_id):
             run_kind='COPY',
             locked_open_shift_instance_ids=edited_locked_open_ids,
             suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
+            backdated_shift_template_revisions=dict(source.backdated_shift_template_revisions or {}),
             start_mode=source.start_mode,
             optimization_focus=source.optimization_focus,
         )
@@ -6921,6 +6930,17 @@ def _backdate_shift_label(facility, start_time, end_time):
     return f'{facility.short_name} {_format_template_time(start_time)}-{_format_template_time(end_time)}'
 
 
+def _latest_shift_template_revisions(template_ids):
+    revisions = {}
+    for template_id, revision in (
+        ShiftTemplateChange.objects.filter(shift_template_id__in=template_ids)
+        .order_by('shift_template_id', '-revision')
+        .values_list('shift_template_id', 'revision')
+    ):
+        revisions.setdefault(template_id, revision)
+    return revisions
+
+
 def _actionable_backdate_templates(
     block,
     templates,
@@ -6954,10 +6974,10 @@ def _actionable_backdate_templates(
                 )
             version, published_run = version_run_by_block[authoritative_block.id]
             if version is not None and published_run is not None:
-                relevant_dates.append((current_date, version))
+                relevant_dates.append((current_date, version, published_run))
         current_date += timedelta(days=1)
 
-    version_ids = {version.id for _candidate_date, version in relevant_dates}
+    version_ids = {version.id for _candidate_date, version, _run in relevant_dates}
     instances_by_key = {}
     if version_ids:
         instances = (
@@ -6979,8 +6999,11 @@ def _actionable_backdate_templates(
             ).append(instance)
 
     actionable_ids = set()
+    latest_revisions = _latest_shift_template_revisions(
+        [template.id for template in templates],
+    )
     now = timezone.now()
-    for candidate_date, version in relevant_dates:
+    for candidate_date, version, published_run in relevant_dates:
         day_name = candidate_date.strftime('%A')
         for template in templates:
             if template.id in actionable_ids:
@@ -6999,11 +7022,17 @@ def _actionable_backdate_templates(
                 (version.id, candidate_date, template.id),
                 [],
             )
-            suppressed_ids = set(
-                version_run_by_block[version.schedule_block_id][1].suppressed_shift_instance_ids
-                or []
-            )
+            suppressed_ids = set(published_run.suppressed_shift_instance_ids or [])
             visible_matches = [match for match in matches if match.id not in suppressed_ids]
+            occurrence_key = f'{candidate_date.isoformat()}:{template.id}'
+            applied_revision = int(
+                (published_run.backdated_shift_template_revisions or {}).get(
+                    occurrence_key,
+                    published_run.shift_configuration_revision,
+                )
+                or 0
+            )
+            revision_pending = latest_revisions.get(template.id, 0) > applied_revision
             should_exist = bool(
                 template.active
                 and template.facility.active
@@ -7012,6 +7041,9 @@ def _actionable_backdate_templates(
             if not should_exist:
                 if visible_matches:
                     actionable_ids.add(template.id)
+                continue
+            if matches and not visible_matches:
+                actionable_ids.add(template.id)
                 continue
             matches = visible_matches
             if not matches:
@@ -7027,7 +7059,7 @@ def _actionable_backdate_templates(
                 instance.start_datetime != proposed_start,
                 instance.end_datetime != proposed_end,
                 instance.required_staffing != template.default_staffing_count,
-            )):
+            )) or revision_pending:
                 actionable_ids.add(template.id)
 
     return [template for template in templates if template.id in actionable_ids]
@@ -7039,6 +7071,9 @@ def _build_backdate_plan(block, parsed):
     skipped_started = []
     now = timezone.now()
     version_run_by_block = {}
+    latest_revisions = _latest_shift_template_revisions(
+        [template.id for template in parsed['templates']],
+    )
     current_date = parsed['start_date']
     while current_date <= parsed['end_date']:
         authoritative_block_id = parsed['authority'].get((block.domain_id, current_date))
@@ -7080,7 +7115,8 @@ def _build_backdate_plan(block, parsed):
             )
             if not should_exist and not visible_instances:
                 continue
-            if should_exist and not visible_instances and instances:
+            restoring = bool(should_exist and not visible_instances and instances)
+            if restoring:
                 # A previously removed occurrence is being restored.
                 visible_instances = [instances[0]]
             instances = visible_instances
@@ -7091,14 +7127,16 @@ def _build_backdate_plan(block, parsed):
                 continue
             instance = instances[0] if instances else None
             assignment_rows = list(
-                assignments_for_viewed_run(version, published_run).filter(
+                ScheduleShiftAssignment.objects.filter(
+                    visible_assignment_filter(published_run),
+                    shift_instance__schedule_version=version,
                     shift_instance=instance,
                 ).select_related('physician__user')
             ) if instance else []
             before = None
             action = 'ADD'
             if instance is not None:
-                action = 'UPDATE'
+                action = 'RESTORE' if restoring else 'UPDATE'
                 before = {
                     'shift_instance_id': instance.id,
                     'facility_id': instance.facility_id,
@@ -7112,6 +7150,7 @@ def _build_backdate_plan(block, parsed):
                         instance.end_datetime.astimezone(_facility_timezone(instance.facility)).time().replace(tzinfo=None),
                     ),
                     'assigned_users': [_physician_display_name(row.physician) for row in assignment_rows],
+                    'assigned_physician_ids': [row.physician_id for row in assignment_rows],
                 }
             if not should_exist:
                 plan.append({
@@ -7126,6 +7165,9 @@ def _build_backdate_plan(block, parsed):
                     'after': None,
                     'replacement_options': [],
                     'suggested_replacement_shift_template_id': None,
+                    'shift_template_revision': latest_revisions.get(
+                        template.id, published_run.shift_configuration_revision,
+                    ),
                 })
                 continue
             after = {
@@ -7138,7 +7180,16 @@ def _build_backdate_plan(block, parsed):
                 'assigned_users': [_physician_display_name(row.physician) for row in assignment_rows],
                 'open': instance is None,
             }
-            changed = instance is None or any((
+            occurrence_key = f'{current_date.isoformat()}:{template.id}'
+            applied_revision = int(
+                (published_run.backdated_shift_template_revisions or {}).get(
+                    occurrence_key,
+                    published_run.shift_configuration_revision,
+                )
+                or 0
+            )
+            revision_pending = latest_revisions.get(template.id, 0) > applied_revision
+            changed = instance is None or restoring or revision_pending or any((
                 instance.facility_id != template.facility_id,
                 instance.start_datetime != proposed_start,
                 instance.end_datetime != proposed_end,
@@ -7160,32 +7211,128 @@ def _build_backdate_plan(block, parsed):
                 'shift_instance_id': instance.id if instance else None,
                 'before': before,
                 'after': after,
+                'shift_template_revision': latest_revisions.get(
+                    template.id, published_run.shift_configuration_revision,
+                ),
             })
         current_date += timedelta(days=1)
     additions_by_date = {}
     for item in plan:
-        if item['action'] == 'ADD':
+        if item['action'] in {'ADD', 'RESTORE'}:
             additions_by_date.setdefault(item['date'], []).append(item)
-    for item in plan:
+    remaining_capacity = {
+        (item['date'], item['shift_template_id'], item['published_run_id']): max(
+            item['after']['required_staffing']
+            - len(item['after'].get('assigned_users') or []),
+            0,
+        )
+        for item in plan if item['action'] in {'ADD', 'RESTORE'}
+    }
+    plan_runs = {
+        run.id: run
+        for run in OptimizerRun.objects.filter(
+            id__in={item['published_run_id'] for item in plan},
+        )
+    }
+    proposed_intervals_by_physician = {}
+    for item in sorted(
+        plan,
+        key=lambda row: (
+            row['date'],
+            (row.get('before') or {}).get('start_datetime', ''),
+            row['shift_template_id'],
+        ),
+    ):
         if item['action'] != 'REMOVE':
             continue
         assigned_count = len((item.get('before') or {}).get('assigned_users') or [])
+        assigned_physician_ids = (item.get('before') or {}).get('assigned_physician_ids') or []
         options = []
         for candidate in additions_by_date.get(item['date'], []):
             after = candidate['after']
-            if after['required_staffing'] < assigned_count:
+            available_positions = max(
+                after['required_staffing'] - len(after.get('assigned_users') or []),
+                0,
+            )
+            if available_positions < assigned_count:
                 continue
+            if assigned_physician_ids:
+                eligible_physician_ids = set(
+                    ContractUserAssignment.objects.filter(
+                        physician_id__in=assigned_physician_ids,
+                        domain_id=block.domain_id,
+                        contract__active=True,
+                        contract__facilities__id=after['facility_id'],
+                    ).values_list('physician_id', flat=True)
+                )
+                if eligible_physician_ids != set(assigned_physician_ids):
+                    continue
+            proposed_start = datetime.fromisoformat(after['start_datetime'])
+            proposed_end = datetime.fromisoformat(after['end_datetime'])
+            published_run = plan_runs[item['published_run_id']]
+            suppressed_ids = set(published_run.suppressed_shift_instance_ids or [])
+            has_conflict = ScheduleShiftAssignment.objects.filter(
+                visible_assignment_filter(published_run),
+                physician_id__in=assigned_physician_ids,
+                shift_instance__schedule_version_id=item['schedule_version_id'],
+                shift_instance__start_datetime__lt=proposed_end,
+                shift_instance__end_datetime__gt=proposed_start,
+            ).exclude(shift_instance_id=item['shift_instance_id']).exclude(
+                shift_instance_id__in=suppressed_ids,
+            ).exists()
+            if has_conflict:
+                continue
+            same_facility = after['facility_id'] == item['before']['facility_id']
+            start_distance = abs(
+                proposed_start.timestamp()
+                - datetime.fromisoformat(item['before']['start_datetime']).timestamp()
+            )
             options.append({
                 'shift_template_id': candidate['shift_template_id'],
                 'label': after['label'],
                 'facility_id': after['facility_id'],
                 'required_staffing': after['required_staffing'],
+                'recommendation_reason': (
+                    'Same facility and closest compatible time'
+                    if same_facility
+                    else 'Closest compatible added shift on this date'
+                ),
+                '_rank': (0 if same_facility else 1, start_distance, candidate['shift_template_id']),
+                '_start_datetime': proposed_start,
+                '_end_datetime': proposed_end,
             })
-        same_facility = [
-            option for option in options
-            if option['facility_id'] == item['before']['facility_id']
-        ]
-        suggested = same_facility[0] if len(same_facility) == 1 else None
+        options.sort(key=lambda option: option['_rank'])
+        suggested = None
+        if assigned_count > 0:
+            for option in options:
+                if remaining_capacity.get(
+                    (item['date'], option['shift_template_id'], item['published_run_id']), 0,
+                ) < assigned_count:
+                    continue
+                conflicts_with_proposal = any(
+                    existing_start < option['_end_datetime']
+                    and existing_end > option['_start_datetime']
+                    for physician_id in assigned_physician_ids
+                    for existing_start, existing_end in proposed_intervals_by_physician.get(
+                        physician_id, []
+                    )
+                )
+                if not conflicts_with_proposal:
+                    suggested = option
+                    break
+        if suggested is not None:
+            capacity_key = (
+                item['date'], suggested['shift_template_id'], item['published_run_id'],
+            )
+            remaining_capacity[capacity_key] -= assigned_count
+            for physician_id in assigned_physician_ids:
+                proposed_intervals_by_physician.setdefault(physician_id, []).append((
+                    suggested['_start_datetime'], suggested['_end_datetime'],
+                ))
+        for option in options:
+            option.pop('_rank', None)
+            option.pop('_start_datetime', None)
+            option.pop('_end_datetime', None)
         item['replacement_options'] = options
         item['suggested_replacement_shift_template_id'] = (
             suggested['shift_template_id'] if suggested else None
@@ -7375,6 +7522,12 @@ def schedule_block_backdate_shifts(request, block_id):
                     published_run.suppressed_shift_instance_ids = sorted(suppressed_ids)
                     published_run.save(update_fields=['suppressed_shift_instance_ids'])
             created_by_key[(item['date'], item['shift_template_id'], item['published_run_id'])] = instance
+            applied_revisions = dict(published_run.backdated_shift_template_revisions or {})
+            applied_revisions[f"{item['date']}:{item['shift_template_id']}"] = item[
+                'shift_template_revision'
+            ]
+            published_run.backdated_shift_template_revisions = applied_revisions
+            published_run.save(update_fields=['backdated_shift_template_revisions'])
             applied_changes.append(item)
 
         for item in [row for row in plan if row['action'] == 'REMOVE']:
@@ -7430,6 +7583,19 @@ def schedule_block_backdate_shifts(request, block_id):
                         raise ValidationError({
                             'assignment_transfers': f'{_physician_display_name(physician)} is not clinically active in this Domain.',
                         })
+                    facility_eligible = ContractUserAssignment.objects.filter(
+                        physician=physician,
+                        domain=target.schedule_version.domain,
+                        contract__active=True,
+                        contract__facilities=target.facility,
+                    ).exists()
+                    if not facility_eligible:
+                        raise ValidationError({
+                            'assignment_transfers': (
+                                f'{_physician_display_name(physician)} is not eligible '
+                                f'for {target.facility.name}.'
+                            ),
+                        })
                     overlap = assignments_for_viewed_run(
                         target.schedule_version, published_run,
                     ).filter(
@@ -7477,8 +7643,14 @@ def schedule_block_backdate_shifts(request, block_id):
             locked_ids.discard(instance.id)
             published_run.suppressed_shift_instance_ids = sorted(suppressed_ids)
             published_run.locked_open_shift_instance_ids = sorted(locked_ids)
+            applied_revisions = dict(published_run.backdated_shift_template_revisions or {})
+            applied_revisions[f"{item['date']}:{item['shift_template_id']}"] = item[
+                'shift_template_revision'
+            ]
+            published_run.backdated_shift_template_revisions = applied_revisions
             published_run.save(update_fields=[
                 'suppressed_shift_instance_ids', 'locked_open_shift_instance_ids',
+                'backdated_shift_template_revisions',
             ])
             item['transferred_users'] = transferred_users
             item['replacement_shift_template_id'] = target_template_id

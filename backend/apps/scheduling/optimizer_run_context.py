@@ -13,6 +13,7 @@ class PreparedOptimizerRun:
     optimizer_run: OptimizerRun
     source_locked_open_ids: list[int]
     source_suppressed_ids: list[int]
+    source_backdated_revisions: dict[str, int]
     runtime_limit_seconds: int
     optimization_focus: str
     seed: int
@@ -69,6 +70,11 @@ def prepare_optimizer_run(
         if source_run is not None
         else []
     )
+    source_backdated_revisions = (
+        dict(source_run.backdated_shift_template_revisions or {})
+        if source_run is not None
+        else {}
+    )
     if optimizer_run is None:
         latest_run_number = (
             OptimizerRun.objects.filter(schedule_version=version)
@@ -109,6 +115,7 @@ def prepare_optimizer_run(
             run_kind=run_kind,
             locked_open_shift_instance_ids=source_locked_open_ids,
             suppressed_shift_instance_ids=source_suppressed_ids,
+            backdated_shift_template_revisions=source_backdated_revisions,
         )
     else:
         optimizer_run_queryset = OptimizerRun.objects
@@ -146,6 +153,9 @@ def prepare_optimizer_run(
         if optimizer_run.suppressed_shift_instance_ids != source_suppressed_ids:
             optimizer_run.suppressed_shift_instance_ids = source_suppressed_ids
             lineage_updates.append('suppressed_shift_instance_ids')
+        if optimizer_run.backdated_shift_template_revisions != source_backdated_revisions:
+            optimizer_run.backdated_shift_template_revisions = source_backdated_revisions
+            lineage_updates.append('backdated_shift_template_revisions')
         if lineage_updates:
             optimizer_run.save(update_fields=lineage_updates)
         runtime_limit_seconds = int(
@@ -172,6 +182,7 @@ def prepare_optimizer_run(
         optimizer_run=optimizer_run,
         source_locked_open_ids=source_locked_open_ids,
         source_suppressed_ids=source_suppressed_ids,
+        source_backdated_revisions=source_backdated_revisions,
         runtime_limit_seconds=runtime_limit_seconds,
         optimization_focus=optimization_focus,
         seed=optimizer_run.seed,

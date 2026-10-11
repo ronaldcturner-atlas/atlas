@@ -174,6 +174,8 @@ select option:checked{
 .propose-trade-controls textarea{min-height:64px;resize:vertical}
 .shift-item-compact{padding:4px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;font-weight:500}
 .shift-item-compact span{display:block;overflow:hidden;text-overflow:ellipsis}
+.shift-item-compact .calendar-shift-label{display:flex;flex-wrap:wrap;align-items:baseline;column-gap:1.5em;row-gap:0;white-space:normal;overflow:visible;text-overflow:clip}
+.shift-item-compact .calendar-shift-name,.shift-item-compact .calendar-shift-user{flex:0 0 auto;white-space:nowrap;overflow:visible;text-overflow:clip}
 .calendar-domain-group{display:flex;flex-direction:column;gap:3px;border-left:3px solid var(--domain-ribbon);padding-left:4px}
 .calendar-domain-group+.calendar-domain-group{margin-top:5px;padding-top:4px;border-top:1px solid rgba(255,255,255,.1)}
 .calendar-domain-heading{color:var(--domain-ribbon);font-size:8px;font-weight:850;line-height:1;text-transform:uppercase;letter-spacing:.055em}
@@ -1343,3 +1345,4 @@ select option {
 .user-self-actions{display:flex;align-items:center;gap:8px}.user-self-actions>button{padding:6px 9px;border:1px solid var(--border);border-radius:7px;background:rgba(255,255,255,.04);color:var(--sidebar-fg);cursor:pointer}.user-self-actions>button:hover{background:rgba(255,255,255,.09)}
 .temporary-password-modal{width:min(520px,calc(100vw - 28px));max-width:520px}.temporary-password-modal p{margin:0 0 14px;color:var(--sidebar-fg)}.temporary-password-value{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid rgba(240,180,41,.4);border-radius:8px;background:rgba(240,180,41,.08)}.temporary-password-value code{flex:1;color:#ffe18a;font-size:16px;overflow-wrap:anywhere}.temporary-password-value button{padding:7px 10px;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}
 .backdate-transfer-choice{display:grid;gap:4px;margin-top:7px}.backdate-transfer-choice select{min-width:0;padding:6px;border:1px solid var(--border);border-radius:6px;background:#fff;color:#111}
+.backdate-batch-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px;border:1px solid rgba(240,180,41,.35);border-radius:8px;background:rgba(240,180,41,.07)}.backdate-batch-actions>span{margin-right:auto;color:var(--muted);font-size:12px;font-weight:700}

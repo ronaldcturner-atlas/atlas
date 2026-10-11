@@ -15,7 +15,7 @@ from apps.domains.permissions import CLINICAL_DEFAULTS, SCHEDULER_DEFAULTS
 from apps.facilities.models import Facility
 
 from .models import (
-    DomainShiftConfiguration, OptimizerRun, PublishedShiftBackdate,
+    Contract, ContractUserAssignment, DomainShiftConfiguration, OptimizerRun, PublishedShiftBackdate,
     ScheduleBlock, ScheduleBlockShiftChange, ScheduleShiftAssignment,
     ScheduleShiftInstance, ScheduleVersion, ShiftTemplate, ShiftTrade,
 )
@@ -66,6 +66,18 @@ class ShiftBackdateWorkflowTests(TestCase):
                 role=DomainMembership.Role.STAFF_PHYSICIAN,
                 role_template=clinical_role,
                 clinically_active=True,
+            )
+        self.contract = Contract.objects.create(
+            domain=self.domain,
+            name='Backdate Contract',
+            active=True,
+        )
+        self.contract.facilities.add(self.facility)
+        for physician in (self.owner, self.recipient):
+            ContractUserAssignment.objects.create(
+                contract=self.contract,
+                domain=self.domain,
+                physician=physician,
             )
         self.client = APIClient()
         self.client.force_authenticate(self.scheduler)
@@ -368,6 +380,107 @@ class ShiftBackdateWorkflowTests(TestCase):
         refreshed_ids = {row['id'] for row in refreshed_context.json()['shift_templates']}
         self.assertNotIn(self.template.id, refreshed_ids)
         self.assertNotIn(replacement.id, refreshed_ids)
+
+    def test_disabled_shift_can_be_removed_then_reenabled_and_restored(self):
+        block, _version, run, instance, _assignment = self._published_schedule()
+        block.end_date = self.future_date
+        block.save(update_fields=['end_date'])
+        payload = {
+            'shift_template_ids': [self.template.id],
+            'start_date': self.future_date.isoformat(),
+            'end_date': self.future_date.isoformat(),
+        }
+
+        disabled = self.client.patch(
+            f'/api/shift-templates/{self.template.id}/',
+            {'active': False},
+            format='json',
+        )
+        self.assertEqual(disabled.status_code, 200)
+        context = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertIn(
+            self.template.id,
+            {row['id'] for row in context.json()['shift_templates']},
+        )
+        removed = self.client.post(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/',
+            {**payload, 'apply': True},
+            format='json',
+        )
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(removed.json()['changes'][0]['action'], 'REMOVE')
+        run.refresh_from_db()
+        self.assertIn(instance.id, run.suppressed_shift_instance_ids)
+
+        enabled = self.client.patch(
+            f'/api/shift-templates/{self.template.id}/',
+            {'active': True},
+            format='json',
+        )
+        self.assertEqual(enabled.status_code, 200)
+        restored_context = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertIn(
+            self.template.id,
+            {row['id'] for row in restored_context.json()['shift_templates']},
+        )
+        preview = self.client.post(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/', payload, format='json',
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.json()['changes'][0]['action'], 'RESTORE')
+        restored = self.client.post(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/',
+            {**payload, 'apply': True},
+            format='json',
+        )
+        self.assertEqual(restored.status_code, 200)
+        run.refresh_from_db()
+        self.assertNotIn(instance.id, run.suppressed_shift_instance_ids)
+
+    def test_metadata_only_shift_change_is_offered_once_per_published_date(self):
+        block, _version, run, _instance, _assignment = self._published_schedule()
+        block.end_date = self.future_date
+        block.save(update_fields=['end_date'])
+        changed = self.client.patch(
+            f'/api/shift-templates/{self.template.id}/',
+            {'night_shift': True},
+            format='json',
+        )
+        self.assertEqual(changed.status_code, 200)
+        context = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertIn(
+            self.template.id,
+            {row['id'] for row in context.json()['shift_templates']},
+        )
+        payload = {
+            'shift_template_ids': [self.template.id],
+            'start_date': self.future_date.isoformat(),
+            'end_date': self.future_date.isoformat(),
+            'apply': True,
+        }
+        applied = self.client.post(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/', payload, format='json',
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.json()['changes'][0]['action'], 'UPDATE')
+        run.refresh_from_db()
+        self.assertIn(
+            f'{self.future_date.isoformat()}:{self.template.id}',
+            run.backdated_shift_template_revisions,
+        )
+        refreshed = self.client.get(
+            f'/api/schedule-blocks/{block.id}/backdate-shifts/context/',
+        )
+        self.assertNotIn(
+            self.template.id,
+            {row['id'] for row in refreshed.json()['shift_templates']},
+        )
 
     def test_backdate_picker_only_lists_modified_or_new_shifts(self):
         block, _version, _run, _instance, _assignment = self._published_schedule()

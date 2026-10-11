@@ -49,6 +49,13 @@ describe('desktop calendar controls', () => {
     expect(calendarStyles).toMatch(/\.calendar-sticky-controls\{[^}]*position:sticky;[^}]*top:52px;/)
     expect(calendarStyles).toMatch(/\.schedule-page-heading\{[^}]*position:sticky;[^}]*top:0;/)
   })
+
+  it('separates complete shift and user names without changing the shift name', () => {
+    expect(calendarSource).toContain('<span className="calendar-shift-name">{shift.facility} {shift.shift}</span>')
+    expect(calendarSource).toContain('<span className="calendar-shift-user">{shift.physician_name}</span>')
+    expect(calendarStyles).toMatch(/\.calendar-shift-label\{[^}]*flex-wrap:wrap;[^}]*column-gap:1\.5em;/)
+    expect(calendarStyles).toMatch(/\.calendar-shift-name,[^{]*\.calendar-shift-user\{[^}]*white-space:nowrap;[^}]*text-overflow:clip/)
+  })
 })
 
 describe('calendar highlight styling', () => {
