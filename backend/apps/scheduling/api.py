@@ -35,11 +35,15 @@ from apps.domains.permissions import (
 from apps.facilities.models import Facility
 
 from .models import (
+    _format_template_time,
     Contract,
     ContractUserAssignment,
+    DomainShiftConfiguration,
     OptimizerRun,
     OptimizerControl,
+    PublishedShiftBackdate,
     ScheduleBlock,
+    ScheduleBlockShiftChange,
     ScheduleCommentSeries,
     ScheduleCommentSeriesException,
     ScheduleDateComment,
@@ -54,6 +58,7 @@ from .models import (
     ShiftTradePolicy,
     ShiftTradeView,
     ShiftTemplate,
+    ShiftTemplateChange,
     SharedRule,
     SharedRuleContract,
 )
@@ -94,6 +99,9 @@ from .trade_lifecycle import expire_started_trade_activity, shift_has_started
 
 
 STALE_OPTIMIZER_RUN_MINUTES = 10
+BACKDATE_TRADE_CANCEL_NOTE = (
+    'Cancelled because an administrator backdated a change to this shift.'
+)
 SHIFT_TEMPLATE_DISPLAY_ORDER = (
     'facility__sort_order',
     'facility__name',
@@ -148,6 +156,108 @@ def _shift_template_fingerprint(block, templates):
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _shift_template_snapshot(template):
+    return {
+        'id': template.id,
+        'domain_id': template.domain_id,
+        'facility_id': template.facility_id,
+        'name': template.generated_name(),
+        'start_time': template.start_time.isoformat(),
+        'end_time': template.end_time.isoformat(),
+        'active_days_of_week': list(template.active_days_of_week or []),
+        'weekend_days': list(template.weekend_days or []),
+        'night_shift': template.night_shift,
+        'default_staffing_count': template.default_staffing_count,
+        'active': template.active,
+    }
+
+
+def _record_shift_template_change(template, before_state, user):
+    """Record one durable Shift Builder revision and fan it out to open Build workspaces."""
+    after_state = _shift_template_snapshot(template)
+    if before_state == after_state:
+        return None
+    if not before_state or (not before_state.get('active') and after_state['active']):
+        change_type = ShiftTemplateChange.ChangeType.ADDED
+    elif before_state.get('active') and not after_state['active']:
+        change_type = ShiftTemplateChange.ChangeType.DELETED
+    else:
+        change_type = ShiftTemplateChange.ChangeType.UPDATED
+    configuration, _created = DomainShiftConfiguration.objects.get_or_create(
+        domain_id=template.domain_id,
+    )
+    configuration = DomainShiftConfiguration.objects.select_for_update().get(
+        pk=configuration.pk,
+    )
+    configuration.revision += 1
+    configuration.save(update_fields=['revision', 'updated_at'])
+    change = ShiftTemplateChange.objects.create(
+        domain_id=template.domain_id,
+        shift_template=template,
+        revision=configuration.revision,
+        change_type=change_type,
+        before_state=before_state or {},
+        after_state=after_state,
+        changed_by=user,
+    )
+    affected_blocks = ScheduleBlock.objects.filter(
+        domain_id=template.domain_id,
+        build_status=ScheduleBlock.BuildStatus.BUILD,
+        published_at__isnull=True,
+    )
+    ScheduleBlockShiftChange.objects.bulk_create([
+        ScheduleBlockShiftChange(schedule_block=block, change=change)
+        for block in affected_blocks
+    ])
+    return change
+
+
+def _pending_shift_change_rows(block):
+    return (
+        ScheduleBlockShiftChange.objects.filter(
+            schedule_block=block,
+            acknowledged_at__isnull=True,
+        )
+        .select_related('change__shift_template__facility', 'change__changed_by')
+        .order_by('change__revision', 'id')
+    )
+
+
+def _pending_shift_change_payload(block):
+    rows = list(_pending_shift_change_rows(block))
+    return [
+        {
+            'id': row.id,
+            'revision': row.change.revision,
+            'change_type': row.change.change_type,
+            'shift_template_id': row.change.shift_template_id,
+            'shift_name': (
+                row.change.after_state.get('name')
+                or row.change.before_state.get('name')
+                or row.change.shift_template.generated_name()
+            ),
+            'before': row.change.before_state,
+            'after': row.change.after_state,
+            'changed_at': row.change.created_at,
+        }
+        for row in rows
+    ]
+
+
+def _pending_shift_change_conflict(block):
+    if _pending_shift_change_rows(block).exists():
+        return Response(
+            {
+                'detail': (
+                    'Shift Builder changes must be acknowledged before this Build workspace can be changed.'
+                ),
+                'entry_blocked_by_shift_changes': True,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+    return None
 
 
 class CsrfProtectedSessionAuthentication(SessionAuthentication):
@@ -232,7 +342,9 @@ def shifts_list_create(request):
             {'detail': 'The selected user does not belong to this Facility organization.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    serializer.save()
+    with transaction.atomic():
+        template = serializer.save()
+        _record_shift_template_change(template, {}, request.user)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -1657,7 +1769,12 @@ def _trade_payload(trade, user, viewed_trade_ids=None):
         and trade_domain is not None
         and has_permission(user, 'approve_pickups_trades', domain=trade_domain)
     )
-    is_incoming = can_accept or can_review
+    is_backdate_cancellation_for_sender = (
+        trade.status == ShiftTrade.Status.CANCELLED
+        and trade.note == BACKDATE_TRADE_CANCEL_NOTE
+        and trade.requester.user_id == user.id
+    )
+    is_incoming = can_accept or can_review or is_backdate_cancellation_for_sender
     if viewed_trade_ids is None:
         has_been_viewed = is_incoming and ShiftTradeView.objects.filter(
             trade=trade,
@@ -1805,6 +1922,12 @@ def shift_trades_mark_seen(request):
         incoming_filter |= Q(
             status=ShiftTrade.Status.PENDING_SCHEDULER,
             domain_id__in=review_domain_ids,
+        )
+    if physician is not None:
+        incoming_filter |= Q(
+            status=ShiftTrade.Status.CANCELLED,
+            requester=physician,
+            note=BACKDATE_TRADE_CANCEL_NOTE,
         )
     trade_ids = list(ShiftTrade.objects.filter(incoming_filter).values_list('id', flat=True))
     ShiftTradeView.objects.bulk_create([
@@ -2264,7 +2387,9 @@ def shift_templates_list_create(request):
             {'detail': 'Shift template management permission is required for this Domain.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    serializer.save()
+    with transaction.atomic():
+        template = serializer.save()
+        _record_shift_template_change(template, {}, request.user)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -2296,7 +2421,15 @@ def shift_template_detail(request, template_id):
             {'detail': 'Shift templates cannot be moved to a Domain you do not manage.'},
             status=status.HTTP_403_FORBIDDEN,
         )
-    serializer.save()
+    if target_domain.id != template.domain_id:
+        return Response(
+            {'domain': 'A Shift Template cannot be moved to another Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    before_state = _shift_template_snapshot(template)
+    with transaction.atomic():
+        template = serializer.save()
+        _record_shift_template_change(template, before_state, request.user)
     return Response(serializer.data)
 
 
@@ -2478,6 +2611,9 @@ def _schedule_block_capabilities(user, block):
         ),
         'can_unpublish_schedule': can_manage_build and has_permission(
             user, 'unpublish_schedule', domain=block.domain,
+        ),
+        'can_backdate_shifts': can_manage_build and has_permission(
+            user, 'batch_update_published_shifts', domain=block.domain,
         ),
     }
 
@@ -3766,6 +3902,32 @@ def schedule_block_build_context(request, block_id):
         block.build_status == ScheduleBlock.BuildStatus.PREVIEW and can_view_preview
     ):
         return _build_workspace_forbidden_response()
+    pending_shift_changes = _pending_shift_change_payload(block) if can_manage else []
+    if pending_shift_changes:
+        return Response({
+            'schedule_block': ScheduleBlockSerializer(block).data,
+            'can_manage_build_workspace': can_manage,
+            'can_view_preview': can_view_preview,
+            'can_publish_schedule': False,
+            'atlas_v2_enabled': bool(getattr(settings, 'ATLAS_V2_ENABLED', False)),
+            'atlas_v2_test_enabled': bool(getattr(settings, 'ATLAS_V2_ENABLED', False)),
+            'domains': [{
+                'id': block.domain_id,
+                'name': block.domain.name,
+                'region': block.domain.region_id,
+                'region_name': block.domain.region.name,
+            }],
+            'entry_blocked_by_shift_changes': True,
+            'pending_shift_changes': pending_shift_changes,
+            'versions': [],
+            'selected_version': None,
+            'shift_generation_required': False,
+            'optimizer_summary': None,
+            'optimizer_runs': [],
+            'selected_optimizer_run': None,
+            'shift_instances': [],
+            'workload_feasibility': None,
+        })
     versions = _schedule_version_queryset(block)
     selected_version = None
 
@@ -3864,6 +4026,8 @@ def schedule_block_build_context(request, block_id):
             'shift_generation_required': _shift_generation_required(
                 block, selected_version,
             ),
+            'entry_blocked_by_shift_changes': False,
+            'pending_shift_changes': [],
             'optimizer_summary': (
                 optimizer_summary
             ),
@@ -4316,6 +4480,9 @@ def schedule_version_optimizer_preflight(request, version_id):
     )
     if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(version.schedule_block)
+    if pending_conflict is not None:
+        return pending_conflict
     start_mode, source_run, start_error = _optimizer_start_options(request, version)
     if start_error:
         return Response(start_error, status=status.HTTP_400_BAD_REQUEST)
@@ -4489,6 +4656,9 @@ def schedule_version_run_optimizer(request, version_id):
     )
     if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(version.schedule_block)
+    if pending_conflict is not None:
+        return pending_conflict
     if not request.data.get('background'):
         return _run_optimizer_response(request, version)
     seed, seed_error = _parse_optimizer_seed(request)
@@ -4604,6 +4774,7 @@ def schedule_version_run_optimizer(request, version_id):
                 )
             optimizer_run = OptimizerRun.objects.create(
                 schedule_version=locked_version,
+                shift_configuration_revision=locked_version.shift_configuration_revision,
                 run_number=latest_number + 1,
                 created_by=request.user,
                 status=OptimizerRun.Status.RUNNING,
@@ -4662,6 +4833,9 @@ def schedule_version_recalculate_score(request, version_id):
     )
     if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(version.schedule_block)
+    if pending_conflict is not None:
+        return pending_conflict
     if (
         version.schedule_block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -4718,6 +4892,7 @@ def optimizer_run_save_copy(request, run_id):
         OptimizerRun.objects.filter(schedule_version=version, is_active=True).update(is_active=False)
         copied = OptimizerRun.objects.create(
             schedule_version=version,
+            shift_configuration_revision=version.shift_configuration_revision,
             run_number=latest_number + 1,
             created_by=request.user,
             status=OptimizerRun.Status.COMPLETED,
@@ -4872,6 +5047,7 @@ def optimizer_run_save_manual_changes_as_new(request, run_id):
         source.save(update_fields=['is_active'])
         saved = OptimizerRun.objects.create(
             schedule_version=version,
+            shift_configuration_revision=version.shift_configuration_revision,
             run_number=latest_number + 1,
             created_by=request.user,
             status=OptimizerRun.Status.COMPLETED,
@@ -5376,6 +5552,9 @@ def schedule_version_clear_optimizer_assignments(request, block_id, version_id):
     )
     if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(block)
+    if pending_conflict is not None:
+        return pending_conflict
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -5442,6 +5621,9 @@ def schedule_version_clear_all_assignments(request, block_id, version_id):
     )
     if not _can_manage_build_workspace(request.user, version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(block)
+    if pending_conflict is not None:
+        return pending_conflict
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or version.status != ScheduleVersion.Status.BUILD
@@ -5662,6 +5844,9 @@ def schedule_shift_assignments(request, block_id, shift_instance_id):
     )
     if not _can_manage_build_workspace(request.user, shift_instance.schedule_version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(block)
+    if pending_conflict is not None:
+        return pending_conflict
 
     if request.method == 'GET':
         return Response(_assignment_context_payload(shift_instance))
@@ -5784,6 +5969,9 @@ def schedule_shift_assignment_detail(request, block_id, shift_instance_id, assig
     )
     if not _can_manage_build_workspace(request.user, shift_instance.schedule_version.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(block)
+    if pending_conflict is not None:
+        return pending_conflict
     if (
         block.build_status != ScheduleBlock.BuildStatus.BUILD
         or shift_instance.schedule_version.status != ScheduleVersion.Status.BUILD
@@ -5921,6 +6109,148 @@ def schedule_version_unlock_physician_assignments(request, version_id, physician
     })
 
 
+def _synchronize_build_versions_to_shift_configuration(block):
+    templates = list(
+        ShiftTemplate.objects.filter(
+            active=True,
+            facility__active=True,
+            domain=block.domain,
+        ).select_related('facility').order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
+    )
+    current_revision = (
+        DomainShiftConfiguration.objects.filter(domain=block.domain)
+        .values_list('revision', flat=True)
+        .first()
+        or 0
+    )
+    template_fingerprint = _shift_template_fingerprint(block, templates)
+    created_count = updated_count = removed_count = 0
+    versions = list(ScheduleVersion.objects.select_for_update().filter(
+        schedule_block=block,
+        domain=block.domain,
+        status=ScheduleVersion.Status.BUILD,
+    ))
+    for version in versions:
+        expected_ids = set()
+        current_date = block.start_date
+        while current_date <= block.end_date:
+            day_name = current_date.strftime('%A')
+            for template in templates:
+                if day_name not in (template.active_days_of_week or []):
+                    continue
+                zone = _facility_timezone(template.facility)
+                end_date = current_date + timedelta(days=1) if template.end_time <= template.start_time else current_date
+                instance = ScheduleShiftInstance.objects.filter(
+                    schedule_version=version,
+                    date=current_date,
+                    shift_template=template,
+                    split_parent__isnull=True,
+                ).order_by('id').first()
+                expected_values = {
+                    'schedule_block': block,
+                    'facility': template.facility,
+                    'start_datetime': datetime.combine(current_date, template.start_time, tzinfo=zone),
+                    'end_datetime': datetime.combine(end_date, template.end_time, tzinfo=zone),
+                    'required_staffing': template.default_staffing_count,
+                }
+                if instance is None:
+                    instance = ScheduleShiftInstance.objects.create(
+                        schedule_version=version,
+                        date=current_date,
+                        shift_template=template,
+                        status=ScheduleShiftInstance.Status.OPEN,
+                        **expected_values,
+                    )
+                    created_count += 1
+                else:
+                    changed_fields = []
+                    for field, value in expected_values.items():
+                        if getattr(instance, field) != value:
+                            setattr(instance, field, value)
+                            changed_fields.append(field)
+                    if changed_fields:
+                        instance.save(update_fields=[*changed_fields, 'updated_at'])
+                        updated_count += 1
+                expected_ids.add(instance.id)
+            current_date += timedelta(days=1)
+
+        obsolete_roots = list(
+            ScheduleShiftInstance.objects.filter(
+                schedule_version=version,
+                date__gte=block.start_date,
+                date__lte=block.end_date,
+                split_parent__isnull=True,
+            ).exclude(id__in=expected_ids).values_list('id', flat=True)
+        )
+        if obsolete_roots:
+            obsolete_ids = list(ScheduleShiftInstance.objects.filter(
+                Q(id__in=obsolete_roots) | Q(split_parent_id__in=obsolete_roots),
+            ).values_list('id', flat=True))
+            now = timezone.now()
+            ShiftTrade.objects.filter(
+                Q(offered_assignment__shift_instance_id__in=obsolete_ids)
+                | Q(requested_assignment__shift_instance_id__in=obsolete_ids),
+                status__in=[
+                    ShiftTrade.Status.PENDING_RECIPIENT,
+                    ShiftTrade.Status.PENDING_SCHEDULER,
+                ],
+            ).update(
+                status=ShiftTrade.Status.CANCELLED,
+                note='Cancelled because Shift Builder changed this Build workspace shift.',
+                updated_at=now,
+            )
+            ScheduleShiftInstance.objects.filter(split_parent_id__in=obsolete_roots).delete()
+            removed_count += ScheduleShiftInstance.objects.filter(id__in=obsolete_roots).count()
+            ScheduleShiftInstance.objects.filter(id__in=obsolete_roots).delete()
+
+        version.shift_template_fingerprint = template_fingerprint
+        version.shift_configuration_revision = current_revision
+        version.score_is_stale = True
+        version.save(update_fields=[
+            'shift_template_fingerprint', 'shift_configuration_revision',
+            'score_is_stale', 'updated_at',
+        ])
+        version.optimizer_runs.update(score_is_stale=True)
+    return current_revision, created_count, updated_count, removed_count
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_acknowledge_shift_changes(request, block_id):
+    block = get_object_or_404(
+        ScheduleBlock.objects.select_related('domain'), id=block_id,
+    )
+    if not _can_manage_build_workspace(request.user, block.domain):
+        return _build_workspace_forbidden_response()
+    if block.build_status != ScheduleBlock.BuildStatus.BUILD or block.published_at is not None:
+        return Response(
+            {'detail': 'Shift changes can only be acknowledged in an unpublished Build workspace.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    with transaction.atomic():
+        block = ScheduleBlock.objects.select_for_update().select_related('domain').get(id=block.id)
+        pending = _pending_shift_change_rows(block).select_for_update()
+        pending_ids = list(pending.values_list('id', flat=True))
+        if not pending_ids:
+            return Response({'detail': 'There are no pending Shift Builder changes.'})
+        revision, created, updated, removed = _synchronize_build_versions_to_shift_configuration(block)
+        now = timezone.now()
+        ScheduleBlockShiftChange.objects.filter(id__in=pending_ids).update(
+            acknowledged_at=now,
+            acknowledged_by=request.user,
+        )
+        block.shift_configuration_revision = revision
+        block.save(update_fields=['shift_configuration_revision', 'updated_at'])
+    return Response({
+        'detail': 'Shift Builder changes were acknowledged and applied.',
+        'created_count': created,
+        'updated_count': updated,
+        'removed_count': removed,
+        'shift_configuration_revision': revision,
+    })
+
+
 @api_view(['POST'])
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -5928,6 +6258,9 @@ def schedule_block_generate_shift_instances(request, block_id):
     block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
     if not _can_manage_build_workspace(request.user, block.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(block)
+    if pending_conflict is not None:
+        return pending_conflict
     if block.build_status not in {
         ScheduleBlock.BuildStatus.PRE_BUILD,
         ScheduleBlock.BuildStatus.BUILD,
@@ -5976,6 +6309,7 @@ def schedule_block_generate_shift_instances(request, block_id):
                 version_number=latest_version_number + 1,
                 name=f'Build {latest_version_number + 1}',
                 status=ScheduleVersion.Status.BUILD,
+                shift_configuration_revision=block.shift_configuration_revision,
             )
 
         templates = list(
@@ -5984,7 +6318,16 @@ def schedule_block_generate_shift_instances(request, block_id):
             .order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
         )
         template_fingerprint = _shift_template_fingerprint(block, templates)
-        if version.shift_template_fingerprint == template_fingerprint:
+        current_revision = (
+            DomainShiftConfiguration.objects.filter(domain=domain)
+            .values_list('revision', flat=True)
+            .first()
+            or 0
+        )
+        if (
+            version.shift_template_fingerprint == template_fingerprint
+            and version.shift_configuration_revision == current_revision
+        ):
             total_count = ScheduleShiftInstance.objects.filter(schedule_version=version).count()
             return Response({
                 'message': 'Schedule shifts are already up to date.',
@@ -6053,7 +6396,10 @@ def schedule_block_generate_shift_instances(request, block_id):
             current_date += timedelta(days=1)
 
         version.shift_template_fingerprint = template_fingerprint
-        version_update_fields = ['shift_template_fingerprint', 'updated_at']
+        version.shift_configuration_revision = current_revision
+        version_update_fields = [
+            'shift_template_fingerprint', 'shift_configuration_revision', 'updated_at',
+        ]
         if created_count or updated_count:
             version.score_is_stale = True
             version_update_fields.append('score_is_stale')
@@ -6062,7 +6408,10 @@ def schedule_block_generate_shift_instances(request, block_id):
 
         if block.build_status == ScheduleBlock.BuildStatus.PRE_BUILD:
             block.build_status = ScheduleBlock.BuildStatus.BUILD
-            block.save(update_fields=['build_status', 'updated_at'])
+            block.shift_configuration_revision = current_revision
+            block.save(update_fields=[
+                'build_status', 'shift_configuration_revision', 'updated_at',
+            ])
 
     total_count = ScheduleShiftInstance.objects.filter(schedule_version=version).count()
     return Response(
@@ -6148,7 +6497,16 @@ def schedule_blocks_list_create(request):
             status=status.HTTP_409_CONFLICT,
         )
 
-    block = serializer.save(build_status=ScheduleBlock.BuildStatus.PRE_BUILD)
+    configuration_revision = (
+        DomainShiftConfiguration.objects.filter(domain=domain)
+        .values_list('revision', flat=True)
+        .first()
+        or 0
+    )
+    block = serializer.save(
+        build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        shift_configuration_revision=configuration_revision,
+    )
     return Response(ScheduleBlockSerializer(block).data, status=status.HTTP_201_CREATED)
 
 
@@ -6200,6 +6558,9 @@ def schedule_block_enter_preview(request, block_id):
     )
     if not _can_manage_build_workspace(request.user, block.domain):
         return _build_workspace_forbidden_response()
+    pending_conflict = _pending_shift_change_conflict(block)
+    if pending_conflict is not None:
+        return pending_conflict
 
     if block.build_status == ScheduleBlock.BuildStatus.ARCHIVE:
         return Response({'detail': 'Archived Schedule Blocks cannot enter preview.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -6227,6 +6588,11 @@ def schedule_block_enter_preview(request, block_id):
         return Response(
             {'optimizer_run_id': 'Only a completed optimizer run can enter preview.'},
             status=status.HTTP_400_BAD_REQUEST,
+        )
+    if preview_run.score_is_stale:
+        return Response(
+            {'optimizer_run_id': 'This run predates acknowledged Shift Builder changes and cannot be previewed or published. Start a new optimizer run from it first.'},
+            status=status.HTTP_409_CONFLICT,
         )
 
     if block.build_status == ScheduleBlock.BuildStatus.PREVIEW:
@@ -6306,6 +6672,11 @@ def schedule_block_publish(request, block_id):
         return Response(
             {'optimizer_run_id': 'Only a completed optimizer run can be published.'},
             status=status.HTTP_400_BAD_REQUEST,
+        )
+    if published_run.score_is_stale:
+        return Response(
+            {'optimizer_run_id': 'This run predates acknowledged Shift Builder changes and cannot be published. Start a new optimizer run from it first.'},
+            status=status.HTTP_409_CONFLICT,
         )
     if block.preview_optimizer_run_id != published_run.id:
         return Response(
@@ -6418,6 +6789,375 @@ def schedule_block_unpublish(request, block_id):
             score_is_stale=True,
         )
     return Response(ScheduleBlockSerializer(block).data)
+
+
+def _published_backdate_authority(block):
+    published_blocks, authority = _published_schedule_authority([block.domain_id])
+    blocks_by_id = {row.id: row for row in published_blocks}
+    authoritative_dates = sorted(
+        candidate_date
+        for (domain_id, candidate_date), block_id in authority.items()
+        if domain_id == block.domain_id and block_id in blocks_by_id
+    )
+    return blocks_by_id, authority, authoritative_dates
+
+
+def _published_version_and_run(block):
+    version = (
+        ScheduleVersion.objects.filter(
+            schedule_block=block,
+            domain=block.domain,
+            published_optimizer_run__isnull=False,
+        ).select_related('published_optimizer_run').order_by('-version_number').first()
+    )
+    if version is None:
+        version = (
+            ScheduleVersion.objects.filter(schedule_block=block, domain=block.domain)
+            .select_related('published_optimizer_run').order_by('-version_number').first()
+        )
+    run = version.published_optimizer_run if version else None
+    if version is not None and run is None:
+        run = version.optimizer_runs.filter(status=OptimizerRun.Status.COMPLETED).order_by(
+            '-is_active', '-run_number',
+        ).first()
+    return version, run
+
+
+def _parse_backdate_request(block, data):
+    raw_template_ids = data.get('shift_template_ids')
+    if not isinstance(raw_template_ids, list) or not raw_template_ids:
+        return None, Response(
+            {'shift_template_ids': 'Select at least one Shift.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        template_ids = list(dict.fromkeys(int(value) for value in raw_template_ids))
+    except (TypeError, ValueError):
+        return None, Response(
+            {'shift_template_ids': 'One or more selected Shifts are invalid.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    templates = list(
+        ShiftTemplate.objects.filter(
+            id__in=template_ids,
+            domain=block.domain,
+            active=True,
+            facility__active=True,
+        ).select_related('facility').order_by(*SHIFT_TEMPLATE_DISPLAY_ORDER)
+    )
+    if len(templates) != len(template_ids):
+        return None, Response(
+            {'shift_template_ids': 'Select active Shifts from this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    start_date = _parse_request_date(data.get('start_date'))
+    end_date = _parse_request_date(data.get('end_date')) if data.get('end_date') else None
+    if start_date is None:
+        return None, Response(
+            {'start_date': 'Select the first date to change.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    blocks_by_id, authority, authoritative_dates = _published_backdate_authority(block)
+    today = timezone.localdate()
+    future_dates = [candidate for candidate in authoritative_dates if candidate >= today]
+    if not future_dates:
+        return None, Response(
+            {'detail': 'This Domain has no current or future published shifts to change.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    horizon_end = max(future_dates)
+    if start_date < today:
+        return None, Response(
+            {'start_date': 'Backdate Shifts cannot change a date before today.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if start_date > horizon_end:
+        return None, Response(
+            {'start_date': 'The starting date is after the current published schedule.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    effective_end = end_date or horizon_end
+    if effective_end < start_date:
+        return None, Response(
+            {'end_date': 'The ending date must be on or after the starting date.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if effective_end > horizon_end:
+        return None, Response(
+            {'end_date': 'The ending date cannot extend past the current published schedule.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return {
+        'templates': templates,
+        'start_date': start_date,
+        'end_date': effective_end,
+        'published_end_date': horizon_end,
+        'blocks_by_id': blocks_by_id,
+        'authority': authority,
+    }, None
+
+
+def _backdate_shift_label(facility, start_time, end_time):
+    return f'{facility.short_name} {_format_template_time(start_time)}-{_format_template_time(end_time)}'
+
+
+def _build_backdate_plan(block, parsed):
+    plan = []
+    warnings = []
+    skipped_started = []
+    now = timezone.now()
+    version_run_by_block = {}
+    current_date = parsed['start_date']
+    while current_date <= parsed['end_date']:
+        authoritative_block_id = parsed['authority'].get((block.domain_id, current_date))
+        authoritative_block = parsed['blocks_by_id'].get(authoritative_block_id)
+        if authoritative_block is None:
+            current_date += timedelta(days=1)
+            continue
+        if authoritative_block.id not in version_run_by_block:
+            version_run_by_block[authoritative_block.id] = _published_version_and_run(authoritative_block)
+        version, published_run = version_run_by_block[authoritative_block.id]
+        if version is None or published_run is None:
+            current_date += timedelta(days=1)
+            continue
+        day_name = current_date.strftime('%A')
+        for template in parsed['templates']:
+            if day_name not in (template.active_days_of_week or []):
+                continue
+            zone = _facility_timezone(template.facility)
+            end_date = current_date + timedelta(days=1) if template.end_time <= template.start_time else current_date
+            proposed_start = datetime.combine(current_date, template.start_time, tzinfo=zone)
+            proposed_end = datetime.combine(end_date, template.end_time, tzinfo=zone)
+            if proposed_start <= now:
+                skipped_started.append({
+                    'date': current_date.isoformat(),
+                    'shift_template_id': template.id,
+                    'shift': template.generated_name(),
+                })
+                continue
+            instances = list(ScheduleShiftInstance.objects.filter(
+                schedule_version=version,
+                date=current_date,
+                shift_template=template,
+                split_parent__isnull=True,
+            ).select_related('facility', 'shift_template').order_by('id'))
+            if len(instances) > 1 or any(instance.split_segments.exists() for instance in instances):
+                warnings.append(
+                    f'{current_date.isoformat()} {template.generated_name()} is split or duplicated and must be corrected through the published schedule tools.'
+                )
+                continue
+            instance = instances[0] if instances else None
+            assignment_rows = list(
+                assignments_for_viewed_run(version, published_run).filter(
+                    shift_instance=instance,
+                ).select_related('physician__user')
+            ) if instance else []
+            before = None
+            action = 'ADD'
+            if instance is not None:
+                action = 'UPDATE'
+                before = {
+                    'shift_instance_id': instance.id,
+                    'facility_id': instance.facility_id,
+                    'facility_name': instance.facility.name,
+                    'start_datetime': instance.start_datetime.isoformat(),
+                    'end_datetime': instance.end_datetime.isoformat(),
+                    'required_staffing': instance.required_staffing,
+                    'label': _backdate_shift_label(
+                        instance.facility,
+                        instance.start_datetime.astimezone(_facility_timezone(instance.facility)).time().replace(tzinfo=None),
+                        instance.end_datetime.astimezone(_facility_timezone(instance.facility)).time().replace(tzinfo=None),
+                    ),
+                    'assigned_users': [_physician_display_name(row.physician) for row in assignment_rows],
+                }
+            after = {
+                'facility_id': template.facility_id,
+                'facility_name': template.facility.name,
+                'start_datetime': proposed_start.isoformat(),
+                'end_datetime': proposed_end.isoformat(),
+                'required_staffing': template.default_staffing_count,
+                'label': template.generated_name(),
+                'assigned_users': [_physician_display_name(row.physician) for row in assignment_rows],
+                'open': instance is None,
+            }
+            changed = instance is None or any((
+                instance.facility_id != template.facility_id,
+                instance.start_datetime != proposed_start,
+                instance.end_datetime != proposed_end,
+                instance.required_staffing != template.default_staffing_count,
+            ))
+            if not changed:
+                continue
+            if instance is not None and len(assignment_rows) > template.default_staffing_count:
+                warnings.append(
+                    f'{current_date.isoformat()} {template.generated_name()} retains {len(assignment_rows)} assigned users but staffing is {template.default_staffing_count}.'
+                )
+            plan.append({
+                'action': action,
+                'date': current_date.isoformat(),
+                'shift_template_id': template.id,
+                'schedule_block_id': authoritative_block.id,
+                'schedule_version_id': version.id,
+                'published_run_id': published_run.id,
+                'shift_instance_id': instance.id if instance else None,
+                'before': before,
+                'after': after,
+            })
+        current_date += timedelta(days=1)
+    return plan, warnings, skipped_started
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_backdate_context(request, block_id):
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not (
+        _can_manage_build_workspace(request.user, block.domain)
+        and has_permission(request.user, 'batch_update_published_shifts', domain=block.domain)
+    ):
+        return _build_workspace_forbidden_response()
+    if block.published_at is None or block.build_status != ScheduleBlock.BuildStatus.ARCHIVE:
+        return Response(
+            {'detail': 'Backdate Shifts is available from a published historical schedule.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    _blocks, _authority, authoritative_dates = _published_backdate_authority(block)
+    today = timezone.localdate()
+    future_dates = [candidate for candidate in authoritative_dates if candidate >= today]
+    return Response({
+        'domain_id': block.domain_id,
+        'domain_name': block.domain.name,
+        'earliest_date': today.isoformat(),
+        'published_end_date': max(future_dates).isoformat() if future_dates else None,
+        'shift_templates': ShiftTemplateSerializer(
+            _ordered_shift_templates().filter(
+                domain=block.domain,
+                active=True,
+                facility__active=True,
+            ),
+            many=True,
+        ).data,
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_backdate_shifts(request, block_id):
+    block = get_object_or_404(ScheduleBlock.objects.select_related('domain'), id=block_id)
+    if not (
+        _can_manage_build_workspace(request.user, block.domain)
+        and has_permission(request.user, 'batch_update_published_shifts', domain=block.domain)
+    ):
+        return _build_workspace_forbidden_response()
+    if block.published_at is None or block.build_status != ScheduleBlock.BuildStatus.ARCHIVE:
+        return Response(
+            {'detail': 'Backdate Shifts is available from a published historical schedule.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    parsed, error_response = _parse_backdate_request(block, request.data)
+    if error_response:
+        return error_response
+    plan, warnings, skipped_started = _build_backdate_plan(block, parsed)
+    payload = {
+        'start_date': parsed['start_date'].isoformat(),
+        'end_date': parsed['end_date'].isoformat(),
+        'published_end_date': parsed['published_end_date'].isoformat(),
+        'changes': plan,
+        'warnings': warnings,
+        'skipped_started_shifts': skipped_started,
+    }
+    if not request.data.get('apply'):
+        return Response(payload)
+    if not plan:
+        return Response(
+            {'detail': 'No future published shifts would change.', **payload},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    cancelled_trade_ids = []
+    applied_changes = []
+    with transaction.atomic():
+        # Rebuild the plan inside the transaction so confirmation never applies a stale preview.
+        plan, warnings, skipped_started = _build_backdate_plan(block, parsed)
+        for item in plan:
+            template = ShiftTemplate.objects.select_related('facility').get(id=item['shift_template_id'])
+            published_run = OptimizerRun.objects.select_for_update().get(id=item['published_run_id'])
+            if item['shift_instance_id'] is None:
+                proposed_start = datetime.fromisoformat(item['after']['start_datetime'])
+                proposed_end = datetime.fromisoformat(item['after']['end_datetime'])
+                instance = ScheduleShiftInstance.objects.create(
+                    schedule_version_id=item['schedule_version_id'],
+                    schedule_block_id=item['schedule_block_id'],
+                    date=date_type.fromisoformat(item['date']),
+                    shift_template=template,
+                    facility=template.facility,
+                    start_datetime=proposed_start,
+                    end_datetime=proposed_end,
+                    required_staffing=template.default_staffing_count,
+                    status=ScheduleShiftInstance.Status.OPEN,
+                    is_locked_open=True,
+                )
+                locked_ids = set(published_run.locked_open_shift_instance_ids or [])
+                locked_ids.add(instance.id)
+                published_run.locked_open_shift_instance_ids = sorted(locked_ids)
+                published_run.save(update_fields=['locked_open_shift_instance_ids'])
+                item['shift_instance_id'] = instance.id
+            else:
+                instance = ScheduleShiftInstance.objects.select_for_update().get(
+                    id=item['shift_instance_id'],
+                )
+                assignment_ids = list(assignments_for_viewed_run(
+                    instance.schedule_version, published_run,
+                ).filter(shift_instance=instance).values_list('id', flat=True))
+                trades = list(ShiftTrade.objects.filter(
+                    Q(offered_assignment_id__in=assignment_ids)
+                    | Q(requested_assignment_id__in=assignment_ids),
+                    status__in=[
+                        ShiftTrade.Status.PENDING_RECIPIENT,
+                        ShiftTrade.Status.PENDING_SCHEDULER,
+                    ],
+                ).select_related('requester__user'))
+                trade_ids = [trade.id for trade in trades]
+                cancelled_trade_ids.extend(trade_ids)
+                ShiftTrade.objects.filter(id__in=trade_ids).update(
+                    status=ShiftTrade.Status.CANCELLED,
+                    note=BACKDATE_TRADE_CANCEL_NOTE,
+                    updated_at=timezone.now(),
+                )
+                for trade in trades:
+                    ShiftTradeView.objects.filter(
+                        trade_id=trade.id,
+                        user_id=trade.requester.user_id,
+                    ).delete()
+                instance.facility = template.facility
+                instance.start_datetime = datetime.fromisoformat(item['after']['start_datetime'])
+                instance.end_datetime = datetime.fromisoformat(item['after']['end_datetime'])
+                instance.required_staffing = template.default_staffing_count
+                instance.save(update_fields=[
+                    'facility', 'start_datetime', 'end_datetime',
+                    'required_staffing', 'updated_at',
+                ])
+            applied_changes.append(item)
+        audit = PublishedShiftBackdate.objects.create(
+            domain=block.domain,
+            initiated_from_block=block,
+            start_date=parsed['start_date'],
+            end_date=parsed['end_date'],
+            shift_template_ids=[template.id for template in parsed['templates']],
+            changes=applied_changes,
+            cancelled_trade_ids=sorted(set(cancelled_trade_ids)),
+            created_by=request.user,
+        )
+    return Response({
+        **payload,
+        'changes': applied_changes,
+        'warnings': warnings,
+        'skipped_started_shifts': skipped_started,
+        'cancelled_trade_ids': sorted(set(cancelled_trade_ids)),
+        'audit_id': audit.id,
+        'detail': f'Backdated {len(applied_changes)} published shift occurrence(s).',
+    })
 
 
 @api_view(['GET', 'POST'])

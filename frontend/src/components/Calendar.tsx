@@ -101,6 +101,7 @@ type Trade = {
   trade_type: 'PICKUP' | 'TRADE'
   status_display: string
   status: 'PENDING_RECIPIENT' | 'PENDING_SCHEDULER' | 'DECLINED' | 'APPROVED' | 'CANCELLED' | 'EXPIRED'
+  note: string
   requester_id: number
   recipient_id: number | null
   offered_assignment: { id: number; physician_name: string; date: string; facility: string; start_time: string; end_time: string }
@@ -1296,6 +1297,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                   <strong>{trade.trade_type === 'PICKUP' ? 'Pickup' : 'Trade'} · {trade.status_display}</strong>
                   <span>{trade.offered_assignment.date} · {trade.offered_assignment.facility} · {trade.offered_assignment.physician_name}</span>
                   {trade.requested_assignment && <span>For {trade.requested_assignment.date} · {trade.requested_assignment.facility} · {trade.requested_assignment.physician_name}</span>}
+                  {trade.note && <span className="trade-request-note">{trade.note}</span>}
                   <div>{trade.can_accept && <><button onClick={() => mutate(`shift-trades/${trade.id}/accept/`, {})}>Accept</button><button onClick={() => mutate(`shift-trades/${trade.id}/decline/`, {})}>Decline</button></>}{trade.can_review && <><button onClick={() => mutate(`shift-trades/${trade.id}/approve/`, {})}>Approve</button><button onClick={() => mutate(`shift-trades/${trade.id}/reject/`, {})}>Reject</button></>}{trade.can_cancel && <button onClick={() => mutate(`shift-trades/${trade.id}/cancel/`, {})}>Cancel</button>}</div>
                 </div>
               ))}

@@ -163,6 +163,7 @@ class ScheduleBlock(models.Model):
         null=True,
         blank=True,
     )
+    shift_configuration_revision = models.PositiveBigIntegerField(default=0)
 
     def __str__(self):
         return self.generated_name
@@ -325,6 +326,7 @@ class ScheduleVersion(models.Model):
     optimizer_summary = models.JSONField(default=dict, blank=True)
     workload_hour_overrides = models.JSONField(default=dict, blank=True)
     shift_template_fingerprint = models.CharField(max_length=64, blank=True, default='')
+    shift_configuration_revision = models.PositiveBigIntegerField(default=0)
     score_is_stale = models.BooleanField(default=False)
     published_optimizer_run = models.ForeignKey(
         'OptimizerRun',
@@ -395,6 +397,7 @@ class OptimizerRun(models.Model):
     notes = models.TextField(blank=True)
     is_active = models.BooleanField(default=False)
     score_is_stale = models.BooleanField(default=False)
+    shift_configuration_revision = models.PositiveBigIntegerField(default=0)
     copied_from_run = models.ForeignKey(
         'self', on_delete=models.SET_NULL, related_name='copies', null=True, blank=True,
     )
@@ -655,6 +658,122 @@ class ShiftTradePolicy(models.Model):
     def load(cls):
         policy, _created = cls.objects.get_or_create(pk=1)
         return policy
+
+
+class DomainShiftConfiguration(models.Model):
+    """Monotonic Shift Builder revision for one scheduling Domain."""
+
+    domain = models.OneToOneField(
+        Domain,
+        on_delete=models.CASCADE,
+        related_name='shift_configuration',
+    )
+    revision = models.PositiveBigIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ShiftTemplateChange(models.Model):
+    class ChangeType(models.TextChoices):
+        ADDED = 'ADDED', 'Added'
+        UPDATED = 'UPDATED', 'Updated'
+        DELETED = 'DELETED', 'Deleted'
+
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.CASCADE,
+        related_name='shift_template_changes',
+    )
+    shift_template = models.ForeignKey(
+        ShiftTemplate,
+        on_delete=models.PROTECT,
+        related_name='configuration_changes',
+    )
+    revision = models.PositiveBigIntegerField()
+    change_type = models.CharField(max_length=12, choices=ChangeType.choices)
+    before_state = models.JSONField(default=dict, blank=True)
+    after_state = models.JSONField(default=dict, blank=True)
+    changed_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='shift_template_changes_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['revision', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['domain', 'revision'],
+                name='unique_shift_configuration_revision_per_domain',
+            ),
+        ]
+
+
+class ScheduleBlockShiftChange(models.Model):
+    """A Shift Builder change that must be acknowledged by one Build workspace."""
+
+    schedule_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.CASCADE,
+        related_name='pending_shift_changes',
+    )
+    change = models.ForeignKey(
+        ShiftTemplateChange,
+        on_delete=models.CASCADE,
+        related_name='affected_schedule_blocks',
+    )
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    acknowledged_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_block_shift_changes_acknowledged',
+    )
+
+    class Meta:
+        ordering = ['change__revision', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['schedule_block', 'change'],
+                name='unique_shift_change_per_schedule_block',
+            ),
+        ]
+
+
+class PublishedShiftBackdate(models.Model):
+    """Immutable audit record for a targeted published-schedule correction."""
+
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.PROTECT,
+        related_name='published_shift_backdates',
+    )
+    initiated_from_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.SET_NULL,
+        related_name='published_shift_backdates',
+        null=True,
+        blank=True,
+    )
+    start_date = models.DateField()
+    end_date = models.DateField()
+    shift_template_ids = models.JSONField(default=list)
+    changes = models.JSONField(default=list)
+    cancelled_trade_ids = models.JSONField(default=list)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='published_shift_backdates_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
 
 
 class ScheduleRequest(models.Model):

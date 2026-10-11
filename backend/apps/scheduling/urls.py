@@ -37,6 +37,7 @@ urlpatterns = [
     path("schedule-blocks/", api.schedule_blocks_list_create, name="schedule_blocks_list_create"),
     path("schedule-blocks/<int:block_id>/", api.schedule_block_detail, name="schedule_block_detail"),
     path("schedule-blocks/<int:block_id>/build/", api.schedule_block_build_context, name="schedule_block_build_context"),
+    path("schedule-blocks/<int:block_id>/build/acknowledge-shift-changes/", api.schedule_block_acknowledge_shift_changes, name="schedule_block_acknowledge_shift_changes"),
     path("schedule-blocks/<int:block_id>/build/generate/", api.schedule_block_generate_shift_instances, name="schedule_block_generate_shift_instances"),
     path("schedule-blocks/<int:block_id>/build/versions/", api.schedule_block_schedule_versions, name="schedule_block_schedule_versions"),
     path("schedule-blocks/<int:block_id>/build/versions/<int:version_id>/shifts/", api.schedule_version_shift_instances, name="schedule_version_shift_instances"),
@@ -70,4 +71,6 @@ urlpatterns = [
     path("schedule-blocks/<int:block_id>/move-back-to-build/", api.schedule_block_move_back_to_build, name="schedule_block_move_back_to_build"),
     path("schedule-blocks/<int:block_id>/publish/", api.schedule_block_publish, name="schedule_block_publish"),
     path("schedule-blocks/<int:block_id>/unpublish/", api.schedule_block_unpublish, name="schedule_block_unpublish"),
+    path("schedule-blocks/<int:block_id>/backdate-shifts/context/", api.schedule_block_backdate_context, name="schedule_block_backdate_context"),
+    path("schedule-blocks/<int:block_id>/backdate-shifts/", api.schedule_block_backdate_shifts, name="schedule_block_backdate_shifts"),
 ]

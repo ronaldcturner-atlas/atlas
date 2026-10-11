@@ -253,6 +253,7 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
             'published_at',
+            'shift_configuration_revision',
             'published_runs',
             'preview_optimizer_run',
             'preview_run_number',
@@ -271,6 +272,7 @@ class ScheduleBlockSerializer(serializers.ModelSerializer):
             'published_runs',
             'preview_optimizer_run',
             'preview_run_number',
+            'shift_configuration_revision',
         ]
 
     def get_name(self, obj):
@@ -378,6 +380,7 @@ class ScheduleVersionSerializer(serializers.ModelSerializer):
             'status',
             'optimizer_summary',
             'workload_hour_overrides',
+            'shift_configuration_revision',
             'score_is_stale',
             'active_optimizer_run',
             'published_optimizer_run',
@@ -426,6 +429,7 @@ class ScheduleVersionWorkspaceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'schedule_block', 'domain', 'domain_name', 'version_number',
             'name', 'status', 'score_is_stale', 'shift_instance_count',
+            'shift_configuration_revision',
             'published_optimizer_run',
             'has_original_published_snapshot',
             'created_at', 'updated_at',
@@ -513,6 +517,7 @@ class OptimizerRunSerializer(serializers.ModelSerializer):
             'is_active',
             'is_published',
             'score_is_stale',
+            'shift_configuration_revision',
             'copied_from_run',
             'copied_from_run_number',
             'started_from_run',
@@ -581,6 +586,7 @@ class OptimizerRunHistorySerializer(serializers.ModelSerializer):
             'id', 'schedule_version', 'run_number', 'created_at', 'started_at',
             'live_best_score', 'created_by_name', 'status', 'seed',
             'initial_score', 'final_score', 'is_active', 'is_published', 'score_is_stale',
+            'shift_configuration_revision',
             'copied_from_run', 'copied_from_run_number', 'run_kind',
             'started_from_run', 'started_from_run_number',
             'locked_open_shift_instance_ids', 'start_mode',

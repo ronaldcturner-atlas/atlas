@@ -32,6 +32,7 @@ type ScheduleBlock = {
   can_open_build_workspace: boolean
   can_publish_schedule: boolean
   can_unpublish_schedule: boolean
+  can_backdate_shifts: boolean
   my_requests?: Array<{
     id: number
     date: string
@@ -53,6 +54,34 @@ type ScheduleBlockFormState = {
   end_date: string
   request_open_datetime: string
   request_close_datetime: string
+}
+
+type BackdateContext = {
+  domain_id: number
+  domain_name: string
+  earliest_date: string
+  published_end_date: string | null
+  shift_templates: Array<{
+    id: number
+    name: string
+    facility_name: string
+    active_days_of_week: string[]
+  }>
+}
+
+type BackdatePreview = {
+  start_date: string
+  end_date: string
+  published_end_date: string
+  changes: Array<{
+    action: 'ADD' | 'UPDATE'
+    date: string
+    shift_template_id: number
+    before: null | { label: string; assigned_users: string[]; required_staffing: number }
+    after: { label: string; assigned_users: string[]; required_staffing: number; open: boolean }
+  }>
+  warnings: string[]
+  skipped_started_shifts: Array<{ date: string; shift: string }>
 }
 
 type ScheduleBlocksViewProps = {
@@ -244,6 +273,13 @@ export default function ScheduleBlocksView({
   const [formState, setFormState] = useState<ScheduleBlockFormState>(defaultFormState)
   const [openedBlock, setOpenedBlock] = useState<ScheduleBlock | null>(null)
   const [activeModalTab, setActiveModalTab] = useState<'details' | 'requests'>('details')
+  const [backdateBlock, setBackdateBlock] = useState<ScheduleBlock | null>(null)
+  const [backdateContext, setBackdateContext] = useState<BackdateContext | null>(null)
+  const [backdateTemplateIds, setBackdateTemplateIds] = useState<number[]>([])
+  const [backdateStartDate, setBackdateStartDate] = useState('')
+  const [backdateEndDate, setBackdateEndDate] = useState('')
+  const [backdatePreview, setBackdatePreview] = useState<BackdatePreview | null>(null)
+  const [isBackdateLoading, setIsBackdateLoading] = useState(false)
 
   const fetchBlocks = async () => {
     try {
@@ -649,6 +685,75 @@ export default function ScheduleBlocksView({
     }
   }
 
+  const closeBackdate = () => {
+    setBackdateBlock(null)
+    setBackdateContext(null)
+    setBackdateTemplateIds([])
+    setBackdateStartDate('')
+    setBackdateEndDate('')
+    setBackdatePreview(null)
+  }
+
+  const openBackdate = async (block: ScheduleBlock) => {
+    try {
+      setError(null)
+      setIsBackdateLoading(true)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/backdate-shifts/context/`, {
+        credentials: 'include',
+        cache: 'no-store',
+      })
+      if (!response.ok) {
+        const parsed = await parseApiResponseError(response)
+        throw new Error(parsed.message ?? 'Unable to open Backdate Shifts.')
+      }
+      const data = await response.json() as BackdateContext
+      setBackdateBlock(block)
+      setBackdateContext(data)
+      setBackdateStartDate(data.earliest_date)
+      setBackdateEndDate('')
+      setBackdateTemplateIds([])
+      setBackdatePreview(null)
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Unable to open Backdate Shifts.')
+    } finally {
+      setIsBackdateLoading(false)
+    }
+  }
+
+  const requestBackdate = async (apply: boolean) => {
+    if (!backdateBlock) return
+    try {
+      setError(null)
+      setIsBackdateLoading(true)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${backdateBlock.id}/backdate-shifts/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shift_template_ids: backdateTemplateIds,
+          start_date: backdateStartDate,
+          end_date: backdateEndDate || null,
+          apply,
+        }),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(data?.detail ?? data?.start_date ?? data?.end_date ?? data?.shift_template_ids ?? 'Unable to backdate these shifts.')
+      }
+      if (apply) {
+        closeBackdate()
+        await fetchBlocks()
+        window.alert(data.detail ?? 'Published shifts were updated.')
+      } else {
+        setBackdatePreview(data as BackdatePreview)
+      }
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Unable to backdate these shifts.')
+    } finally {
+      setIsBackdateLoading(false)
+    }
+  }
+
   if (requestUserView) {
     return (
       <div className="facilities-view-card">
@@ -806,6 +911,11 @@ export default function ScheduleBlocksView({
                     {block.can_unpublish_schedule && block.build_status === 'ARCHIVE' && block.published_at && (
                       <button type="button" onClick={() => unpublishBlock(block)}>Unpublish / Return to Build</button>
                     )}
+                    {block.can_backdate_shifts && block.build_status === 'ARCHIVE' && block.published_at && (
+                      <button type="button" onClick={() => void openBackdate(block)} disabled={isBackdateLoading}>
+                        Backdate Shifts
+                      </button>
+                    )}
                   </div>
                 </td>
               </tr>
@@ -815,6 +925,101 @@ export default function ScheduleBlocksView({
       </div>
 
       {!sortedBlocks.length && <div className="empty-state">No Schedule Blocks found</div>}
+
+      {backdateBlock && backdateContext && (
+        <div className="shift-modal-overlay" onClick={closeBackdate}>
+          <div className="shift-modal shift-modal-wide backdate-shifts-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="shift-modal-header">
+              <h2>Backdate Shifts</h2>
+              <p>Targeted corrections or additions to the current published schedule. Existing assignments are retained; newly added shifts are open.</p>
+            </div>
+            <div className="shift-modal-body">
+              {!backdatePreview ? (
+                <>
+                  <div className="backdate-date-fields">
+                    <label>
+                      <span>First date</span>
+                      <input
+                        type="date"
+                        min={backdateContext.earliest_date}
+                        max={backdateContext.published_end_date ?? undefined}
+                        value={backdateStartDate}
+                        onChange={(event) => setBackdateStartDate(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>End date (optional)</span>
+                      <input
+                        type="date"
+                        min={backdateStartDate || backdateContext.earliest_date}
+                        max={backdateContext.published_end_date ?? undefined}
+                        value={backdateEndDate}
+                        onChange={(event) => setBackdateEndDate(event.target.value)}
+                      />
+                      <small>Leave blank to continue through {backdateContext.published_end_date ? formatDate(backdateContext.published_end_date) : 'the published schedule end'}.</small>
+                    </label>
+                  </div>
+                  <fieldset className="backdate-shift-picker">
+                    <legend>Select updated or newly added Shifts</legend>
+                    {backdateContext.shift_templates.map((template) => (
+                      <label key={template.id}>
+                        <input
+                          type="checkbox"
+                          checked={backdateTemplateIds.includes(template.id)}
+                          onChange={(event) => setBackdateTemplateIds((current) => (
+                            event.target.checked
+                              ? [...current, template.id]
+                              : current.filter((id) => id !== template.id)
+                          ))}
+                        />
+                        <span><strong>{template.name}</strong><small>{template.active_days_of_week.join(', ')}</small></span>
+                      </label>
+                    ))}
+                  </fieldset>
+                </>
+              ) : (
+                <div className="backdate-preview">
+                  <div className="backdate-preview-heading">
+                    <strong>{backdatePreview.changes.length} affected shift occurrence{backdatePreview.changes.length === 1 ? '' : 's'}</strong>
+                    <span>{formatDate(backdatePreview.start_date)} – {formatDate(backdatePreview.end_date)}</span>
+                  </div>
+                  {backdatePreview.warnings.map((warning) => <div className="facilities-error" key={warning}>{warning}</div>)}
+                  {!!backdatePreview.skipped_started_shifts.length && (
+                    <div className="backdate-started-note">
+                      {backdatePreview.skipped_started_shifts.length} shift occurrence(s) already started and will not be changed.
+                    </div>
+                  )}
+                  <div className="backdate-change-list">
+                    {backdatePreview.changes.map((change, index) => (
+                      <article key={`${change.date}-${change.shift_template_id}-${index}`}>
+                        <header><strong>{formatDate(change.date)}</strong><span>{change.action === 'ADD' ? 'New open shift' : 'Modified shift'}</span></header>
+                        <div><span>Current</span><strong>{change.before?.label ?? 'No shift'}</strong><small>{change.before?.assigned_users.join(', ') || 'Unassigned'}</small></div>
+                        <div><span>Proposed</span><strong>{change.after.label}</strong><small>{change.after.assigned_users.join(', ') || 'Open shift'}</small></div>
+                      </article>
+                    ))}
+                    {!backdatePreview.changes.length && <div className="empty-state">No future published shifts would change.</div>}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="shift-modal-actions backdate-modal-actions">
+              <button type="button" className="secondary" onClick={closeBackdate}>Cancel</button>
+              {backdatePreview ? (
+                <>
+                  <button type="button" className="secondary" onClick={() => setBackdatePreview(null)}>Back</button>
+                  <button type="button" className="primary-action" disabled={isBackdateLoading || !backdatePreview.changes.length} onClick={() => void requestBackdate(true)}>
+                    {isBackdateLoading ? 'Applying...' : 'Backdate Shifts'}
+                  </button>
+                </>
+              ) : (
+                <button type="button" className="primary-action" disabled={isBackdateLoading || !backdateTemplateIds.length || !backdateStartDate} onClick={() => void requestBackdate(false)}>
+                  {isBackdateLoading ? 'Loading...' : 'Preview Change'}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {isModalOpen && (
         <div className="shift-modal-overlay" onClick={closeModal}>

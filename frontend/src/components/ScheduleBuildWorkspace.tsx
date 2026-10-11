@@ -308,6 +308,15 @@ type BuildContext = {
   atlas_v2_enabled: boolean
   atlas_v2_test_enabled?: boolean
   shift_generation_required: boolean
+  entry_blocked_by_shift_changes?: boolean
+  pending_shift_changes?: Array<{
+    id: number
+    revision: number
+    change_type: 'ADDED' | 'UPDATED' | 'DELETED'
+    shift_template_id: number
+    shift_name: string
+    changed_at: string
+  }>
   domains: DomainOption[]
   versions: ScheduleVersion[]
   selected_version: ScheduleVersion | null
@@ -792,6 +801,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [visibleMonth, setVisibleMonth] = useState<Date | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isAcknowledgingShiftChanges, setIsAcknowledgingShiftChanges] = useState(false)
   const automaticGenerationKeyRef = useRef<string | null>(null)
   const [isLaunchingOptimizer, setIsLaunchingOptimizer] = useState(false)
   const [stoppingOptimizerRunIds, setStoppingOptimizerRunIds] = useState<number[]>([])
@@ -1062,6 +1072,27 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
       if (!options.quiet) {
         setIsLoading(false)
       }
+    }
+  }
+
+  const acknowledgeShiftChanges = async () => {
+    try {
+      setIsAcknowledgingShiftChanges(true)
+      setError(null)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${blockId}/build/acknowledge-shift-changes/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(apiError(data, 'Unable to acknowledge Shift Builder changes.'))
+      setNotice(data?.detail ?? 'Shift Builder changes were applied.')
+      await fetchContext(undefined, { optimizerRunId: null })
+    } catch (acknowledgeError) {
+      setError(acknowledgeError instanceof Error ? acknowledgeError.message : 'Unable to acknowledge Shift Builder changes.')
+    } finally {
+      setIsAcknowledgingShiftChanges(false)
     }
   }
 
@@ -2288,6 +2319,38 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     return <div className="scheduler-loading">Loading Schedule Build Workspace...</div>
   }
 
+  if (context?.entry_blocked_by_shift_changes) {
+    return (
+      <div className="facilities-view-card shift-change-gate">
+        <div className="facilities-header">
+          <div>
+            <h2>Shift Builder Changes Require Acknowledgment</h2>
+            <p>This Build workspace cannot be opened until these Shift changes are acknowledged.</p>
+          </div>
+        </div>
+        {error && <div className="facilities-error">{error}</div>}
+        <div className="shift-change-gate-list">
+          {(context.pending_shift_changes ?? []).map((change) => (
+            <article key={change.id}>
+              <span className={`shift-change-type shift-change-type-${change.change_type.toLowerCase()}`}>{change.change_type}</span>
+              <strong>{change.shift_name}</strong>
+              <small>Shift Builder revision {change.revision}</small>
+            </article>
+          ))}
+        </div>
+        <div className="shift-change-gate-note">
+          Cancel to return to Shift Builder and correct any mistakes. You cannot enter this affected Build workspace until the discrepancies are corrected or the changes are acknowledged.
+        </div>
+        <div className="shift-change-gate-actions">
+          <button type="button" className="secondary" onClick={onBack}>Cancel</button>
+          <button type="button" className="primary-action" disabled={isAcknowledgingShiftChanges} onClick={() => void acknowledgeShiftChanges()}>
+            {isAcknowledgingShiftChanges ? 'Applying Changes...' : 'Acknowledge Shift Changes'}
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   if (!context || !visibleMonth || !blockStart || !blockEnd) {
     return (
       <div className="facilities-view-card">
@@ -3081,7 +3144,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                     type="button"
                     className="primary-action"
                     onClick={() => void previewOptimizerRun(selectedRunForActions)}
-                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions) || selectedRunForActions.has_pending_manual_changes}
+                    disabled={!context.can_manage_build_workspace || isMutatingBuild || !isCompletedOptimizerRun(selectedRunForActions) || selectedRunForActions.has_pending_manual_changes || selectedRunForActions.score_is_stale}
+                    title={selectedRunForActions.score_is_stale ? 'This run predates acknowledged Shift Builder changes. Start a new optimizer run from it first.' : undefined}
                   >
                     {isPreviewingRunId === selectedRunForActions.id ? 'Changing status...' : 'Change status to Preview'}
                   </button>

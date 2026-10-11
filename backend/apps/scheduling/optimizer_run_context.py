@@ -75,6 +75,7 @@ def prepare_optimizer_run(
             seed = secrets.randbits(63)
         optimizer_run = OptimizerRun.objects.create(
             schedule_version=version,
+            shift_configuration_revision=version.shift_configuration_revision,
             run_number=latest_run_number + 1,
             created_by=created_by,
             status=OptimizerRun.Status.RUNNING,
