@@ -6,6 +6,10 @@ This document records product decisions that are already established by the curr
 
 This is a product-behavior summary, not a claim that every roadmap phase is complete. Where roadmap language and the running code differ, the code describes current behavior while the roadmap describes sequencing and future scope.
 
+### Maintenance cadence
+
+This source of truth must be read and compared with the current codebase and settled product decisions at least once every 24 hours. If behavior, terminology, permissions, workflows, or known future work have changed, this document must be updated during that review. The reviewer must not add assumptions merely to make the document appear complete; unresolved questions remain explicit until the product owner settles them.
+
 ## Product Principles
 
 1. Atlas is a physician scheduling platform.
@@ -13,7 +17,7 @@ This is a product-behavior summary, not a claim that every roadmap phase is comp
 3. Prefer simple, explicit workflows over hidden automation.
 4. A feature should solve a real scheduling problem before it is added.
 5. Product decisions precede implementation decisions.
-6. Optimization is future workflow behavior; each optimization run must be treated as a new search, not as an invisible mutation of an existing result.
+6. Each optimization Run is an independent, auditable search. Starting from an earlier schedule never silently mutates that source Run or the published Live Schedule.
 
 ## Core Concept Boundaries
 
@@ -39,6 +43,7 @@ Shift Builder defines generic recurring Shift Templates using day-of-week rules.
 
 Each Shift Template has:
 
+- one Domain;
 - one Facility;
 - start and end times;
 - one or more active days selected from Sunday through Saturday;
@@ -97,21 +102,44 @@ Status is workflow-controlled and cannot be edited as an ordinary field.
 - `PREVIEW` is view-only. Schedulers can either publish it or move it back to `BUILD`; moving back preserves all schedule versions, optimizer runs, and assignments.
 - Only `PREVIEW` blocks can be published.
 - Publishing stamps `published_at`, moves the block to `ARCHIVE`, and records the exact active Optimizer Run used by each Schedule Version as the published schedule snapshot.
-- Archived block definitions and publication lifecycle are read-only and cannot return to preview. Authorized Live Schedule assignment operations remain available after publication.
+- Archived block definitions and publication lifecycle are read-only. An authorized scheduler may explicitly unpublish an archived block and return it to `BUILD`; until that happens, only authorized Live Schedule operations may change its published assignments.
 
 Publication freezes the displayed score and violation diagnostics under the contracts and requests that existed at publication time. Opening a published block does not rerun feasibility checks, and later Contract changes do not mark its stored scores stale or reevaluate it. The published Optimizer Run is visibly identified in the Schedule Build Workspace and run history. Unpublishing is the explicit action that returns the block to `BUILD`, clears the publication snapshot, re-enables feasibility checks, and marks retained run scores for reevaluation against current rules.
 
 On the Live Schedule, an assigned user may split their own shift and may recombine all portions when the same current user set remains assigned to every portion. Cancelled, declined, approved, or otherwise historical trade activity never blocks recombination; references from removed split portions are retained against the surviving recombined assignment, and any still-pending trade affecting those portions is cancelled. If current portion owners differ, an ordinary user is directed to an administrator or scheduler. Administrators and schedulers may post, split, recombine, open, refill, reassign, and directly swap any users' published assignments. Opening a shift preserves its historical trade details while cancelling pending activity. A direct time overlap or mixed-owner recombination produces a warning with an explicit proceed-anyway option instead of a hard prohibition, because the action may be one step in a multi-shift correction. Structurally invalid input, such as a split point outside the shift, remains blocked.
 
+Every active clinician who is marked clinically active in a Domain retains the ordinary clinician workflows in that Domain: submit their own requests, post or offer their own shifts, propose and receive trades, split their own shifts, and pick up eligible open or posted shifts. Administrative and scheduler powers are additional capabilities; they never replace these end-user capabilities. A shift cannot be posted, offered, traded, or picked up once its exact start time has been reached. A pending trade is cancelled automatically when either involved shift reaches its start time. An accepted trade updates the authoritative published assignment, not merely the trade record.
+
+The Trade Requests control counts pending activity. A newly received, unseen request adds the request-open accent border; opening the trade list marks it seen and removes the border without requiring the user to accept, decline, or otherwise resolve the request. Sending a request does not mark the sender's own control as unseen. The Schedule page supports Group Schedule, My Schedule, and Mine & Available Shifts views. Resolved trades return to the ordinary ownership-based schedule colors.
+
+When a request window is open, a compact Requests Open control appears in the Schedule view for a clinically active user in the applicable Domain and links directly to that block's request entry workflow.
+
 Administrators and schedulers may attach one calendar comment to a date in the authoritative published schedule by selecting its date number. The single-line title appears below that date's shifts at no more than one shift-row height; its optional details appear on hover. All authenticated schedule viewers may read comments, while only administrators and schedulers may add, edit, or delete them. A comment may repeat every one to four weeks on its selected weekday or monthly on the selected weekday occurrence, ending on a date, after a number of occurrences, or never. Recurring series exist independently of schedule blocks but render only on dates covered by the current authoritative published schedule; they do not appear in BUILD or PREVIEW, and a never-ending series begins appearing automatically as later schedules are published. An occurrence can be edited or deleted for that date only, that date and future dates, or the entire series.
 
 Overlapping planning blocks are allowed. Creating a block that overlaps already-published dates requires acknowledgement. Publishing over already-published dates also requires acknowledgement: the newer publication replaces the Live Schedule for overlapping dates, while the previous published block remains archived as historical schedule-of-record data.
+
+### Backdate Shifts
+
+Backdate Shifts is an administrator/scheduler workflow for targeted corrections or additions to the current and future portion of the authoritative published schedule. It is not a substitute for unpublishing and rebuilding a schedule when changes are broad.
+
+- The workflow is available only to a user with both Build Workspace management and published-shift batch-update permission.
+- It offers only Shift Templates that have actually been added, modified, disabled, or re-enabled since the applicable published schedule snapshot.
+- The first affected date cannot be earlier than today. The optional end date cannot be later than the end of the currently published schedule; leaving it blank applies the change through that published horizon.
+- Only occurrences inside the selected window change. The Shift Builder definition remains in its newly configured state regardless of the selected backdate window.
+- The preview is a compact date-by-date list of removals, additions, and replacements, not a calendar.
+- An existing assignment is retained when its shift is modified. A newly added shift begins open unless the scheduler approves a proposed assignment transfer.
+- When a shift is removed and another is added on the same date, Atlas recommends the removed shift's assigned user as the replacement when that transfer is valid. The scheduler may approve each proposal, leave it open, accept all valid proposals, or leave all additions open.
+- A transfer recommendation must still satisfy staffing, clinical activity, Facility eligibility, and overlap rules.
+- Pending trades involving an affected assignment are cancelled and the sender is notified with the reason.
+- The applied batch is recorded for audit.
+
+If the scheduler needs substantial restructuring, the established workflow is to unpublish the schedule, return it to `BUILD`, and use the optimizer rather than forcing the change through Backdate Shifts.
 
 ## Schedule Build Workspace
 
 ### Settled purpose
 
-The Schedule Build Workspace is the pre-optimizer workspace for a Schedule Block. It generates and displays the dated, unassigned staffing requirements that later scheduling work will fill.
+The Schedule Build Workspace is the pre-publication workspace for a Schedule Block. It generates, displays, edits, scores, and optimizes the dated staffing requirements that later become the published schedule.
 
 - A Schedule Version belongs to one Schedule Block and one Domain.
 - The initial generated version has `BUILD` status.
@@ -123,42 +151,58 @@ The Schedule Build Workspace is the pre-optimizer workspace for a Schedule Block
 
 Schedulers and Admins can manually assign active physicians to generated Shift Instances in a BUILD version. Assignments belong to instances, never to Shift Templates. An instance supports separate assignment records up to its required staffing; the same physician cannot be assigned to the same instance twice or to overlapping Shift Instances in the same Schedule Version. Staffing displays as assigned/required, and an instance remains open while its assigned count is below required staffing. Manual assignments persist with the BUILD version and may be removed there.
 
-Manual Assignment V1 uses the physician's active Contract assignment in the Schedule Version's Domain as the available domain-membership evidence. The Contract must include the instance's Facility for the physician to be eligible. The assignment picker lists only active physicians who meet that eligibility; when none do, it shows an explicit empty state. It does not infer membership from primary Facility or clinician type.
+Manual assignment currently requires an active physician with an active Contract assignment in the Schedule Version's Domain, and that Contract must include the instance's Facility. The assignment picker displays only physicians who can actually be assigned; when none qualify, it shows an explicit empty state. Domain membership and permissions remain separate access concepts, and scheduling eligibility is not inferred from primary Facility or clinician type.
 
-The workspace is not the Live Schedule, preview, or publication. Manual Assignment V1 prevents overlapping assignments as basic schedule validity, but does not evaluate requests, workload, nights, weekends, rest, penalties, or other soft scheduling rules.
+The workspace is not the Live Schedule, preview, or publication. Manual assignment prevents overlapping assignments as basic schedule validity; authoritative optimizer scoring separately evaluates requests, workload, nights, weekends, rest, penalties, and the configured Contract rules.
 
-Shift Templates do not currently have a Domain relationship. The Schedule Version is Domain-scoped, while V1 generation reads the existing global active Shift Template catalog. Atlas must not infer a hidden Template-to-Domain mapping through Contracts or Facilities.
+Shift Templates belong to a Domain and Facility. BUILD generation uses only active templates in the Schedule Version's Domain and active Facilities; templates from another Domain or Region must never leak into the workspace.
 
-### Optimizer v0
+### Shift Builder changes during BUILD
 
-Optimizer v0 runs inside the selected `BUILD` Schedule Version. It does not create a new Schedule Version, does not preview, does not publish, and does not create or mutate a Live Schedule. It uses a greedy initial fill followed by bounded local-search improvement that keeps only valid reassignment or swap moves that lower the total score.
+Shift Builder records an event when a template is added, modified, disabled, re-enabled, or deleted while an affected unpublished Schedule Block is already in `BUILD`. This event-driven notification avoids rescanning every template whenever the Build Workspace opens.
 
-The default maximum runtime for a new optimizer run is 120 minutes. Schedulers may choose any whole-number limit from 1 through 240 minutes. The Schedule Build Workspace remembers the most recently selected valid runtime in that browser and uses it for subsequent blocks and runs until the scheduler changes it again. The backend and persisted `OptimizerRun` default are also 120 minutes when a caller does not provide a runtime explicitly.
+The affected workspace cannot continue until an authorized scheduler either acknowledges the changes or cancels. Cancelling clearly explains that the scheduler must correct the Shift Builder discrepancy or acknowledge the changes before re-entering that workspace. A block created after the template change already begins from the current template catalog and does not receive a retroactive acknowledgement requirement.
 
-Optimizer v0 scoring includes coverage, workload, request, final validity, and configured distribution penalties. Distribution penalties cover excessive consecutive days, repeated same shift templates, night-shift distribution and configured night rules, and weekend concentration. Where existing Contract rule values are available, v0 uses them; otherwise it falls back to conservative defaults. Same-shift repetition is measured by consecutive occurrences of the same Shift Template for the same physician, with a v0 fallback of max 2 and penalty 2000 per excess occurrence. Night scoring uses night-designated Shift Templates, configured night volume/consecutive/day-off rules when present, and mild distribution balancing when no night volume rule is configured. Night rules are evaluated using night blocks: consecutive night-designated assignments on consecutive dates for the same physician form one block, max consecutive nights controls the length of one night block, days off after a night block before a non-night shift apply to the next non-night assignment after that block, and days off after a night block before the next night block apply only between distinct night blocks. Atlas does not require days off before starting an initial night block except normal overlap and minimum-rest validity. Valid night blocks are preferred over scattered isolated nights when Contract rules allow them. Configured minimum night volume is treated as a high-priority v0 optimization target before extra night-block concentration and workload balancing when valid alternatives exist. Optimizer v0 fills night shifts before general non-night shifts, then strongly avoids assigning non-night shifts inside configured post-night recovery windows and assigning separate night blocks inside configured post-night night-block recovery windows when other valid candidates exist. Its improvement pass uses targeted workload-transfer, same-shift, night-minimum, night-block/recovery, and consecutive-day phases before pairwise swaps. These penalties are draft-build guidance, not preview, publication, or Live Schedule logic.
+Runs created before an acknowledged template change remain available as optimizer starting points, but they are visibly stale and cannot be moved to preview or published. A new optimizer Run may use that schedule as a seed, incorporates the current template snapshot, explicitly represents newly valid open shifts, and fills them when eligible placement exists.
 
-Facility and broad time-of-day distribution are default optimizer tie-breakers, not schedule penalties. Atlas first preserves hard validity, authoritative requests, workload, and every configured rule score. When a legal swap leaves that authoritative score unchanged, the optimizer prefers the result whose non-manual-only assignments more closely match a jointly feasible distribution of the actual eligible opportunity pool. The target matrix preserves every physician's applicable assignment total, exactly preserves the assignments that must be distributed in each facility or time category, and enforces facility eligibility and Contract-governed template exclusions as structural zeroes. This prevents independently normalized physician targets from collectively demanding more assignments at a Facility than actually exist. The opportunity pool is weighted by generated staffing slots and reduced by immutable manual-only coverage such as nocturnists; it is never an equal-per-Facility target. Time-of-day distribution uses starts before 9:00 AM, 10:00 AM through 1:59 PM, 2:00 PM or later, and a separate 9:00 AM through 9:59 AM fallback band for template catalogs that contain those starts. Shift Templates governed by an explicit Contract shift-group rule are excluded from the default facility and time calculation for that Contract, so scheduler-authored rules remain authoritative. Each displayed value is an assignment-weighted percentage: half the absolute deviation from the feasible matrix divided by all applicable optimizer-controlled assignments. A distribution improvement may never increase the official schedule penalty.
+### Optimizer V2 and Run history
 
-Each optimizer run stores one of two scheduler/admin-selected focus modes. `STANDARD` remains the default: proportionality is retained as a score-neutral tie-breaker, but proportionality-only changes do not make a search epoch productive and therefore cannot postpone the normal deep-restart progression. `DISTRIBUTION` is shown in the Schedule Build Workspace as **Facility/Shift distribution focus**. It tries the proportional-distribution neighborhood first and allows score-neutral facility/time proportionality progress to renew that focus-mode search. Both modes use the same lexicographic retention rule: hard validity and authoritative requests come first, a lower official penalty always replaces a higher one, and proportionality decides only between schedules with the same official penalty. The selected focus is persisted on `OptimizerRun`, displayed in active-run and Run History context, and passed unchanged to a background worker.
+Optimizer V2 is the production optimizer. V1 remains an internal regression/compatibility reference and cannot be selected to launch a new production Run.
 
-Long optimizer runs may use at most two deep pipeline restarts without extending the scheduler's selected maximum runtime. The first follows two consecutive zero-gain soft epochs. After one deep restart has failed, Atlas permits one larger structural deep restart only when at least the greater of 15 minutes or 25% of the configured runtime remains, the official score is still above its proven floor by at least 10,000 points of repairable configured-rule penalty, and the run previously produced progress relevant to its selected focus. The structural restart fully reopens repair strategies and uses a larger, dominant-violation-directed reconstruction neighborhood. In `STANDARD`, proportionality-only changes do not satisfy the prior-progress requirement; in `DISTRIBUTION`, they may. A zero-gain structural deep epoch ends the search early, and no restart can extend the absolute runtime deadline.
+An optimizer Run executes in the background inside the selected `BUILD` Schedule Version. The scheduler may leave the page or log out while it runs. The default maximum runtime is 120 minutes, the accepted range is 1 through 240 whole minutes, and the browser remembers the most recently selected valid value. The selected focus and initiating user are stored with the Run and shown in Run history.
 
-The latest Optimizer v0 summary/debug payload is stored on the selected Schedule Version and is returned by the Schedule Build Workspace context API so the workspace can reload the latest optimizer result after navigation or browser refresh. If no optimizer has run for that version, the workspace shows no optimizer summary.
+The supported starting sources are:
 
-The Schedule Build Workspace can open an Optimizer Violation Report for the selected Schedule Version. Its Details tab reuses Optimizer v0 scoring data, lists every eligible physician, and breaks visible penalty totals into per-user violation rows. Its Summary tab aggregates each evaluated rule for the full Schedule Block, includes configured Shifts- and Night-tab rules even when their penalty is zero, and reconciles the displayed rule totals to the authoritative total penalty. Facility and time distribution are shown separately as percentages with simple lower-is-better guidance. Atlas does not present a target, benchmark, quality band, or recommendation for these values; the scheduler uses them as directional comparisons between Runs. Internally, the two assignment-weighted percentages share the same scale before Atlas applies 40% facility and 60% time-of-day priority. The values are not part of the total penalty and remain informational only; the report does not change Contract rules, assignments, active-run selection, Schedule Version lifecycle, preview, publication, or Live Schedule behavior.
+- **Fresh Fill**: build from the current valid staffing requirements with no prior schedule assignments.
+- **Previous Optimizer Run**: copy a selected completed Run, snapshot the rules, requests, users, Facilities, templates, and other inputs that are valid now, authoritatively rescore the copied schedule, and use that current score as the new Run's starting point. The source Run is never modified.
+- **Current Schedule**: start from the current authoritative published schedule, including approved trades, posts, pickups, and scheduler edits that occurred after publication.
+- **Original Published Schedule**: start from the virgin schedule captured at the most recent publication, before subsequent Live Schedule changes.
 
-## Atlas v1 boundary
+Only sources that exist for the block are offered. A BUILD workspace with no publication must not label its active BUILD Run as a Current Schedule. Previous completed Runs remain selectable until the applicable retention policy removes them.
 
-The Git tag `v1.0.0` marks the completed Atlas v1 product and optimizer baseline. Atlas v1 remains the maintenance reference for its documented scheduling behavior. Atlas v2 begins from that exact checkpoint and may replace optimizer internals, but it must preserve authoritative contract/request scoring, independent run history, explicit run activation, published-schedule immutability, and the rule that proportionality can never worsen the official penalty. The first Atlas v2 performance objective is a compact incremental search kernel capable of evaluating at least 100 million genuinely distinct candidate schedules in approximately 3,000 seconds while periodically reconciling accepted results against the authoritative Atlas scorer.
+Each Run is independent and receives the next consecutive Run number. Selecting a completed Run in the Viewing Optimizer Run control makes it the active BUILD Run; there is no separate user-facing Activate action. The selected Run can be moved to preview with the explicit **Change status to preview** action only when it reflects the current acknowledged Shift Builder configuration.
 
-Schedule Shift Assignments record their source as either `MANUAL` or `OPTIMIZER`. Manual assignments may be explicitly locked for preservation during optimizer runs; unlocked manual assignments seed the next optimizer search and may be reassigned. A Shift Instance may likewise be explicitly locked open so the optimizer leaves it unassigned; an unlocked open instance may be filled. Optimizer-generated assignments are replaceable: each optimizer run starts a new search, keeps only explicitly locked manual assignments fixed, honors locked-open instances, and writes its assignments for that run into the same Schedule Version. Fixed requests remain high-penalty preferences rather than hard constraints.
+If a scheduler manually edits an existing Run, the save choices appear only after an actual manual change:
 
-During the MVP build phase, the Schedule Build Workspace includes development clear actions for schedulers/admins:
+- **Save as New** preserves the original Run and records the edited schedule as the next Run with a recalculated score.
+- **Save Current Run and Recalculate Score** updates that Run in place and retains its number.
 
-- Clear Optimizer Assignments removes only `OPTIMIZER` assignments for the selected Schedule Version.
-- Clear All Assignments removes all assignments for the selected Schedule Version and is for development/testing only.
+Manual assignments record their source as `MANUAL`; optimizer assignments record `OPTIMIZER`. An explicitly locked manual assignment remains fixed during optimization, while an unlocked manual assignment may seed and then move during the search. An instance explicitly locked open remains unfilled; any other valid open instance may be filled.
 
-These clear actions do not delete Shift Instances and do not alter preview, publication, or Live Schedule behavior.
+Before every Run, Atlas snapshots the current authoritative inputs and reconciles the chosen source to them. The source schedule is authoritatively rescored before search. Missing current shift instances are represented explicitly, and newly valid open shifts receive a proven placement pass before V2 improvement begins. The vectorized search must periodically reconcile against the authoritative scorer, and a candidate may never be retained as an improvement when the authoritative score does not improve under the required ordering.
+
+The two focus modes are:
+
+- `STANDARD`, the default, which treats Facility and broad time-of-day proportionality as a score-neutral tie-breaker.
+- `DISTRIBUTION`, displayed as **Facility/Shift distribution focus**, which searches the proportional-distribution neighborhood first and permits score-neutral distribution progress to renew that focus.
+
+Both modes preserve hard validity and authoritative requests, always prefer a lower official penalty, and use proportionality only between schedules with the same official penalty. Proportionality can never worsen the official score. Facility/time distribution remains informational and is not added to the total penalty.
+
+The Violation Report's Details tab explains the per-user contributing violations. The Summary tab shows only rule penalties greater than zero that contribute to the authoritative total; informational totals such as nights assigned or maximum nights are not shown as violations unless they generate a penalty. Facility and time distribution remain separate lower-is-better comparison percentages and do not change assignments, rules, Run selection, preview, publication, or the Live Schedule.
+
+Publishing records the exact active Run and a virgin Original Published Schedule snapshot. Republish resets the Run-retention clock. Unused Runs in an archived block may be purged 30 days after the most recent publication, while the published Run, current controlled Run, and running Runs are preserved. A Run protected by active state, current viewing, publication, or another active Run's source relationship cannot be deleted manually.
+
+The Git tag `v1.0.0` remains the historical Atlas V1 baseline. V2 may replace optimizer internals, but it must preserve authoritative Contract/request scoring, independent Run history, published-schedule immutability, and the rule that proportionality never worsens the official penalty.
 
 ## Request Builder
 
@@ -188,19 +232,20 @@ Choosing `None` in the single-request editor removes the request for that physic
 
 Requests have separate `USER` and `ADMIN` scopes. Atlas permits one request of each scope for the same Schedule Block, physician, and date; the two records may coexist.
 
-- Ordinary authenticated physician users can view and modify only their own `USER` requests.
-- Staff, superusers, and members of the Admin or Scheduler groups can work with any physician and can create `ADMIN` requests.
+- Ordinary authenticated clinician users can view and modify only their own `USER` requests.
+- Domain permissions determine who may manage other users' requests. Creating or editing `ADMIN` requests requires administrative request permission, and using `FIXED` requires the separate fixed-request permission.
+- `ADMIN` requests are never exposed to a user who lacks administrative request visibility.
 - Users without a linked Physician profile receive a read-only calendar context rather than an invented clinician identity.
 
 Single and bulk request writes are allowed only while the block is `PRE_BUILD` or `BUILD`. `PREVIEW` and `ARCHIVE` requests are read-only.
 
 Schedulers can bulk-apply a request to multiple physicians and dates. The UI includes date helpers for every occurrence of a weekday, remaining occurrences of a weekday, and the nth weekday of each month. These helpers select explicit dates; they do not create a permanently recurring request rule.
 
-### Current enforcement boundary
+### Current enforcement
 
-The request open/close timestamps currently produce display status only. The API gates writes by Schedule Block lifecycle, not by whether the current time is inside the request window.
+The request open and close timestamps authorize ordinary user writes. An ordinary user may submit requests only while the request window is open and the Schedule Block is in a writable lifecycle state. An authorized request manager may make administrative changes outside the ordinary user window while the block remains writable. `PREVIEW` and `ARCHIVE` remain read-only.
 
-When a physician has one unambiguous active Contract assignment, Request Builder uses that Contract to:
+When a physician has an applicable active Contract assignment in the selected Domain, Request Builder uses that Contract to:
 
 - limit an ordinary user's available request types;
 - limit Shift Templates to the Contract's eligible Facilities;
@@ -208,19 +253,21 @@ When a physician has one unambiguous active Contract assignment, Request Builder
 - treat Low as unlimited when configured;
 - calculate and display request counters.
 
-Staff, superusers, Admins, and Schedulers always receive all request type options. Admin-scope requests coexist with and remain hidden from the physician's user-scope request. Contract limits apply to user-scope requests; admin-scope requests do not consume them.
+Authorized request managers receive the request types allowed by their Domain permissions. Admin-scope requests coexist with and remain hidden from ordinary users. Contract limits apply to user-scope requests; admin-scope requests do not consume them. The request calendar cohorts user requests above administrative requests and provides separate priority totals plus a weekend total.
 
 Weekend counting follows Shift Template weekend designations. Day Off counts once when at least one eligible, active template designates that date's weekday as a weekend day. Shift Off counts once when at least one selected template carries that designation. Multiple selected shifts on the same request still count as one request.
 
-If Atlas cannot resolve exactly one active Contract for the physician, Request Builder does not infer cross-domain policy. An ordinary user cannot create a new request type until an applicable Contract is unambiguous; they may still select `None` to remove an existing user request. Admins and Schedulers retain all request type options. Resolving multiple domain Contracts requires a separate product decision.
+If the clinician has no active Contract in the selected Domain, Request Builder does not infer policy from another Domain. An ordinary user cannot create a new request until the applicable Contract is configured; they may still select `None` to remove an existing user request. An authorized request manager retains the options granted by Domain permissions.
 
-`FIXED` is a high-penalty preference, not a hard scheduling constraint.
+`FIXED` is an admin-only high-penalty instruction, not a hard scheduling constraint. It does not appear as an ordinary user's request option.
 
 ## Organizations, Regions, and Domains
 
 An Organization is Atlas's tenant-level container. An Organization has one or more named Regions, and every Region has one or more named Domains. Region names are unique within their Organization, and Domain names are unique within their Region rather than globally. Org Admins may manage Regions and Domains. Used Regions or Domains are deactivated instead of deleted. An Organization must retain at least one active Region and one active Domain. For a single-region organization, the Organization and Region may intentionally use the same name so the hierarchy is available without inventing a meaningless label.
 
 Users belong to an Organization through a role-free Organization Membership and may belong to any number of its Domains across any Region. Roles exist only on Domain Memberships: Org Admin, Medical Director, Admin, Staff Physician, APP, Scheduler, or View Only. A user may hold a different role in every Domain. An Org Admin role in any Domain grants management authority for the containing Organization. Domain Membership records are the authoritative foundation for domain-specific access; scheduling screens must not infer Domain membership from clinician type, primary Facility, or Contract alone.
+
+Domain permissions, rather than legacy global groups or profile labels, authorize Domain-specific work. An active membership marked clinically active always carries the base clinician workflow permissions for that Domain: submit one's own requests, post or offer one's own shifts, propose trades, split one's own shifts, pick up eligible shifts, and receive the corresponding trade workflows. Scheduler, Admin, Medical Director, and Org Admin capabilities are additive. Marking a membership clinically inactive removes the clinical workflow basis without erasing historical schedule data.
 
 The pre-Organization Atlas data is preserved inside the initial editable `Lowcountry Emergency Physicians` Organization and its initial `Lowcountry Emergency Physicians` Region. Existing Domains, users, Contracts, schedules, and optimizer history retain their identifiers and relationships. A commercial deployment may have its top-level Organization created by an Atlas administrator.
 
@@ -258,9 +305,11 @@ Inactive Contracts cannot receive physician assignments unless reactivated. Cont
 
 Domain-specific user membership is modeled separately from Contract assignment. A user may belong to a Domain without a Contract, but a Contract assignment is valid only inside that Contract's Domain.
 
-### Current enforcement boundary
+### Current enforcement
 
-Contract rules are persisted as structured JSON configuration. Request Builder consumes the applicable Contract's Facility eligibility, allowed request types, request limits, and unlimited-Low setting. Optimizer v0 reads limited available Contract and request data for simple draft scoring and basic rest checks, but the repository does not yet contain the full operational schedule constraint engine described by the roadmap.
+Contract rules are persisted as structured JSON configuration. Request Builder consumes the applicable Contract's Facility eligibility, allowed request types, configurable request limits, request weights, and unlimited-Low setting. Optimizer V2 and its authoritative scorer evaluate the configured coverage, workload, shift-group, night, weekend, request, overlap, rest, eligibility, and distribution rules that apply to the Run. Violation reporting must reconcile to the same authoritative score used to accept or reject schedules.
+
+Atlas enforces at most one default Contract per physician per Domain. Policy from another Domain must never be silently merged into the selected Domain. When no active applicable Contract exists, the workflow must stop or limit itself to explicitly safe administrative, removal, or read-only behavior.
 
 ## Facilities
 
@@ -305,6 +354,14 @@ The primary Facility is descriptive/default affiliation; it does not restrict th
 
 Physicians are disabled rather than deleted. Domain access and domain-specific roles are stored through Domain Memberships. Atlas does not automatically assign a Contract based on FTE, clinician type, or primary Facility.
 
+## Account Access and User Administration
+
+Successful login, including completion of a required first-login password change, opens the Schedule calendar rather than an administrative directory. Navigation and actions are then limited by the user's Domain permissions and Scheduler/User view.
+
+Creating a user or performing an Org Admin password reset issues a unique eight-character temporary password containing exactly one special character and at least one uppercase letter, lowercase letter, and digit. The temporary credential is shown once, invalidates the user's existing sessions when it replaces a password, and must be changed before the rest of Atlas can be used. An administrator must never retrieve, display, or reset a user's existing password merely to troubleshoot access.
+
+An Org Admin may edit their own full managed profile, including Domain memberships, roles, and clinical activity, just as they may for another managed user. A non-managing user may update only their own permitted contact fields. Active status is changed only through the protected deactivation/reactivation workflow so Atlas cannot accidentally remove the last required administrator or discard historical identity.
+
 ## What Atlas Explicitly Should Not Build
 
 Atlas should not build:
@@ -317,20 +374,21 @@ Atlas should not build:
 - destructive deletion as the normal lifecycle for Facilities, Physicians, Shift Templates, Contracts, or published Schedule Blocks;
 - silent replacement of a published Live Schedule without explicit overlap acknowledgement;
 - recurring request records when the current pattern helper is only a way to select explicit dates;
-- claims that Contract workload, shift, night, or weekend scheduling rules are enforced before the optimizer integration actually exists.
+- management roles that remove the same user's clinically active end-user workflows;
+- treating the active BUILD Run as the Current Schedule when no published schedule exists;
+- allowing a stale Run to be previewed or published after an unacknowledged Shift Builder change;
+- a separate native mobile application before the existing application has been made responsive and mobile-friendly.
 
-The following roadmap items are deferred, not permanently prohibited: the schedule version tree beyond the initial BUILD version, penalty engine, background optimization, preview/publish/live editing beyond the current block lifecycle, and report builder/export. They should be implemented only in their intended phase and after their product behavior is settled.
+Atlas does not need a user-facing Schedule Version tree or preserved Build-number branching for the current product workflow. Independent Runs, the current published schedule, and the virgin Original Published Schedule provide the required sources. Report builder/export and responsive mobile presentation remain future work and require separately settled behavior.
 
-## Known Gaps That Must Not Be Filled by Assumption
+## Remaining Future Work and Guardrails
 
-- Organization, Region, and Domain membership are modeled; remaining scheduling interfaces must consistently apply the selected Domain and membership permissions.
-- The full Contract workload, shift, night, and weekend scheduling rule set is not yet evaluated by the schedule builder; Manual Assignment reads Domain and Facility eligibility and separately enforces overlap validity, while Optimizer v0 uses only limited available rule data for simple draft scoring and basic rest checks.
-- Request Builder cannot choose among multiple active Contracts across different Domains; Contract enforcement requires one unambiguous active assignment.
-- Request timestamps do not currently authorize or reject request writes.
-- Publishing records block history, but the repository does not yet contain the full Live Schedule editing workflow described by the roadmap.
-- Optimization, schedule version branching, penalties, comments, reports, and exports remain roadmap work.
+- Every scheduling interface must continue to apply the selected Domain and its Domain Membership permissions consistently; this is a correctness invariant, not unfinished role functionality. Legacy profile labels and global groups are not substitutes.
+- Request Builder and scheduling policy require an active applicable Contract in the selected Domain. A missing Contract is a configuration state to communicate clearly, not permission to borrow policy from another Domain.
+- The responsive/mobile-friendly version of the existing application, including a mobile list/day experience, remains future work. A separate native application is not the first mobile direction.
+- General report builder/export behavior remains unsettled future work.
 
-These gaps require explicit product decisions. Their absence is not permission to infer policy.
+Future work requires explicit product decisions. A missing configuration is not permission to infer policy.
 
 ## Local Development
 
