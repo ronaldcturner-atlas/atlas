@@ -462,7 +462,8 @@ def published_schedule(request):
             'shift_instance__facility__sort_order', 'shift_instance__facility__timezone',
             'shift_instance__shift_template__name', 'shift_instance__start_datetime',
             'shift_instance__end_datetime', 'shift_instance__segment_start_time',
-            'shift_instance__segment_end_time', 'posting__mode', 'posting__active',
+            'shift_instance__segment_end_time', 'posting__mode', 'posting__comment',
+            'posting__active',
             'shift_instance__shift_template__start_time',
             'shift_instance__shift_template__end_time',
             'shift_instance__shift_template__night_shift',
@@ -538,6 +539,9 @@ def published_schedule(request):
             'split_group_start_time': split_group_start_time.isoformat() if split_group_start_time else None,
             'is_split': split_group_id is not None,
             'posting_mode': assignment['posting__mode'] if assignment['posting__active'] else None,
+            'posting_comment': assignment['posting__comment'] if assignment['posting__active'] else '',
+            'can_pick_up': False,
+            'pickup_ineligibility_reason': '',
             'status': 'scheduled',
             'status_display': 'Scheduled',
             'schedule_block': block_id,
@@ -547,6 +551,8 @@ def published_schedule(request):
             'region': assignment['shift_instance__schedule_version__domain__region_id'],
             'region_name': assignment['shift_instance__schedule_version__domain__region__name'],
         })
+    current_physician = getattr(request.user, 'physician', None)
+    published_now = timezone.now()
     open_instances = ScheduleShiftInstance.objects.filter(
         schedule_block__in=published_blocks,
         schedule_version_id__in=active_runs.keys(),
@@ -559,6 +565,21 @@ def published_schedule(request):
         domain = instance.schedule_version.domain
         if authoritative_block_by_date.get((domain.id, instance.date)) != instance.schedule_block_id:
             continue
+        can_pick_up = False
+        pickup_ineligibility_reason = ''
+        if (
+            current_physician is not None
+            and has_permission(request.user, 'pick_up_shifts', domain=domain)
+            and _physician_is_active_in_domain(current_physician, domain)
+        ):
+            if instance.start_datetime <= published_now:
+                pickup_ineligibility_reason = 'This shift has already started.'
+            else:
+                pickup_eligibility = _physician_assignment_eligibility(
+                    current_physician, instance,
+                )
+                can_pick_up = pickup_eligibility['can_assign']
+                pickup_ineligibility_reason = pickup_eligibility['ineligibility_reason']
         start_time = instance.segment_start_time or instance.shift_template.start_time
         end_time = instance.segment_end_time or instance.shift_template.end_time
         rows.append({
@@ -582,6 +603,9 @@ def published_schedule(request):
             'split_group_start_time': None,
             'is_split': False,
             'posting_mode': None,
+            'posting_comment': '',
+            'can_pick_up': can_pick_up,
+            'pickup_ineligibility_reason': pickup_ineligibility_reason,
             'status': 'open',
             'status_display': 'Open',
             'schedule_block': instance.schedule_block_id,
@@ -1234,6 +1258,12 @@ def schedule_assignment_posting(request, assignment_id):
     if not has_permission(request.user, permission, domain=domain):
         return Response({'detail': 'You do not have permission to manage this shift posting.'}, status=status.HTTP_403_FORBIDDEN)
     mode = request.data.get('mode')
+    comment = str(request.data.get('comment', '')).strip()
+    if len(comment) > 1000:
+        return Response(
+            {'detail': 'Posting comments cannot exceed 1000 characters.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
     if mode == 'CLOSE':
         ShiftPosting.objects.filter(assignment=assignment).update(active=False)
     elif mode in (ShiftPosting.Mode.PICKUP, ShiftPosting.Mode.TRADE_ONLY):
@@ -1242,11 +1272,23 @@ def schedule_assignment_posting(request, assignment_id):
                 {'detail': 'A shift cannot be posted after its start time.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        ShiftPosting.objects.update_or_create(assignment=assignment, defaults={'mode': mode, 'active': True, 'posted_by': request.user})
+        ShiftPosting.objects.update_or_create(
+            assignment=assignment,
+            defaults={
+                'mode': mode,
+                'comment': comment,
+                'active': True,
+                'posted_by': request.user,
+            },
+        )
     else:
         return Response({'detail': 'Choose pickup, trade only, or close.'}, status=status.HTTP_400_BAD_REQUEST)
     posting = ShiftPosting.objects.filter(assignment=assignment, active=True).first()
-    return Response({'assignment_id': assignment.id, 'posting_mode': posting.mode if posting else None})
+    return Response({
+        'assignment_id': assignment.id,
+        'posting_mode': posting.mode if posting else None,
+        'posting_comment': posting.comment if posting else '',
+    })
 
 
 @api_view(['POST'])
@@ -1670,6 +1712,135 @@ def shift_instance_assign(request, instance_id):
         locked_instance.save(update_fields=['is_locked_open', 'status', 'updated_at'])
         _set_active_run_locked_open(locked_instance, remains_open)
     return Response({'detail': 'Open shift assigned.'})
+
+
+@api_view(['POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def shift_instance_pickup(request, instance_id):
+    """Allow an eligible clinician to accept an open published shift."""
+    instance = _published_instance_or_404(instance_id, is_locked_open=True)
+    domain = instance.schedule_version.domain
+    physician = getattr(request.user, 'physician', None)
+    if physician is None:
+        return Response(
+            {'detail': 'Your user account is not linked to a physician.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not has_permission(request.user, 'pick_up_shifts', domain=domain):
+        return Response(
+            {'detail': 'You do not have permission to pick up shifts in this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not _physician_is_active_in_domain(physician, domain):
+        return Response(
+            {'detail': 'You are not clinically active in this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if instance.start_datetime <= timezone.now():
+        return Response(
+            {'detail': 'This shift is no longer eligible because its start time has passed.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    eligibility = _physician_assignment_eligibility(physician, instance)
+    if not eligibility['can_assign']:
+        return Response(
+            {'detail': eligibility['ineligibility_reason'] or 'You are not eligible for this shift.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        locked_instance = (
+            ScheduleShiftInstance.objects.select_for_update()
+            .select_related('schedule_version__domain', 'schedule_block')
+            .get(id=instance.id)
+        )
+        published_run = _published_run_for_version(locked_instance.schedule_version)
+        if (
+            published_run is None
+            or not locked_instance.is_locked_open
+            or locked_instance.id in set(published_run.suppressed_shift_instance_ids or [])
+            or not _is_authoritative_published_instance(locked_instance)
+        ):
+            return Response(
+                {'detail': 'This shift is no longer available for pickup.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if locked_instance.start_datetime <= timezone.now():
+            return Response(
+                {'detail': 'This shift is no longer eligible because its start time has passed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        locked_domain = locked_instance.schedule_version.domain
+        if not has_permission(request.user, 'pick_up_shifts', domain=locked_domain):
+            return Response(
+                {'detail': 'You do not have permission to pick up shifts in this Domain.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if not _physician_is_active_in_domain(physician, locked_domain):
+            return Response(
+                {'detail': 'You are not clinically active in this Domain.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        locked_eligibility = _physician_assignment_eligibility(
+            physician, locked_instance,
+        )
+        if not locked_eligibility['can_assign']:
+            return Response(
+                {
+                    'detail': locked_eligibility['ineligibility_reason']
+                    or 'You are not eligible for this shift.'
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        assigned_count = ScheduleShiftAssignment.objects.filter(
+            shift_instance=locked_instance,
+            optimizer_run=published_run,
+        ).count()
+        if assigned_count >= locked_instance.required_staffing:
+            return Response(
+                {'detail': 'This shift no longer has an open position.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if ScheduleShiftAssignment.objects.filter(
+            shift_instance=locked_instance,
+            optimizer_run=published_run,
+            physician=physician,
+        ).exists():
+            return Response(
+                {'detail': 'You are already assigned to this shift.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        overlap = ScheduleShiftAssignment.objects.filter(
+            physician=physician,
+            optimizer_run=published_run,
+            shift_instance__schedule_block=locked_instance.schedule_block,
+            shift_instance__start_datetime__lt=locked_instance.end_datetime,
+            shift_instance__end_datetime__gt=locked_instance.start_datetime,
+        ).exclude(shift_instance=locked_instance).exists()
+        if overlap:
+            return Response(
+                {'detail': f'{physician} has an overlapping assignment.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=locked_instance,
+            physician=physician,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=published_run,
+            created_by=request.user,
+            is_locked=True,
+        )
+        remains_open = assigned_count + 1 < locked_instance.required_staffing
+        locked_instance.is_locked_open = remains_open
+        locked_instance.status = (
+            ScheduleShiftInstance.Status.OPEN
+            if remains_open
+            else ScheduleShiftInstance.Status.ASSIGNED
+        )
+        locked_instance.save(update_fields=['is_locked_open', 'status', 'updated_at'])
+        _set_active_run_locked_open(locked_instance, remains_open)
+    return Response({'detail': 'Open shift picked up.'})
 
 
 @api_view(['PATCH'])

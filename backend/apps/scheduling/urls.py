@@ -25,6 +25,7 @@ urlpatterns = [
     path("schedule-assignments/<int:assignment_id>/reassign/", api.schedule_assignment_reassign, name="schedule_assignment_reassign"),
     path("schedule-assignments/<int:assignment_id>/open/", api.schedule_assignment_open, name="schedule_assignment_open"),
     path("shift-instances/<int:instance_id>/assign/", api.shift_instance_assign, name="shift_instance_assign"),
+    path("shift-instances/<int:instance_id>/pickup/", api.shift_instance_pickup, name="shift_instance_pickup"),
     path("shift-instances/<int:instance_id>/times/", api.shift_instance_times, name="shift_instance_times"),
     path("shift-trades/", api.shift_trades, name="shift_trades"),
     path("shift-trades/mark-seen/", api.shift_trades_mark_seen, name="shift_trades_mark_seen"),

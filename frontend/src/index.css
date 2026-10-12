@@ -164,10 +164,14 @@ select option:checked{
 .shift-status-trade-sent{--shift-hover:rgba(168,85,247,0.34);background:rgba(168,85,247,0.34);border-left-color:#c084fc}
 .shift-status-trade-received{--shift-hover:rgba(236,72,153,0.34);background:rgba(236,72,153,0.34);border-left-color:#f472b6}
 .shift-status-open{--shift-hover:rgba(239,68,68,0.30);background:rgba(239,68,68,0.30);border-left-color:#f87171}
-.shift-post-controls{display:flex!important;align-items:center;gap:8px;flex-wrap:nowrap!important}
+.shift-post-controls{display:grid!important;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:8px}
 .shift-post-controls strong{font-size:12px;white-space:nowrap}
 .shift-post-controls label{display:flex;align-items:center;gap:5px;margin-left:auto;white-space:nowrap;font-size:12px}
 .schedule-shift-actions .shift-post-controls input[type="radio"]{width:14px;height:14px;min-width:14px;margin:0;accent-color:var(--accent)}
+.shift-post-controls .shift-post-comment{grid-column:1/-1;display:grid;gap:5px;margin:0;white-space:normal;color:var(--muted)}
+.schedule-shift-actions .shift-post-comment textarea{width:100%;min-height:58px;padding:8px;border:1px solid var(--border);border-radius:6px;background:#fff;color:#111;resize:vertical}
+.pickup-confirmation{display:grid!important;gap:5px;padding:10px;border:1px solid #fbbf24;border-radius:8px;background:rgba(251,191,36,.12);color:var(--sidebar-fg)}
+.pickup-confirmation>strong{font-size:12px;color:#fbbf24}.pickup-confirmation>span{font-size:11px}.pickup-confirmation>div{display:flex;justify-content:flex-end;gap:7px}
 .propose-trade-controls{display:grid;gap:8px;margin-top:8px;padding-top:10px;border-top:1px solid var(--border)}
 .propose-trade-controls label{display:grid;gap:4px;color:var(--muted)}
 .propose-trade-controls select,.propose-trade-controls textarea{width:100%}
@@ -1414,6 +1418,7 @@ select option {
 .schedule-light-theme .schedule-shift-actions button:hover{background:#eef2ff}
 .schedule-light-theme .schedule-shift-actions,
 .schedule-light-theme .propose-trade-controls{border-color:#e2e8f0}
+.schedule-light-theme .pickup-confirmation{background:#fffbeb;color:#92400e}.schedule-light-theme .pickup-confirmation>strong{color:#92400e}
 .schedule-light-theme .trade-policy,
 .schedule-light-theme .trade-request-note{background:#fffbeb}
 .schedule-light-theme .trade-request-card{border-color:#dbe2ea}

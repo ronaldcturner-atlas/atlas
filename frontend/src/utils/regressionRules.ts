@@ -129,11 +129,13 @@ export function isVisibleInAvailableShifts(
     start_datetime: string
     posting_mode: 'PICKUP' | 'TRADE_ONLY' | null
     status: string
+    can_pick_up: boolean
   },
   physicianId: number,
   nowMs = Date.now(),
 ) {
   if (shift.physician === physicianId) return true
   if (shiftHasStarted(shift.start_datetime, nowMs)) return false
-  return shift.posting_mode !== null || shift.status.toLowerCase() === 'open'
+  if (shift.posting_mode !== null) return true
+  return shift.status.toLowerCase() === 'open' && shift.can_pick_up
 }

@@ -168,15 +168,17 @@ describe('available shifts filter', () => {
       physician: 10,
       start_datetime: '2026-10-09T07:00:00-04:00',
       posting_mode: null,
+      can_pick_up: true,
       status: 'scheduled',
     }, 10, noon)).toBe(true)
   })
 
   it('includes future posted and open shifts but excludes ordinary shifts and past availability', () => {
     const future = '2026-10-10T13:00:00-04:00'
-    expect(isVisibleInAvailableShifts({ physician: 20, start_datetime: future, posting_mode: 'PICKUP', status: 'scheduled' }, 10, noon)).toBe(true)
-    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: future, posting_mode: null, status: 'open' }, 10, noon)).toBe(true)
-    expect(isVisibleInAvailableShifts({ physician: 20, start_datetime: future, posting_mode: null, status: 'scheduled' }, 10, noon)).toBe(false)
-    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: '2026-10-10T12:00:00-04:00', posting_mode: null, status: 'open' }, 10, noon)).toBe(false)
+    expect(isVisibleInAvailableShifts({ physician: 20, start_datetime: future, posting_mode: 'PICKUP', status: 'scheduled', can_pick_up: false }, 10, noon)).toBe(true)
+    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: future, posting_mode: null, status: 'open', can_pick_up: true }, 10, noon)).toBe(true)
+    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: future, posting_mode: null, status: 'open', can_pick_up: false }, 10, noon)).toBe(false)
+    expect(isVisibleInAvailableShifts({ physician: 20, start_datetime: future, posting_mode: null, status: 'scheduled', can_pick_up: false }, 10, noon)).toBe(false)
+    expect(isVisibleInAvailableShifts({ physician: null, start_datetime: '2026-10-10T12:00:00-04:00', posting_mode: null, status: 'open', can_pick_up: true }, 10, noon)).toBe(false)
   })
 })

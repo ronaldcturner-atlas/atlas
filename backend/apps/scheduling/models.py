@@ -649,6 +649,7 @@ class ShiftPosting(models.Model):
     )
     posted_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='shift_postings')
     mode = models.CharField(max_length=16, choices=Mode.choices)
+    comment = models.TextField(blank=True)
     active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

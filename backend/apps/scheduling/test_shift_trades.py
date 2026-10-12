@@ -174,6 +174,43 @@ class ShiftTradeApiTests(TestCase):
         self.assertIsNone(self.assignment.shift_instance.segment_start_time)
         self.assertIsNone(self.assignment.shift_instance.segment_end_time)
 
+    def test_posting_comment_is_retained_and_visible_with_active_posting(self):
+        self.client.force_authenticate(self.owner_user)
+        posted = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/posting/',
+            {'mode': 'PICKUP', 'comment': '  Please call me before pickup.  '},
+            format='json',
+        )
+        self.assertEqual(posted.status_code, 200)
+        self.assertEqual(posted.json()['posting_comment'], 'Please call me before pickup.')
+        posting = ShiftPosting.objects.get(assignment=self.assignment)
+        self.assertEqual(posting.comment, 'Please call me before pickup.')
+
+        self.client.force_authenticate(self.requester_user)
+        published = self.client.get('/api/published-schedule/')
+        self.assertEqual(published.status_code, 200)
+        row = next(item for item in published.json() if item['id'] == self.assignment.id)
+        self.assertEqual(row['posting_mode'], 'PICKUP')
+        self.assertEqual(row['posting_comment'], 'Please call me before pickup.')
+
+    def test_posting_comment_rejects_more_than_1000_characters(self):
+        self.client.force_authenticate(self.owner_user)
+
+        response = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/posting/',
+            {'mode': 'PICKUP', 'comment': 'x' * 1001},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('1000 characters', response.json()['detail'])
+        self.assertFalse(
+            ShiftPosting.objects.filter(
+                assignment=self.assignment,
+                active=True,
+            ).exists()
+        )
+
     def test_shift_cannot_be_posted_at_or_after_its_start_time(self):
         now = timezone.now()
         self.assignment.shift_instance.start_datetime = now
@@ -585,6 +622,75 @@ class ShiftTradeApiTests(TestCase):
         self.assertTrue(replacement.is_locked)
         replacement.shift_instance.refresh_from_db()
         self.assertFalse(replacement.shift_instance.is_locked_open)
+
+    def test_eligible_clinician_can_confirm_pickup_of_open_shift(self):
+        instance_id = self.assignment.shift_instance_id
+        self.client.force_authenticate(self.scheduler_user)
+        opened = self.client.post(
+            f'/api/schedule-assignments/{self.assignment.id}/open/',
+            {},
+            format='json',
+        )
+        self.assertEqual(opened.status_code, 200)
+
+        self.client.force_authenticate(self.requester_user)
+        schedule = self.client.get('/api/published-schedule/')
+        open_row = next(
+            row for row in schedule.json()
+            if row['shift_instance_id'] == instance_id
+        )
+        self.assertTrue(open_row['can_pick_up'])
+        picked_up = self.client.post(
+            f'/api/shift-instances/{instance_id}/pickup/',
+            {},
+            format='json',
+        )
+        self.assertEqual(picked_up.status_code, 200)
+        replacement = ScheduleShiftAssignment.objects.get(
+            shift_instance_id=instance_id,
+            optimizer_run=self.run,
+        )
+        self.assertEqual(replacement.physician, self.requester)
+        self.assertEqual(replacement.created_by, self.requester_user)
+        self.assertTrue(replacement.is_locked)
+        replacement.shift_instance.refresh_from_db()
+        self.assertFalse(replacement.shift_instance.is_locked_open)
+
+    def test_open_shift_pickup_requires_contract_facility_eligibility(self):
+        excluded_facility = Facility.objects.create(
+            name='Excluded Open Hospital', short_name='EOH',
+        )
+        excluded_template = ShiftTemplate.objects.create(
+            domain=self.domain, facility=excluded_facility, name='Excluded Open',
+            start_time=time(7), end_time=time(16),
+            active_days_of_week=['Wednesday'], weekend_days=[],
+            default_staffing_count=1,
+        )
+        open_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2036, 9, 2), shift_template=excluded_template,
+            facility=excluded_facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.OPEN,
+            is_locked_open=True,
+        )
+
+        self.client.force_authenticate(self.requester_user)
+        schedule = self.client.get('/api/published-schedule/')
+        row = next(
+            item for item in schedule.json()
+            if item['shift_instance_id'] == open_instance.id
+        )
+        self.assertFalse(row['can_pick_up'])
+        self.assertIn('Contract does not include', row['pickup_ineligibility_reason'])
+        denied = self.client.post(
+            f'/api/shift-instances/{open_instance.id}/pickup/',
+            {},
+            format='json',
+        )
+        self.assertEqual(denied.status_code, 400)
+        self.assertIn('Contract does not include', denied.json()['detail'])
 
     def test_scheduler_can_directly_swap_users_with_conflict_override(self):
         target_instance = ScheduleShiftInstance.objects.create(

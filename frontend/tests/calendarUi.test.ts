@@ -32,6 +32,21 @@ describe('desktop calendar controls', () => {
     expect(calendarSource).toContain('setAllShifts(await scheduleResponse.json())')
   })
 
+  it('uses explicit pickup confirmation for posted and eligible open shifts', () => {
+    expect(calendarSource).toContain('You will be responsible for this shift.')
+    expect(calendarSource).toContain("setPickupConfirmation('POSTED')")
+    expect(calendarSource).toContain("setPickupConfirmation('OPEN')")
+    expect(calendarSource).toContain('>Pickup Shift</button>')
+    expect(calendarSource).toContain('shift-instances/${selectedShift.instanceId}/pickup/')
+    expect(calendarSource).toContain('>Send trade request</button>')
+  })
+
+  it('retains an optional posting comment and shows it in shift details', () => {
+    expect(calendarSource).toContain('Comment (optional)<textarea')
+    expect(calendarSource).toContain('comment: postingComment')
+    expect(calendarSource).toContain('Posting comment')
+  })
+
   it('uses the Requests Open gold border only for unseen incoming trades', () => {
     expect(calendarSource).toContain('trade-center-button-unseen')
     expect(calendarSource).toContain('shift-trades/mark-seen/')
