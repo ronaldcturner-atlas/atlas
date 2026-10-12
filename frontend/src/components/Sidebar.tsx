@@ -133,11 +133,11 @@ export default function Sidebar({ activeView, onSelectView, userView, canManageO
       {activeView === 'my-schedule' && (
         <section className="sidebar-shift-legend" aria-label="Shift colors">
           <h2>Shift colors</h2>
-          <div><span className="sidebar-legend-swatch sidebar-legend-own" aria-hidden="true" />My shifts</div>
-          <div><span className="sidebar-legend-swatch sidebar-legend-available" aria-hidden="true" />Available pickup</div>
+          <div><span className="sidebar-legend-swatch sidebar-legend-own" aria-hidden="true" />My assigned shift</div>
+          <div><span className="sidebar-legend-swatch sidebar-legend-available" aria-hidden="true" />Available for pickup</div>
           <div><span className="sidebar-legend-swatch sidebar-legend-posted" aria-hidden="true" />My posted shift</div>
-          <div><span className="sidebar-legend-swatch sidebar-legend-trade-sent" aria-hidden="true" />Sent trade</div>
-          <div><span className="sidebar-legend-swatch sidebar-legend-trade-received" aria-hidden="true" />Received trade</div>
+          <div><span className="sidebar-legend-swatch sidebar-legend-trade-sent" aria-hidden="true" />Trade sent</div>
+          <div><span className="sidebar-legend-swatch sidebar-legend-trade-received" aria-hidden="true" />Trade received</div>
           <div><span className="sidebar-legend-swatch sidebar-legend-open" aria-hidden="true" />Open shift</div>
         </section>
       )}

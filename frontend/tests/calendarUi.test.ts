@@ -13,6 +13,10 @@ const sidebarSource = readFileSync(
   new URL('../src/components/Sidebar.tsx', import.meta.url),
   'utf8',
 )
+const dashboardSource = readFileSync(
+  new URL('../src/components/Dashboard.tsx', import.meta.url),
+  'utf8',
+)
 
 describe('desktop calendar controls', () => {
   it('uses the compact current-month action without the obsolete Today and Month buttons', () => {
@@ -85,8 +89,36 @@ describe('calendar highlight styling', () => {
     expect(calendarSource).not.toContain('schedule-status-legend')
     expect(sidebarSource).toContain("activeView === 'my-schedule'")
     expect(sidebarSource).toContain('sidebar-shift-legend')
-    expect(sidebarSource).toContain('Available pickup')
+    expect(sidebarSource).toContain('My assigned shift')
+    expect(sidebarSource).toContain('Available for pickup')
+    expect(sidebarSource).toContain('My posted shift')
+    expect(sidebarSource).toContain('Trade sent')
+    expect(sidebarSource).toContain('Trade received')
+    expect(sidebarSource).toContain('Open shift')
+    expect(calendarStyles).toContain('.sidebar-legend-own{background:#1f65a6}')
+    expect(calendarStyles).toContain('.sidebar-legend-available{background:#34d399}')
+    expect(calendarStyles).toContain('.sidebar-legend-posted{background:#fbbf24}')
+    expect(calendarStyles).toContain('.sidebar-legend-trade-sent{background:#c084fc}')
+    expect(calendarStyles).toContain('.sidebar-legend-trade-received{background:#f472b6}')
+    expect(calendarStyles).toContain('.sidebar-legend-open{background:#f87171}')
     expect(calendarStyles).toMatch(/\.sidebar-shift-legend\{[^}]*border-top:/)
+  })
+
+  it('keeps an assigned shift blue before considering posting or pending-trade states', () => {
+    const resolver = calendarSource.slice(
+      calendarSource.indexOf('const statusClassForShift'),
+      calendarSource.indexOf('const tradePartners'),
+    )
+    expect(resolver.indexOf("if (isOwn) return 'shift-status-own'")).toBeGreaterThan(-1)
+    expect(resolver.indexOf("if (isOwn) return 'shift-status-own'")).toBeLessThan(resolver.indexOf('sentAssignmentIds.has'))
+    expect(resolver.indexOf("if (isOwn) return 'shift-status-own'")).toBeLessThan(resolver.indexOf('shift.postingMode'))
+  })
+
+  it('uses the approved light visual language only for the desktop Schedule experience', () => {
+    expect(dashboardSource).toContain("activeView === 'my-schedule' ? ' schedule-light-theme' : ''")
+    expect(calendarStyles).toMatch(/\.schedule-light-theme\{[^}]*--app-bg:#f1f5f9;[^}]*--surface:#fff;[^}]*--muted:#64748b;/)
+    expect(calendarStyles).toMatch(/\.schedule-light-theme \.calendar-card\{[^}]*background:#fff;/)
+    expect(calendarStyles).toContain('.schedule-light-theme .day-cell{border:1px solid #dbe2ea;background:#fff}')
   })
 
   it('keeps the shared sidebar fixed while the page content scrolls', () => {

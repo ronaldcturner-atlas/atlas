@@ -1346,3 +1346,81 @@ select option {
 .temporary-password-modal{width:min(520px,calc(100vw - 28px));max-width:520px}.temporary-password-modal p{margin:0 0 14px;color:var(--sidebar-fg)}.temporary-password-value{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid rgba(240,180,41,.4);border-radius:8px;background:rgba(240,180,41,.08)}.temporary-password-value code{flex:1;color:#ffe18a;font-size:16px;overflow-wrap:anywhere}.temporary-password-value button{padding:7px 10px;border:0;border-radius:6px;background:var(--accent);color:#fff;cursor:pointer}
 .backdate-transfer-choice{display:grid;gap:4px;margin-top:7px}.backdate-transfer-choice select{min-width:0;padding:6px;border:1px solid var(--border);border-radius:6px;background:#fff;color:#111}
 .backdate-batch-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px;border:1px solid rgba(240,180,41,.35);border-radius:8px;background:rgba(240,180,41,.07)}.backdate-batch-actions>span{margin-right:auto;color:var(--muted);font-size:12px;font-weight:700}
+
+/* Desktop Schedule light theme. Mobile keeps its separately approved layout
+   and simplified two-dot calendar language. */
+.schedule-light-theme{
+  --app-bg:#f1f5f9;
+  --sidebar-bg:#fff;
+  --sidebar-fg:#172033;
+  --text:#172033;
+  --accent:#4f46e5;
+  --accent-hover:#4338ca;
+  --surface:#fff;
+  --panel:#fff;
+  --panel-raised:#fff;
+  --muted:#64748b;
+  --border:#dbe2ea;
+  background:var(--app-bg);
+  color:var(--text);
+}
+.schedule-light-theme .sidebar{box-shadow:4px 0 18px rgba(15,23,42,.06)}
+.schedule-light-theme .logo-copy strong,
+.schedule-light-theme .sidebar-shift-legend h2{color:#172033}
+.schedule-light-theme .nav button{color:#334155}
+.schedule-light-theme .nav button.active{background:#eef2ff;color:#3730a3}
+.schedule-light-theme .nav button:hover{background:#f1f5f9}
+.schedule-light-theme .sidebar-collapse-button{border-color:#cbd5e1;background:#f8fafc;color:#475569}
+.schedule-light-theme .sidebar-collapse-button:hover{border-color:#94a3b8;background:#f1f5f9}
+.schedule-light-theme .schedule-page-heading{border-bottom:1px solid var(--border)}
+.schedule-light-theme .calendar-card{border-color:var(--border);background:#fff;box-shadow:0 10px 28px rgba(15,23,42,.08)}
+.schedule-light-theme .calendar-sticky-controls{background:#fff;box-shadow:0 8px 14px -12px rgba(15,23,42,.35)}
+.schedule-light-theme .schedule-scope-toolbar{border-bottom-color:#e2e8f0}
+.schedule-light-theme .schedule-scope-field>select,
+.schedule-light-theme .month-label select{border-color:#cbd5e1;background:#fff;color:#172033}
+.schedule-light-theme .schedule-view-button,
+.schedule-light-theme .trade-center-button,
+.schedule-light-theme .physician-filter-menu summary{border-color:#cbd5e1;background:#fff;color:#334155}
+.schedule-light-theme .schedule-view-button:hover,
+.schedule-light-theme .schedule-view-button.selected{border-color:#818cf8;background:#eef2ff;color:#3730a3}
+.schedule-light-theme .trade-center-button{border-color:#a5b4fc;background:#eef2ff;color:#3730a3}
+.schedule-light-theme .trade-center-button-unseen{border-color:#f6c344;box-shadow:0 0 0 2px rgba(240,180,41,.2)}
+.schedule-light-theme .physician-filter-menu[open] summary{border-color:#818cf8;background:#eef2ff}
+.schedule-light-theme .physician-filter-popover{border-color:#cbd5e1;background:#fff;color:#172033;box-shadow:0 18px 50px rgba(15,23,42,.18)}
+.schedule-light-theme .physician-filter-heading{border-bottom-color:#e2e8f0}
+.schedule-light-theme .physician-filter-list label:hover{background:#f1f5f9}
+.schedule-light-theme .schedule-filter-status{background:#eef2ff;color:#3730a3}
+.schedule-light-theme .calendar-weekday-banner{border-color:#e2e8f0;background:#f8fafc;color:#64748b}
+.schedule-light-theme .day-cell{border:1px solid #dbe2ea;background:#fff}
+.schedule-light-theme .day-cell-adjacent{border-color:#e2e8f0;background:#f8fafc}
+.schedule-light-theme .day-cell-adjacent .day-number{color:#94a3b8}
+.schedule-light-theme .day-cell-past{border-color:#e2e8f0;background:#f8fafc}
+.schedule-light-theme .day-cell-past .shift-item{opacity:.72;filter:saturate(.7)}
+.schedule-light-theme .day-number{color:#475569}
+.schedule-light-theme .day-cell-today{border:2px solid #fbbf24;box-shadow:0 0 0 2px rgba(251,191,36,.16)}
+.schedule-light-theme .day-cell-today .day-number{color:#92400e}
+.schedule-light-theme .calendar-domain-group+.calendar-domain-group{border-top-color:#e2e8f0}
+.schedule-light-theme .shift-item{color:#172033;box-shadow:inset 0 0 0 1px rgba(15,23,42,.08)}
+.schedule-light-theme .shift-status-own{color:#fff}
+.schedule-light-theme .shift-status-posted-other{background:#d1fae5;color:#065f46}
+.schedule-light-theme .shift-status-own-posted{background:#fef3c7;color:#92400e}
+.schedule-light-theme .shift-status-trade-sent{background:#f3e8ff;color:#6b21a8}
+.schedule-light-theme .shift-status-trade-received{background:#fce7f3;color:#9d174d}
+.schedule-light-theme .shift-status-open{background:#fee2e2;color:#991b1b}
+.schedule-light-theme .shift-modal{border-color:#cbd5e1;background:#fff;color:#172033;box-shadow:0 22px 60px rgba(15,23,42,.24)}
+.schedule-light-theme .shift-modal-actions button,
+.schedule-light-theme .schedule-shift-actions button{border:1px solid #cbd5e1;background:#f8fafc;color:#334155}
+.schedule-light-theme .shift-modal-actions button:hover,
+.schedule-light-theme .schedule-shift-actions button:hover{background:#eef2ff}
+.schedule-light-theme .schedule-shift-actions,
+.schedule-light-theme .propose-trade-controls{border-color:#e2e8f0}
+.schedule-light-theme .trade-policy,
+.schedule-light-theme .trade-request-note{background:#fffbeb}
+.schedule-light-theme .trade-request-card{border-color:#dbe2ea}
+.schedule-light-theme .view-mode-toggle{border-color:#cbd5e1;background:#f1f5f9}
+.schedule-light-theme .view-mode-toggle button{color:#475569}
+.schedule-light-theme .view-mode-toggle button.active{background:#334155;color:#fff;box-shadow:0 1px 3px rgba(15,23,42,.16)}
+.topbar-logout{border:1px solid var(--border);background:rgba(255,255,255,.08);color:var(--sidebar-fg)}
+.topbar-logout:hover{background:rgba(255,255,255,.12)}
+.schedule-light-theme .topbar-logout{border-color:#cbd5e1;background:#fff;color:#334155}
+.schedule-light-theme .topbar-logout:hover{background:#f1f5f9}

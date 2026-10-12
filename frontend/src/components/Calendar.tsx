@@ -628,11 +628,10 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const statusClassForShift = (shift: Shift) => {
     if (shift.status.toLowerCase() === 'open') return 'shift-status-open'
     const isOwn = shift.physicianId === myPhysicianId
+    if (isOwn) return 'shift-status-own'
     if (shift.assignmentId != null && sentAssignmentIds.has(shift.assignmentId)) return 'shift-status-trade-sent'
     if (shift.assignmentId != null && receivedAssignmentIds.has(shift.assignmentId)) return 'shift-status-trade-received'
-    if (isOwn && shift.postingMode) return 'shift-status-own-posted'
     if (!isOwn && shift.postingMode) return 'shift-status-posted-other'
-    if (isOwn) return 'shift-status-own'
     return getShiftTone(shift.role)
   }
   const tradePartners = Array.from(new Map(
