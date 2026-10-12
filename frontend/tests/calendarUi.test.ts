@@ -50,6 +50,12 @@ describe('desktop calendar controls', () => {
     expect(calendarStyles).toMatch(/\.schedule-page-heading\{[^}]*position:sticky;[^}]*top:0;/)
   })
 
+  it('keeps calendar popups above the sticky desktop controls and within the viewport', () => {
+    expect(calendarStyles).toMatch(/\.shift-modal-overlay\{[^}]*padding:16px;[^}]*z-index:100;/)
+    expect(calendarStyles).toMatch(/\.shift-trade-modal\{[^}]*max-height:calc\(100vh - 32px\);[^}]*overflow:hidden/)
+    expect(calendarStyles).toMatch(/\.trade-request-list\{[^}]*min-height:0;[^}]*overflow:auto/)
+  })
+
   it('separates complete shift and user names without changing the shift name', () => {
     expect(calendarSource).toContain('<span className="calendar-shift-name">{shift.facility} {shift.shift}</span>')
     expect(calendarSource).toContain('<span className="calendar-shift-user">{shift.physician_name}</span>')
