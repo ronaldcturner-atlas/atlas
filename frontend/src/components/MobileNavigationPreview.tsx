@@ -1,5 +1,6 @@
 import React from 'react'
 import { useAuth } from '../contexts/AuthContext'
+import { API_BASE } from '../api'
 import './MobileNavigationPreview.css'
 
 type PreviewPage = 'schedule' | 'stats' | 'users' | 'more'
@@ -15,13 +16,53 @@ const primaryItems: Array<{ id: PreviewPage; label: string; icon: string }> = [
   { id: 'more', label: 'More', icon: '•••' },
 ]
 
-const sampleDays = Array.from({ length: 35 }, (_, index) => {
-  const day = index - 3
-  return day > 0 && day <= 31 ? day : null
-})
-
-type PreviewShift = { facility: string; time: string; physician: string; domain: 'Physician' | 'APP'; tone?: ShiftTone; isMine?: boolean; postingMode?: 'pickup' | 'trade' }
+type PreviewShift = {
+  facility: string
+  time: string
+  physician: string
+  domain: string
+  tone?: ShiftTone
+  isMine?: boolean
+  postingMode?: 'pickup' | 'trade'
+  assignmentId?: number | null
+  instanceId?: number
+  physicianId?: number | null
+  startDateTime?: string
+  canPickUp?: boolean
+  pickupIneligibilityReason?: string
+  postingComment?: string
+  domainId?: number
+}
 type SelectedPreviewShift = PreviewShift & { date: Date }
+
+type APIShift = {
+  id: number | null
+  shift_instance_id: number
+  facility_name: string
+  facility_short_name: string
+  physician: number | null
+  physician_name: string
+  date: string
+  start_datetime: string
+  start_time: string
+  end_time: string
+  status: string
+  posting_mode: 'PICKUP' | 'TRADE_ONLY' | null
+  posting_comment: string
+  can_pick_up: boolean
+  pickup_ineligibility_reason: string
+  domain: number
+  domain_name: string
+  region: number
+  region_name: string
+}
+
+type DomainOption = { id: number; name: string; region: number; region_name: string; active: boolean }
+
+const demoDomains: DomainOption[] = [
+  { id: -1, name: 'Physician', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
+  { id: -2, name: 'APP', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
+]
 
 const sampleShiftsByDay: Record<number, PreviewShift[]> = {
   11: [
@@ -64,16 +105,52 @@ function dateKey(value: Date) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`
 }
 
-function PreviewShiftList({ date, shifts = fallbackShifts, label = 'Selected date', onSelect, currentUserName }: { date: Date; shifts?: PreviewShift[]; label?: string; onSelect?: (shift: SelectedPreviewShift) => void; currentUserName?: string }) {
+function weekOffset(date: Date, start: Date) {
+  const dateUtc = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
+  const startUtc = Date.UTC(start.getFullYear(), start.getMonth(), start.getDate())
+  return Math.floor((dateUtc - startUtc) / 604800000)
+}
+
+function formatClockValue(value: string) {
+  const [hoursValue, minutesValue = '0'] = value.split(':')
+  const hours = Number(hoursValue)
+  const minutes = Number(minutesValue)
+  const suffix = hours < 12 ? 'a' : 'p'
+  const displayHour = hours % 12 || 12
+  return `${displayHour}${minutes ? `:${String(minutes).padStart(2, '0')}` : ''}${suffix}`
+}
+
+function PreviewShiftList({ date, shifts = fallbackShifts, label = 'Selected date', onSelect, currentUserName, prioritizeCalendarShifts = false }: { date: Date; shifts?: PreviewShift[]; label?: string; onSelect?: (shift: SelectedPreviewShift) => void; currentUserName?: string; prioritizeCalendarShifts?: boolean }) {
+  const displayedShifts = prioritizeCalendarShifts
+    ? [...shifts].sort((left, right) => {
+      const priority = (shift: PreviewShift) => shift.isMine ? 0 : shift.tone && shift.tone !== 'standard' ? 1 : 2
+      return priority(left) - priority(right)
+    })
+    : shifts
+  const availableIndexes = displayedShifts.flatMap((shift, index) => (
+    prioritizeCalendarShifts && !shift.isMine && shift.tone && shift.tone !== 'standard' ? [index] : []
+  ))
+  const firstAvailableIndex = availableIndexes[0]
+  const lastAvailableIndex = availableIndexes[availableIndexes.length - 1]
+
   return (
     <section className="mobile-day-schedule" aria-label={`Schedule for ${date.toLocaleDateString('en-US')}`}>
       <header><span>{label}</span><strong>{date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</strong></header>
-      {shifts.length === 0 && <div className="mobile-no-shifts">No shifts scheduled</div>}
-      {shifts.map(({ facility, time, physician, domain, tone = 'standard', isMine, postingMode }) => {
+      {displayedShifts.length === 0 && <div className="mobile-no-shifts">No shifts scheduled</div>}
+      {displayedShifts.map((shift, index) => {
+        const { facility, time, physician, domain, tone = 'standard', isMine, postingMode } = shift
         const displayedPhysician = isMine && currentUserName ? currentUserName : physician
         const mobileTone = isMine ? 'own' : tone === 'standard' ? 'standard' : 'other-status'
         const statusLabel = postingMode === 'pickup' ? 'Pickup' : postingMode === 'trade' ? 'Trade' : tone === 'open' ? 'Open' : ''
-        return <button type="button" className={`shift-tone-${mobileTone}`} key={`${facility}-${time}`} onClick={() => onSelect?.({ facility, time, physician: displayedPhysician, domain, tone, isMine, postingMode, date })}><i /><span><strong>{facility}</strong><small>{time}</small></span><b>{displayedPhysician}<small>{domain === 'APP' ? 'APP' : 'MD'}{statusLabel ? ` · ${statusLabel}` : ''}</small></b><em>›</em></button>
+        const domainLabel = domain === 'Physician' ? 'MD' : domain
+        const calendarHighlight = prioritizeCalendarShifts
+          ? isMine
+            ? ' calendar-own-highlight'
+            : index >= firstAvailableIndex && index <= lastAvailableIndex
+              ? ` calendar-available-highlight${index === firstAvailableIndex ? ' available-first' : ''}${index === lastAvailableIndex ? ' available-last' : ''}`
+              : ''
+          : ''
+        return <button type="button" className={`shift-tone-${mobileTone}${calendarHighlight}`} key={`${shift.instanceId ?? facility}-${time}`} onClick={() => onSelect?.({ ...shift, physician: displayedPhysician, date })}><i /><span><strong>{facility}</strong><small>{time}</small></span><b>{displayedPhysician}<small>{domainLabel}{statusLabel ? ` · ${statusLabel}` : ''}</small></b><em>›</em></button>
       })}
     </section>
   )
@@ -102,39 +179,80 @@ export default function MobileNavigationPreview() {
   const [splitTime, setSplitTime] = React.useState('10:30')
   const [workflowMessage, setWorkflowMessage] = React.useState('')
   const [testUserView, setTestUserView] = React.useState(false)
+  const [scheduleDataState, setScheduleDataState] = React.useState<'loading' | 'live' | 'demo'>('loading')
+  const [scheduleDataMessage, setScheduleDataMessage] = React.useState('')
+  const [apiShifts, setApiShifts] = React.useState<APIShift[]>([])
+  const [availableDomains, setAvailableDomains] = React.useState<DomainOption[]>([])
+  const [viewDate, setViewDate] = React.useState(() => {
+    const stored = window.localStorage.getItem('atlas.mobile-preview.month')
+    const parsed = stored ? new Date(`${stored}-01T12:00:00`) : new Date()
+    return Number.isNaN(parsed.getTime()) ? new Date(new Date().getFullYear(), new Date().getMonth(), 1) : new Date(parsed.getFullYear(), parsed.getMonth(), 1)
+  })
   const [selectedDay, setSelectedDay] = React.useState(() => {
     const stored = Number(window.localStorage.getItem('atlas.mobile-preview.day'))
     return Number.isInteger(stored) && stored >= 1 && stored <= 31 ? stored : new Date().getDate()
   })
-  const [activeListDate, setActiveListDate] = React.useState(() => dateKey(new Date(new Date().getFullYear(), new Date().getMonth(), selectedDay)))
+  const [activeListDate, setActiveListDate] = React.useState(() => dateKey(new Date(viewDate.getFullYear(), viewDate.getMonth(), selectedDay)))
   const [weekIndex, setWeekIndex] = React.useState(() => {
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+    const monthStart = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1)
     const monthGridStart = new Date(monthStart.getFullYear(), monthStart.getMonth(), 1 - monthStart.getDay())
     const gridStart = new Date(monthGridStart.getFullYear(), monthGridStart.getMonth(), monthGridStart.getDate() - 28)
-    const selectedDate = new Date(new Date().getFullYear(), new Date().getMonth(), selectedDay)
-    return Math.max(0, Math.min(15, Math.floor((selectedDate.getTime() - gridStart.getTime()) / 604800000)))
+    const selectedDate = new Date(viewDate.getFullYear(), viewDate.getMonth(), selectedDay)
+    return Math.max(0, Math.min(15, weekOffset(selectedDate, gridStart)))
   })
   const contentRef = React.useRef<HTMLElement>(null)
   const programmaticScrollRef = React.useRef(false)
   const pendingWeekJumpRef = React.useRef(false)
-  const [selectedRegion, setSelectedRegion] = React.useState(() => (
-    window.localStorage.getItem('atlas.mobile-preview.region') || 'Lowcountry Emergency Physicians'
-  ))
-  const [selectedDomains, setSelectedDomains] = React.useState<string[]>(() => {
+  const [selectedRegionId, setSelectedRegionId] = React.useState<number | null>(() => {
+    const stored = Number(window.localStorage.getItem('atlas.mobile-preview.region-id'))
+    return Number.isFinite(stored) && stored !== 0 ? stored : null
+  })
+  const [selectedDomainIds, setSelectedDomainIds] = React.useState<number[]>(() => {
     try {
-      const value = JSON.parse(window.localStorage.getItem('atlas.mobile-preview.domains') || '[]')
-      return Array.isArray(value) && value.length ? value : ['Physician', 'APP']
+      const value = JSON.parse(window.localStorage.getItem('atlas.mobile-preview.domain-ids') || '[]')
+      return Array.isArray(value) ? value.filter((id): id is number => typeof id === 'number') : []
     } catch {
-      return ['Physician', 'APP']
+      return []
     }
   })
 
   React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.page', activePage), [activePage])
   React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.display', display), [display])
   React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.list-scope', listScheduleScope), [listScheduleScope])
-  React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.region', selectedRegion), [selectedRegion])
-  React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.domains', JSON.stringify(selectedDomains)), [selectedDomains])
+  React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.month', `${viewDate.getFullYear()}-${String(viewDate.getMonth() + 1).padStart(2, '0')}`), [viewDate])
+  React.useEffect(() => {
+    if (selectedRegionId != null) window.localStorage.setItem('atlas.mobile-preview.region-id', String(selectedRegionId))
+  }, [selectedRegionId])
+  React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.domain-ids', JSON.stringify(selectedDomainIds)), [selectedDomainIds])
   React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.day', String(selectedDay)), [selectedDay])
+
+  React.useEffect(() => {
+    let cancelled = false
+    const loadPublishedSchedule = async () => {
+      setScheduleDataState('loading')
+      try {
+        const [scheduleResponse, domainsResponse] = await Promise.all([
+          fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
+          fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include', cache: 'no-store' }),
+        ])
+        if (!scheduleResponse.ok || !domainsResponse.ok) throw new Error('Published schedule could not be loaded.')
+        const [schedule, domains] = await Promise.all([scheduleResponse.json(), domainsResponse.json()])
+        if (cancelled) return
+        setApiShifts(Array.isArray(schedule) ? schedule : [])
+        setAvailableDomains(Array.isArray(domains) ? domains : [])
+        setScheduleDataState('live')
+        setScheduleDataMessage('')
+      } catch (error) {
+        if (cancelled) return
+        setApiShifts([])
+        setAvailableDomains([])
+        setScheduleDataState('demo')
+        setScheduleDataMessage(error instanceof Error ? error.message : 'Published schedule could not be loaded.')
+      }
+    }
+    void loadPublishedSchedule()
+    return () => { cancelled = true }
+  }, [])
 
   const selectPrimary = (page: PreviewPage) => {
     if (page === 'more') {
@@ -147,21 +265,99 @@ export default function MobileNavigationPreview() {
     setShowScope(false)
   }
 
-  const toggleDomain = (domain: string) => {
-    setSelectedDomains((current) => current.includes(domain)
-      ? current.length === 1 ? current : current.filter((value) => value !== domain)
-      : [...current, domain])
+  const effectiveDomains = scheduleDataState === 'live' ? availableDomains : demoDomains
+  const regions = Array.from(new Map(effectiveDomains.map((domain) => [domain.region, { id: domain.region, name: domain.region_name }])).values())
+  const domainsForRegion = effectiveDomains.filter((domain) => domain.region === selectedRegionId)
+
+  React.useEffect(() => {
+    if (!effectiveDomains.length) return
+    const validRegion = regions.some((region) => region.id === selectedRegionId)
+    const nextRegionId = validRegion && selectedRegionId != null ? selectedRegionId : regions[0].id
+    if (nextRegionId !== selectedRegionId) setSelectedRegionId(nextRegionId)
+    const regionDomainIds = effectiveDomains.filter((domain) => domain.region === nextRegionId).map((domain) => domain.id)
+    const validSelectedIds = selectedDomainIds.filter((id) => regionDomainIds.includes(id))
+    if (!validSelectedIds.length || validSelectedIds.length !== selectedDomainIds.length) {
+      setSelectedDomainIds(validSelectedIds.length ? validSelectedIds : regionDomainIds)
+    }
+  }, [scheduleDataState, availableDomains, selectedRegionId])
+
+  const changeRegion = (regionId: number) => {
+    setSelectedRegionId(regionId)
+    setSelectedDomainIds(effectiveDomains.filter((domain) => domain.region === regionId).map((domain) => domain.id))
+  }
+  const toggleDomain = (domainId: number) => {
+    setSelectedDomainIds((current) => current.includes(domainId)
+      ? current.length === 1 ? current : current.filter((value) => value !== domainId)
+      : [...current, domainId])
+  }
+  const moveMonth = (direction: -1 | 1) => {
+    const nextMonth = new Date(viewDate.getFullYear(), viewDate.getMonth() + direction, 1)
+    const today = new Date()
+    const nextDay = nextMonth.getFullYear() === today.getFullYear() && nextMonth.getMonth() === today.getMonth() ? today.getDate() : 1
+    const nextGridStart = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), 1 - nextMonth.getDay() - 28)
+    const nextSelectedDate = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextDay)
+    setViewDate(nextMonth)
+    setSelectedDay(nextDay)
+    setActiveListDate(dateKey(new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextDay)))
+    setWeekIndex(Math.max(0, Math.min(15, weekOffset(nextSelectedDate, nextGridStart))))
   }
 
-  const currentMonth = new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+  const currentMonth = viewDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
   const currentUserName = [user?.first_name, user?.last_name].filter(Boolean).join(' ') || 'My account'
-  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+  const monthStart = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1)
   const monthGridStart = new Date(monthStart.getFullYear(), monthStart.getMonth(), 1 - monthStart.getDay())
+  const daysInMonth = new Date(viewDate.getFullYear(), viewDate.getMonth() + 1, 0).getDate()
+  const monthCellCount = Math.ceil((monthStart.getDay() + daysInMonth) / 7) * 7
+  const monthDays = Array.from({ length: monthCellCount }, (_, index) => {
+    const day = index - monthStart.getDay() + 1
+    return day >= 1 && day <= daysInMonth ? day : null
+  })
   const listStart = new Date(monthGridStart.getFullYear(), monthGridStart.getMonth(), monthGridStart.getDate() - 28)
   const listDates = Array.from({ length: 112 }, (_, index) => new Date(listStart.getFullYear(), listStart.getMonth(), listStart.getDate() + index))
   const weekDays = listDates.slice(weekIndex * 7, (weekIndex * 7) + 7)
   const listMonthLabel = (weekDays[3] || monthStart).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
-  const shiftsForDate = (date: Date) => date.getMonth() === new Date().getMonth() ? sampleShiftsByDay[date.getDate()] || [] : []
+
+  React.useEffect(() => {
+    if (selectedDay > daysInMonth) {
+      setSelectedDay(daysInMonth)
+      setActiveListDate(dateKey(new Date(viewDate.getFullYear(), viewDate.getMonth(), daysInMonth)))
+    }
+  }, [daysInMonth, selectedDay])
+  const liveShiftsByDate = apiShifts.reduce<Record<string, PreviewShift[]>>((result, shift) => {
+    if (selectedDomainIds.length && !selectedDomainIds.includes(shift.domain)) return result
+    const isMine = shift.physician != null && shift.physician === user?.physician_id
+    const status = shift.status?.toUpperCase()
+    const postingMode = shift.posting_mode === 'PICKUP' ? 'pickup' : shift.posting_mode === 'TRADE_ONLY' ? 'trade' : undefined
+    const previewShift: PreviewShift = {
+      facility: shift.facility_short_name || shift.facility_name,
+      time: `${formatClockValue(shift.start_time)}–${formatClockValue(shift.end_time)}`,
+      physician: shift.physician_name || 'Open shift',
+      domain: shift.domain_name,
+      tone: isMine ? 'own' : status === 'OPEN' ? 'open' : postingMode ? 'available' : 'standard',
+      isMine,
+      postingMode,
+      assignmentId: shift.id,
+      instanceId: shift.shift_instance_id,
+      physicianId: shift.physician,
+      startDateTime: shift.start_datetime,
+      canPickUp: shift.can_pick_up,
+      pickupIneligibilityReason: shift.pickup_ineligibility_reason,
+      postingComment: shift.posting_comment,
+      domainId: shift.domain,
+    }
+    result[shift.date] = [...(result[shift.date] || []), previewShift]
+    return result
+  }, {})
+  const shiftsForDate = (date: Date) => {
+    if (scheduleDataState === 'live') return liveShiftsByDate[dateKey(date)] || []
+    const today = new Date()
+    return date.getFullYear() === today.getFullYear() && date.getMonth() === today.getMonth()
+      ? (sampleShiftsByDay[date.getDate()] || []).filter((shift) => {
+        const demoDomain = demoDomains.find((domain) => domain.name === shift.domain)
+        return !selectedDomainIds.length || (demoDomain && selectedDomainIds.includes(demoDomain.id))
+      })
+      : []
+  }
   const datesWithMyShifts = listDates.filter((date) => shiftsForDate(date).some((shift) => shift.isMine))
   const visibleListDates = listScheduleScope === 'mine' ? datesWithMyShifts : listDates
   const todayStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate())
@@ -180,7 +376,7 @@ export default function MobileNavigationPreview() {
     const target = document.getElementById(`mobile-list-day-${key}`)
     if (content && target) content.scrollTo({ top: Math.max(0, target.offsetTop - 128), behavior: 'auto' })
     setActiveListDate(key)
-    const nextWeekIndex = Math.max(0, Math.min(15, Math.floor((date.getTime() - listStart.getTime()) / 604800000)))
+    const nextWeekIndex = Math.max(0, Math.min(15, weekOffset(date, listStart)))
     setWeekIndex(nextWeekIndex)
   }
   const moveListWeek = (direction: -1 | 1) => {
@@ -219,7 +415,7 @@ export default function MobileNavigationPreview() {
       if (!key) return
       setActiveListDate((current) => current === key ? current : key)
       const date = new Date(`${key}T12:00:00`)
-      const nextWeekIndex = Math.max(0, Math.min(15, Math.floor((date.getTime() - listStart.getTime()) / 604800000)))
+      const nextWeekIndex = Math.max(0, Math.min(15, weekOffset(date, listStart)))
       setWeekIndex((current) => current === nextWeekIndex ? current : nextWeekIndex)
     }
     const resumeManualTracking = () => { programmaticScrollRef.current = false }
@@ -248,7 +444,7 @@ export default function MobileNavigationPreview() {
     const targetKey = dateKey(targetDate)
     if (targetKey !== activeListDate) setActiveListDate(targetKey)
     if (listScheduleScope === 'mine') {
-      const nextWeekIndex = Math.max(0, Math.min(15, Math.floor((targetDate.getTime() - listStart.getTime()) / 604800000)))
+      const nextWeekIndex = Math.max(0, Math.min(15, weekOffset(targetDate, listStart)))
       setWeekIndex((current) => current === nextWeekIndex ? current : nextWeekIndex)
     }
     const target = document.getElementById(`mobile-list-day-${targetKey}`)
@@ -291,9 +487,12 @@ export default function MobileNavigationPreview() {
                   <button type="button" className={listScheduleScope === 'mine' ? 'active' : ''} onClick={() => setListScheduleScope('mine')}>My schedule</button>
                 </div>
                 <div className="mobile-month-heading">
-                  <button type="button" aria-label="Previous month">‹</button><strong>{display === 'list' ? listMonthLabel : currentMonth}</strong><button type="button" aria-label="Next month">›</button>
+                  <button type="button" aria-label="Previous month" onClick={() => moveMonth(-1)}>‹</button><strong>{display === 'list' ? listMonthLabel : currentMonth}</strong><button type="button" aria-label="Next month" onClick={() => moveMonth(1)}>›</button>
                 </div>
               </header>
+
+              {scheduleDataState === 'loading' && <div className="mobile-data-notice">Loading published schedule…</div>}
+              {scheduleDataState === 'demo' && <div className="mobile-data-notice warning">Demo schedule shown · {scheduleDataMessage}</div>}
 
               {display === 'month' ? (
                 <section className="mobile-month-preview" aria-label={`${currentMonth} calendar preview`}>
@@ -302,14 +501,17 @@ export default function MobileNavigationPreview() {
                   </div>
                   <div className="mobile-weekdays">{['S','M','T','W','T','F','S'].map((day, index) => <span key={`${day}-${index}`}>{day}</span>)}</div>
                   <div className="mobile-month-grid">
-                    {sampleDays.map((day, index) => {
-                      const { hasOwnShift, hasOtherStatus } = day ? markerStateForDate(new Date(new Date().getFullYear(), new Date().getMonth(), day)) : { hasOwnShift: false, hasOtherStatus: false }
-                      return <button type="button" key={index} className={`${day === new Date().getDate() ? 'today ' : ''}${day === selectedDay ? 'selected' : ''}`} disabled={day == null} onClick={() => day && setSelectedDay(day)}>
+                    {monthDays.map((day, index) => {
+                      const calendarDate = day ? new Date(viewDate.getFullYear(), viewDate.getMonth(), day) : null
+                      const { hasOwnShift, hasOtherStatus } = calendarDate ? markerStateForDate(calendarDate) : { hasOwnShift: false, hasOtherStatus: false }
+                      const today = new Date()
+                      const isToday = calendarDate != null && dateKey(calendarDate) === dateKey(today)
+                      return <button type="button" key={index} className={`${isToday ? 'today ' : ''}${day === selectedDay ? 'selected' : ''}`} disabled={day == null} onClick={() => day && setSelectedDay(day)}>
                         {day && <><span>{day}</span>{(hasOwnShift || hasOtherStatus) && <i className="mobile-date-shift-dots">{hasOwnShift && <b className="own" aria-label="My shift" />}{hasOtherStatus && <b className="other-status" aria-label="Available or open shift" />}</i>}</>}
                       </button>
                     })}
                   </div>
-                  <PreviewShiftList date={new Date(new Date().getFullYear(), new Date().getMonth(), selectedDay)} shifts={(sampleShiftsByDay[selectedDay] || fallbackShifts).filter((shift) => listScheduleScope === 'group' || shift.isMine)} onSelect={openShift} currentUserName={currentUserName} />
+                  <PreviewShiftList date={new Date(viewDate.getFullYear(), viewDate.getMonth(), selectedDay)} shifts={shiftsForDate(new Date(viewDate.getFullYear(), viewDate.getMonth(), selectedDay)).filter((shift) => listScheduleScope === 'group' || shift.isMine)} onSelect={openShift} currentUserName={currentUserName} prioritizeCalendarShifts />
                 </section>
               ) : (
                 <section className="mobile-list-preview" aria-label="List view preview">
@@ -327,8 +529,9 @@ export default function MobileNavigationPreview() {
                   </div>
                   {visibleListDates.map((date) => {
                     const key = dateKey(date)
-                    const currentMonthDate = date.getMonth() === new Date().getMonth()
-                    const allShifts = shiftsForDate(date).length ? shiftsForDate(date) : fallbackShifts.slice(0, date.getDate() % 3 === 0 ? 3 : 2)
+                    const currentMonthDate = date.getFullYear() === viewDate.getFullYear() && date.getMonth() === viewDate.getMonth()
+                    const scheduledShifts = shiftsForDate(date)
+                    const allShifts = scheduledShifts.length || scheduleDataState === 'live' ? scheduledShifts : fallbackShifts.slice(0, date.getDate() % 3 === 0 ? 3 : 2)
                     const shifts = listScheduleScope === 'mine' ? allShifts.filter((shift) => shift.isMine) : allShifts
                     return <div id={`mobile-list-day-${key}`} data-date={key} className={`mobile-list-day-anchor${currentMonthDate ? '' : ' adjacent-month'}`} key={key}><PreviewShiftList date={date} shifts={shifts} label={key === dateKey(new Date()) ? 'Today' : 'Schedule'} onSelect={openShift} currentUserName={currentUserName} /></div>
                   })}
@@ -355,6 +558,7 @@ export default function MobileNavigationPreview() {
                 <div><span>Scheduled</span><strong>{selectedShift.physician} · {selectedShift.domain}</strong></div>
                 {!selectedShift.isMine && selectedShift.postingMode && <div><span>Availability</span><strong>{selectedShift.postingMode === 'pickup' ? 'Posted for pickup' : 'Trade only'}</strong></div>}
                 {!selectedShift.isMine && selectedShift.tone === 'open' && <div><span>Status</span><strong>Open shift</strong></div>}
+                {selectedShift.postingComment && <div><span>Comment</span><strong>{selectedShift.postingComment}</strong></div>}
               </div>
               {shiftWorkflow === 'post' ? (
                 <div className="mobile-workflow-form">
@@ -411,6 +615,8 @@ export default function MobileNavigationPreview() {
                   <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
                 </div>
+              ) : (selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open') && selectedShift.canPickUp === false ? (
+                <p className="mobile-shift-readonly">{selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.'}</p>
               ) : selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open' ? (
                 <div className="mobile-shift-actions"><strong>{selectedShift.tone === 'open' ? 'Open shift' : 'Available shift'}</strong><button type="button" onClick={() => showWorkflow('pickup')}>Pickup Shift <span>›</span></button></div>
               ) : selectedShift.postingMode === 'trade' ? (
@@ -425,8 +631,8 @@ export default function MobileNavigationPreview() {
             <section className="mobile-sheet" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
               <header><strong>Schedule scope</strong><button type="button" onClick={() => setShowScope(false)} aria-label="Close schedule scope">×</button></header>
-              <label>Region<select value={selectedRegion} onChange={(event) => setSelectedRegion(event.target.value)}><option>Lowcountry Emergency Physicians</option><option>Roper North</option></select></label>
-              <fieldset><legend>Domains</legend>{['Physician', 'APP'].map((domain) => <label key={domain}><input type="checkbox" checked={selectedDomains.includes(domain)} onChange={() => toggleDomain(domain)} />{domain}</label>)}</fieldset>
+              <label>Region<select value={selectedRegionId ?? ''} onChange={(event) => changeRegion(Number(event.target.value))}>{regions.map((region) => <option value={region.id} key={region.id}>{region.name}</option>)}</select></label>
+              <fieldset><legend>Domains</legend>{domainsForRegion.map((domain) => <label key={domain.id}><input type="checkbox" checked={selectedDomainIds.includes(domain.id)} onChange={() => toggleDomain(domain.id)} />{domain.name}</label>)}</fieldset>
               <button type="button" className="mobile-sheet-done" onClick={() => setShowScope(false)}>Done</button>
             </section>
           </div>
@@ -439,7 +645,7 @@ export default function MobileNavigationPreview() {
               <header><strong>More</strong><button type="button" onClick={() => setShowMore(false)} aria-label="Close More menu">×</button></header>
               <div className="mobile-account-summary"><strong>{user?.first_name} {user?.last_name}</strong><span>Signed in on this device</span></div>
               {user?.can_manage_schedules && <div className="mobile-more-view-choice"><span>Interface view</span><div className="mobile-testing-switch" role="group" aria-label="Interface view"><button type="button" className={!testUserView ? 'active' : ''} onClick={() => setTestUserView(false)}>Scheduler</button><button type="button" className={testUserView ? 'active' : ''} onClick={() => setTestUserView(true)}>User</button></div></div>}
-              <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{selectedRegion.replace(' Emergency Physicians', '')} · {selectedDomains.length === 2 ? 'All domains' : selectedDomains.join(', ')}</small></span><b>›</b></button>
+              <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>
               <button type="button" className="mobile-more-action">Account settings <span>›</span></button>
               <button type="button" className="mobile-more-action">Sign out <span>›</span></button>
             </section>

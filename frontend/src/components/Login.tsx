@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { DEFAULT_AUTHENTICATED_PATH } from '../utils/regressionRules'
 import './Login.css'
@@ -11,6 +11,7 @@ export default function Login() {
   const [isLoading, setIsLoading] = useState(false)
   const { login } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -19,7 +20,7 @@ export default function Login() {
 
     try {
       await login(email.trim().toLowerCase(), password)
-      navigate(DEFAULT_AUTHENTICATED_PATH, { replace: true })
+      navigate(location.pathname === '/mobile-preview' ? '/mobile-preview' : DEFAULT_AUTHENTICATED_PATH, { replace: true })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed')
     } finally {
