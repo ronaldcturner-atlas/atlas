@@ -178,6 +178,10 @@ export default function MobileNavigationPreview() {
   const [tradeNote, setTradeNote] = React.useState('')
   const [splitTime, setSplitTime] = React.useState('10:30')
   const [workflowMessage, setWorkflowMessage] = React.useState('')
+  const [pickupFeedback, setPickupFeedback] = React.useState('')
+  const [pickupRequiresForce, setPickupRequiresForce] = React.useState(false)
+  const [isPickupSaving, setIsPickupSaving] = React.useState(false)
+  const [scheduleActionMessage, setScheduleActionMessage] = React.useState('')
   const [testUserView, setTestUserView] = React.useState(false)
   const [scheduleDataState, setScheduleDataState] = React.useState<'loading' | 'live' | 'demo'>('loading')
   const [scheduleDataMessage, setScheduleDataMessage] = React.useState('')
@@ -454,16 +458,80 @@ export default function MobileNavigationPreview() {
     setSelectedShift(shift)
     setShiftWorkflow(null)
     setWorkflowMessage('')
+    setPickupFeedback('')
+    setPickupRequiresForce(false)
     setTradeTarget('')
   }
   const closeShift = () => {
     setSelectedShift(null)
     setShiftWorkflow(null)
     setWorkflowMessage('')
+    setPickupFeedback('')
+    setPickupRequiresForce(false)
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
     setWorkflowMessage('')
+    setPickupFeedback('')
+    setPickupRequiresForce(false)
+  }
+
+  const confirmPickup = async () => {
+    if (!selectedShift || isPickupSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this shift would now be assigned to you.')
+      return
+    }
+    if (selectedShift.canPickUp === false) {
+      setPickupFeedback(selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.')
+      return
+    }
+    if (selectedShift.instanceId == null || (selectedShift.assignmentId != null && selectedShift.assignmentId <= 0)) {
+      setPickupFeedback('This shift cannot be identified for pickup. Refresh the schedule and try again.')
+      return
+    }
+
+    setIsPickupSaving(true)
+    setPickupFeedback('')
+    try {
+      const isOpenShift = selectedShift.assignmentId == null
+      const endpoint = isOpenShift
+        ? `${API_BASE}/shift-instances/${selectedShift.instanceId}/pickup/`
+        : `${API_BASE}/shift-trades/`
+      const body: Record<string, unknown> = isOpenShift
+        ? {}
+        : { target_assignment_id: selectedShift.assignmentId, offered_assignment_id: null }
+      if (pickupRequiresForce) body.force = true
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setPickupRequiresForce(true)
+        setPickupFeedback(data.detail || 'This pickup creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to pick up this shift.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The pickup was recorded, but the updated schedule could not be loaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      const nextShifts: APIShift[] = Array.isArray(refreshedSchedule) ? refreshedSchedule : []
+      setApiShifts(nextShifts)
+      setScheduleDataState('live')
+      const pickedUpShift = nextShifts.find((shift) => (
+        shift.shift_instance_id === selectedShift.instanceId && shift.physician === user?.physician_id
+      ))
+      setScheduleActionMessage(pickedUpShift ? 'Shift picked up and added to My schedule.' : 'Pickup request submitted successfully.')
+      closeShift()
+    } catch (error) {
+      setPickupFeedback(error instanceof Error ? error.message : 'Unable to pick up this shift.')
+    } finally {
+      setIsPickupSaving(false)
+    }
   }
 
   return (
@@ -493,6 +561,7 @@ export default function MobileNavigationPreview() {
 
               {scheduleDataState === 'loading' && <div className="mobile-data-notice">Loading published schedule…</div>}
               {scheduleDataState === 'demo' && <div className="mobile-data-notice warning">Demo schedule shown · {scheduleDataMessage}</div>}
+              {scheduleActionMessage && <div className="mobile-data-notice success">{scheduleActionMessage}<button type="button" onClick={() => setScheduleActionMessage('')} aria-label="Dismiss message">×</button></div>}
 
               {display === 'month' ? (
                 <section className="mobile-month-preview" aria-label={`${currentMonth} calendar preview`}>
@@ -587,7 +656,8 @@ export default function MobileNavigationPreview() {
               ) : shiftWorkflow === 'pickup' ? (
                 <div className="mobile-workflow-form">
                   <div className="mobile-workflow-warning"><strong>You will be responsible for this shift.</strong><span>Confirm only if you are able to work the complete scheduled time shown above.</span></div>
-                  <button type="button" className="mobile-workflow-primary" onClick={() => setWorkflowMessage('Preview complete — this shift would now be assigned to you.')}>Confirm pickup</button>
+                  {pickupFeedback && <div className="mobile-workflow-message error">{pickupFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={isPickupSaving} onClick={confirmPickup}>{isPickupSaving ? 'Confirming…' : pickupRequiresForce ? 'Confirm pickup anyway' : 'Confirm pickup'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
               ) : shiftWorkflow === 'offer' ? (
