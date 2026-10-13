@@ -8,7 +8,7 @@ type PreviewPage = 'schedule' | 'stats' | 'users' | 'more'
 type ScheduleDisplay = 'list' | 'month'
 type ListScheduleScope = 'group' | 'mine'
 type ShiftTone = 'standard' | 'own' | 'available' | 'posted' | 'trade-sent' | 'trade-received' | 'open'
-type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'reassign' | 'times' | 'pickup' | 'offer'
+type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'reassign' | 'times' | 'swap' | 'pickup' | 'offer'
 
 const primaryItems: Array<{ id: PreviewPage; label: string; icon: string }> = [
   { id: 'schedule', label: 'Schedule', icon: '▦' },
@@ -223,6 +223,12 @@ export default function MobileNavigationPreview() {
   const [timesFeedback, setTimesFeedback] = React.useState('')
   const [timesRequireForce, setTimesRequireForce] = React.useState(false)
   const [isTimesSaving, setIsTimesSaving] = React.useState(false)
+  const [swapTargetId, setSwapTargetId] = React.useState<number | ''>('')
+  const [swapOptions, setSwapOptions] = React.useState<TradeOption[]>([])
+  const [swapFeedback, setSwapFeedback] = React.useState('')
+  const [swapRequiresForce, setSwapRequiresForce] = React.useState(false)
+  const [isLoadingSwapOptions, setIsLoadingSwapOptions] = React.useState(false)
+  const [isSwapSaving, setIsSwapSaving] = React.useState(false)
   const [workflowMessage, setWorkflowMessage] = React.useState('')
   const [pickupFeedback, setPickupFeedback] = React.useState('')
   const [pickupRequiresForce, setPickupRequiresForce] = React.useState(false)
@@ -527,6 +533,9 @@ export default function MobileNavigationPreview() {
     setReassignRequiresForce(false)
     setTimesFeedback('')
     setTimesRequireForce(false)
+    setSwapTargetId('')
+    setSwapFeedback('')
+    setSwapRequiresForce(false)
   }
   const closeShift = () => {
     setSelectedShift(null)
@@ -549,6 +558,9 @@ export default function MobileNavigationPreview() {
     setReassignRequiresForce(false)
     setTimesFeedback('')
     setTimesRequireForce(false)
+    setSwapTargetId('')
+    setSwapFeedback('')
+    setSwapRequiresForce(false)
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
@@ -567,6 +579,8 @@ export default function MobileNavigationPreview() {
     setReassignRequiresForce(false)
     setTimesFeedback('')
     setTimesRequireForce(false)
+    setSwapFeedback('')
+    setSwapRequiresForce(false)
     if (workflow === 'post' && selectedShift) {
       setPostingMode(selectedShift.postingMode || 'pickup')
       setPostComment(selectedShift.postingComment || '')
@@ -592,6 +606,11 @@ export default function MobileNavigationPreview() {
     if (workflow === 'times' && selectedShift) {
       setActualStartTime(selectedShift.startTime?.slice(0, 5) || '')
       setActualEndTime(selectedShift.endTime?.slice(0, 5) || '')
+    }
+    if (workflow === 'swap') {
+      setSwapTargetId('')
+      setSwapOptions([])
+      setIsLoadingSwapOptions(true)
     }
   }
 
@@ -627,6 +646,49 @@ export default function MobileNavigationPreview() {
     void loadUsers()
     return () => { cancelled = true }
   }, [shiftWorkflow, selectedShift?.domainId, scheduleDataState])
+
+  React.useEffect(() => {
+    if (shiftWorkflow !== 'swap' || !selectedShift) return
+    if (scheduleDataState !== 'live') {
+      setSwapOptions([
+        { id: -301, physicianId: -31, physicianName: 'Taylor', date: '2026-10-24', facility: 'Roper', time: '7a–4p' },
+      ])
+      setIsLoadingSwapOptions(false)
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setSwapFeedback('Only an assigned shift can be swapped.')
+      setIsLoadingSwapOptions(false)
+      return
+    }
+    let cancelled = false
+    const loadSwapOptions = async () => {
+      setIsLoadingSwapOptions(true)
+      setSwapFeedback('')
+      try {
+        const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include', cache: 'no-store' })
+        const data = await response.json().catch(() => [])
+        if (!response.ok) throw new Error(data.detail || 'Unable to load swap options.')
+        if (cancelled) return
+        const options: TradeOption[] = (Array.isArray(data) ? data : []).map((option) => ({
+          id: option.id,
+          physicianId: option.physician_id,
+          physicianName: option.physician_name,
+          date: option.date,
+          facility: option.facility,
+          time: `${formatClockValue(option.start_time)}–${formatClockValue(option.end_time)}`,
+        }))
+        setSwapOptions(options)
+        if (!options.length) setSwapFeedback('No swap options are currently available.')
+      } catch (error) {
+        if (!cancelled) setSwapFeedback(error instanceof Error ? error.message : 'Unable to load swap options.')
+      } finally {
+        if (!cancelled) setIsLoadingSwapOptions(false)
+      }
+    }
+    void loadSwapOptions()
+    return () => { cancelled = true }
+  }, [shiftWorkflow, selectedShift?.assignmentId, scheduleDataState])
 
   React.useEffect(() => {
     if (shiftWorkflow !== 'trade' || !selectedShift) return
@@ -1032,6 +1094,50 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const swapScheduledUsers = async () => {
+    if (!selectedShift || swapTargetId === '' || isSwapSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would swap the scheduled users.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setSwapFeedback('Only an assigned shift can be swapped.')
+      return
+    }
+
+    setIsSwapSaving(true)
+    setSwapFeedback('')
+    try {
+      const body: Record<string, unknown> = { target_assignment_id: swapTargetId }
+      if (swapRequiresForce) body.force = true
+      const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/swap/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setSwapRequiresForce(true)
+        setSwapFeedback(data.detail || 'This swap creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to swap the scheduled users.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The users were swapped, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(data.detail || 'Scheduled users swapped.')
+      closeShift()
+    } catch (error) {
+      setSwapFeedback(error instanceof Error ? error.message : 'Unable to swap the scheduled users.')
+    } finally {
+      setIsSwapSaving(false)
+    }
+  }
+
   const submitTradeOffer = async () => {
     if (!selectedShift || tradeOfferAssignmentId === '' || isTradeOfferSaving) return
     if (scheduleDataState !== 'live') {
@@ -1219,7 +1325,7 @@ export default function MobileNavigationPreview() {
           <div className="mobile-sheet-backdrop" onClick={closeShift}>
             <section className="mobile-sheet mobile-shift-sheet" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
-              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'reassign' ? 'Change scheduled user' : shiftWorkflow === 'times' ? 'Adjust actual times' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
+              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'reassign' ? 'Change scheduled user' : shiftWorkflow === 'times' ? 'Adjust actual times' : shiftWorkflow === 'swap' ? 'Swap scheduled users' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
               {shiftWorkflow && <button type="button" className="mobile-workflow-back" onClick={() => { setShiftWorkflow(null); setWorkflowMessage('') }}>‹ Shift details</button>}
               <div className="mobile-shift-summary">
                 <div><span>Date &amp; time</span><strong>{selectedShift.date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {selectedShift.time}</strong></div>
@@ -1279,6 +1385,13 @@ export default function MobileNavigationPreview() {
                   <button type="button" className="mobile-workflow-primary" disabled={!actualStartTime || !actualEndTime || isTimesSaving} onClick={updateShiftTimes}>{isTimesSaving ? 'Updating…' : timesRequireForce ? 'Confirm times anyway' : 'Update times'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
+              ) : shiftWorkflow === 'swap' ? (
+                <div className="mobile-workflow-form">
+                  <label className="field">Swap with<select value={swapTargetId} disabled={isLoadingSwapOptions} onChange={(event) => { setSwapTargetId(Number(event.target.value) || ''); setSwapRequiresForce(false); setSwapFeedback('') }}><option value="">{isLoadingSwapOptions ? 'Loading shifts…' : 'Choose another user’s shift'}</option>{swapOptions.map((option) => <option value={option.id} key={option.id}>{option.physicianName} · {new Date(`${option.date}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {option.facility} · {option.time}</option>)}</select></label>
+                  {swapFeedback && <div className="mobile-workflow-message error">{swapFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={swapTargetId === '' || isLoadingSwapOptions || isSwapSaving} onClick={swapScheduledUsers}>{isSwapSaving ? 'Swapping…' : swapRequiresForce ? 'Confirm swap anyway' : 'Swap users'}</button>
+                  {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
+                </div>
               ) : shiftWorkflow === 'pickup' ? (
                 <div className="mobile-workflow-form">
                   <div className="mobile-workflow-warning"><strong>You will be responsible for this shift.</strong><span>Confirm only if you are able to work the complete scheduled time shown above.</span></div>
@@ -1302,7 +1415,7 @@ export default function MobileNavigationPreview() {
                   <strong>Manage this shift</strong>
                   <button type="button" onClick={() => showWorkflow('reassign')}>Change scheduled user <span>›</span></button>
                   <button type="button" onClick={() => showWorkflow('times')}>Adjust actual times <span>›</span></button>
-                  <button type="button">Swap scheduled users <span>›</span></button>
+                  <button type="button" onClick={() => showWorkflow('swap')}>Swap scheduled users <span>›</span></button>
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
                   {selectedShift.isSplit && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
                   <button type="button" className="caution">Open shift <span>›</span></button>

@@ -67,6 +67,15 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain("data.detail || 'Actual shift times updated.'")
   })
 
+  it('swaps scheduled users through the desktop trade-options and swap endpoints', () => {
+    expect(mobileSource).toContain("showWorkflow('swap')")
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/trade-options/')
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/swap/')
+    expect(mobileSource).toContain('target_assignment_id: swapTargetId')
+    expect(mobileSource).toContain('setSwapRequiresForce(true)')
+    expect(mobileSource).toContain("data.detail || 'Scheduled users swapped.'")
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')
