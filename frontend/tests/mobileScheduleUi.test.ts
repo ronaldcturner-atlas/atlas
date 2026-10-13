@@ -68,6 +68,16 @@ describe('mobile published schedule actions', () => {
     expect(installHandler).not.toContain('self.skipWaiting()')
   })
 
+  it('offers supported PWA installation and iOS Home Screen guidance only when needed', () => {
+    expect(mobileSource).toContain("window.addEventListener('beforeinstallprompt', handleInstallPrompt)")
+    expect(mobileSource).toContain("window.addEventListener('appinstalled', handleInstalled)")
+    expect(mobileSource).toContain("window.matchMedia('(display-mode: standalone)').matches")
+    expect(mobileSource).toContain('await installPrompt.prompt()')
+    expect(mobileSource).toContain('Install Atlas')
+    expect(mobileSource).toContain('Choose Add to Home Screen, then tap Add.')
+    expect(mobileStyles).toContain('.mobile-install-instructions')
+  })
+
   it('uses the authoritative pickup workflows for open and posted shifts', () => {
     expect(mobileSource).toContain('shift-instances/${selectedShift.instanceId}/pickup/')
     expect(mobileSource).toContain("`${API_BASE}/shift-trades/`")

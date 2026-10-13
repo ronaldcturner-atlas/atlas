@@ -108,6 +108,10 @@ type MobileDirectoryResponse = {
   selected_domain_id: number | null
   users: MobileDirectoryProfile[]
 }
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
+}
 
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -281,6 +285,12 @@ export default function MobileNavigationPreview() {
   const [directoryError, setDirectoryError] = React.useState('')
   const [isOnline, setIsOnline] = React.useState(() => navigator.onLine)
   const [pwaUpdateAvailable, setPwaUpdateAvailable] = React.useState(false)
+  const [installPrompt, setInstallPrompt] = React.useState<BeforeInstallPromptEvent | null>(null)
+  const [showInstallInstructions, setShowInstallInstructions] = React.useState(false)
+  const [isInstalled, setIsInstalled] = React.useState(() => (
+    window.matchMedia('(display-mode: standalone)').matches
+    || Boolean((navigator as Navigator & { standalone?: boolean }).standalone)
+  ))
   const applyingPwaUpdateRef = React.useRef(false)
   const [viewDate, setViewDate] = React.useState(() => {
     const stored = window.localStorage.getItem('atlas.mobile-preview.month')
@@ -336,6 +346,24 @@ export default function MobileNavigationPreview() {
       setTradeCenterFeedback(error instanceof Error ? error.message : 'Trade requests could not be loaded.')
     } finally {
       setIsLoadingTradeRequests(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    const handleInstallPrompt = (event: Event) => {
+      event.preventDefault()
+      setInstallPrompt(event as BeforeInstallPromptEvent)
+    }
+    const handleInstalled = () => {
+      setIsInstalled(true)
+      setInstallPrompt(null)
+      setShowInstallInstructions(false)
+    }
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt)
+    window.addEventListener('appinstalled', handleInstalled)
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt)
+      window.removeEventListener('appinstalled', handleInstalled)
     }
   }, [])
 
@@ -422,6 +450,19 @@ export default function MobileNavigationPreview() {
     }
     applyingPwaUpdateRef.current = true
     registration.waiting.postMessage({ type: 'SKIP_WAITING' })
+  }
+
+  const isIosDevice = /iphone|ipad|ipod/i.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  const canOfferInstallation = !isInstalled && (Boolean(installPrompt) || isIosDevice)
+  const installAtlas = async () => {
+    if (!installPrompt) {
+      setShowInstallInstructions(true)
+      return
+    }
+    await installPrompt.prompt()
+    await installPrompt.userChoice
+    setInstallPrompt(null)
   }
 
   const selectPrimary = (page: PreviewPage) => {
@@ -1892,6 +1933,8 @@ export default function MobileNavigationPreview() {
               {user?.can_manage_schedules && <div className="mobile-more-view-choice"><span>Interface view</span><div className="mobile-testing-switch" role="group" aria-label="Interface view"><button type="button" className={!testUserView ? 'active' : ''} onClick={() => setTestUserView(false)}>Scheduler</button><button type="button" className={testUserView ? 'active' : ''} onClick={() => setTestUserView(true)}>User</button></div></div>}
               <button type="button" className="mobile-more-scope-action" onClick={openTradeRequests}><span><strong>Trade requests{actionableTradeCount ? ` (${actionableTradeCount})` : ''}</strong><small>{unseenTradeCount ? `${unseenTradeCount} new` : 'Review pickup and trade activity'}</small></span><b>›</b></button>
               {scheduleDataState === 'live' && <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>}
+              {canOfferInstallation && <button type="button" className="mobile-more-action" onClick={() => void installAtlas()}>Install Atlas <span>›</span></button>}
+              {showInstallInstructions && !isInstalled && <div className="mobile-install-instructions"><strong>Add Atlas to your Home Screen</strong><ol><li>Open Atlas in Safari.</li><li>Tap the Share button.</li><li>Choose Add to Home Screen, then tap Add.</li></ol></div>}
               {signOutFeedback && <div className="mobile-workflow-message error">{signOutFeedback}</div>}
               <button type="button" className="mobile-more-action" disabled={isSigningOut} onClick={() => void signOut()}>{isSigningOut ? 'Signing out…' : 'Sign out'} <span>›</span></button>
             </section>
