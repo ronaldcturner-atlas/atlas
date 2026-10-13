@@ -101,6 +101,14 @@ describe('mobile published schedule actions', () => {
     expect(mobileStyles).toContain('.mobile-trade-card')
   })
 
+  it('signs out through the shared authentication context without clearing view preferences', () => {
+    expect(mobileSource).toContain('const { user, logout } = useAuth()')
+    expect(mobileSource).toContain('await logout()')
+    expect(mobileSource).toContain('setApiShifts([])')
+    expect(mobileSource).toContain('setTradeRequests([])')
+    expect(mobileSource).not.toContain("localStorage.removeItem('atlas.mobile-preview")
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')

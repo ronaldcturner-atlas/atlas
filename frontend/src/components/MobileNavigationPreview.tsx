@@ -186,7 +186,7 @@ function PreviewShiftList({ date, shifts = fallbackShifts, label = 'Selected dat
 }
 
 export default function MobileNavigationPreview() {
-  const { user } = useAuth()
+  const { user, logout } = useAuth()
   const [activePage, setActivePage] = React.useState<PreviewPage>(() => (
     (window.localStorage.getItem('atlas.mobile-preview.page') as PreviewPage) || 'schedule'
   ))
@@ -269,6 +269,8 @@ export default function MobileNavigationPreview() {
   const [tradeCenterFeedback, setTradeCenterFeedback] = React.useState('')
   const [tradeActionSaving, setTradeActionSaving] = React.useState('')
   const [tradeActionConfirmation, setTradeActionConfirmation] = React.useState<{ tradeId: number; action: string } | null>(null)
+  const [isSigningOut, setIsSigningOut] = React.useState(false)
+  const [signOutFeedback, setSignOutFeedback] = React.useState('')
   const [viewDate, setViewDate] = React.useState(() => {
     const stored = window.localStorage.getItem('atlas.mobile-preview.month')
     const parsed = stored ? new Date(`${stored}-01T12:00:00`) : new Date()
@@ -380,6 +382,28 @@ export default function MobileNavigationPreview() {
     }).then((response) => {
       if (response.ok) setTradeRequests((current) => current.map((trade) => ({ ...trade, is_unseen: false })))
     })
+  }
+
+  const signOut = async () => {
+    if (isSigningOut) return
+    setIsSigningOut(true)
+    setSignOutFeedback('')
+    setShowMore(false)
+    setShowScope(false)
+    setShowTradeRequests(false)
+    setSelectedShift(null)
+    setShiftWorkflow(null)
+    try {
+      await logout()
+      setApiShifts([])
+      setTradeRequests([])
+      setAvailableDomains([])
+    } catch (error) {
+      setSignOutFeedback(error instanceof Error ? error.message : 'Unable to sign out. Please try again.')
+      setShowMore(true)
+    } finally {
+      setIsSigningOut(false)
+    }
   }
 
   const effectiveDomains = scheduleDataState === 'live' ? availableDomains : demoDomains
@@ -1724,7 +1748,8 @@ export default function MobileNavigationPreview() {
               <button type="button" className="mobile-more-scope-action" onClick={openTradeRequests}><span><strong>Trade requests{actionableTradeCount ? ` (${actionableTradeCount})` : ''}</strong><small>{unseenTradeCount ? `${unseenTradeCount} new` : 'Review pickup and trade activity'}</small></span><b>›</b></button>
               <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>
               <button type="button" className="mobile-more-action">Account settings <span>›</span></button>
-              <button type="button" className="mobile-more-action">Sign out <span>›</span></button>
+              {signOutFeedback && <div className="mobile-workflow-message error">{signOutFeedback}</div>}
+              <button type="button" className="mobile-more-action" disabled={isSigningOut} onClick={() => void signOut()}>{isSigningOut ? 'Signing out…' : 'Sign out'} <span>›</span></button>
             </section>
           </div>
         )}

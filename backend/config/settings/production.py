@@ -111,7 +111,7 @@ SESSION_COOKIE_SAMESITE = os.environ.get('SESSION_COOKIE_SAMESITE', 'Lax').strip
 if SESSION_COOKIE_SAMESITE not in {'Lax', 'Strict', 'None'}:
     raise ImproperlyConfigured('SESSION_COOKIE_SAMESITE must be Lax, Strict, or None.')
 try:
-    SESSION_COOKIE_AGE = int(os.environ.get('SESSION_COOKIE_AGE_SECONDS', '43200'))
+    SESSION_COOKIE_AGE = int(os.environ.get('SESSION_COOKIE_AGE_SECONDS', '604800'))
 except ValueError as exc:
     raise ImproperlyConfigured('SESSION_COOKIE_AGE_SECONDS must be a whole number.') from exc
 if SESSION_COOKIE_AGE <= 0:

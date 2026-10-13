@@ -111,9 +111,12 @@ an Org Admin cannot alter every other Organization's behavior.
 ## Sessions and HTTPS
 
 Production session cookies are always secure and HTTP-only. Atlas uses a
-12-hour sliding inactivity window by default, controlled by
-`SESSION_COOKIE_AGE_SECONDS`. Every authenticated request refreshes that window.
-Logout invalidates the server-side session immediately.
+seven-day sliding inactivity window by default, controlled by
+`SESSION_COOKIE_AGE_SECONDS`. Every authenticated request, including reopening
+the installed mobile PWA, refreshes that window. Logout invalidates only the
+current browser or device session immediately; sessions on other devices remain
+active. Password resets continue to invalidate all sessions for the affected
+user.
 
 `SESSION_COOKIE_SAMESITE` defaults to `Lax`, which is appropriate when the
 frontend and API share a site, including sibling subdomains. Use `None` only if
