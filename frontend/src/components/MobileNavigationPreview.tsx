@@ -59,6 +59,8 @@ type APIShift = {
 }
 
 type DomainOption = { id: number; name: string; region: number; region_name: string; active: boolean }
+type TradeOfferOption = { id: number; date: string; facility: string; time: string }
+type TradeOption = TradeOfferOption & { physicianId: number; physicianName: string }
 
 const demoDomains: DomainOption[] = [
   { id: -1, name: 'Physician', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
@@ -174,9 +176,21 @@ export default function MobileNavigationPreview() {
   const [shiftWorkflow, setShiftWorkflow] = React.useState<ShiftWorkflow | null>(null)
   const [postingMode, setPostingMode] = React.useState<'pickup' | 'trade'>('pickup')
   const [postComment, setPostComment] = React.useState('')
-  const [tradePartner, setTradePartner] = React.useState('')
-  const [tradeTarget, setTradeTarget] = React.useState('')
+  const [tradePartner, setTradePartner] = React.useState<number | ''>('')
+  const [tradeTarget, setTradeTarget] = React.useState<number | ''>('')
   const [tradeNote, setTradeNote] = React.useState('')
+  const [tradeOptions, setTradeOptions] = React.useState<TradeOption[]>([])
+  const [isLoadingTradeOptions, setIsLoadingTradeOptions] = React.useState(false)
+  const [tradeFeedback, setTradeFeedback] = React.useState('')
+  const [tradeRequiresForce, setTradeRequiresForce] = React.useState(false)
+  const [isTradeSaving, setIsTradeSaving] = React.useState(false)
+  const [tradeOfferAssignmentId, setTradeOfferAssignmentId] = React.useState<number | ''>('')
+  const [tradeOfferNote, setTradeOfferNote] = React.useState('')
+  const [eligibleTradeOffers, setEligibleTradeOffers] = React.useState<TradeOfferOption[]>([])
+  const [isLoadingTradeOffers, setIsLoadingTradeOffers] = React.useState(false)
+  const [tradeOfferFeedback, setTradeOfferFeedback] = React.useState('')
+  const [tradeOfferRequiresForce, setTradeOfferRequiresForce] = React.useState(false)
+  const [isTradeOfferSaving, setIsTradeOfferSaving] = React.useState(false)
   const [splitTime, setSplitTime] = React.useState('10:30')
   const [workflowMessage, setWorkflowMessage] = React.useState('')
   const [pickupFeedback, setPickupFeedback] = React.useState('')
@@ -464,6 +478,10 @@ export default function MobileNavigationPreview() {
     setPickupFeedback('')
     setPickupRequiresForce(false)
     setPostingFeedback('')
+    setTradeOfferFeedback('')
+    setTradeOfferRequiresForce(false)
+    setTradeFeedback('')
+    setTradeRequiresForce(false)
     setTradeTarget('')
   }
   const closeShift = () => {
@@ -473,6 +491,10 @@ export default function MobileNavigationPreview() {
     setPickupFeedback('')
     setPickupRequiresForce(false)
     setPostingFeedback('')
+    setTradeOfferFeedback('')
+    setTradeOfferRequiresForce(false)
+    setTradeFeedback('')
+    setTradeRequiresForce(false)
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
@@ -480,11 +502,131 @@ export default function MobileNavigationPreview() {
     setPickupFeedback('')
     setPickupRequiresForce(false)
     setPostingFeedback('')
+    setTradeOfferFeedback('')
+    setTradeOfferRequiresForce(false)
+    setTradeFeedback('')
+    setTradeRequiresForce(false)
     if (workflow === 'post' && selectedShift) {
       setPostingMode(selectedShift.postingMode || 'pickup')
       setPostComment(selectedShift.postingComment || '')
     }
+    if (workflow === 'offer') {
+      setTradeOfferAssignmentId('')
+      setTradeOfferNote('')
+      setEligibleTradeOffers([])
+      setIsLoadingTradeOffers(true)
+    }
+    if (workflow === 'trade') {
+      setTradePartner('')
+      setTradeTarget('')
+      setTradeNote('')
+      setTradeOptions([])
+      setIsLoadingTradeOptions(true)
+    }
   }
+
+  React.useEffect(() => {
+    if (shiftWorkflow !== 'trade' || !selectedShift) return
+    if (scheduleDataState !== 'live') {
+      setTradeOptions([
+        { id: -201, physicianId: -21, physicianName: 'Moe', date: '2026-10-13', facility: 'Roper', time: '6a–3p' },
+        { id: -202, physicianId: -22, physicianName: 'Taylor', date: '2026-10-15', facility: 'Berkeley', time: '4p–1a' },
+      ])
+      setIsLoadingTradeOptions(false)
+      return
+    }
+    if (selectedShift.assignmentId == null || !selectedShift.isMine || Boolean(selectedShift.startDateTime && shiftHasStarted(selectedShift.startDateTime))) {
+      setTradeOptions([])
+      setTradeFeedback('This shift is not eligible to start a trade proposal.')
+      setIsLoadingTradeOptions(false)
+      return
+    }
+
+    let cancelled = false
+    const loadTradeOptions = async () => {
+      setIsLoadingTradeOptions(true)
+      setTradeFeedback('')
+      try {
+        const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include', cache: 'no-store' })
+        const data = await response.json().catch(() => [])
+        if (!response.ok) throw new Error(data.detail || 'Unable to load eligible trade options.')
+        if (cancelled) return
+        const options: TradeOption[] = (Array.isArray(data) ? data : []).map((option) => ({
+          id: option.id,
+          physicianId: option.physician_id,
+          physicianName: option.physician_name,
+          date: option.date,
+          facility: option.facility,
+          time: `${formatClockValue(option.start_time)}–${formatClockValue(option.end_time)}`,
+        }))
+        setTradeOptions(options)
+        if (!options.length) setTradeFeedback('No eligible trade options are currently available.')
+      } catch (error) {
+        if (!cancelled) setTradeFeedback(error instanceof Error ? error.message : 'Unable to load eligible trade options.')
+      } finally {
+        if (!cancelled) setIsLoadingTradeOptions(false)
+      }
+    }
+    void loadTradeOptions()
+    return () => { cancelled = true }
+  }, [shiftWorkflow, selectedShift?.assignmentId, selectedShift?.isMine, selectedShift?.startDateTime, scheduleDataState])
+
+  React.useEffect(() => {
+    if (shiftWorkflow !== 'offer' || !selectedShift) return
+    if (scheduleDataState !== 'live') {
+      setEligibleTradeOffers([
+        { id: -101, date: '2026-10-14', facility: 'St Francis', time: '9a–6p' },
+        { id: -102, date: '2026-10-15', facility: 'Berkeley', time: '4p–1a' },
+      ])
+      setIsLoadingTradeOffers(false)
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setEligibleTradeOffers([])
+      setTradeOfferFeedback('This shift is not available for a trade request.')
+      setIsLoadingTradeOffers(false)
+      return
+    }
+
+    let cancelled = false
+    const loadEligibleOffers = async () => {
+      setIsLoadingTradeOffers(true)
+      setTradeOfferFeedback('')
+      setEligibleTradeOffers([])
+      const candidates = apiShifts.filter((shift) => (
+        shift.id != null
+        && shift.physician === user?.physician_id
+        && shift.domain === selectedShift.domainId
+        && !shiftHasStarted(shift.start_datetime)
+      ))
+      try {
+        const checkedCandidates = await Promise.all(candidates.map(async (candidate) => {
+          const response = await fetch(`${API_BASE}/schedule-assignments/${candidate.id}/trade-options/`, { credentials: 'include', cache: 'no-store' })
+          const options = await response.json().catch(() => [])
+          if (!response.ok || !Array.isArray(options)) return null
+          return options.some((option: { id?: number }) => option.id === selectedShift.assignmentId) ? candidate : null
+        }))
+        if (cancelled) return
+        const options = checkedCandidates
+          .filter((candidate): candidate is APIShift => candidate != null && candidate.id != null)
+          .sort((left, right) => left.start_datetime.localeCompare(right.start_datetime))
+          .map((candidate) => ({
+            id: candidate.id as number,
+            date: candidate.date,
+            facility: candidate.facility_short_name || candidate.facility_name,
+            time: `${formatClockValue(candidate.start_time)}–${formatClockValue(candidate.end_time)}`,
+          }))
+        setEligibleTradeOffers(options)
+        if (!options.length) setTradeOfferFeedback('No eligible shifts are currently available to offer.')
+      } catch (error) {
+        if (!cancelled) setTradeOfferFeedback(error instanceof Error ? error.message : 'Unable to load eligible trade offers.')
+      } finally {
+        if (!cancelled) setIsLoadingTradeOffers(false)
+      }
+    }
+    void loadEligibleOffers()
+    return () => { cancelled = true }
+  }, [shiftWorkflow, selectedShift?.assignmentId, selectedShift?.domainId, scheduleDataState, apiShifts, user?.physician_id])
 
   const confirmPickup = async () => {
     if (!selectedShift || isPickupSaving) return
@@ -585,7 +727,106 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const submitTradeOffer = async () => {
+    if (!selectedShift || tradeOfferAssignmentId === '' || isTradeOfferSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would send the trade request.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setTradeOfferFeedback('This shift is no longer available for trade.')
+      return
+    }
+
+    setIsTradeOfferSaving(true)
+    setTradeOfferFeedback('')
+    try {
+      const body: Record<string, unknown> = {
+        target_assignment_id: selectedShift.assignmentId,
+        offered_assignment_id: tradeOfferAssignmentId,
+        note: tradeOfferNote,
+      }
+      if (tradeOfferRequiresForce) body.force = true
+      const response = await fetch(`${API_BASE}/shift-trades/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setTradeOfferRequiresForce(true)
+        setTradeOfferFeedback(data.detail || 'This trade creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to send this trade request.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The trade request was sent, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage('Trade request sent successfully.')
+      closeShift()
+    } catch (error) {
+      setTradeOfferFeedback(error instanceof Error ? error.message : 'Unable to send this trade request.')
+    } finally {
+      setIsTradeOfferSaving(false)
+    }
+  }
+
+  const submitTradeProposal = async () => {
+    if (!selectedShift || tradeTarget === '' || isTradeSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would send the trade proposal.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setTradeFeedback('This shift is no longer eligible for a trade proposal.')
+      return
+    }
+
+    setIsTradeSaving(true)
+    setTradeFeedback('')
+    try {
+      const body: Record<string, unknown> = {
+        offered_assignment_id: selectedShift.assignmentId,
+        target_assignment_id: tradeTarget,
+        note: tradeNote,
+      }
+      if (tradeRequiresForce) body.force = true
+      const response = await fetch(`${API_BASE}/shift-trades/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setTradeRequiresForce(true)
+        setTradeFeedback(data.detail || 'This trade creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to send this trade proposal.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The proposal was sent, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage('Trade proposal sent successfully.')
+      closeShift()
+    } catch (error) {
+      setTradeFeedback(error instanceof Error ? error.message : 'Unable to send this trade proposal.')
+    } finally {
+      setIsTradeSaving(false)
+    }
+  }
+
   const selectedShiftHasStarted = Boolean(selectedShift?.startDateTime && shiftHasStarted(selectedShift.startDateTime))
+  const tradePartners = Array.from(new Map(tradeOptions.map((option) => [option.physicianId, option.physicianName])).entries())
+    .sort((left, right) => left[1].localeCompare(right[1]))
+  const selectedPartnerTradeOptions = tradePartner === '' ? [] : tradeOptions.filter((option) => option.physicianId === tradePartner)
 
   return (
     <div className="mobile-preview-workbench">
@@ -695,10 +936,11 @@ export default function MobileNavigationPreview() {
                 </div>
               ) : shiftWorkflow === 'trade' ? (
                 <div className="mobile-workflow-form">
-                  <label className="field">Trade with<select value={tradePartner} onChange={(event) => { setTradePartner(event.target.value); setTradeTarget('') }}><option value="">Choose clinician</option><option value="moe">Moe</option><option value="taylor">Taylor</option></select></label>
-                  <label className="field">Shift requested<select value={tradeTarget} disabled={!tradePartner} onChange={(event) => setTradeTarget(event.target.value)}><option value="">Choose shift</option><option value="oct-13">Tue, Oct 13 · Roper · 6a–3p</option><option value="oct-15">Thu, Oct 15 · Berkeley · 4p–1a</option></select></label>
-                  <label className="field">Comments (optional)<textarea value={tradeNote} onChange={(event) => setTradeNote(event.target.value)} /></label>
-                  <button type="button" className="mobile-workflow-primary" disabled={!tradeTarget} onClick={() => setWorkflowMessage('Preview complete — this would send the trade proposal.')}>Send trade proposal</button>
+                  <label className="field">Trade with<select value={tradePartner} disabled={isLoadingTradeOptions || !tradePartners.length} onChange={(event) => { setTradePartner(Number(event.target.value) || ''); setTradeTarget(''); setTradeFeedback(''); setTradeRequiresForce(false) }}><option value="">{isLoadingTradeOptions ? 'Loading eligible clinicians…' : 'Choose clinician'}</option>{tradePartners.map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select></label>
+                  <label className="field">Shift requested<select value={tradeTarget} disabled={tradePartner === ''} onChange={(event) => { setTradeTarget(Number(event.target.value) || ''); setTradeFeedback(''); setTradeRequiresForce(false) }}><option value="">Choose shift</option>{selectedPartnerTradeOptions.map((option) => <option value={option.id} key={option.id}>{new Date(`${option.date}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {option.facility} · {option.time}</option>)}</select></label>
+                  <label className="field">Comment (optional)<textarea value={tradeNote} maxLength={1000} onChange={(event) => setTradeNote(event.target.value)} placeholder="Add a note for the other clinician" /></label>
+                  {tradeFeedback && <div className="mobile-workflow-message error">{tradeFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={tradeTarget === '' || isLoadingTradeOptions || isTradeSaving} onClick={submitTradeProposal}>{isTradeSaving ? 'Sending…' : tradeRequiresForce ? 'Send trade proposal anyway' : 'Send trade proposal'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
               ) : shiftWorkflow === 'split' ? (
@@ -718,8 +960,10 @@ export default function MobileNavigationPreview() {
               ) : shiftWorkflow === 'offer' ? (
                 <div className="mobile-workflow-form">
                   <p>This shift is available only in exchange for one of your eligible shifts.</p>
-                  <label className="field">Your shift offered<select value={tradeTarget} onChange={(event) => setTradeTarget(event.target.value)}><option value="">Choose one of your shifts</option><option value="oct-14">Wed, Oct 14 · St Francis · 9a–6p</option><option value="oct-15">Thu, Oct 15 · Berkeley · 4p–1a</option></select></label>
-                  <button type="button" className="mobile-workflow-primary" disabled={!tradeTarget} onClick={() => setWorkflowMessage('Preview complete — this would send the trade request.')}>Send trade request</button>
+                  <label className="field">Your shift offered<select value={tradeOfferAssignmentId} disabled={isLoadingTradeOffers || !eligibleTradeOffers.length} onChange={(event) => { setTradeOfferAssignmentId(Number(event.target.value) || ''); setTradeOfferFeedback(''); setTradeOfferRequiresForce(false) }}><option value="">{isLoadingTradeOffers ? 'Checking eligible shifts…' : 'Choose one of your shifts'}</option>{eligibleTradeOffers.map((option) => <option value={option.id} key={option.id}>{new Date(`${option.date}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {option.facility} · {option.time}</option>)}</select></label>
+                  <label className="field">Comment (optional)<textarea value={tradeOfferNote} maxLength={1000} onChange={(event) => setTradeOfferNote(event.target.value)} placeholder="Add a note for the other clinician" /></label>
+                  {tradeOfferFeedback && <div className="mobile-workflow-message error">{tradeOfferFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={tradeOfferAssignmentId === '' || isLoadingTradeOffers || isTradeOfferSaving} onClick={submitTradeOffer}>{isTradeOfferSaving ? 'Sending…' : tradeOfferRequiresForce ? 'Send trade request anyway' : 'Send trade request'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
               ) : user?.can_manage_schedules && !testUserView && selectedShift.tone === 'open' ? (
@@ -737,7 +981,7 @@ export default function MobileNavigationPreview() {
                 <div className="mobile-shift-actions">
                   <strong>Shift actions</strong>
                   {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.postingMode ? 'Review posting' : 'Post this shift'} <span>›</span></button>}
-                  <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>
+                  {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>}
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
                 </div>
               ) : (selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open') && selectedShift.canPickUp === false ? (

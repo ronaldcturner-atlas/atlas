@@ -33,6 +33,24 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain('shiftHasStarted(selectedShift.startDateTime)')
   })
 
+  it('loads authoritative trade-only offers and submits the selected exchange', () => {
+    expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
+    expect(mobileSource).toContain('option.id === selectedShift.assignmentId')
+    expect(mobileSource).toContain('offered_assignment_id: tradeOfferAssignmentId')
+    expect(mobileSource).toContain('target_assignment_id: selectedShift.assignmentId')
+    expect(mobileSource).toContain('note: tradeOfferNote')
+    expect(mobileSource).toContain('Trade request sent successfully.')
+  })
+
+  it('loads and submits authoritative trade proposals from an owned shift', () => {
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/trade-options/')
+    expect(mobileSource).toContain('offered_assignment_id: selectedShift.assignmentId')
+    expect(mobileSource).toContain('target_assignment_id: tradeTarget')
+    expect(mobileSource).toContain('note: tradeNote')
+    expect(mobileSource).toContain('Trade proposal sent successfully.')
+    expect(mobileSource).toContain('selectedPartnerTradeOptions')
+  })
+
   it('keeps selected-day priority highlights scoped to the month calendar', () => {
     expect(mobileSource).toContain('prioritizeCalendarShifts')
     expect(mobileStyles).toContain('.mobile-month-preview .mobile-day-schedule>button.calendar-own-highlight')
