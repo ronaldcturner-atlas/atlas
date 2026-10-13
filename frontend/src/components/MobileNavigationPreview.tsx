@@ -88,6 +88,26 @@ type UnsplitUserOption = {
   active: boolean
   domain_memberships: Array<{ domain_id: number; active: boolean; clinically_active: boolean }>
 }
+type MobileDirectoryDomain = { id: number; name: string; region_id: number; region_name: string }
+type MobileDirectoryProfile = {
+  id: number
+  name: string
+  display_name: string
+  email: string | null
+  phone_number: string | null
+  clinician_type: string
+  primary_facility: string | null
+  role_name: string | null
+  clinically_active: boolean
+  contract: string | null
+  is_org_admin: boolean
+}
+type MobileDirectoryResponse = {
+  self_profile: MobileDirectoryProfile
+  domains: MobileDirectoryDomain[]
+  selected_domain_id: number | null
+  users: MobileDirectoryProfile[]
+}
 
 const demoDomains: DomainOption[] = [
   { id: -1, name: 'Physician', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
@@ -295,6 +315,12 @@ export default function MobileNavigationPreview() {
   const statsToday = new Date()
   const [statsMonth, setStatsMonth] = React.useState(statsToday.getMonth())
   const [statsYear, setStatsYear] = React.useState(statsToday.getFullYear())
+  const [directoryData, setDirectoryData] = React.useState<MobileDirectoryResponse | null>(null)
+  const [directoryDomainId, setDirectoryDomainId] = React.useState<number | null>(null)
+  const [directorySearch, setDirectorySearch] = React.useState('')
+  const [selectedDirectoryUser, setSelectedDirectoryUser] = React.useState<MobileDirectoryProfile | null>(null)
+  const [isDirectoryLoading, setIsDirectoryLoading] = React.useState(false)
+  const [directoryError, setDirectoryError] = React.useState('')
   const [viewDate, setViewDate] = React.useState(() => {
     const stored = window.localStorage.getItem('atlas.mobile-preview.month')
     const parsed = stored ? new Date(`${stored}-01T12:00:00`) : new Date()
@@ -353,6 +379,27 @@ export default function MobileNavigationPreview() {
   }, [])
 
   React.useEffect(() => { void loadTradeRequests() }, [loadTradeRequests])
+
+  const loadUserDirectory = React.useCallback(async (domainId?: number) => {
+    setIsDirectoryLoading(true)
+    setDirectoryError('')
+    try {
+      const query = domainId ? `?domain=${domainId}` : ''
+      const response = await fetch(`${API_BASE}/user-directory/${query}`, { credentials: 'include', cache: 'no-store' })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || 'The user directory could not be loaded.')
+      setDirectoryData(data)
+      setDirectoryDomainId(data.selected_domain_id ?? null)
+    } catch (error) {
+      setDirectoryError(error instanceof Error ? error.message : 'The user directory could not be loaded.')
+    } finally {
+      setIsDirectoryLoading(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    if (activePage === 'users') void loadUserDirectory(directoryDomainId ?? undefined)
+  }, [activePage])
 
   React.useEffect(() => {
     let cancelled = false
@@ -422,6 +469,7 @@ export default function MobileNavigationPreview() {
       setApiShifts([])
       setTradeRequests([])
       setAvailableDomains([])
+      setDirectoryData(null)
     } catch (error) {
       setSignOutFeedback(error instanceof Error ? error.message : 'Unable to sign out. Please try again.')
       setShowMore(true)
@@ -485,6 +533,12 @@ export default function MobileNavigationPreview() {
     .sort((left, right) => left.date.localeCompare(right.date) || left.start_time.localeCompare(right.start_time))
   const myStatsTotalHours = myStatsShifts.reduce((total, shift) => total + shiftHours(shift.start_time, shift.end_time), 0)
   const myStatsNightHours = myStatsShifts.reduce((total, shift) => total + (shift.is_night ? shiftHours(shift.start_time, shift.end_time) : 0), 0)
+  const visibleDirectoryUsers = (directoryData?.users ?? []).filter((directoryUser) => {
+    const search = directorySearch.trim().toLowerCase()
+    if (!search) return true
+    return [directoryUser.name, directoryUser.role_name, directoryUser.clinician_type, directoryUser.primary_facility]
+      .some((value) => value?.toLowerCase().includes(search))
+  })
   const monthStart = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1)
   const monthGridStart = new Date(monthStart.getFullYear(), monthStart.getMonth(), 1 - monthStart.getDay())
   const daysInMonth = new Date(viewDate.getFullYear(), viewDate.getMonth() + 1, 0).getDate()
@@ -1628,6 +1682,24 @@ export default function MobileNavigationPreview() {
                 </div>
               </>}
             </section>
+          ) : activePage === 'users' ? (
+            <section className="mobile-users-page" aria-label="Users">
+              <header className="mobile-users-toolbar">
+                <div><strong>Users</strong><span>Contact directory</span></div>
+                {(directoryData?.domains.length ?? 0) > 1 && <label><span>Domain</span><select aria-label="Directory domain" value={directoryDomainId ?? ''} onChange={(event) => void loadUserDirectory(Number(event.target.value))}>{directoryData?.domains.map((domain) => <option value={domain.id} key={domain.id}>{domain.region_name} · {domain.name}</option>)}</select></label>}
+                {directoryData?.domains.length === 1 && <p>{directoryData.domains[0].region_name} · {directoryData.domains[0].name}</p>}
+                {!!directoryData?.domains.length && <input type="search" aria-label="Search users" value={directorySearch} onChange={(event) => setDirectorySearch(event.target.value)} placeholder="Search users" />}
+              </header>
+              {directoryError && <div className="mobile-stats-empty">{directoryError}</div>}
+              {isDirectoryLoading && !directoryData ? <div className="mobile-stats-empty">Loading users…</div> : !directoryData?.domains.length ? <div className="mobile-stats-empty">Your role does not include access to a Domain user directory.</div> : <div className="mobile-user-list">
+                {visibleDirectoryUsers.map((directoryUser) => <button type="button" key={directoryUser.id} onClick={() => setSelectedDirectoryUser(directoryUser)}>
+                  <span aria-hidden="true">{directoryUser.name.split(/\s+/).map((part) => part[0]).slice(0, 2).join('')}</span>
+                  <div><strong>{directoryUser.name}{directoryUser.is_org_admin && <small>Org Admin</small>}</strong><span>{directoryUser.role_name || directoryUser.clinician_type}{directoryUser.primary_facility ? ` · ${directoryUser.primary_facility}` : ''}</span></div>
+                  <b>›</b>
+                </button>)}
+                {!visibleDirectoryUsers.length && <div className="mobile-stats-empty">No users match this search.</div>}
+              </div>}
+            </section>
           ) : (
             <section className="mobile-secondary-preview">
               <div>{primaryItems.find((item) => item.id === activePage)?.icon}</div>
@@ -1759,6 +1831,23 @@ export default function MobileNavigationPreview() {
               ) : selectedShift.postingMode === 'trade' ? (
                 <div className="mobile-shift-actions"><strong>Trade-only shift</strong><button type="button" onClick={() => showWorkflow('offer')}>Offer one of my shifts <span>›</span></button></div>
               ) : <p className="mobile-shift-readonly">No actions are available for this shift.</p>}
+            </section>
+          </div>
+        )}
+
+        {selectedDirectoryUser && (
+          <div className="mobile-sheet-backdrop" onClick={() => setSelectedDirectoryUser(null)}>
+            <section className="mobile-sheet mobile-user-details" onClick={(event) => event.stopPropagation()}>
+              <div className="mobile-sheet-handle" />
+              <header><div><span>User</span><strong>{selectedDirectoryUser.name}</strong></div><button type="button" onClick={() => setSelectedDirectoryUser(null)} aria-label="Close user details">×</button></header>
+              <div className="mobile-user-detail-grid">
+                <div><span>Domain role</span><strong>{selectedDirectoryUser.role_name || '—'}</strong></div>
+                <div><span>Clinical status</span><strong>{selectedDirectoryUser.clinically_active ? 'Clinically active' : 'Not clinically active'}</strong></div>
+                <div><span>Contract</span><strong>{selectedDirectoryUser.contract || 'No contract'}</strong></div>
+                <div><span>Primary facility</span><strong>{selectedDirectoryUser.primary_facility || 'Unassigned'}</strong></div>
+                {selectedDirectoryUser.phone_number && <div><span>Phone</span><strong><a href={`tel:${selectedDirectoryUser.phone_number}`}>{selectedDirectoryUser.phone_number}</a></strong></div>}
+                {selectedDirectoryUser.email && <div><span>Email</span><strong><a href={`mailto:${selectedDirectoryUser.email}`}>{selectedDirectoryUser.email}</a></strong></div>}
+              </div>
             </section>
           </div>
         )}

@@ -9,8 +9,23 @@ const mobileStyles = readFileSync(
   new URL('../src/components/MobileNavigationPreview.css', import.meta.url),
   'utf8',
 )
+const appSource = readFileSync(
+  new URL('../src/App.tsx', import.meta.url),
+  'utf8',
+)
+const manifestSource = readFileSync(
+  new URL('../public/manifest.webmanifest', import.meta.url),
+  'utf8',
+)
 
 describe('mobile published schedule actions', () => {
+  it('loads the responsive mobile application from the normal installed Atlas entry point', () => {
+    expect(appSource).toContain("'(max-width: 820px), (display-mode: standalone)'")
+    expect(appSource).toContain("location.pathname === '/mobile-preview' || isMobileApplication")
+    expect(mobileStyles).toContain('@media(max-width:820px),(display-mode:standalone)')
+    expect(JSON.parse(manifestSource).start_url).toBe('/')
+  })
+
   it('uses the authoritative pickup workflows for open and posted shifts', () => {
     expect(mobileSource).toContain('shift-instances/${selectedShift.instanceId}/pickup/')
     expect(mobileSource).toContain("`${API_BASE}/shift-trades/`")
@@ -119,6 +134,16 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).not.toContain('Account settings')
     expect(mobileSource).not.toContain('Group Stats')
     expect(mobileStyles).toContain('.mobile-stats-page')
+  })
+
+  it('uses the permission-filtered directory endpoint for a read-only mobile Users tab', () => {
+    expect(mobileSource).toContain('`${API_BASE}/user-directory/${query}`')
+    expect(mobileSource).toContain('aria-label="Directory domain"')
+    expect(mobileSource).toContain('aria-label="Search users"')
+    expect(mobileSource).toContain('selectedDirectoryUser.phone_number')
+    expect(mobileSource).toContain('selectedDirectoryUser.email')
+    expect(mobileSource).not.toContain('Change password')
+    expect(mobileStyles).toContain('.mobile-users-page')
   })
 
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
