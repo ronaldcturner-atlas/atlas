@@ -229,6 +229,8 @@ export default function MobileNavigationPreview() {
   const [swapRequiresForce, setSwapRequiresForce] = React.useState(false)
   const [isLoadingSwapOptions, setIsLoadingSwapOptions] = React.useState(false)
   const [isSwapSaving, setIsSwapSaving] = React.useState(false)
+  const [openShiftFeedback, setOpenShiftFeedback] = React.useState('')
+  const [isOpenShiftSaving, setIsOpenShiftSaving] = React.useState(false)
   const [workflowMessage, setWorkflowMessage] = React.useState('')
   const [pickupFeedback, setPickupFeedback] = React.useState('')
   const [pickupRequiresForce, setPickupRequiresForce] = React.useState(false)
@@ -536,6 +538,7 @@ export default function MobileNavigationPreview() {
     setSwapTargetId('')
     setSwapFeedback('')
     setSwapRequiresForce(false)
+    setOpenShiftFeedback('')
   }
   const closeShift = () => {
     setSelectedShift(null)
@@ -561,6 +564,7 @@ export default function MobileNavigationPreview() {
     setSwapTargetId('')
     setSwapFeedback('')
     setSwapRequiresForce(false)
+    setOpenShiftFeedback('')
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
@@ -1138,6 +1142,43 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const openScheduledShift = async () => {
+    if (!selectedShift || isOpenShiftSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this shift would now be open.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setOpenShiftFeedback('This shift is already open.')
+      return
+    }
+
+    setIsOpenShiftSaving(true)
+    setOpenShiftFeedback('')
+    try {
+      const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/open/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || 'Unable to open this shift.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The shift was opened, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(data.detail || 'Shift opened.')
+      closeShift()
+    } catch (error) {
+      setOpenShiftFeedback(error instanceof Error ? error.message : 'Unable to open this shift.')
+    } finally {
+      setIsOpenShiftSaving(false)
+    }
+  }
+
   const submitTradeOffer = async () => {
     if (!selectedShift || tradeOfferAssignmentId === '' || isTradeOfferSaving) return
     if (scheduleDataState !== 'live') {
@@ -1418,7 +1459,8 @@ export default function MobileNavigationPreview() {
                   <button type="button" onClick={() => showWorkflow('swap')}>Swap scheduled users <span>›</span></button>
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
                   {selectedShift.isSplit && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
-                  <button type="button" className="caution">Open shift <span>›</span></button>
+                  <button type="button" className="caution" disabled={isOpenShiftSaving} onClick={openScheduledShift}>{isOpenShiftSaving ? 'Opening…' : 'Open shift'} <span>›</span></button>
+                  {openShiftFeedback && <div className="mobile-workflow-message error">{openShiftFeedback}</div>}
                 </div>
               ) : selectedShift.isMine ? (
                 <div className="mobile-shift-actions">

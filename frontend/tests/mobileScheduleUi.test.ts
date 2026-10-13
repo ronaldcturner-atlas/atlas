@@ -76,6 +76,12 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain("data.detail || 'Scheduled users swapped.'")
   })
 
+  it('opens an assigned shift through the desktop published-assignment endpoint', () => {
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/open/')
+    expect(mobileSource).toContain('onClick={openScheduledShift}')
+    expect(mobileSource).toContain("data.detail || 'Shift opened.'")
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')
