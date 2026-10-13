@@ -50,6 +50,14 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain('body.force = true')
   })
 
+  it('changes the scheduled user through the desktop reassignment endpoint', () => {
+    expect(mobileSource).toContain("showWorkflow('reassign')")
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/reassign/')
+    expect(mobileSource).toContain('physician_id: reassignUserId')
+    expect(mobileSource).toContain('setReassignRequiresForce(true)')
+    expect(mobileSource).toContain("data.detail || 'Scheduled user changed.'")
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')

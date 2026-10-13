@@ -8,7 +8,7 @@ type PreviewPage = 'schedule' | 'stats' | 'users' | 'more'
 type ScheduleDisplay = 'list' | 'month'
 type ListScheduleScope = 'group' | 'mine'
 type ShiftTone = 'standard' | 'own' | 'available' | 'posted' | 'trade-sent' | 'trade-received' | 'open'
-type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'pickup' | 'offer'
+type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'reassign' | 'pickup' | 'offer'
 
 const primaryItems: Array<{ id: PreviewPage; label: string; icon: string }> = [
   { id: 'schedule', label: 'Schedule', icon: '▦' },
@@ -212,6 +212,12 @@ export default function MobileNavigationPreview() {
   const [unsplitUserId, setUnsplitUserId] = React.useState<number | ''>('')
   const [unsplitUsers, setUnsplitUsers] = React.useState<UnsplitUserOption[]>([])
   const [isUnsplitSaving, setIsUnsplitSaving] = React.useState(false)
+  const [reassignUserId, setReassignUserId] = React.useState<number | ''>('')
+  const [reassignUsers, setReassignUsers] = React.useState<UnsplitUserOption[]>([])
+  const [reassignFeedback, setReassignFeedback] = React.useState('')
+  const [reassignRequiresForce, setReassignRequiresForce] = React.useState(false)
+  const [isLoadingReassignUsers, setIsLoadingReassignUsers] = React.useState(false)
+  const [isReassignSaving, setIsReassignSaving] = React.useState(false)
   const [workflowMessage, setWorkflowMessage] = React.useState('')
   const [pickupFeedback, setPickupFeedback] = React.useState('')
   const [pickupRequiresForce, setPickupRequiresForce] = React.useState(false)
@@ -511,6 +517,9 @@ export default function MobileNavigationPreview() {
     setUnsplitRequiresForce(false)
     setUnsplitRequiresUser(false)
     setUnsplitUserId('')
+    setReassignUserId('')
+    setReassignFeedback('')
+    setReassignRequiresForce(false)
   }
   const closeShift = () => {
     setSelectedShift(null)
@@ -528,6 +537,9 @@ export default function MobileNavigationPreview() {
     setUnsplitRequiresForce(false)
     setUnsplitRequiresUser(false)
     setUnsplitUserId('')
+    setReassignUserId('')
+    setReassignFeedback('')
+    setReassignRequiresForce(false)
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
@@ -542,6 +554,8 @@ export default function MobileNavigationPreview() {
     setSplitFeedback('')
     setUnsplitFeedback('')
     setUnsplitRequiresForce(false)
+    setReassignFeedback('')
+    setReassignRequiresForce(false)
     if (workflow === 'post' && selectedShift) {
       setPostingMode(selectedShift.postingMode || 'pickup')
       setPostComment(selectedShift.postingComment || '')
@@ -560,7 +574,44 @@ export default function MobileNavigationPreview() {
       setIsLoadingTradeOptions(true)
     }
     if (workflow === 'split') setSplitTime('12:00')
+    if (workflow === 'reassign') {
+      setReassignUserId('')
+      setReassignUsers([])
+    }
   }
+
+  React.useEffect(() => {
+    if (shiftWorkflow !== 'reassign' || !selectedShift?.domainId) return
+    if (scheduleDataState !== 'live') {
+      setIsLoadingReassignUsers(false)
+      return
+    }
+    let cancelled = false
+    const loadUsers = async () => {
+      setIsLoadingReassignUsers(true)
+      setReassignFeedback('')
+      try {
+        const response = await fetch(`${API_BASE}/physicians/`, { credentials: 'include', cache: 'no-store' })
+        const data = await response.json().catch(() => [])
+        if (!response.ok || !Array.isArray(data)) throw new Error('Unable to load users for this shift.')
+        if (cancelled) return
+        setReassignUsers(data.filter((candidate: UnsplitUserOption) => (
+          candidate.active
+          && candidate.domain_memberships.some((membership) => (
+            membership.domain_id === selectedShift.domainId
+            && membership.active
+            && membership.clinically_active
+          ))
+        )))
+      } catch (error) {
+        if (!cancelled) setReassignFeedback(error instanceof Error ? error.message : 'Unable to load users for this shift.')
+      } finally {
+        if (!cancelled) setIsLoadingReassignUsers(false)
+      }
+    }
+    void loadUsers()
+    return () => { cancelled = true }
+  }, [shiftWorkflow, selectedShift?.domainId, scheduleDataState])
 
   React.useEffect(() => {
     if (shiftWorkflow !== 'trade' || !selectedShift) return
@@ -878,6 +929,50 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const reassignShift = async () => {
+    if (!selectedShift || reassignUserId === '' || isReassignSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would change the scheduled user.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setReassignFeedback('Only an assigned shift can be reassigned.')
+      return
+    }
+
+    setIsReassignSaving(true)
+    setReassignFeedback('')
+    try {
+      const body: Record<string, unknown> = { physician_id: reassignUserId }
+      if (reassignRequiresForce) body.force = true
+      const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/reassign/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setReassignRequiresForce(true)
+        setReassignFeedback(data.detail || 'This reassignment creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to change the scheduled user.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The scheduled user was changed, but the updated schedule could not be loaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(data.detail || 'Scheduled user changed.')
+      closeShift()
+    } catch (error) {
+      setReassignFeedback(error instanceof Error ? error.message : 'Unable to change the scheduled user.')
+    } finally {
+      setIsReassignSaving(false)
+    }
+  }
+
   const submitTradeOffer = async () => {
     if (!selectedShift || tradeOfferAssignmentId === '' || isTradeOfferSaving) return
     if (scheduleDataState !== 'live') {
@@ -1065,7 +1160,7 @@ export default function MobileNavigationPreview() {
           <div className="mobile-sheet-backdrop" onClick={closeShift}>
             <section className="mobile-sheet mobile-shift-sheet" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
-              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
+              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'reassign' ? 'Change scheduled user' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
               {shiftWorkflow && <button type="button" className="mobile-workflow-back" onClick={() => { setShiftWorkflow(null); setWorkflowMessage('') }}>‹ Shift details</button>}
               <div className="mobile-shift-summary">
                 <div><span>Date &amp; time</span><strong>{selectedShift.date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {selectedShift.time}</strong></div>
@@ -1110,6 +1205,13 @@ export default function MobileNavigationPreview() {
                   <button type="button" className="mobile-workflow-primary" disabled={isUnsplitSaving || (unsplitRequiresUser && unsplitUserId === '')} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : unsplitRequiresForce ? 'Confirm unsplit shift' : 'Unsplit shift'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
+              ) : shiftWorkflow === 'reassign' ? (
+                <div className="mobile-workflow-form">
+                  <label className="field">Scheduled user<select value={reassignUserId} disabled={isLoadingReassignUsers} onChange={(event) => { setReassignUserId(Number(event.target.value) || ''); setReassignRequiresForce(false); setReassignFeedback('') }}><option value="">{isLoadingReassignUsers ? 'Loading users…' : 'Choose user'}</option>{reassignUsers.map((candidate) => <option value={candidate.id} key={candidate.id}>{candidate.display_name || `${candidate.first_name} ${candidate.last_name}`}</option>)}</select></label>
+                  {reassignFeedback && <div className="mobile-workflow-message error">{reassignFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={reassignUserId === '' || isLoadingReassignUsers || isReassignSaving} onClick={reassignShift}>{isReassignSaving ? 'Changing…' : reassignRequiresForce ? 'Confirm change anyway' : 'Change user'}</button>
+                  {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
+                </div>
               ) : shiftWorkflow === 'pickup' ? (
                 <div className="mobile-workflow-form">
                   <div className="mobile-workflow-warning"><strong>You will be responsible for this shift.</strong><span>Confirm only if you are able to work the complete scheduled time shown above.</span></div>
@@ -1131,7 +1233,7 @@ export default function MobileNavigationPreview() {
               ) : user?.can_manage_schedules && !testUserView ? (
                 <div className="mobile-shift-actions">
                   <strong>Manage this shift</strong>
-                  <button type="button">Change scheduled user <span>›</span></button>
+                  <button type="button" onClick={() => showWorkflow('reassign')}>Change scheduled user <span>›</span></button>
                   <button type="button">Adjust actual times <span>›</span></button>
                   <button type="button">Swap scheduled users <span>›</span></button>
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
