@@ -26,6 +26,16 @@ describe('mobile published schedule actions', () => {
     expect(JSON.parse(manifestSource).start_url).toBe('/')
   })
 
+  it('never substitutes fictional shifts when the published schedule is unavailable', () => {
+    expect(mobileSource).toContain("setScheduleDataState('error')")
+    expect(mobileSource).toContain('<strong>Schedule unavailable</strong>')
+    expect(mobileSource).toContain('onClick={() => void loadPublishedSchedule()}')
+    expect(mobileSource).not.toContain('sampleShiftsByDay')
+    expect(mobileSource).not.toContain('fallbackShifts')
+    expect(mobileSource).not.toContain('Demo schedule shown')
+    expect(mobileStyles).toContain('.mobile-data-unavailable')
+  })
+
   it('uses the authoritative pickup workflows for open and posted shifts', () => {
     expect(mobileSource).toContain('shift-instances/${selectedShift.instanceId}/pickup/')
     expect(mobileSource).toContain("`${API_BASE}/shift-trades/`")

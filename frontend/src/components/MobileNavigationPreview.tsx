@@ -109,48 +109,6 @@ type MobileDirectoryResponse = {
   users: MobileDirectoryProfile[]
 }
 
-const demoDomains: DomainOption[] = [
-  { id: -1, name: 'Physician', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
-  { id: -2, name: 'APP', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
-]
-
-const sampleShiftsByDay: Record<number, PreviewShift[]> = {
-  11: [
-    { facility: 'Berkeley', time: '8a–5p', physician: 'Santos', domain: 'APP' },
-  ],
-  12: [
-    { facility: 'Roper', time: '6a–3p', physician: 'Mullin', domain: 'Physician', tone: 'own', isMine: true },
-    { facility: 'Berkeley', time: '7a–4p', physician: 'Moe', domain: 'Physician' },
-    { facility: 'St Francis', time: '2p–11p', physician: 'Feingold', domain: 'APP' },
-  ],
-  13: [
-    { facility: 'Roper', time: '6a–3p', physician: 'Taylor', domain: 'Physician', tone: 'available', postingMode: 'pickup' },
-    { facility: 'Roper', time: '3p–12a', physician: 'Santos', domain: 'APP' },
-  ],
-  14: [
-    { facility: 'Berkeley', time: '7a–4p', physician: 'Moe', domain: 'Physician' },
-    { facility: 'St Francis', time: '9a–6p', physician: 'Turner', domain: 'APP', tone: 'posted', isMine: true },
-    { facility: 'Roper', time: '3p–12a', physician: 'Mullin', domain: 'Physician' },
-  ],
-  15: [
-    { facility: 'St Francis', time: '6a–3p', physician: 'Feingold', domain: 'APP' },
-    { facility: 'Berkeley', time: '4p–1a', physician: 'Taylor', domain: 'Physician', tone: 'trade-sent', isMine: true },
-  ],
-  16: [
-    { facility: 'Roper', time: '7a–4p', physician: 'Open shift', domain: 'Physician', tone: 'open' },
-    { facility: 'St Francis', time: '3p–12a', physician: 'Moe', domain: 'Physician' },
-  ],
-  17: [
-    { facility: 'Berkeley', time: '7a–4p', physician: 'Feingold', domain: 'APP', tone: 'available', postingMode: 'trade' },
-  ],
-}
-
-const fallbackShifts: PreviewShift[] = [
-  { facility: 'Roper', time: '6a–3p', physician: 'Mullin', domain: 'Physician' },
-  { facility: 'Berkeley', time: '7a–4p', physician: 'Moe', domain: 'Physician' },
-  { facility: 'St Francis', time: '2p–11p', physician: 'Feingold', domain: 'APP' },
-]
-
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
@@ -190,7 +148,7 @@ function displayHours(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(1)
 }
 
-function PreviewShiftList({ date, shifts = fallbackShifts, label = 'Selected date', onSelect, currentUserName, prioritizeCalendarShifts = false }: { date: Date; shifts?: PreviewShift[]; label?: string; onSelect?: (shift: SelectedPreviewShift) => void; currentUserName?: string; prioritizeCalendarShifts?: boolean }) {
+function PreviewShiftList({ date, shifts, label = 'Selected date', onSelect, currentUserName, prioritizeCalendarShifts = false }: { date: Date; shifts: PreviewShift[]; label?: string; onSelect?: (shift: SelectedPreviewShift) => void; currentUserName?: string; prioritizeCalendarShifts?: boolean }) {
   const displayedShifts = prioritizeCalendarShifts
     ? [...shifts].sort((left, right) => {
       const priority = (shift: PreviewShift) => shift.isMine ? 0 : shift.tone && shift.tone !== 'standard' ? 1 : 2
@@ -301,7 +259,7 @@ export default function MobileNavigationPreview() {
   const [isPostingSaving, setIsPostingSaving] = React.useState(false)
   const [scheduleActionMessage, setScheduleActionMessage] = React.useState('')
   const [testUserView, setTestUserView] = React.useState(false)
-  const [scheduleDataState, setScheduleDataState] = React.useState<'loading' | 'live' | 'demo'>('loading')
+  const [scheduleDataState, setScheduleDataState] = React.useState<'loading' | 'live' | 'error'>('loading')
   const [scheduleDataMessage, setScheduleDataMessage] = React.useState('')
   const [apiShifts, setApiShifts] = React.useState<APIShift[]>([])
   const [availableDomains, setAvailableDomains] = React.useState<DomainOption[]>([])
@@ -401,33 +359,28 @@ export default function MobileNavigationPreview() {
     if (activePage === 'users') void loadUserDirectory(directoryDomainId ?? undefined)
   }, [activePage])
 
-  React.useEffect(() => {
-    let cancelled = false
-    const loadPublishedSchedule = async () => {
-      setScheduleDataState('loading')
-      try {
-        const [scheduleResponse, domainsResponse] = await Promise.all([
-          fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
-          fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include', cache: 'no-store' }),
-        ])
-        if (!scheduleResponse.ok || !domainsResponse.ok) throw new Error('Published schedule could not be loaded.')
-        const [schedule, domains] = await Promise.all([scheduleResponse.json(), domainsResponse.json()])
-        if (cancelled) return
-        setApiShifts(Array.isArray(schedule) ? schedule : [])
-        setAvailableDomains(Array.isArray(domains) ? domains : [])
-        setScheduleDataState('live')
-        setScheduleDataMessage('')
-      } catch (error) {
-        if (cancelled) return
-        setApiShifts([])
-        setAvailableDomains([])
-        setScheduleDataState('demo')
-        setScheduleDataMessage(error instanceof Error ? error.message : 'Published schedule could not be loaded.')
-      }
+  const loadPublishedSchedule = React.useCallback(async () => {
+    setScheduleDataState('loading')
+    setScheduleDataMessage('')
+    try {
+      const [scheduleResponse, domainsResponse] = await Promise.all([
+        fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
+        fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include', cache: 'no-store' }),
+      ])
+      if (!scheduleResponse.ok || !domainsResponse.ok) throw new Error('Published schedule could not be loaded.')
+      const [schedule, domains] = await Promise.all([scheduleResponse.json(), domainsResponse.json()])
+      setApiShifts(Array.isArray(schedule) ? schedule : [])
+      setAvailableDomains(Array.isArray(domains) ? domains : [])
+      setScheduleDataState('live')
+    } catch (error) {
+      setApiShifts([])
+      setAvailableDomains([])
+      setScheduleDataState('error')
+      setScheduleDataMessage(error instanceof Error ? error.message : 'Published schedule could not be loaded.')
     }
-    void loadPublishedSchedule()
-    return () => { cancelled = true }
   }, [])
+
+  React.useEffect(() => { void loadPublishedSchedule() }, [loadPublishedSchedule])
 
   const selectPrimary = (page: PreviewPage) => {
     if (page === 'more') {
@@ -478,7 +431,7 @@ export default function MobileNavigationPreview() {
     }
   }
 
-  const effectiveDomains = scheduleDataState === 'live' ? availableDomains : demoDomains
+  const effectiveDomains = availableDomains
   const regions = Array.from(new Map(effectiveDomains.map((domain) => [domain.region, { id: domain.region, name: domain.region_name }])).values())
   const domainsForRegion = effectiveDomains.filter((domain) => domain.region === selectedRegionId)
 
@@ -586,16 +539,7 @@ export default function MobileNavigationPreview() {
     result[shift.date] = [...(result[shift.date] || []), previewShift]
     return result
   }, {})
-  const shiftsForDate = (date: Date) => {
-    if (scheduleDataState === 'live') return liveShiftsByDate[dateKey(date)] || []
-    const today = new Date()
-    return date.getFullYear() === today.getFullYear() && date.getMonth() === today.getMonth()
-      ? (sampleShiftsByDay[date.getDate()] || []).filter((shift) => {
-        const demoDomain = demoDomains.find((domain) => domain.name === shift.domain)
-        return !selectedDomainIds.length || (demoDomain && selectedDomainIds.includes(demoDomain.id))
-      })
-      : []
-  }
+  const shiftsForDate = (date: Date) => liveShiftsByDate[dateKey(date)] || []
   const datesWithMyShifts = listDates.filter((date) => shiftsForDate(date).some((shift) => shift.isMine))
   const visibleListDates = listScheduleScope === 'mine' ? datesWithMyShifts : listDates
   const todayStart = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate())
@@ -1610,10 +1554,10 @@ export default function MobileNavigationPreview() {
               </header>
 
               {scheduleDataState === 'loading' && <div className="mobile-data-notice">Loading published schedule…</div>}
-              {scheduleDataState === 'demo' && <div className="mobile-data-notice warning">Demo schedule shown · {scheduleDataMessage}</div>}
+              {scheduleDataState === 'error' && <div className="mobile-data-unavailable"><strong>Schedule unavailable</strong><span>{scheduleDataMessage}</span><button type="button" onClick={() => void loadPublishedSchedule()}>Retry</button></div>}
               {scheduleActionMessage && <div className="mobile-data-notice success">{scheduleActionMessage}<button type="button" onClick={() => setScheduleActionMessage('')} aria-label="Dismiss message">×</button></div>}
 
-              {display === 'month' ? (
+              {scheduleDataState === 'live' && (display === 'month' ? (
                 <section className="mobile-month-preview" aria-label={`${currentMonth} calendar preview`}>
                   <div className="mobile-shift-legend" aria-label="Shift colors">
                     <span><i className="own" />My shifts</span>{listScheduleScope === 'group' && <span><i className="other-status" />Available or open</span>}
@@ -1650,12 +1594,11 @@ export default function MobileNavigationPreview() {
                     const key = dateKey(date)
                     const currentMonthDate = date.getFullYear() === viewDate.getFullYear() && date.getMonth() === viewDate.getMonth()
                     const scheduledShifts = shiftsForDate(date)
-                    const allShifts = scheduledShifts.length || scheduleDataState === 'live' ? scheduledShifts : fallbackShifts.slice(0, date.getDate() % 3 === 0 ? 3 : 2)
-                    const shifts = listScheduleScope === 'mine' ? allShifts.filter((shift) => shift.isMine) : allShifts
+                    const shifts = listScheduleScope === 'mine' ? scheduledShifts.filter((shift) => shift.isMine) : scheduledShifts
                     return <div id={`mobile-list-day-${key}`} data-date={key} className={`mobile-list-day-anchor${currentMonthDate ? '' : ' adjacent-month'}`} key={key}><PreviewShiftList date={date} shifts={shifts} label={key === dateKey(new Date()) ? 'Today' : 'Schedule'} onSelect={openShift} currentUserName={currentUserName} /></div>
                   })}
                 </section>
-              )}
+              ))}
             </>
           ) : activePage === 'stats' ? (
             <section className="mobile-stats-page" aria-label="My Stats">
@@ -1666,7 +1609,7 @@ export default function MobileNavigationPreview() {
                   <label><span>Year</span><select aria-label="Stats year" value={statsYear} onChange={(event) => setStatsYear(Number(event.target.value))}>{statsYears.map((year) => <option value={year} key={year}>{year}</option>)}</select></label>
                 </div>
               </header>
-              {scheduleDataState === 'loading' ? <div className="mobile-stats-empty">Loading your statistics…</div> : scheduleDataState !== 'live' ? <div className="mobile-stats-empty">Your statistics could not be loaded.</div> : <>
+              {scheduleDataState === 'loading' ? <div className="mobile-stats-empty">Loading your statistics…</div> : scheduleDataState !== 'live' ? <div className="mobile-data-unavailable"><strong>Statistics unavailable</strong><span>{scheduleDataMessage}</span><button type="button" onClick={() => void loadPublishedSchedule()}>Retry</button></div> : <>
                 <div className="mobile-stats-summary">
                   <div><span>Total hours</span><strong>{displayHours(myStatsTotalHours)}</strong></div>
                   <div><span>Night hours</span><strong>{displayHours(myStatsNightHours)}</strong></div>
@@ -1900,7 +1843,7 @@ export default function MobileNavigationPreview() {
               <div className="mobile-account-summary"><strong>{user?.first_name} {user?.last_name}</strong><span>Signed in on this device</span></div>
               {user?.can_manage_schedules && <div className="mobile-more-view-choice"><span>Interface view</span><div className="mobile-testing-switch" role="group" aria-label="Interface view"><button type="button" className={!testUserView ? 'active' : ''} onClick={() => setTestUserView(false)}>Scheduler</button><button type="button" className={testUserView ? 'active' : ''} onClick={() => setTestUserView(true)}>User</button></div></div>}
               <button type="button" className="mobile-more-scope-action" onClick={openTradeRequests}><span><strong>Trade requests{actionableTradeCount ? ` (${actionableTradeCount})` : ''}</strong><small>{unseenTradeCount ? `${unseenTradeCount} new` : 'Review pickup and trade activity'}</small></span><b>›</b></button>
-              <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>
+              {scheduleDataState === 'live' && <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>}
               {signOutFeedback && <div className="mobile-workflow-message error">{signOutFeedback}</div>}
               <button type="button" className="mobile-more-action" disabled={isSigningOut} onClick={() => void signOut()}>{isSigningOut ? 'Signing out…' : 'Sign out'} <span>›</span></button>
             </section>
