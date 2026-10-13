@@ -15,7 +15,8 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain('shift-instances/${selectedShift.instanceId}/pickup/')
     expect(mobileSource).toContain("`${API_BASE}/shift-trades/`")
     expect(mobileSource).toContain('target_assignment_id: selectedShift.assignmentId')
-    expect(mobileSource).toContain('selectedShift.canPickUp === false')
+    expect(mobileSource).toContain('selectedShift.assignmentId == null && selectedShift.canPickUp === false')
+    expect(mobileSource).toContain("selectedShift.tone === 'open' && selectedShift.canPickUp === false")
   })
 
   it('supports explicit conflict confirmation and reloads published ownership', () => {

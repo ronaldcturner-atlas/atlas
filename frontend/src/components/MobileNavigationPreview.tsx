@@ -634,7 +634,7 @@ export default function MobileNavigationPreview() {
       setWorkflowMessage('Preview complete — this shift would now be assigned to you.')
       return
     }
-    if (selectedShift.canPickUp === false) {
+    if (selectedShift.assignmentId == null && selectedShift.canPickUp === false) {
       setPickupFeedback(selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.')
       return
     }
@@ -984,7 +984,7 @@ export default function MobileNavigationPreview() {
                   {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>}
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
                 </div>
-              ) : (selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open') && selectedShift.canPickUp === false ? (
+              ) : selectedShift.tone === 'open' && selectedShift.canPickUp === false ? (
                 <p className="mobile-shift-readonly">{selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.'}</p>
               ) : selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open' ? (
                 <div className="mobile-shift-actions"><strong>{selectedShift.tone === 'open' ? 'Open shift' : 'Available shift'}</strong><button type="button" onClick={() => showWorkflow('pickup')}>Pickup Shift <span>›</span></button></div>

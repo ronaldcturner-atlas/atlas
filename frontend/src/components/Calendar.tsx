@@ -1208,7 +1208,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                       <label>
                         Trade with
                         <select value={tradePartnerId} onChange={(event) => { setTradePartnerId(Number(event.target.value) || ''); setTradeTargetId('') }}>
-                          <option value="">Choose physician</option>
+                          <option value="">Choose user</option>
                           {tradePartners.map(([physicianId, physicianName]) => <option key={physicianId} value={physicianId}>{physicianName}</option>)}
                         </select>
                       </label>
