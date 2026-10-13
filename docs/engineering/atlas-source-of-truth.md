@@ -368,6 +368,31 @@ Creating a user or performing an Org Admin password reset issues a unique eight-
 
 An Org Admin may edit their own full managed profile, including Domain memberships, roles, and clinical activity, just as they may for another managed user. A non-managing user may update only their own permitted contact fields. Active status is changed only through the protected deactivation/reactivation workflow so Atlas cannot accidentally remove the last required administrator or discard historical identity.
 
+Production sessions use a rolling seven-day default lifetime, refreshed by authenticated activity (including reopening Atlas), unless deployment configuration explicitly overrides that duration. Closing the browser does not end the session by itself. Explicit sign-out invalidates only the current browser/device session and is available from both desktop and mobile navigation; a separate authenticated session on another device remains signed in. A password reset continues to invalidate all sessions for the affected account.
+
+## Mobile Direction
+
+Atlas's approved mobile direction is a responsive presentation of the existing application, not a separate native application. At viewport widths up to 820 pixels, or when Atlas is running in installed standalone display mode, authenticated users enter the responsive mobile surface automatically. The explicit `/mobile-preview` route remains available for direct access and testing. Larger desktop viewports retain the full desktop application. The mobile surface reads the authoritative published schedule and accessible Domain scope through the existing APIs; it does not define a separate mobile data model or separate scheduling policy.
+
+The approved mobile presentation is light and schedule-first. It uses compact List/Month and Group/My Schedule controls, a weekly navigator in List view, persistent device-local view selection, bottom navigation for user-facing destinations, and Region/Domain scope inside More. Administrative Schedule Block and build navigation remain desktop workflows and are not reproduced in the compact user-facing mobile navigation.
+
+The mobile Month calendar and weekly navigator deliberately use a simplified two-dot status language:
+
+- blue (`#1f65a6`) means the signed-in user is assigned to at least one shift on that date and remains blue regardless of posting or pending-trade state;
+- amber (`#fbbf24`) means at least one other shift is open, posted for pickup, or posted for trade;
+- a date shows no more than one blue dot and one amber dot;
+- ordinary group shifts do not create a dot.
+
+This mobile summary language does not replace the detailed shift rows or the desktop six-color legend. Mobile actions use the same authoritative permissions, eligibility rules, confirmation requirements, and workflows as desktop. The production-connected user workflows include direct pickup of an eligible open shift, pickup requests for another clinician's posted shift, creation/update/removal of the signed-in clinician's own pickup or trade-only posting, trade proposals and offers, the Trade Requests center and its permitted actions, and split/recombine. Posting supports the same optional comment and exact shift-start boundary.
+
+When the signed-in user has the applicable scheduler permissions and is using Scheduler view, the connected mobile workflows also include changing or swapping scheduled users, adjusting actual shift times, opening an assigned shift, and assigning an open shift. These actions use the shared permission-safe APIs and explicit conflict confirmations; mobile does not broaden scheduler authority. Mobile sign-out invalidates the authenticated session. **My Stats** provides a one-month-at-a-time month/year view of the signed-in clinician's published shift list, shift count, total hours, and night hours. Custom date ranges and Group Stats remain desktop-only. The mobile **Users** destination is a production-connected, Domain-scoped directory with search and permission-filtered user contact/profile details; it does not expose administrative user editing.
+
+Atlas is delivered as an installable Progressive Web App, not a separate native application. Its production manifest supplies Atlas home-screen icons and standalone launch behavior. Where the browser exposes a native install prompt, the mobile More menu offers **Install Atlas**; iPhone and iPad users receive Safari Share → Add to Home Screen guidance. Installation controls are hidden when Atlas is already running as an installed app.
+
+The mobile surface never substitutes demonstration schedule data when authoritative production data cannot be loaded. It presents an unavailable/error state with an explicit retry. While the device is offline, existing visible information is read-only and mutation, trade, and schedule actions are blocked. API responses are not treated as cached authoritative data. When an updated application build is available, Atlas presents an update notice and applies the waiting service worker only after the user explicitly chooses to update and reload.
+
+Other destinations or controls that have not been connected to an authoritative API remain preview-only. A visible mobile control is not evidence that its persistence or backend workflow is complete.
+
 ## What Atlas Explicitly Should Not Build
 
 Atlas should not build:
@@ -385,13 +410,13 @@ Atlas should not build:
 - allowing a stale Run to be previewed or published after an unacknowledged Shift Builder change;
 - a separate native mobile application before the existing application has been made responsive and mobile-friendly.
 
-Atlas does not need a user-facing Schedule Version tree or preserved Build-number branching for the current product workflow. Independent Runs, the current published schedule, and the virgin Original Published Schedule provide the required sources. Report builder/export and responsive mobile presentation remain future work and require separately settled behavior.
+Atlas does not need a user-facing Schedule Version tree or preserved Build-number branching for the current product workflow. Independent Runs, the current published schedule, and the virgin Original Published Schedule provide the required sources. Report builder/export remains unsettled future work. The approved responsive mobile surface is production-connected for the named schedule, trade, statistics, directory, and session workflows; completing the remaining responsive destinations and authoritative workflows remains future engineering work.
 
 ## Remaining Future Work and Guardrails
 
 - Every scheduling interface must continue to apply the selected Domain and its Domain Membership permissions consistently; this is a correctness invariant, not unfinished role functionality. Legacy profile labels and global groups are not substitutes.
 - Request Builder and scheduling policy require an active applicable Contract in the selected Domain. A missing Contract is a configuration state to communicate clearly, not permission to borrow policy from another Domain.
-- The responsive/mobile-friendly version of the existing application, including a mobile list/day experience, remains future work. A separate native application is not the first mobile direction.
+- Completing production integration for the remaining responsive/mobile destinations and workflows remains future work. A separate native application is not the first mobile direction.
 - General report builder/export behavior remains unsettled future work.
 
 Future work requires explicit product decisions. A missing configuration is not permission to infer policy.
