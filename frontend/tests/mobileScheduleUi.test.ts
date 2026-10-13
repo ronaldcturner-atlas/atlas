@@ -82,6 +82,14 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain("data.detail || 'Shift opened.'")
   })
 
+  it('assigns an open shift through the desktop shift-instance endpoint', () => {
+    expect(mobileSource).toContain("showWorkflow('assign')")
+    expect(mobileSource).toContain('shift-instances/${selectedShift.instanceId}/assign/')
+    expect(mobileSource).toContain('physician_id: assignUserId')
+    expect(mobileSource).toContain('setAssignRequiresForce(true)')
+    expect(mobileSource).toContain("data.detail || 'Open shift assigned.'")
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')

@@ -8,7 +8,7 @@ type PreviewPage = 'schedule' | 'stats' | 'users' | 'more'
 type ScheduleDisplay = 'list' | 'month'
 type ListScheduleScope = 'group' | 'mine'
 type ShiftTone = 'standard' | 'own' | 'available' | 'posted' | 'trade-sent' | 'trade-received' | 'open'
-type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'reassign' | 'times' | 'swap' | 'pickup' | 'offer'
+type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'reassign' | 'assign' | 'times' | 'swap' | 'pickup' | 'offer'
 
 const primaryItems: Array<{ id: PreviewPage; label: string; icon: string }> = [
   { id: 'schedule', label: 'Schedule', icon: '▦' },
@@ -218,6 +218,12 @@ export default function MobileNavigationPreview() {
   const [reassignRequiresForce, setReassignRequiresForce] = React.useState(false)
   const [isLoadingReassignUsers, setIsLoadingReassignUsers] = React.useState(false)
   const [isReassignSaving, setIsReassignSaving] = React.useState(false)
+  const [assignUserId, setAssignUserId] = React.useState<number | ''>('')
+  const [assignUsers, setAssignUsers] = React.useState<UnsplitUserOption[]>([])
+  const [assignFeedback, setAssignFeedback] = React.useState('')
+  const [assignRequiresForce, setAssignRequiresForce] = React.useState(false)
+  const [isLoadingAssignUsers, setIsLoadingAssignUsers] = React.useState(false)
+  const [isAssignSaving, setIsAssignSaving] = React.useState(false)
   const [actualStartTime, setActualStartTime] = React.useState('')
   const [actualEndTime, setActualEndTime] = React.useState('')
   const [timesFeedback, setTimesFeedback] = React.useState('')
@@ -533,6 +539,9 @@ export default function MobileNavigationPreview() {
     setReassignUserId('')
     setReassignFeedback('')
     setReassignRequiresForce(false)
+    setAssignUserId('')
+    setAssignFeedback('')
+    setAssignRequiresForce(false)
     setTimesFeedback('')
     setTimesRequireForce(false)
     setSwapTargetId('')
@@ -559,6 +568,9 @@ export default function MobileNavigationPreview() {
     setReassignUserId('')
     setReassignFeedback('')
     setReassignRequiresForce(false)
+    setAssignUserId('')
+    setAssignFeedback('')
+    setAssignRequiresForce(false)
     setTimesFeedback('')
     setTimesRequireForce(false)
     setSwapTargetId('')
@@ -581,6 +593,8 @@ export default function MobileNavigationPreview() {
     setUnsplitRequiresForce(false)
     setReassignFeedback('')
     setReassignRequiresForce(false)
+    setAssignFeedback('')
+    setAssignRequiresForce(false)
     setTimesFeedback('')
     setTimesRequireForce(false)
     setSwapFeedback('')
@@ -606,6 +620,10 @@ export default function MobileNavigationPreview() {
     if (workflow === 'reassign') {
       setReassignUserId('')
       setReassignUsers([])
+    }
+    if (workflow === 'assign') {
+      setAssignUserId('')
+      setAssignUsers([])
     }
     if (workflow === 'times' && selectedShift) {
       setActualStartTime(selectedShift.startTime?.slice(0, 5) || '')
@@ -645,6 +663,39 @@ export default function MobileNavigationPreview() {
         if (!cancelled) setReassignFeedback(error instanceof Error ? error.message : 'Unable to load users for this shift.')
       } finally {
         if (!cancelled) setIsLoadingReassignUsers(false)
+      }
+    }
+    void loadUsers()
+    return () => { cancelled = true }
+  }, [shiftWorkflow, selectedShift?.domainId, scheduleDataState])
+
+  React.useEffect(() => {
+    if (shiftWorkflow !== 'assign' || !selectedShift?.domainId) return
+    if (scheduleDataState !== 'live') {
+      setIsLoadingAssignUsers(false)
+      return
+    }
+    let cancelled = false
+    const loadUsers = async () => {
+      setIsLoadingAssignUsers(true)
+      setAssignFeedback('')
+      try {
+        const response = await fetch(`${API_BASE}/physicians/`, { credentials: 'include', cache: 'no-store' })
+        const data = await response.json().catch(() => [])
+        if (!response.ok || !Array.isArray(data)) throw new Error('Unable to load users for this shift.')
+        if (cancelled) return
+        setAssignUsers(data.filter((candidate: UnsplitUserOption) => (
+          candidate.active
+          && candidate.domain_memberships.some((membership) => (
+            membership.domain_id === selectedShift.domainId
+            && membership.active
+            && membership.clinically_active
+          ))
+        )))
+      } catch (error) {
+        if (!cancelled) setAssignFeedback(error instanceof Error ? error.message : 'Unable to load users for this shift.')
+      } finally {
+        if (!cancelled) setIsLoadingAssignUsers(false)
       }
     }
     void loadUsers()
@@ -1054,6 +1105,50 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const assignOpenShift = async () => {
+    if (!selectedShift || assignUserId === '' || isAssignSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would assign the open shift.')
+      return
+    }
+    if (selectedShift.instanceId == null) {
+      setAssignFeedback('This shift cannot be identified. Refresh the schedule and try again.')
+      return
+    }
+
+    setIsAssignSaving(true)
+    setAssignFeedback('')
+    try {
+      const body: Record<string, unknown> = { physician_id: assignUserId }
+      if (assignRequiresForce) body.force = true
+      const response = await fetch(`${API_BASE}/shift-instances/${selectedShift.instanceId}/assign/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setAssignRequiresForce(true)
+        setAssignFeedback(data.detail || 'This assignment creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to assign this open shift.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The shift was assigned, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(data.detail || 'Open shift assigned.')
+      closeShift()
+    } catch (error) {
+      setAssignFeedback(error instanceof Error ? error.message : 'Unable to assign this open shift.')
+    } finally {
+      setIsAssignSaving(false)
+    }
+  }
+
   const updateShiftTimes = async () => {
     if (!selectedShift || !actualStartTime || !actualEndTime || isTimesSaving) return
     if (scheduleDataState !== 'live') {
@@ -1366,7 +1461,7 @@ export default function MobileNavigationPreview() {
           <div className="mobile-sheet-backdrop" onClick={closeShift}>
             <section className="mobile-sheet mobile-shift-sheet" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
-              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'reassign' ? 'Change scheduled user' : shiftWorkflow === 'times' ? 'Adjust actual times' : shiftWorkflow === 'swap' ? 'Swap scheduled users' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
+              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'reassign' ? 'Change scheduled user' : shiftWorkflow === 'assign' ? 'Assign user' : shiftWorkflow === 'times' ? 'Adjust actual times' : shiftWorkflow === 'swap' ? 'Swap scheduled users' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
               {shiftWorkflow && <button type="button" className="mobile-workflow-back" onClick={() => { setShiftWorkflow(null); setWorkflowMessage('') }}>‹ Shift details</button>}
               <div className="mobile-shift-summary">
                 <div><span>Date &amp; time</span><strong>{selectedShift.date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {selectedShift.time}</strong></div>
@@ -1418,6 +1513,13 @@ export default function MobileNavigationPreview() {
                   <button type="button" className="mobile-workflow-primary" disabled={reassignUserId === '' || isLoadingReassignUsers || isReassignSaving} onClick={reassignShift}>{isReassignSaving ? 'Changing…' : reassignRequiresForce ? 'Confirm change anyway' : 'Change user'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
+              ) : shiftWorkflow === 'assign' ? (
+                <div className="mobile-workflow-form">
+                  <label className="field">Assign to<select value={assignUserId} disabled={isLoadingAssignUsers} onChange={(event) => { setAssignUserId(Number(event.target.value) || ''); setAssignRequiresForce(false); setAssignFeedback('') }}><option value="">{isLoadingAssignUsers ? 'Loading users…' : 'Choose user'}</option>{assignUsers.map((candidate) => <option value={candidate.id} key={candidate.id}>{candidate.display_name || `${candidate.first_name} ${candidate.last_name}`}</option>)}</select></label>
+                  {assignFeedback && <div className="mobile-workflow-message error">{assignFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={assignUserId === '' || isLoadingAssignUsers || isAssignSaving} onClick={assignOpenShift}>{isAssignSaving ? 'Assigning…' : assignRequiresForce ? 'Confirm assignment anyway' : 'Assign user'}</button>
+                  {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
+                </div>
               ) : shiftWorkflow === 'times' ? (
                 <div className="mobile-workflow-form">
                   <label className="field">Actual start time<input type="time" value={actualStartTime} onChange={(event) => { setActualStartTime(event.target.value); setTimesRequireForce(false); setTimesFeedback('') }} /></label>
@@ -1450,7 +1552,7 @@ export default function MobileNavigationPreview() {
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
               ) : user?.can_manage_schedules && !testUserView && selectedShift.tone === 'open' ? (
-                <div className="mobile-shift-actions"><strong>Manage open shift</strong><button type="button">Assign user <span>›</span></button></div>
+                <div className="mobile-shift-actions"><strong>Manage open shift</strong><button type="button" onClick={() => showWorkflow('assign')}>Assign user <span>›</span></button></div>
               ) : user?.can_manage_schedules && !testUserView ? (
                 <div className="mobile-shift-actions">
                   <strong>Manage this shift</strong>
