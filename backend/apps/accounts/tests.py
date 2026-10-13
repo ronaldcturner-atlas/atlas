@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.conf import settings
@@ -475,6 +476,76 @@ class AccountsTests(TestCase):
         self.assertIn(settings.SESSION_COOKIE_NAME, response.cookies)
         self.assertEqual(response.cookies[settings.SESSION_COOKIE_NAME]['max-age'], 0)
         self.assertEqual(self.client.get('/api/me/').status_code, 403)
+
+    @override_settings(
+        SESSION_COOKIE_AGE=604800,
+        SESSION_SAVE_EVERY_REQUEST=True,
+        SESSION_EXPIRE_AT_BROWSER_CLOSE=False,
+    )
+    def test_authenticated_activity_renews_seven_day_persistent_session(self):
+        user = get_user_model().objects.create_user(
+            username='rolling-session@example.com',
+            email='rolling-session@example.com',
+            password='atlas',
+        )
+        self.client.force_login(user)
+        session_key = self.client.session.session_key
+        initial_expiry = Session.objects.get(session_key=session_key).expire_date
+
+        response = self.client.get('/api/me/')
+
+        self.assertEqual(response.status_code, 200)
+        refreshed_expiry = Session.objects.get(session_key=session_key).expire_date
+        self.assertGreater(refreshed_expiry, initial_expiry)
+        session_cookie = response.cookies[settings.SESSION_COOKIE_NAME]
+        self.assertEqual(session_cookie['max-age'], 604800)
+        self.assertTrue(session_cookie['expires'])
+
+    @override_settings(
+        SESSION_COOKIE_AGE=4,
+        SESSION_SAVE_EVERY_REQUEST=True,
+        SESSION_EXPIRE_AT_BROWSER_CLOSE=False,
+    )
+    def test_inactive_session_expires_without_waiting_for_real_time(self):
+        user = get_user_model().objects.create_user(
+            username='expired-session@example.com',
+            email='expired-session@example.com',
+            password='atlas',
+        )
+        self.client.force_login(user)
+        session_key = self.client.session.session_key
+        Session.objects.filter(session_key=session_key).update(
+            expire_date=timezone.now() - timedelta(seconds=1),
+        )
+
+        response = self.client.get('/api/me/')
+
+        self.assertEqual(response.status_code, 403)
+        self.assertLess(
+            Session.objects.get(session_key=session_key).expire_date,
+            timezone.now(),
+        )
+
+    def test_logout_on_one_device_preserves_another_device_session(self):
+        user = get_user_model().objects.create_user(
+            username='independent-devices@example.com',
+            email='independent-devices@example.com',
+            password='atlas',
+        )
+        desktop_browser = Client()
+        mobile_browser = Client()
+        desktop_browser.force_login(user)
+        mobile_browser.force_login(user)
+        desktop_session_key = desktop_browser.session.session_key
+        mobile_session_key = mobile_browser.session.session_key
+        self.assertNotEqual(desktop_session_key, mobile_session_key)
+
+        response = desktop_browser.post('/api/logout/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Session.objects.filter(session_key=desktop_session_key).exists())
+        self.assertTrue(Session.objects.filter(session_key=mobile_session_key).exists())
+        self.assertEqual(mobile_browser.get('/api/me/').status_code, 200)
 
     def test_physician_profile_includes_current_contract_and_roles(self):
         manager = get_user_model().objects.create_user(
