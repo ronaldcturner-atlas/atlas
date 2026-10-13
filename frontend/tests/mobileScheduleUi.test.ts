@@ -25,6 +25,14 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain('Shift picked up and added to My schedule.')
   })
 
+  it('creates, updates, and removes an owned shift posting through the shared endpoint', () => {
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/posting/')
+    expect(mobileSource).toContain("savePosting(postingMode === 'pickup' ? 'PICKUP' : 'TRADE_ONLY')")
+    expect(mobileSource).toContain("savePosting('CLOSE')")
+    expect(mobileSource).toContain('comment: postComment')
+    expect(mobileSource).toContain('shiftHasStarted(selectedShift.startDateTime)')
+  })
+
   it('keeps selected-day priority highlights scoped to the month calendar', () => {
     expect(mobileSource).toContain('prioritizeCalendarShifts')
     expect(mobileStyles).toContain('.mobile-month-preview .mobile-day-schedule>button.calendar-own-highlight')

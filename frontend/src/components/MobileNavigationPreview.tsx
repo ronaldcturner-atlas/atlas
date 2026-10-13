@@ -1,6 +1,7 @@
 import React from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { API_BASE } from '../api'
+import { shiftHasStarted } from '../utils/regressionRules'
 import './MobileNavigationPreview.css'
 
 type PreviewPage = 'schedule' | 'stats' | 'users' | 'more'
@@ -181,6 +182,8 @@ export default function MobileNavigationPreview() {
   const [pickupFeedback, setPickupFeedback] = React.useState('')
   const [pickupRequiresForce, setPickupRequiresForce] = React.useState(false)
   const [isPickupSaving, setIsPickupSaving] = React.useState(false)
+  const [postingFeedback, setPostingFeedback] = React.useState('')
+  const [isPostingSaving, setIsPostingSaving] = React.useState(false)
   const [scheduleActionMessage, setScheduleActionMessage] = React.useState('')
   const [testUserView, setTestUserView] = React.useState(false)
   const [scheduleDataState, setScheduleDataState] = React.useState<'loading' | 'live' | 'demo'>('loading')
@@ -460,6 +463,7 @@ export default function MobileNavigationPreview() {
     setWorkflowMessage('')
     setPickupFeedback('')
     setPickupRequiresForce(false)
+    setPostingFeedback('')
     setTradeTarget('')
   }
   const closeShift = () => {
@@ -468,12 +472,18 @@ export default function MobileNavigationPreview() {
     setWorkflowMessage('')
     setPickupFeedback('')
     setPickupRequiresForce(false)
+    setPostingFeedback('')
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
     setWorkflowMessage('')
     setPickupFeedback('')
     setPickupRequiresForce(false)
+    setPostingFeedback('')
+    if (workflow === 'post' && selectedShift) {
+      setPostingMode(selectedShift.postingMode || 'pickup')
+      setPostComment(selectedShift.postingComment || '')
+    }
   }
 
   const confirmPickup = async () => {
@@ -533,6 +543,49 @@ export default function MobileNavigationPreview() {
       setIsPickupSaving(false)
     }
   }
+
+  const savePosting = async (mode: 'PICKUP' | 'TRADE_ONLY' | 'CLOSE') => {
+    if (!selectedShift || isPostingSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage(mode === 'CLOSE' ? 'Preview complete — this would remove the posting.' : 'Preview complete — this would post the shift.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setPostingFeedback('Only an assigned shift can be posted.')
+      return
+    }
+    if (selectedShift.startDateTime && shiftHasStarted(selectedShift.startDateTime)) {
+      setPostingFeedback('This shift has already started and can no longer be posted.')
+      return
+    }
+
+    setIsPostingSaving(true)
+    setPostingFeedback('')
+    try {
+      const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/posting/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, ...(mode === 'CLOSE' ? {} : { comment: postComment }) }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || 'Unable to update this shift posting.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The posting was updated, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(mode === 'CLOSE' ? 'Shift posting removed.' : mode === 'PICKUP' ? 'Shift posted for pickup.' : 'Shift posted for trade only.')
+      closeShift()
+    } catch (error) {
+      setPostingFeedback(error instanceof Error ? error.message : 'Unable to update this shift posting.')
+    } finally {
+      setIsPostingSaving(false)
+    }
+  }
+
+  const selectedShiftHasStarted = Boolean(selectedShift?.startDateTime && shiftHasStarted(selectedShift.startDateTime))
 
   return (
     <div className="mobile-preview-workbench">
@@ -620,12 +673,12 @@ export default function MobileNavigationPreview() {
           <div className="mobile-sheet-backdrop" onClick={closeShift}>
             <section className="mobile-sheet mobile-shift-sheet" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
-              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
+              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
               {shiftWorkflow && <button type="button" className="mobile-workflow-back" onClick={() => { setShiftWorkflow(null); setWorkflowMessage('') }}>‹ Shift details</button>}
               <div className="mobile-shift-summary">
                 <div><span>Date &amp; time</span><strong>{selectedShift.date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {selectedShift.time}</strong></div>
                 <div><span>Scheduled</span><strong>{selectedShift.physician} · {selectedShift.domain}</strong></div>
-                {!selectedShift.isMine && selectedShift.postingMode && <div><span>Availability</span><strong>{selectedShift.postingMode === 'pickup' ? 'Posted for pickup' : 'Trade only'}</strong></div>}
+                {selectedShift.postingMode && <div><span>Availability</span><strong>{selectedShift.postingMode === 'pickup' ? 'Posted for pickup' : 'Trade only'}</strong></div>}
                 {!selectedShift.isMine && selectedShift.tone === 'open' && <div><span>Status</span><strong>Open shift</strong></div>}
                 {selectedShift.postingComment && <div><span>Comment</span><strong>{selectedShift.postingComment}</strong></div>}
               </div>
@@ -634,8 +687,10 @@ export default function MobileNavigationPreview() {
                   <p>Choose how other clinicians may respond to this shift.</p>
                   <label><input type="radio" name="posting-mode" checked={postingMode === 'pickup'} onChange={() => setPostingMode('pickup')} /><span><strong>Available for pickup</strong><small>A clinician may request this shift without offering one back.</small></span></label>
                   <label><input type="radio" name="posting-mode" checked={postingMode === 'trade'} onChange={() => setPostingMode('trade')} /><span><strong>Trade only</strong><small>A clinician must offer one of their shifts in return.</small></span></label>
-                  <label className="field">Comment (optional)<textarea value={postComment} onChange={(event) => setPostComment(event.target.value)} placeholder="Add a note for other clinicians" /></label>
-                  <button type="button" className="mobile-workflow-primary" onClick={() => setWorkflowMessage('Preview complete — this would post the shift.')}>Post shift</button>
+                  <label className="field">Comment (optional)<textarea value={postComment} maxLength={1000} onChange={(event) => setPostComment(event.target.value)} placeholder="Add a note for other clinicians" /></label>
+                  {postingFeedback && <div className="mobile-workflow-message error">{postingFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={isPostingSaving} onClick={() => savePosting(postingMode === 'pickup' ? 'PICKUP' : 'TRADE_ONLY')}>{isPostingSaving ? 'Saving…' : selectedShift.postingMode ? 'Update posting' : 'Post shift'}</button>
+                  {selectedShift.postingMode && <button type="button" className="mobile-workflow-secondary caution" disabled={isPostingSaving} onClick={() => savePosting('CLOSE')}>Remove posting</button>}
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
               ) : shiftWorkflow === 'trade' ? (
@@ -681,7 +736,7 @@ export default function MobileNavigationPreview() {
               ) : selectedShift.isMine ? (
                 <div className="mobile-shift-actions">
                   <strong>Shift actions</strong>
-                  <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.tone === 'posted' ? 'Review posting' : 'Post this shift'} <span>›</span></button>
+                  {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.postingMode ? 'Review posting' : 'Post this shift'} <span>›</span></button>}
                   <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
                 </div>
