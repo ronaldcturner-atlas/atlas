@@ -17,6 +17,14 @@ const manifestSource = readFileSync(
   new URL('../public/manifest.webmanifest', import.meta.url),
   'utf8',
 )
+const mainSource = readFileSync(
+  new URL('../src/main.tsx', import.meta.url),
+  'utf8',
+)
+const serviceWorkerSource = readFileSync(
+  new URL('../public/sw.js', import.meta.url),
+  'utf8',
+)
 
 describe('mobile published schedule actions', () => {
   it('loads the responsive mobile application from the normal installed Atlas entry point', () => {
@@ -34,6 +42,30 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).not.toContain('fallbackShifts')
     expect(mobileSource).not.toContain('Demo schedule shown')
     expect(mobileStyles).toContain('.mobile-data-unavailable')
+  })
+
+  it('blocks mobile mutations offline and refreshes authoritative data after reconnecting', () => {
+    expect(mobileSource).toContain('navigator.onLine')
+    expect(mobileSource).toContain("window.addEventListener('online', handleOnline)")
+    expect(mobileSource).toContain("window.addEventListener('offline', handleOffline)")
+    expect(mobileSource).toContain('Reconnect to Atlas before changing this shift.')
+    expect(mobileSource).toContain('void loadPublishedSchedule()')
+    expect(mobileSource).toContain('void loadTradeRequests()')
+    expect(mobileStyles).toContain('.mobile-system-banner.offline')
+  })
+
+  it('offers controlled installed-app updates without caching API responses', () => {
+    expect(mainSource).toContain("new Event('atlas:pwa-update-available')")
+    expect(mainSource).toContain("register(`/sw.js?build=${encodeURIComponent(buildId || 'atlas')}`)")
+    expect(mobileSource).toContain("registration.waiting.postMessage({ type: 'SKIP_WAITING' })")
+    expect(serviceWorkerSource).toContain("if (event.data?.type === 'SKIP_WAITING') self.skipWaiting()")
+    expect(serviceWorkerSource).toContain("const CACHE_NAME = `atlas-app-shell-${BUILD_ID}`")
+    expect(serviceWorkerSource).toContain("url.pathname.startsWith('/api/')")
+    const installHandler = serviceWorkerSource.slice(
+      serviceWorkerSource.indexOf("self.addEventListener('install'"),
+      serviceWorkerSource.indexOf("self.addEventListener('message'"),
+    )
+    expect(installHandler).not.toContain('self.skipWaiting()')
   })
 
   it('uses the authoritative pickup workflows for open and posted shifts', () => {

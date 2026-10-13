@@ -1,9 +1,13 @@
-const CACHE_NAME = 'atlas-app-shell-v1'
+const BUILD_ID = new URL(self.location.href).searchParams.get('build') || 'atlas'
+const CACHE_NAME = `atlas-app-shell-${BUILD_ID}`
 const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icons/atlas-192.png', '/icons/atlas-512.png']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)))
-  self.skipWaiting()
+})
+
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'SKIP_WAITING') self.skipWaiting()
 })
 
 self.addEventListener('activate', (event) => {

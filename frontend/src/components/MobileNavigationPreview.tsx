@@ -279,6 +279,9 @@ export default function MobileNavigationPreview() {
   const [selectedDirectoryUser, setSelectedDirectoryUser] = React.useState<MobileDirectoryProfile | null>(null)
   const [isDirectoryLoading, setIsDirectoryLoading] = React.useState(false)
   const [directoryError, setDirectoryError] = React.useState('')
+  const [isOnline, setIsOnline] = React.useState(() => navigator.onLine)
+  const [pwaUpdateAvailable, setPwaUpdateAvailable] = React.useState(false)
+  const applyingPwaUpdateRef = React.useRef(false)
   const [viewDate, setViewDate] = React.useState(() => {
     const stored = window.localStorage.getItem('atlas.mobile-preview.month')
     const parsed = stored ? new Date(`${stored}-01T12:00:00`) : new Date()
@@ -382,6 +385,45 @@ export default function MobileNavigationPreview() {
 
   React.useEffect(() => { void loadPublishedSchedule() }, [loadPublishedSchedule])
 
+  React.useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true)
+      void loadPublishedSchedule()
+      void loadTradeRequests()
+      if (activePage === 'users') void loadUserDirectory(directoryDomainId ?? undefined)
+    }
+    const handleOffline = () => setIsOnline(false)
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [activePage, directoryDomainId, loadPublishedSchedule, loadTradeRequests, loadUserDirectory])
+
+  React.useEffect(() => {
+    const handleUpdate = () => setPwaUpdateAvailable(true)
+    const handleControllerChange = () => {
+      if (applyingPwaUpdateRef.current) window.location.reload()
+    }
+    window.addEventListener('atlas:pwa-update-available', handleUpdate)
+    navigator.serviceWorker?.addEventListener('controllerchange', handleControllerChange)
+    return () => {
+      window.removeEventListener('atlas:pwa-update-available', handleUpdate)
+      navigator.serviceWorker?.removeEventListener('controllerchange', handleControllerChange)
+    }
+  }, [])
+
+  const applyPwaUpdate = async () => {
+    const registration = await navigator.serviceWorker?.getRegistration()
+    if (!registration?.waiting) {
+      setPwaUpdateAvailable(false)
+      return
+    }
+    applyingPwaUpdateRef.current = true
+    registration.waiting.postMessage({ type: 'SKIP_WAITING' })
+  }
+
   const selectPrimary = (page: PreviewPage) => {
     if (page === 'more') {
       setShowMore(true)
@@ -397,6 +439,7 @@ export default function MobileNavigationPreview() {
     setShowMore(false)
     setShowTradeRequests(true)
     setTradeCenterFeedback('')
+    if (!isOnline) return
     void loadTradeRequests()
     void fetch(`${API_BASE}/shift-trades/mark-seen/`, {
       method: 'POST',
@@ -1537,6 +1580,8 @@ export default function MobileNavigationPreview() {
 
       <div className="mobile-preview-phone" aria-label="Atlas mobile schedule preview">
         <main ref={contentRef} className="mobile-preview-content">
+          {!isOnline && <div className="mobile-system-banner offline"><strong>Offline</strong><span>Reconnect to refresh Atlas or change a shift.</span></div>}
+          {pwaUpdateAvailable && <div className="mobile-system-banner update"><span>A new Atlas version is ready.</span><button type="button" onClick={() => void applyPwaUpdate()}>Update</button></div>}
           {activePage === 'schedule' ? (
             <>
               <header className="mobile-schedule-toolbar">
@@ -1665,7 +1710,9 @@ export default function MobileNavigationPreview() {
                 {!selectedShift.isMine && selectedShift.tone === 'open' && <div><span>Status</span><strong>Open shift</strong></div>}
                 {selectedShift.postingComment && <div><span>Comment</span><strong>{selectedShift.postingComment}</strong></div>}
               </div>
-              {shiftWorkflow === 'post' ? (
+              {!isOnline ? (
+                <p className="mobile-shift-readonly">Reconnect to Atlas before changing this shift.</p>
+              ) : shiftWorkflow === 'post' ? (
                 <div className="mobile-workflow-form">
                   <p>Choose how other clinicians may respond to this shift.</p>
                   <label><input type="radio" name="posting-mode" checked={postingMode === 'pickup'} onChange={() => setPostingMode('pickup')} /><span><strong>Available for pickup</strong><small>A clinician may request this shift without offering one back.</small></span></label>
@@ -1812,9 +1859,10 @@ export default function MobileNavigationPreview() {
             <section className="mobile-sheet mobile-trade-center" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
               <header><div><strong>Trade requests</strong><span>{actionableTradeCount ? `${actionableTradeCount} awaiting action` : 'No requests awaiting action'}</span></div><button type="button" onClick={() => setShowTradeRequests(false)} aria-label="Close trade requests">×</button></header>
+              {!isOnline && <div className="mobile-trade-empty">Reconnect to review or respond to trade requests.</div>}
               {tradeCenterFeedback && <div className="mobile-workflow-message error">{tradeCenterFeedback}</div>}
-              {isLoadingTradeRequests && <div className="mobile-trade-empty">Loading trade requests…</div>}
-              {!isLoadingTradeRequests && tradeRequests.map((trade) => {
+              {isOnline && isLoadingTradeRequests && <div className="mobile-trade-empty">Loading trade requests…</div>}
+              {isOnline && !isLoadingTradeRequests && tradeRequests.map((trade) => {
                 const confirmationAction = tradeActionConfirmation?.tradeId === trade.id ? tradeActionConfirmation.action : ''
                 return (
                   <article className={`mobile-trade-card${trade.is_unseen ? ' unseen' : ''}`} key={trade.id}>
@@ -1830,7 +1878,7 @@ export default function MobileNavigationPreview() {
                   </article>
                 )
               })}
-              {!isLoadingTradeRequests && !tradeRequests.length && <div className="mobile-trade-empty">No trade requests</div>}
+              {isOnline && !isLoadingTradeRequests && !tradeRequests.length && <div className="mobile-trade-empty">No trade requests</div>}
             </section>
           </div>
         )}
