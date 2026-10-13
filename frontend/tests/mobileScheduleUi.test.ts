@@ -109,6 +109,18 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).not.toContain("localStorage.removeItem('atlas.mobile-preview")
   })
 
+  it('shows only monthly personal statistics in the mobile Stats view', () => {
+    expect(mobileSource).toContain('<strong>My Stats</strong>')
+    expect(mobileSource).toContain('aria-label="Stats month"')
+    expect(mobileSource).toContain('aria-label="Stats year"')
+    expect(mobileSource).toContain('shift.physician === user?.physician_id')
+    expect(mobileSource).toContain('myStatsTotalHours')
+    expect(mobileSource).toContain('myStatsNightHours')
+    expect(mobileSource).not.toContain('Account settings')
+    expect(mobileSource).not.toContain('Group Stats')
+    expect(mobileStyles).toContain('.mobile-stats-page')
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')

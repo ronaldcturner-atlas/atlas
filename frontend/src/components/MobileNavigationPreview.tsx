@@ -60,6 +60,7 @@ type APIShift = {
   region: number
   region_name: string
   is_split: boolean
+  is_night: boolean
 }
 
 type DomainOption = { id: number; name: string; region: number; region_name: string; active: boolean }
@@ -130,6 +131,11 @@ const fallbackShifts: PreviewShift[] = [
   { facility: 'St Francis', time: '2p–11p', physician: 'Feingold', domain: 'APP' },
 ]
 
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+]
+
 function dateKey(value: Date) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`
 }
@@ -147,6 +153,21 @@ function formatClockValue(value: string) {
   const suffix = hours < 12 ? 'a' : 'p'
   const displayHour = hours % 12 || 12
   return `${displayHour}${minutes ? `:${String(minutes).padStart(2, '0')}` : ''}${suffix}`
+}
+
+function shiftHours(startTime: string, endTime: string) {
+  const clockMinutes = (value: string) => {
+    const [hours, minutes] = value.split(':').map(Number)
+    return hours * 60 + minutes
+  }
+  const start = clockMinutes(startTime)
+  let end = clockMinutes(endTime)
+  if (end <= start) end += 24 * 60
+  return (end - start) / 60
+}
+
+function displayHours(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1)
 }
 
 function PreviewShiftList({ date, shifts = fallbackShifts, label = 'Selected date', onSelect, currentUserName, prioritizeCalendarShifts = false }: { date: Date; shifts?: PreviewShift[]; label?: string; onSelect?: (shift: SelectedPreviewShift) => void; currentUserName?: string; prioritizeCalendarShifts?: boolean }) {
@@ -271,6 +292,9 @@ export default function MobileNavigationPreview() {
   const [tradeActionConfirmation, setTradeActionConfirmation] = React.useState<{ tradeId: number; action: string } | null>(null)
   const [isSigningOut, setIsSigningOut] = React.useState(false)
   const [signOutFeedback, setSignOutFeedback] = React.useState('')
+  const statsToday = new Date()
+  const [statsMonth, setStatsMonth] = React.useState(statsToday.getMonth())
+  const [statsYear, setStatsYear] = React.useState(statsToday.getFullYear())
   const [viewDate, setViewDate] = React.useState(() => {
     const stored = window.localStorage.getItem('atlas.mobile-preview.month')
     const parsed = stored ? new Date(`${stored}-01T12:00:00`) : new Date()
@@ -445,6 +469,22 @@ export default function MobileNavigationPreview() {
 
   const currentMonth = viewDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
   const currentUserName = [user?.first_name, user?.last_name].filter(Boolean).join(' ') || 'My account'
+  const statsYears = React.useMemo(() => {
+    const publishedYears = apiShifts.map((shift) => Number(shift.date.slice(0, 4))).filter(Number.isFinite)
+    const minimum = Math.min(statsToday.getFullYear() - 3, ...publishedYears)
+    const maximum = Math.max(statsToday.getFullYear() + 3, ...publishedYears)
+    return Array.from({ length: maximum - minimum + 1 }, (_, index) => minimum + index)
+  }, [apiShifts])
+  const myStatsShifts = apiShifts
+    .filter((shift) => (
+      shift.physician === user?.physician_id
+      && shift.status?.toUpperCase() !== 'OPEN'
+      && Number(shift.date.slice(0, 4)) === statsYear
+      && Number(shift.date.slice(5, 7)) === statsMonth + 1
+    ))
+    .sort((left, right) => left.date.localeCompare(right.date) || left.start_time.localeCompare(right.start_time))
+  const myStatsTotalHours = myStatsShifts.reduce((total, shift) => total + shiftHours(shift.start_time, shift.end_time), 0)
+  const myStatsNightHours = myStatsShifts.reduce((total, shift) => total + (shift.is_night ? shiftHours(shift.start_time, shift.end_time) : 0), 0)
   const monthStart = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1)
   const monthGridStart = new Date(monthStart.getFullYear(), monthStart.getMonth(), 1 - monthStart.getDay())
   const daysInMonth = new Date(viewDate.getFullYear(), viewDate.getMonth() + 1, 0).getDate()
@@ -1563,6 +1603,31 @@ export default function MobileNavigationPreview() {
                 </section>
               )}
             </>
+          ) : activePage === 'stats' ? (
+            <section className="mobile-stats-page" aria-label="My Stats">
+              <header className="mobile-stats-toolbar">
+                <strong>My Stats</strong>
+                <div>
+                  <label><span>Month</span><select aria-label="Stats month" value={statsMonth} onChange={(event) => setStatsMonth(Number(event.target.value))}>{MONTH_NAMES.map((month, index) => <option value={index} key={month}>{month}</option>)}</select></label>
+                  <label><span>Year</span><select aria-label="Stats year" value={statsYear} onChange={(event) => setStatsYear(Number(event.target.value))}>{statsYears.map((year) => <option value={year} key={year}>{year}</option>)}</select></label>
+                </div>
+              </header>
+              {scheduleDataState === 'loading' ? <div className="mobile-stats-empty">Loading your statistics…</div> : scheduleDataState !== 'live' ? <div className="mobile-stats-empty">Your statistics could not be loaded.</div> : <>
+                <div className="mobile-stats-summary">
+                  <div><span>Total hours</span><strong>{displayHours(myStatsTotalHours)}</strong></div>
+                  <div><span>Night hours</span><strong>{displayHours(myStatsNightHours)}</strong></div>
+                  <div><span>Shifts</span><strong>{myStatsShifts.length}</strong></div>
+                </div>
+                <div className="mobile-stats-list">
+                  {myStatsShifts.map((shift) => <article key={`${shift.shift_instance_id}-${shift.id ?? 'open'}`}>
+                    <time dateTime={shift.date}><strong>{new Date(`${shift.date}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</strong><span>{shift.domain_name}</span></time>
+                    <div><strong>{shift.facility_short_name || shift.facility_name}</strong><span>{formatClockValue(shift.start_time)}–{formatClockValue(shift.end_time)}</span></div>
+                    <b>{displayHours(shiftHours(shift.start_time, shift.end_time))}<small>hours</small></b>
+                  </article>)}
+                  {!myStatsShifts.length && <div className="mobile-stats-empty">No assigned shifts in {MONTH_NAMES[statsMonth]} {statsYear}.</div>}
+                </div>
+              </>}
+            </section>
           ) : (
             <section className="mobile-secondary-preview">
               <div>{primaryItems.find((item) => item.id === activePage)?.icon}</div>
@@ -1747,7 +1812,6 @@ export default function MobileNavigationPreview() {
               {user?.can_manage_schedules && <div className="mobile-more-view-choice"><span>Interface view</span><div className="mobile-testing-switch" role="group" aria-label="Interface view"><button type="button" className={!testUserView ? 'active' : ''} onClick={() => setTestUserView(false)}>Scheduler</button><button type="button" className={testUserView ? 'active' : ''} onClick={() => setTestUserView(true)}>User</button></div></div>}
               <button type="button" className="mobile-more-scope-action" onClick={openTradeRequests}><span><strong>Trade requests{actionableTradeCount ? ` (${actionableTradeCount})` : ''}</strong><small>{unseenTradeCount ? `${unseenTradeCount} new` : 'Review pickup and trade activity'}</small></span><b>›</b></button>
               <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>
-              <button type="button" className="mobile-more-action">Account settings <span>›</span></button>
               {signOutFeedback && <div className="mobile-workflow-message error">{signOutFeedback}</div>}
               <button type="button" className="mobile-more-action" disabled={isSigningOut} onClick={() => void signOut()}>{isSigningOut ? 'Signing out…' : 'Sign out'} <span>›</span></button>
             </section>
