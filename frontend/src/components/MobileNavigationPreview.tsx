@@ -65,6 +65,20 @@ type APIShift = {
 type DomainOption = { id: number; name: string; region: number; region_name: string; active: boolean }
 type TradeOfferOption = { id: number; date: string; facility: string; time: string }
 type TradeOption = TradeOfferOption & { physicianId: number; physicianName: string }
+type MobileTradeAssignment = { id: number; physician_name: string; date: string; facility: string; start_time: string; end_time: string }
+type MobileTradeRequest = {
+  id: number
+  trade_type: 'PICKUP' | 'TRADE'
+  status: string
+  status_display: string
+  note: string
+  offered_assignment: MobileTradeAssignment
+  requested_assignment: MobileTradeAssignment | null
+  can_accept: boolean
+  can_cancel: boolean
+  can_review: boolean
+  is_unseen: boolean
+}
 type UnsplitUserOption = {
   id: number
   display_name: string
@@ -184,6 +198,7 @@ export default function MobileNavigationPreview() {
   ))
   const [showMore, setShowMore] = React.useState(false)
   const [showScope, setShowScope] = React.useState(false)
+  const [showTradeRequests, setShowTradeRequests] = React.useState(false)
   const [selectedShift, setSelectedShift] = React.useState<SelectedPreviewShift | null>(null)
   const [shiftWorkflow, setShiftWorkflow] = React.useState<ShiftWorkflow | null>(null)
   const [postingMode, setPostingMode] = React.useState<'pickup' | 'trade'>('pickup')
@@ -249,6 +264,11 @@ export default function MobileNavigationPreview() {
   const [scheduleDataMessage, setScheduleDataMessage] = React.useState('')
   const [apiShifts, setApiShifts] = React.useState<APIShift[]>([])
   const [availableDomains, setAvailableDomains] = React.useState<DomainOption[]>([])
+  const [tradeRequests, setTradeRequests] = React.useState<MobileTradeRequest[]>([])
+  const [isLoadingTradeRequests, setIsLoadingTradeRequests] = React.useState(false)
+  const [tradeCenterFeedback, setTradeCenterFeedback] = React.useState('')
+  const [tradeActionSaving, setTradeActionSaving] = React.useState('')
+  const [tradeActionConfirmation, setTradeActionConfirmation] = React.useState<{ tradeId: number; action: string } | null>(null)
   const [viewDate, setViewDate] = React.useState(() => {
     const stored = window.localStorage.getItem('atlas.mobile-preview.month')
     const parsed = stored ? new Date(`${stored}-01T12:00:00`) : new Date()
@@ -292,6 +312,22 @@ export default function MobileNavigationPreview() {
   React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.domain-ids', JSON.stringify(selectedDomainIds)), [selectedDomainIds])
   React.useEffect(() => window.localStorage.setItem('atlas.mobile-preview.day', String(selectedDay)), [selectedDay])
 
+  const loadTradeRequests = React.useCallback(async () => {
+    setIsLoadingTradeRequests(true)
+    try {
+      const response = await fetch(`${API_BASE}/shift-trades/`, { credentials: 'include', cache: 'no-store' })
+      const data = await response.json().catch(() => [])
+      if (!response.ok || !Array.isArray(data)) throw new Error('Trade requests could not be loaded.')
+      setTradeRequests(data)
+    } catch (error) {
+      setTradeCenterFeedback(error instanceof Error ? error.message : 'Trade requests could not be loaded.')
+    } finally {
+      setIsLoadingTradeRequests(false)
+    }
+  }, [])
+
+  React.useEffect(() => { void loadTradeRequests() }, [loadTradeRequests])
+
   React.useEffect(() => {
     let cancelled = false
     const loadPublishedSchedule = async () => {
@@ -329,6 +365,21 @@ export default function MobileNavigationPreview() {
     setActivePage(page)
     setShowMore(false)
     setShowScope(false)
+  }
+
+  const openTradeRequests = () => {
+    setShowMore(false)
+    setShowTradeRequests(true)
+    setTradeCenterFeedback('')
+    void loadTradeRequests()
+    void fetch(`${API_BASE}/shift-trades/mark-seen/`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }).then((response) => {
+      if (response.ok) setTradeRequests((current) => current.map((trade) => ({ ...trade, is_unseen: false })))
+    })
   }
 
   const effectiveDomains = scheduleDataState === 'live' ? availableDomains : demoDomains
@@ -1370,10 +1421,50 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const runTradeAction = async (tradeId: number, action: 'accept' | 'decline' | 'approve' | 'reject' | 'cancel') => {
+    const actionKey = `${tradeId}:${action}`
+    if (tradeActionSaving) return
+    setTradeActionSaving(actionKey)
+    setTradeCenterFeedback('')
+    try {
+      const force = tradeActionConfirmation?.tradeId === tradeId && tradeActionConfirmation.action === action
+      const response = await fetch(`${API_BASE}/shift-trades/${tradeId}/${action}/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(force ? { force: true } : {}),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_confirmation && !data.requires_physician_selection) {
+        setTradeActionConfirmation({ tradeId, action })
+        setTradeCenterFeedback(data.detail || 'This action creates a scheduling conflict. Confirm again to continue.')
+        return
+      }
+      if (!response.ok) throw new Error(data.detail || 'Unable to update this trade request.')
+
+      const [scheduleResponse] = await Promise.all([
+        fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
+        loadTradeRequests(),
+      ])
+      if (!scheduleResponse.ok) throw new Error('The request was updated, but the schedule could not be reloaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setTradeActionConfirmation(null)
+      setScheduleActionMessage(data.detail || 'Trade request updated.')
+    } catch (error) {
+      setTradeCenterFeedback(error instanceof Error ? error.message : 'Unable to update this trade request.')
+    } finally {
+      setTradeActionSaving('')
+    }
+  }
+
   const selectedShiftHasStarted = Boolean(selectedShift?.startDateTime && shiftHasStarted(selectedShift.startDateTime))
   const tradePartners = Array.from(new Map(tradeOptions.map((option) => [option.physicianId, option.physicianName])).entries())
     .sort((left, right) => left[1].localeCompare(right[1]))
   const selectedPartnerTradeOptions = tradePartner === '' ? [] : tradeOptions.filter((option) => option.physicianId === tradePartner)
+  const unseenTradeCount = tradeRequests.filter((trade) => trade.is_unseen).length
+  const actionableTradeCount = tradeRequests.filter((trade) => trade.can_accept || trade.can_cancel || trade.can_review).length
 
   return (
     <div className="mobile-preview-workbench">
@@ -1595,6 +1686,34 @@ export default function MobileNavigationPreview() {
           </div>
         )}
 
+        {showTradeRequests && (
+          <div className="mobile-sheet-backdrop" onClick={() => setShowTradeRequests(false)}>
+            <section className="mobile-sheet mobile-trade-center" onClick={(event) => event.stopPropagation()}>
+              <div className="mobile-sheet-handle" />
+              <header><div><strong>Trade requests</strong><span>{actionableTradeCount ? `${actionableTradeCount} awaiting action` : 'No requests awaiting action'}</span></div><button type="button" onClick={() => setShowTradeRequests(false)} aria-label="Close trade requests">×</button></header>
+              {tradeCenterFeedback && <div className="mobile-workflow-message error">{tradeCenterFeedback}</div>}
+              {isLoadingTradeRequests && <div className="mobile-trade-empty">Loading trade requests…</div>}
+              {!isLoadingTradeRequests && tradeRequests.map((trade) => {
+                const confirmationAction = tradeActionConfirmation?.tradeId === trade.id ? tradeActionConfirmation.action : ''
+                return (
+                  <article className={`mobile-trade-card${trade.is_unseen ? ' unseen' : ''}`} key={trade.id}>
+                    <header><strong>{trade.trade_type === 'PICKUP' ? 'Pickup' : 'Trade'}</strong><span>{trade.status_display}</span></header>
+                    <div><span>{trade.offered_assignment.date} · {trade.offered_assignment.facility}</span><strong>{trade.offered_assignment.physician_name}</strong></div>
+                    {trade.requested_assignment && <div><span>For {trade.requested_assignment.date} · {trade.requested_assignment.facility}</span><strong>{trade.requested_assignment.physician_name}</strong></div>}
+                    {trade.note && <p>{trade.note}</p>}
+                    {(trade.can_accept || trade.can_cancel || trade.can_review) && <footer>
+                      {trade.can_accept && <><button type="button" disabled={Boolean(tradeActionSaving)} onClick={() => runTradeAction(trade.id, 'accept')}>{tradeActionSaving === `${trade.id}:accept` ? 'Accepting…' : 'Accept'}</button><button type="button" className="secondary" disabled={Boolean(tradeActionSaving)} onClick={() => runTradeAction(trade.id, 'decline')}>{tradeActionSaving === `${trade.id}:decline` ? 'Declining…' : 'Decline'}</button></>}
+                      {trade.can_review && <><button type="button" disabled={Boolean(tradeActionSaving)} onClick={() => runTradeAction(trade.id, 'approve')}>{tradeActionSaving === `${trade.id}:approve` ? 'Approving…' : confirmationAction === 'approve' ? 'Confirm approval' : 'Approve'}</button><button type="button" className="secondary" disabled={Boolean(tradeActionSaving)} onClick={() => runTradeAction(trade.id, 'reject')}>{tradeActionSaving === `${trade.id}:reject` ? 'Rejecting…' : 'Reject'}</button></>}
+                      {trade.can_cancel && <button type="button" className="secondary" disabled={Boolean(tradeActionSaving)} onClick={() => runTradeAction(trade.id, 'cancel')}>{tradeActionSaving === `${trade.id}:cancel` ? 'Cancelling…' : 'Cancel request'}</button>}
+                    </footer>}
+                  </article>
+                )
+              })}
+              {!isLoadingTradeRequests && !tradeRequests.length && <div className="mobile-trade-empty">No trade requests</div>}
+            </section>
+          </div>
+        )}
+
         {showMore && (
           <div className="mobile-sheet-backdrop" onClick={() => setShowMore(false)}>
             <section className="mobile-sheet mobile-more-sheet" onClick={(event) => event.stopPropagation()}>
@@ -1602,6 +1721,7 @@ export default function MobileNavigationPreview() {
               <header><strong>More</strong><button type="button" onClick={() => setShowMore(false)} aria-label="Close More menu">×</button></header>
               <div className="mobile-account-summary"><strong>{user?.first_name} {user?.last_name}</strong><span>Signed in on this device</span></div>
               {user?.can_manage_schedules && <div className="mobile-more-view-choice"><span>Interface view</span><div className="mobile-testing-switch" role="group" aria-label="Interface view"><button type="button" className={!testUserView ? 'active' : ''} onClick={() => setTestUserView(false)}>Scheduler</button><button type="button" className={testUserView ? 'active' : ''} onClick={() => setTestUserView(true)}>User</button></div></div>}
+              <button type="button" className="mobile-more-scope-action" onClick={openTradeRequests}><span><strong>Trade requests{actionableTradeCount ? ` (${actionableTradeCount})` : ''}</strong><small>{unseenTradeCount ? `${unseenTradeCount} new` : 'Review pickup and trade activity'}</small></span><b>›</b></button>
               <button type="button" className="mobile-more-scope-action" onClick={() => { setShowMore(false); setShowScope(true) }}><span><strong>Schedule scope</strong><small>{regions.find((region) => region.id === selectedRegionId)?.name.replace(' Emergency Physicians', '') || 'Region'} · {selectedDomainIds.length === domainsForRegion.length ? 'All domains' : domainsForRegion.filter((domain) => selectedDomainIds.includes(domain.id)).map((domain) => domain.name).join(', ')}</small></span><b>›</b></button>
               <button type="button" className="mobile-more-action">Account settings <span>›</span></button>
               <button type="button" className="mobile-more-action">Sign out <span>›</span></button>
@@ -1611,7 +1731,7 @@ export default function MobileNavigationPreview() {
 
         <nav className="mobile-bottom-nav" aria-label="Primary mobile navigation">
           {primaryItems.map((item) => (
-            <button type="button" key={item.id} className={(item.id === activePage && !showMore) || (item.id === 'more' && showMore) ? 'active' : ''} aria-current={item.id === activePage && !showMore ? 'page' : undefined} onClick={() => selectPrimary(item.id)}><span aria-hidden="true">{item.icon}</span>{item.label}</button>
+            <button type="button" key={item.id} className={`${(item.id === activePage && !showMore) || (item.id === 'more' && showMore) ? 'active' : ''}${item.id === 'more' && unseenTradeCount ? ' has-attention' : ''}`} aria-current={item.id === activePage && !showMore ? 'page' : undefined} onClick={() => selectPrimary(item.id)}><span aria-hidden="true">{item.icon}</span>{item.label}</button>
           ))}
         </nav>
       </div>

@@ -90,6 +90,17 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain("data.detail || 'Open shift assigned.'")
   })
 
+  it('manages trade requests using backend action flags and endpoints', () => {
+    expect(mobileSource).toContain("fetch(`${API_BASE}/shift-trades/`, { credentials: 'include', cache: 'no-store' })")
+    expect(mobileSource).toContain('shift-trades/mark-seen/')
+    expect(mobileSource).toContain('shift-trades/${tradeId}/${action}/')
+    expect(mobileSource).toContain('trade.can_accept')
+    expect(mobileSource).toContain('trade.can_cancel')
+    expect(mobileSource).toContain('trade.can_review')
+    expect(mobileSource).toContain('setTradeActionConfirmation({ tradeId, action })')
+    expect(mobileStyles).toContain('.mobile-trade-card')
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')
