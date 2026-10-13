@@ -34,6 +34,22 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain('shiftHasStarted(selectedShift.startDateTime)')
   })
 
+  it('splits an owned shift through the same published-assignment endpoint as desktop', () => {
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/split/')
+    expect(mobileSource).toContain('split_time: splitTime')
+    expect(mobileSource).toContain("data.detail || 'Shift split successfully.'")
+    expect(mobileSource).not.toContain('Preview complete — this would split the shift.</button>')
+  })
+
+  it('supports scheduler split and backend-directed unsplit workflows', () => {
+    expect(mobileSource).toContain("onClick={() => showWorkflow('split')}")
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/unsplit/')
+    expect(mobileSource).toContain('data.requires_physician_selection')
+    expect(mobileSource).toContain('data.requires_confirmation')
+    expect(mobileSource).toContain('body.physician_id = unsplitUserId')
+    expect(mobileSource).toContain('body.force = true')
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')

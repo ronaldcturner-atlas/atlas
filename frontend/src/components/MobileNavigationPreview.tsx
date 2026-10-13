@@ -8,7 +8,7 @@ type PreviewPage = 'schedule' | 'stats' | 'users' | 'more'
 type ScheduleDisplay = 'list' | 'month'
 type ListScheduleScope = 'group' | 'mine'
 type ShiftTone = 'standard' | 'own' | 'available' | 'posted' | 'trade-sent' | 'trade-received' | 'open'
-type ShiftWorkflow = 'post' | 'trade' | 'split' | 'pickup' | 'offer'
+type ShiftWorkflow = 'post' | 'trade' | 'split' | 'unsplit' | 'pickup' | 'offer'
 
 const primaryItems: Array<{ id: PreviewPage; label: string; icon: string }> = [
   { id: 'schedule', label: 'Schedule', icon: '▦' },
@@ -29,6 +29,9 @@ type PreviewShift = {
   instanceId?: number
   physicianId?: number | null
   startDateTime?: string
+  startTime?: string
+  endTime?: string
+  isSplit?: boolean
   canPickUp?: boolean
   pickupIneligibilityReason?: string
   postingComment?: string
@@ -56,11 +59,20 @@ type APIShift = {
   domain_name: string
   region: number
   region_name: string
+  is_split: boolean
 }
 
 type DomainOption = { id: number; name: string; region: number; region_name: string; active: boolean }
 type TradeOfferOption = { id: number; date: string; facility: string; time: string }
 type TradeOption = TradeOfferOption & { physicianId: number; physicianName: string }
+type UnsplitUserOption = {
+  id: number
+  display_name: string
+  first_name: string
+  last_name: string
+  active: boolean
+  domain_memberships: Array<{ domain_id: number; active: boolean; clinically_active: boolean }>
+}
 
 const demoDomains: DomainOption[] = [
   { id: -1, name: 'Physician', region: -1, region_name: 'Lowcountry Emergency Physicians', active: true },
@@ -191,7 +203,15 @@ export default function MobileNavigationPreview() {
   const [tradeOfferFeedback, setTradeOfferFeedback] = React.useState('')
   const [tradeOfferRequiresForce, setTradeOfferRequiresForce] = React.useState(false)
   const [isTradeOfferSaving, setIsTradeOfferSaving] = React.useState(false)
-  const [splitTime, setSplitTime] = React.useState('10:30')
+  const [splitTime, setSplitTime] = React.useState('12:00')
+  const [splitFeedback, setSplitFeedback] = React.useState('')
+  const [isSplitSaving, setIsSplitSaving] = React.useState(false)
+  const [unsplitFeedback, setUnsplitFeedback] = React.useState('')
+  const [unsplitRequiresForce, setUnsplitRequiresForce] = React.useState(false)
+  const [unsplitRequiresUser, setUnsplitRequiresUser] = React.useState(false)
+  const [unsplitUserId, setUnsplitUserId] = React.useState<number | ''>('')
+  const [unsplitUsers, setUnsplitUsers] = React.useState<UnsplitUserOption[]>([])
+  const [isUnsplitSaving, setIsUnsplitSaving] = React.useState(false)
   const [workflowMessage, setWorkflowMessage] = React.useState('')
   const [pickupFeedback, setPickupFeedback] = React.useState('')
   const [pickupRequiresForce, setPickupRequiresForce] = React.useState(false)
@@ -361,6 +381,9 @@ export default function MobileNavigationPreview() {
       instanceId: shift.shift_instance_id,
       physicianId: shift.physician,
       startDateTime: shift.start_datetime,
+      startTime: shift.start_time,
+      endTime: shift.end_time,
+      isSplit: shift.is_split,
       canPickUp: shift.can_pick_up,
       pickupIneligibilityReason: shift.pickup_ineligibility_reason,
       postingComment: shift.posting_comment,
@@ -483,6 +506,11 @@ export default function MobileNavigationPreview() {
     setTradeFeedback('')
     setTradeRequiresForce(false)
     setTradeTarget('')
+    setSplitFeedback('')
+    setUnsplitFeedback('')
+    setUnsplitRequiresForce(false)
+    setUnsplitRequiresUser(false)
+    setUnsplitUserId('')
   }
   const closeShift = () => {
     setSelectedShift(null)
@@ -495,6 +523,11 @@ export default function MobileNavigationPreview() {
     setTradeOfferRequiresForce(false)
     setTradeFeedback('')
     setTradeRequiresForce(false)
+    setSplitFeedback('')
+    setUnsplitFeedback('')
+    setUnsplitRequiresForce(false)
+    setUnsplitRequiresUser(false)
+    setUnsplitUserId('')
   }
   const showWorkflow = (workflow: ShiftWorkflow) => {
     setShiftWorkflow(workflow)
@@ -506,6 +539,9 @@ export default function MobileNavigationPreview() {
     setTradeOfferRequiresForce(false)
     setTradeFeedback('')
     setTradeRequiresForce(false)
+    setSplitFeedback('')
+    setUnsplitFeedback('')
+    setUnsplitRequiresForce(false)
     if (workflow === 'post' && selectedShift) {
       setPostingMode(selectedShift.postingMode || 'pickup')
       setPostComment(selectedShift.postingComment || '')
@@ -523,6 +559,7 @@ export default function MobileNavigationPreview() {
       setTradeOptions([])
       setIsLoadingTradeOptions(true)
     }
+    if (workflow === 'split') setSplitTime('12:00')
   }
 
   React.useEffect(() => {
@@ -727,6 +764,120 @@ export default function MobileNavigationPreview() {
     }
   }
 
+  const splitShift = async () => {
+    if (!selectedShift || !splitTime || isSplitSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would split the shift.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setSplitFeedback('Only an assigned shift can be split.')
+      return
+    }
+
+    setIsSplitSaving(true)
+    setSplitFeedback('')
+    try {
+      const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/split/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ split_time: splitTime }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.detail || 'Unable to split this shift.')
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The shift was split, but the updated schedule could not be loaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(data.detail || 'Shift split successfully.')
+      closeShift()
+    } catch (error) {
+      setSplitFeedback(error instanceof Error ? error.message : 'Unable to split this shift.')
+    } finally {
+      setIsSplitSaving(false)
+    }
+  }
+
+  const loadUnsplitUsers = async () => {
+    if (!selectedShift?.domainId) return
+    try {
+      const response = await fetch(`${API_BASE}/physicians/`, { credentials: 'include', cache: 'no-store' })
+      const data = await response.json().catch(() => [])
+      if (!response.ok || !Array.isArray(data)) throw new Error('Unable to load users for this shift.')
+      setUnsplitUsers(data.filter((candidate: UnsplitUserOption) => (
+        candidate.active
+        && candidate.domain_memberships.some((membership) => (
+          membership.domain_id === selectedShift.domainId
+          && membership.active
+          && membership.clinically_active
+        ))
+      )))
+    } catch (error) {
+      setUnsplitFeedback(error instanceof Error ? error.message : 'Unable to load users for this shift.')
+    }
+  }
+
+  const unsplitShift = async () => {
+    if (!selectedShift || isUnsplitSaving) return
+    if (scheduleDataState !== 'live') {
+      setWorkflowMessage('Preview complete — this would recombine the split shift.')
+      return
+    }
+    if (selectedShift.assignmentId == null) {
+      setShiftWorkflow('unsplit')
+      setUnsplitFeedback('Only an assigned split shift can be recombined.')
+      return
+    }
+
+    setIsUnsplitSaving(true)
+    setUnsplitFeedback('')
+    try {
+      const body: Record<string, unknown> = {}
+      if (unsplitUserId !== '') body.physician_id = unsplitUserId
+      if (unsplitRequiresForce) body.force = true
+      const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/unsplit/`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (response.status === 409 && data.requires_physician_selection) {
+        setShiftWorkflow('unsplit')
+        setUnsplitRequiresUser(true)
+        setUnsplitRequiresForce(false)
+        setUnsplitFeedback(data.detail || 'Choose the user who should receive the recombined shift.')
+        await loadUnsplitUsers()
+        return
+      }
+      if (response.status === 409 && data.requires_confirmation) {
+        setShiftWorkflow('unsplit')
+        setUnsplitRequiresForce(true)
+        setUnsplitFeedback(data.detail || 'Confirm that you want to recombine this shift.')
+        return
+      }
+      if (!response.ok) {
+        setShiftWorkflow('unsplit')
+        throw new Error(data.detail || 'Unable to recombine this shift.')
+      }
+
+      const scheduleResponse = await fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' })
+      if (!scheduleResponse.ok) throw new Error('The shift was recombined, but the updated schedule could not be loaded.')
+      const refreshedSchedule = await scheduleResponse.json()
+      setApiShifts(Array.isArray(refreshedSchedule) ? refreshedSchedule : [])
+      setScheduleDataState('live')
+      setScheduleActionMessage(data.detail || 'Shift recombined successfully.')
+      closeShift()
+    } catch (error) {
+      setUnsplitFeedback(error instanceof Error ? error.message : 'Unable to recombine this shift.')
+    } finally {
+      setIsUnsplitSaving(false)
+    }
+  }
+
   const submitTradeOffer = async () => {
     if (!selectedShift || tradeOfferAssignmentId === '' || isTradeOfferSaving) return
     if (scheduleDataState !== 'live') {
@@ -914,7 +1065,7 @@ export default function MobileNavigationPreview() {
           <div className="mobile-sheet-backdrop" onClick={closeShift}>
             <section className="mobile-sheet mobile-shift-sheet" onClick={(event) => event.stopPropagation()}>
               <div className="mobile-sheet-handle" />
-              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
+              <header><div><span>{shiftWorkflow ? 'Shift workflow' : 'Published shift'}</span><strong>{shiftWorkflow === 'post' ? selectedShift.postingMode ? 'Update this posting' : 'Post this shift' : shiftWorkflow === 'trade' ? 'Propose a trade' : shiftWorkflow === 'split' ? 'Split shift' : shiftWorkflow === 'unsplit' ? 'Unsplit shift' : shiftWorkflow === 'pickup' ? 'Pickup shift' : shiftWorkflow === 'offer' ? 'Offer a trade' : selectedShift.facility}</strong></div><button type="button" onClick={closeShift} aria-label="Close shift details">×</button></header>
               {shiftWorkflow && <button type="button" className="mobile-workflow-back" onClick={() => { setShiftWorkflow(null); setWorkflowMessage('') }}>‹ Shift details</button>}
               <div className="mobile-shift-summary">
                 <div><span>Date &amp; time</span><strong>{selectedShift.date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · {selectedShift.time}</strong></div>
@@ -946,8 +1097,17 @@ export default function MobileNavigationPreview() {
               ) : shiftWorkflow === 'split' ? (
                 <div className="mobile-workflow-form">
                   <label className="field">Split at<input type="time" value={splitTime} onChange={(event) => setSplitTime(event.target.value)} /></label>
-                  <div className="mobile-split-preview"><span>Resulting portions</span><strong>6a–{splitTime || '—'} · {splitTime || '—'}–3p</strong></div>
-                  <button type="button" className="mobile-workflow-primary" disabled={!splitTime} onClick={() => setWorkflowMessage('Preview complete — this would split the shift.')}>Split shift</button>
+                  <div className="mobile-split-preview"><span>Resulting portions</span><strong>{selectedShift.startTime ? formatClockValue(selectedShift.startTime) : selectedShift.time.split('–')[0]}–{splitTime ? formatClockValue(splitTime) : '—'} · {splitTime ? formatClockValue(splitTime) : '—'}–{selectedShift.endTime ? formatClockValue(selectedShift.endTime) : selectedShift.time.split('–')[1]}</strong></div>
+                  {splitFeedback && <div className="mobile-workflow-message error">{splitFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={!splitTime || isSplitSaving} onClick={splitShift}>{isSplitSaving ? 'Splitting…' : 'Split shift'}</button>
+                  {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
+                </div>
+              ) : shiftWorkflow === 'unsplit' ? (
+                <div className="mobile-workflow-form">
+                  <p>Recombine the portions into the original complete shift.</p>
+                  {unsplitRequiresUser && <label className="field">User for recombined shift<select value={unsplitUserId} onChange={(event) => { setUnsplitUserId(Number(event.target.value) || ''); setUnsplitRequiresForce(false); setUnsplitFeedback('') }}><option value="">Choose user</option>{unsplitUsers.map((candidate) => <option value={candidate.id} key={candidate.id}>{candidate.display_name || `${candidate.first_name} ${candidate.last_name}`}</option>)}</select></label>}
+                  {unsplitFeedback && <div className="mobile-workflow-message error">{unsplitFeedback}</div>}
+                  <button type="button" className="mobile-workflow-primary" disabled={isUnsplitSaving || (unsplitRequiresUser && unsplitUserId === '')} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : unsplitRequiresForce ? 'Confirm unsplit shift' : 'Unsplit shift'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
               ) : shiftWorkflow === 'pickup' ? (
@@ -974,7 +1134,8 @@ export default function MobileNavigationPreview() {
                   <button type="button">Change scheduled user <span>›</span></button>
                   <button type="button">Adjust actual times <span>›</span></button>
                   <button type="button">Swap scheduled users <span>›</span></button>
-                  <button type="button">Split shift <span>›</span></button>
+                  <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
+                  {selectedShift.isSplit && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
                   <button type="button" className="caution">Open shift <span>›</span></button>
                 </div>
               ) : selectedShift.isMine ? (
@@ -983,6 +1144,7 @@ export default function MobileNavigationPreview() {
                   {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.postingMode ? 'Review posting' : 'Post this shift'} <span>›</span></button>}
                   {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>}
                   <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
+                  {selectedShift.isSplit && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
                 </div>
               ) : selectedShift.tone === 'open' && selectedShift.canPickUp === false ? (
                 <p className="mobile-shift-readonly">{selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.'}</p>
