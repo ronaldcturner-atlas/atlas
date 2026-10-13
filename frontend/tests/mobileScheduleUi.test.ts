@@ -58,6 +58,15 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain("data.detail || 'Scheduled user changed.'")
   })
 
+  it('adjusts actual times through the desktop shift-instance endpoint', () => {
+    expect(mobileSource).toContain("showWorkflow('times')")
+    expect(mobileSource).toContain('shift-instances/${selectedShift.instanceId}/times/')
+    expect(mobileSource).toContain("method: 'PATCH'")
+    expect(mobileSource).toContain('start_time: actualStartTime, end_time: actualEndTime')
+    expect(mobileSource).toContain('setTimesRequireForce(true)')
+    expect(mobileSource).toContain("data.detail || 'Actual shift times updated.'")
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')
