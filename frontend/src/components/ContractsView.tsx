@@ -1115,23 +1115,25 @@ export default function ContractsView() {
                 </select>
               </label>
 
-              <label className="facility-field physician-active-field">
-                <span>Active</span>
-                <input
-                  type="checkbox"
-                  checked={formState.active}
-                  onChange={(event) => setFormState((current) => ({ ...current, active: event.target.checked }))}
-                />
-              </label>
+              <div className="contract-header-toggles">
+                <label className="contract-toggle-field">
+                  <span>Active</span>
+                  <input
+                    type="checkbox"
+                    checked={formState.active}
+                    onChange={(event) => setFormState((current) => ({ ...current, active: event.target.checked }))}
+                  />
+                </label>
 
-              <label className="facility-field physician-active-field">
-                <span>Manual assignment only</span>
-                <input
-                  type="checkbox"
-                  checked={formState.manual_assignment_only}
-                  onChange={(event) => setFormState((current) => ({ ...current, manual_assignment_only: event.target.checked }))}
-                />
-              </label>
+                <label className="contract-toggle-field">
+                  <span>Manual assignment only</span>
+                  <input
+                    type="checkbox"
+                    checked={formState.manual_assignment_only}
+                    onChange={(event) => setFormState((current) => ({ ...current, manual_assignment_only: event.target.checked }))}
+                  />
+                </label>
+              </div>
             </div>
 
             {formState.manual_assignment_only && (
@@ -1205,19 +1207,47 @@ export default function ContractsView() {
                   <button type="button" className="primary-action" onClick={() => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: [...current.workload_settings.period_rules, makeMinMaxRule('MONTH')] } }))}>Add Workload Period Rule</button>
 
                   <h3>Additional Workload Rules</h3>
-                  <div className="contract-input-grid">
-                    <label className="facility-field"><span>Minimum time off between shifts (hours)</span><input type="number" value={formState.workload_settings.min_time_off_hours} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_hours: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Time off penalty weight</span><input type="number" value={formState.workload_settings.min_time_off_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_penalty_weight: event.target.value } }))} /></label>
-                    <label className="inline-checkbox-field"><span>Circadian rhythm enabled</span><input type="checkbox" checked={formState.workload_settings.circadian_enabled} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_enabled: event.target.checked } }))} /></label>
-                    <label className="facility-field"><span>Circadian penalty</span><input type="number" value={formState.workload_settings.circadian_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Min days in a row</span><input type="number" value={formState.workload_settings.min_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_days_in_row: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Min days in a row penalty</span><input type="number" value={formState.workload_settings.min_days_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_days_in_row_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Max days in a row</span><input type="number" value={formState.workload_settings.max_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_days_in_row: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Max days in a row penalty</span><input type="number" value={formState.workload_settings.max_days_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_days_in_row_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Min same shifts in a row</span><input type="number" value={formState.workload_settings.min_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_same_shifts_in_row: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Min same shifts in a row penalty</span><input type="number" value={formState.workload_settings.min_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Max same shifts in a row</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Max same shifts in a row penalty</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
+                  <div className="contract-additional-workload-grid">
+                    <div className="contract-additional-workload-card">
+                      <div className="contract-minmax-title">Time off between shifts</div>
+                      <div className="contract-value-penalty-row">
+                        <label className="facility-field"><span>Minimum hours</span><input type="number" value={formState.workload_settings.min_time_off_hours} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_hours: event.target.value } }))} /></label>
+                        <label className="facility-field"><span>Penalty weight</span><input type="number" value={formState.workload_settings.min_time_off_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_penalty_weight: event.target.value } }))} /></label>
+                      </div>
+                    </div>
+                    <div className="contract-additional-workload-card">
+                      <div className="contract-minmax-title">Circadian rhythm</div>
+                      <div className="contract-value-penalty-row">
+                        <label className="contract-toggle-field contract-workload-toggle"><span>Enabled</span><input type="checkbox" checked={formState.workload_settings.circadian_enabled} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_enabled: event.target.checked } }))} /></label>
+                        <label className="facility-field"><span>Penalty weight</span><input type="number" value={formState.workload_settings.circadian_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_penalty_weight: event.target.value } }))} /></label>
+                      </div>
+                    </div>
+                    <div className="contract-additional-workload-card">
+                      <div className="contract-minmax-title">Days in a row</div>
+                      <div className="contract-value-penalty-columns">
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum</span><input type="number" value={formState.workload_settings.min_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_days_in_row: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_days_in_row: event.target.value } }))} /></label>
+                        </div>
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum penalty</span><input type="number" value={formState.workload_settings.min_days_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_days_in_row_penalty_weight: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_days_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_days_in_row_penalty_weight: event.target.value } }))} /></label>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="contract-additional-workload-card">
+                      <div className="contract-minmax-title">Same shifts in a row</div>
+                      <div className="contract-value-penalty-columns">
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum</span><input type="number" value={formState.workload_settings.min_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_same_shifts_in_row: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row: event.target.value } }))} /></label>
+                        </div>
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum penalty</span><input type="number" value={formState.workload_settings.min_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}

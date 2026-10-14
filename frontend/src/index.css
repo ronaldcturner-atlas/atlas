@@ -651,9 +651,17 @@ select option:checked{
 .sidebar + .main-area .contract-modal-overlay{left:250px}
 .sidebar.sidebar-collapsed + .main-area .contract-modal-overlay{left:76px}
 .contract-header-grid{display:grid;grid-template-columns:2fr 1.5fr 0.8fr;gap:12px;margin-bottom:14px}
+.contract-header-toggles{grid-column:1/-1;display:flex;align-items:center;gap:28px;min-height:36px}
+.contract-toggle-field{display:inline-flex;align-items:center;justify-content:flex-start;gap:8px;width:max-content;color:var(--muted);font-size:13px;cursor:pointer}
+.contract-toggle-field input[type="checkbox"]{width:18px;height:18px;margin:0;padding:0;flex:0 0 auto;cursor:pointer}
 .contract-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
 .contract-section-stack{display:grid;gap:12px}
 .contract-input-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;align-items:end}
+.contract-additional-workload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.contract-additional-workload-card{display:grid;gap:10px;min-width:0;padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.02)}
+.contract-value-penalty-row,.contract-value-penalty-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end}
+.contract-minmax-stack{display:grid;gap:10px;min-width:0}
+.contract-workload-toggle{align-self:end;min-height:36px}
 .contract-rule-grid{display:grid;gap:10px}
 .contract-rule-row{display:grid;gap:12px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02);align-items:end}
 .contract-rule-row .facility-field,.contract-rule-row .inline-checkbox-field{min-width:0}
@@ -693,11 +701,14 @@ select option:checked{
 
 @media (max-width: 900px){
   .contract-header-grid{grid-template-columns:1fr}
+  .contract-additional-workload-grid{grid-template-columns:1fr}
   .contract-priority-grid{grid-template-columns:repeat(2,minmax(150px,1fr))}
   .contract-minmax-columns{grid-template-columns:1fr}
 }
 
 @media (max-width: 650px){
+  .contract-header-toggles{align-items:flex-start;flex-direction:column;gap:10px}
+  .contract-value-penalty-row,.contract-value-penalty-columns{grid-template-columns:1fr}
   .contract-priority-grid{grid-template-columns:1fr}
 }
 
