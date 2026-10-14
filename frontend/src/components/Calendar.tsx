@@ -234,6 +234,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const [postingComment, setPostingComment] = useState('')
   const [pickupConfirmation, setPickupConfirmation] = useState<'POSTED' | 'OPEN' | null>(null)
   const [tradeOptions, setTradeOptions] = useState<TradeOption[]>([])
+  const [adminSwapOptions, setAdminSwapOptions] = useState<TradeOption[]>([])
   const [tradePartnerId, setTradePartnerId] = useState<number | ''>('')
   const [tradeTargetId, setTradeTargetId] = useState<number | ''>('')
   const [tradeNote, setTradeNote] = useState('')
@@ -441,6 +442,28 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     ?? exactNamePhysician?.id
     ?? (lastNameMatches.length === 1 ? lastNameMatches[0].id : null)
   const canManage = !forceUserView && Boolean(user?.can_manage_schedules)
+  const selectedShiftPermissions = new Set(
+    user?.domain_access.find((access) => (
+      access.active && access.domain_id === selectedShift?.domainId
+    ))?.permissions ?? [],
+  )
+  const hasSelectedShiftPermission = (permission: string) => Boolean(
+    user?.is_org_admin || selectedShiftPermissions.has(permission)
+  )
+  const selectedShiftIsMine = selectedShift?.physicianId === myPhysicianId
+  const canPostSelectedShift = Boolean(selectedShift && (
+    (selectedShiftIsMine && hasSelectedShiftPermission('post_own_shifts'))
+    || hasSelectedShiftPermission('manage_any_shift_posting')
+  ))
+  const canSplitSelectedShift = Boolean(selectedShift && (
+    (selectedShiftIsMine && hasSelectedShiftPermission('split_own_shift'))
+    || hasSelectedShiftPermission('split_any_published_shift')
+  ))
+  const canProposeSelectedTrade = Boolean(
+    selectedShiftIsMine && hasSelectedShiftPermission('propose_trade')
+  )
+  const canManagePublishedAssignment = hasSelectedShiftPermission('manage_published_assignments')
+  const canModifyAnyShiftTimes = hasSelectedShiftPermission('modify_any_published_shift_times')
 
   useEffect(() => {
     setTradeOptions([])
@@ -453,7 +476,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     setPickupConfirmation(null)
     if (
       !selectedShift?.assignmentId
-      || (selectedShift.physicianId !== myPhysicianId && !canManage)
+      || selectedShift.physicianId !== myPhysicianId
       || shiftHasStarted(selectedShift.startDateTime)
     ) return
     fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include' })
@@ -463,7 +486,23 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         setTradeOptions(data)
       })
       .catch((error) => setLoadError(error instanceof Error ? error.message : 'Unable to load trade options.'))
-  }, [selectedShift?.assignmentId, selectedShift?.physicianId, selectedShift?.startDateTime, myPhysicianId, canManage])
+  }, [selectedShift?.assignmentId, selectedShift?.physicianId, selectedShift?.startDateTime, myPhysicianId])
+
+  useEffect(() => {
+    setAdminSwapOptions([])
+    if (
+      !selectedShift?.assignmentId
+      || !canManagePublishedAssignment
+      || shiftHasStarted(selectedShift.startDateTime)
+    ) return
+    fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/?purpose=scheduler_swap`, { credentials: 'include' })
+      .then(async (response) => {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.detail ?? 'Unable to load swap options.')
+        setAdminSwapOptions(data)
+      })
+      .catch((error) => setLoadError(error instanceof Error ? error.message : 'Unable to load swap options.'))
+  }, [selectedShift?.assignmentId, selectedShift?.startDateTime, canManagePublishedAssignment])
 
   const selectedPhysicianSet = new Set(selectedPhysicianIds)
   const isGroupSchedule = !showAvailableShifts && selectedPhysicianIds.length === 0
@@ -1174,25 +1213,25 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
             </div>
             <div className="shift-modal-body">
               <div className="detail-row"><span>Facility</span><span>{selectedShift.facility}</span></div>
-              <div className="detail-row"><span>Physician</span><span>{selectedShift.physician_name}</span></div>
+              <div className="detail-row"><span>User</span><span>{selectedShift.physician_name}</span></div>
               <div className="detail-row"><span>Role</span><span>{selectedShift.role}</span></div>
               <div className="detail-row"><span>Date</span><span>{selectedShift.date}</span></div>
               <div className="detail-row"><span>Time</span><span>{selectedShift.shift}</span></div>
               {selectedShiftHasStarted && <div className="detail-row"><span>Trade status</span><span>Shift has started</span></div>}
               {selectedShift.postingMode && <div className="detail-row"><span>Posted</span><span>{selectedShift.postingMode === 'PICKUP' ? 'Available for pickup' : 'Trade only'}</span></div>}
               {selectedShift.postingComment && <div className="detail-row"><span>Posting comment</span><span>{selectedShift.postingComment}</span></div>}
-              {selectedShift.assignmentId != null && (selectedShift.physicianId === myPhysicianId || canManage) && (
+              {selectedShift.assignmentId != null && (canPostSelectedShift || canSplitSelectedShift || canProposeSelectedTrade) && (
                 <div className="schedule-shift-actions">
-                  {!selectedShiftHasStarted && <div className="shift-post-controls">
+                  {!selectedShiftHasStarted && canPostSelectedShift && <div className="shift-post-controls">
                     <strong>Post this shift</strong>
                     <label><input type="radio" checked={tradeOnlyPosting} onClick={() => setTradeOnlyPosting((current) => !current)} readOnly /> Trade only</label>
                     <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/posting/`, { mode: tradeOnlyPosting ? 'TRADE_ONLY' : 'PICKUP', comment: postingComment })}>Post</button>
                     {selectedShift.postingMode && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/posting/`, { mode: 'CLOSE' })}>Remove posting</button>}
                     <label className="shift-post-comment">Comment (optional)<textarea maxLength={1000} value={postingComment} onChange={(event) => setPostingComment(event.target.value)} placeholder="Add a note for other clinicians" /></label>
                   </div>}
-                  <strong>Split shift</strong>
-                  <div><input type="time" value={splitTime} onChange={(event) => setSplitTime(event.target.value)} /><button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/split/`, { split_time: splitTime })}>Split</button></div>
-                  {selectedShift.isSplit && canManage && (
+                  {canSplitSelectedShift && <><strong>Split shift</strong>
+                  <div><input type="time" value={splitTime} onChange={(event) => setSplitTime(event.target.value)} /><button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/split/`, { split_time: splitTime })}>Split</button></div></>}
+                  {selectedShift.isSplit && hasSelectedShiftPermission('split_any_published_shift') && (
                     <label>
                       Recombined shift user if portions differ
                       <select value={unsplitPhysicianId} onChange={(event) => setUnsplitPhysicianId(Number(event.target.value) || '')}>
@@ -1201,8 +1240,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                       </select>
                     </label>
                   )}
-                  {selectedShift.isSplit && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/unsplit/`, { physician_id: unsplitPhysicianId || null })}>Unsplit shift</button>}
-                  {selectedShift.physicianId === myPhysicianId && !selectedShiftHasStarted && (
+                  {selectedShift.isSplit && canSplitSelectedShift && <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/unsplit/`, { physician_id: unsplitPhysicianId || null })}>Unsplit shift</button>}
+                  {canProposeSelectedTrade && !selectedShiftHasStarted && (
                     <div className="propose-trade-controls">
                       <strong>Propose a trade</strong>
                       <label>
@@ -1255,24 +1294,24 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                   )}
                 </div>
               )}
-              {selectedShift.assignmentId != null && canManage && (
+              {selectedShift.assignmentId != null && (canManagePublishedAssignment || canModifyAnyShiftTimes) && (
                 <div className="schedule-shift-actions">
-                  <strong>Actual shift times</strong>
+                  {canModifyAnyShiftTimes && <><strong>Actual shift times</strong>
                   <div className="actual-shift-time-controls">
                     <label>Start<input type="time" value={actualStartTime} onChange={(event) => setActualStartTime(event.target.value)} /></label>
                     <label>End<input type="time" value={actualEndTime} onChange={(event) => setActualEndTime(event.target.value)} /></label>
                     <button disabled={isMutating || !actualStartTime || !actualEndTime} onClick={() => mutate(`shift-instances/${selectedShift.instanceId}/times/`, { start_time: actualStartTime, end_time: actualEndTime }, 'PATCH')}>Update times</button>
-                  </div>
-                  <strong>Change scheduled user</strong>
+                  </div></>}
+                  {canManagePublishedAssignment && <><strong>Change scheduled user</strong>
                   <select value={reassignPhysicianId} onChange={(event) => setReassignPhysicianId(Number(event.target.value) || '')}>
-                    <option value="">Choose physician</option>
+                    <option value="">Choose user</option>
                     {assignablePhysicians.map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
                   </select>
                   <button disabled={isMutating || !reassignPhysicianId} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/reassign/`, { physician_id: reassignPhysicianId })}>Change user</button>
                   <strong>Swap scheduled users</strong>
                   <select value={adminSwapAssignmentId} onChange={(event) => setAdminSwapAssignmentId(Number(event.target.value) || '')}>
                     <option value="">Choose another user&apos;s shift</option>
-                    {tradeOptions.map((option) => (
+                    {adminSwapOptions.map((option) => (
                       <option key={option.id} value={option.id}>
                         {option.physician_name} · {option.date} · {option.facility} · {formatClockValue(option.start_time)}-{formatClockValue(option.end_time)}
                       </option>
@@ -1280,14 +1319,14 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                   </select>
                   <button disabled={isMutating || !adminSwapAssignmentId} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/swap/`, { target_assignment_id: adminSwapAssignmentId })}>Swap users</button>
                   <strong>Open shift</strong>
-                  <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/open/`, {})}>Open shift</button>
+                  <button disabled={isMutating} onClick={() => mutate(`schedule-assignments/${selectedShift.assignmentId}/open/`, {})}>Open shift</button></>}
                 </div>
               )}
-              {selectedShift.assignmentId == null && selectedShift.status.toLowerCase() === 'open' && canManage && (
+              {selectedShift.assignmentId == null && selectedShift.status.toLowerCase() === 'open' && canManagePublishedAssignment && (
                 <div className="schedule-shift-actions">
                   <strong>Fill open shift</strong>
                   <select value={openShiftPhysicianId} onChange={(event) => setOpenShiftPhysicianId(Number(event.target.value) || '')}>
-                    <option value="">Choose physician</option>
+                    <option value="">Choose user</option>
                     {assignablePhysicians.map((physician) => <option key={physician.id} value={physician.id}>{physician.display_name}</option>)}
                   </select>
                   <button disabled={isMutating || !openShiftPhysicianId} onClick={() => mutate(`shift-instances/${selectedShift.instanceId}/assign/`, { physician_id: openShiftPhysicianId })}>Assign user</button>
