@@ -2131,54 +2131,68 @@ def _trade_options_for_assignment(offered, allow_conflicts=False):
     proposer = offered.physician
     run = offered.optimizer_run
     block = offered.shift_instance.schedule_block
-    cohort = ScheduleShiftAssignment.objects.filter(
+    cohort = list(ScheduleShiftAssignment.objects.filter(
         shift_instance__schedule_block=block,
         shift_instance__start_datetime__gt=timezone.now(),
         optimizer_run=run,
         physician__active=True,
-    )
-    cohort_rows = list(cohort.order_by(
+    ).select_related(
+        'physician__user', 'shift_instance__facility',
+        'shift_instance__shift_template', 'shift_instance__schedule_version__domain',
+    ).order_by(
         'physician__display_name', 'shift_instance__date',
         'shift_instance__facility__sort_order', 'shift_instance__start_datetime', 'id',
-    ).values(
-        'id', 'physician_id', 'physician__display_name',
-        'physician__user__first_name', 'physician__user__last_name', 'physician__user__username',
-        'shift_instance__date', 'shift_instance__facility_id', 'shift_instance__facility__short_name',
-        'shift_instance__segment_start_time', 'shift_instance__segment_end_time',
-        'shift_instance__shift_template__start_time', 'shift_instance__shift_template__end_time',
     ))
-    proposer_work_dates = {
-        row['shift_instance__date'] for row in cohort_rows if row['physician_id'] == proposer.id
+    relevant_physician_ids = {proposer.id} | {
+        assignment.physician_id for assignment in cohort
     }
-    physician_dates = {}
-    for row in cohort_rows:
-        physician_dates.setdefault(row['physician_id'], set()).add(row['shift_instance__date'])
+    assignment_rows = list(ScheduleShiftAssignment.objects.filter(
+        shift_instance__schedule_block=block,
+        optimizer_run=run,
+        physician_id__in=relevant_physician_ids,
+    ).values(
+        'id', 'physician_id',
+        'shift_instance__start_datetime', 'shift_instance__end_datetime',
+    ))
+    domain = offered.shift_instance.schedule_version.domain
+    clinical_activity = {
+        proposer.id: _physician_is_active_in_domain(proposer, domain),
+    }
     options = []
-    for target in cohort_rows:
-        if target['physician_id'] == proposer.id:
+    for target in cohort:
+        if target.physician_id == proposer.id:
             continue
-        target_date = target['shift_instance__date']
-        if not allow_conflicts and target_date in proposer_work_dates:
-            continue
-        if (
-            not allow_conflicts
-            and offered.shift_instance.date
-            in physician_dates.get(target['physician_id'], set())
-        ):
-            continue
-        start_time = target['shift_instance__segment_start_time'] or target['shift_instance__shift_template__start_time']
-        end_time = target['shift_instance__segment_end_time'] or target['shift_instance__shift_template__end_time']
-        physician_name = target['physician__display_name'] or ' '.join(
+        if not allow_conflicts:
+            if target.physician_id not in clinical_activity:
+                clinical_activity[target.physician_id] = (
+                    _physician_is_active_in_domain(target.physician, domain)
+                )
+            excluded_ids = [offered.id, target.id]
+            proposer_valid, _reason = _trade_assignment_is_valid(
+                proposer, target, excluded_ids, assignment_rows=assignment_rows,
+                clinically_active=clinical_activity[proposer.id],
+            )
+            recipient_valid, _reason = _trade_assignment_is_valid(
+                target.physician, offered, excluded_ids,
+                assignment_rows=assignment_rows,
+                clinically_active=clinical_activity[target.physician_id],
+            )
+            if not proposer_valid or not recipient_valid:
+                continue
+        instance = target.shift_instance
+        start_time = instance.segment_start_time or instance.shift_template.start_time
+        end_time = instance.segment_end_time or instance.shift_template.end_time
+        physician_name = target.physician.display_name or ' '.join(
             part for part in (
-                target['physician__user__first_name'], target['physician__user__last_name'],
+                target.physician.user.first_name, target.physician.user.last_name,
             ) if part
-        ) or target['physician__user__username']
+        ) or target.physician.user.username
         options.append({
-            'id': target['id'],
-            'physician_id': target['physician_id'],
+            'id': target.id,
+            'physician_id': target.physician_id,
             'physician_name': physician_name,
-            'date': target_date.isoformat(),
-            'facility': target['shift_instance__facility__short_name'],
+            'date': instance.date.isoformat(),
+            'facility': instance.facility.short_name,
             'start_time': start_time.isoformat(),
             'end_time': end_time.isoformat(),
         })
@@ -2330,20 +2344,35 @@ def schedule_assignment_swap(request, assignment_id):
     return Response({'detail': 'Scheduled users swapped.'})
 
 
-def _trade_assignment_is_valid(physician, assignment, excluded_ids):
+def _trade_assignment_is_valid(
+    physician, assignment, excluded_ids, assignment_rows=None,
+    clinically_active=None,
+):
     instance = assignment.shift_instance
     if not physician.active:
         return False, f'{physician} is not an active physician.'
     domain = instance.schedule_version.domain
-    if not _physician_is_active_in_domain(physician, domain):
+    if clinically_active is None:
+        clinically_active = _physician_is_active_in_domain(physician, domain)
+    if not clinically_active:
         return False, f'{physician} is not clinically active in {domain.name}.'
-    overlap = ScheduleShiftAssignment.objects.filter(
-        physician=physician,
-        optimizer_run=assignment.optimizer_run,
-        shift_instance__schedule_block=instance.schedule_block,
-        shift_instance__start_datetime__lt=instance.end_datetime,
-        shift_instance__end_datetime__gt=instance.start_datetime,
-    ).exclude(id__in=excluded_ids).exists()
+    if assignment_rows is None:
+        overlap = ScheduleShiftAssignment.objects.filter(
+            physician=physician,
+            optimizer_run=assignment.optimizer_run,
+            shift_instance__schedule_block=instance.schedule_block,
+            shift_instance__start_datetime__lt=instance.end_datetime,
+            shift_instance__end_datetime__gt=instance.start_datetime,
+        ).exclude(id__in=excluded_ids).exists()
+    else:
+        excluded_id_set = set(excluded_ids)
+        overlap = any(
+            row['physician_id'] == physician.id
+            and row['id'] not in excluded_id_set
+            and row['shift_instance__start_datetime'] < instance.end_datetime
+            and row['shift_instance__end_datetime'] > instance.start_datetime
+            for row in assignment_rows
+        )
     if overlap:
         return False, f'{physician} has an overlapping assignment.'
     return True, ''

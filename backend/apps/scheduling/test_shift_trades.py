@@ -987,6 +987,56 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(proposed.json()['trade_type'], 'TRADE')
         self.assertEqual(proposed.json()['requested_assignment']['id'], self.assignment.id)
 
+    def test_trade_options_keep_only_reciprocal_same_day_shift(self):
+        same_day_template = ShiftTemplate.objects.create(
+            domain=self.domain, facility=self.facility, name='Alternate Day',
+            start_time=time(7), end_time=time(16),
+            active_days_of_week=['Tuesday'], weekend_days=[],
+            default_staffing_count=1,
+        )
+        same_day_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2036, 9, 1), shift_template=same_day_template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 1, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 1, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        same_day_target = ScheduleShiftAssignment.objects.create(
+            shift_instance=same_day_instance, physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=self.run,
+        )
+        other_day_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2036, 9, 2), shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        other_day_target = ScheduleShiftAssignment.objects.create(
+            shift_instance=other_day_instance, physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=self.run,
+        )
+
+        self.client.force_authenticate(self.owner_user)
+        options = self.client.get(
+            f'/api/schedule-assignments/{self.assignment.id}/trade-options/'
+        )
+
+        self.assertEqual(options.status_code, 200)
+        option_ids = [row['id'] for row in options.json()]
+        self.assertEqual(option_ids, [same_day_target.id])
+        self.assertNotIn(other_day_target.id, option_ids)
+
+        proposed = self.client.post('/api/shift-trades/', {
+            'offered_assignment_id': self.assignment.id,
+            'target_assignment_id': same_day_target.id,
+        }, format='json')
+        self.assertEqual(proposed.status_code, 201)
+
     def test_clinically_active_scheduler_gets_user_safe_trade_options(self):
         scheduler_role = RoleTemplate.objects.get(
             region=self.domain.region,
@@ -1141,6 +1191,20 @@ class ShiftTradeApiTests(TestCase):
         User = get_user_model()
         second_user = User.objects.create_user('second', password='x')
         second = Physician.objects.create(user=second_user, display_name='Second')
+        OrganizationMembership.objects.create(
+            organization=self.domain.region.organization,
+            user=second_user,
+        )
+        DomainMembership.objects.create(
+            domain=self.domain,
+            user=second_user,
+            role=DomainMembership.Role.STAFF_PHYSICIAN,
+            role_template=RoleTemplate.objects.get(
+                region=self.domain.region,
+                system_key='staff_physician',
+            ),
+            clinically_active=True,
+        )
         contract = Contract.objects.get(name='Test')
         ContractUserAssignment.objects.create(contract=contract, physician=second)
 
