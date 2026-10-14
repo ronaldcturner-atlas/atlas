@@ -86,6 +86,14 @@ describe('desktop calendar controls', () => {
     expect(calendarSource).toContain('Boolean(user?.can_manage_schedules)')
     expect(calendarSource).not.toContain("groups.some((group) => ['admin', 'scheduler']")
   })
+
+  it('keeps personal trade options separate from permission-gated scheduler swap options', () => {
+    expect(calendarSource).toContain("hasSelectedShiftPermission('propose_trade')")
+    expect(calendarSource).toContain("hasSelectedShiftPermission('manage_any_shift_posting')")
+    expect(calendarSource).toContain("hasSelectedShiftPermission('split_any_published_shift')")
+    expect(calendarSource).toContain('trade-options/?purpose=scheduler_swap')
+    expect(calendarSource).toContain('{adminSwapOptions.map((option) => (')
+  })
 })
 
 describe('calendar highlight styling', () => {

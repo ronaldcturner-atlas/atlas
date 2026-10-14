@@ -987,6 +987,73 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(proposed.json()['trade_type'], 'TRADE')
         self.assertEqual(proposed.json()['requested_assignment']['id'], self.assignment.id)
 
+    def test_clinically_active_scheduler_gets_user_safe_trade_options(self):
+        scheduler_role = RoleTemplate.objects.get(
+            region=self.domain.region,
+            system_key='scheduler',
+        )
+        membership = DomainMembership.objects.get(
+            domain=self.domain,
+            user=self.owner_user,
+        )
+        membership.role = DomainMembership.Role.SCHEDULER
+        membership.role_template = scheduler_role
+        membership.clinically_active = True
+        membership.save(update_fields=[
+            'role', 'role_template', 'clinically_active',
+        ])
+        target_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2036, 9, 2), shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 2, 7)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 2, 16)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        target = ScheduleShiftAssignment.objects.create(
+            shift_instance=target_instance, physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER,
+            optimizer_run=self.run,
+        )
+        reciprocal_conflict_instance = ScheduleShiftInstance.objects.create(
+            schedule_version=self.version, schedule_block=self.block,
+            date=date(2036, 9, 1), shift_template=self.template,
+            facility=self.facility,
+            start_datetime=timezone.make_aware(datetime(2036, 9, 1, 8)),
+            end_datetime=timezone.make_aware(datetime(2036, 9, 1, 12)),
+            status=ScheduleShiftInstance.Status.ASSIGNED,
+        )
+        ScheduleShiftAssignment.objects.create(
+            shift_instance=reciprocal_conflict_instance,
+            physician=self.requester,
+            assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            optimizer_run=self.run,
+        )
+
+        self.client.force_authenticate(self.owner_user)
+        proposal_options = self.client.get(
+            f'/api/schedule-assignments/{self.assignment.id}/trade-options/'
+        )
+        scheduler_swap_options = self.client.get(
+            f'/api/schedule-assignments/{self.assignment.id}/trade-options/',
+            {'purpose': 'scheduler_swap'},
+        )
+
+        self.assertEqual(proposal_options.status_code, 200)
+        self.assertNotIn(target.id, [row['id'] for row in proposal_options.json()])
+        self.assertEqual(scheduler_swap_options.status_code, 200)
+        self.assertIn(target.id, [row['id'] for row in scheduler_swap_options.json()])
+
+        rejected = self.client.post('/api/shift-trades/', {
+            'offered_assignment_id': self.assignment.id,
+            'target_assignment_id': target.id,
+        }, format='json')
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(
+            rejected.json()['detail'],
+            'That shift is not a valid trade option for your current schedule.',
+        )
+
     def test_trade_options_include_contract_excluded_facilities(self):
         excluded_facility = Facility.objects.create(
             name='Excluded Hospital', short_name='EX',

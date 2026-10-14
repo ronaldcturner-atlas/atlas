@@ -918,7 +918,7 @@ export default function MobileNavigationPreview() {
       setIsLoadingSwapOptions(true)
       setSwapFeedback('')
       try {
-        const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/`, { credentials: 'include', cache: 'no-store' })
+        const response = await fetch(`${API_BASE}/schedule-assignments/${selectedShift.assignmentId}/trade-options/?purpose=scheduler_swap`, { credentials: 'include', cache: 'no-store' })
         const data = await response.json().catch(() => [])
         if (!response.ok) throw new Error(data.detail || 'Unable to load swap options.')
         if (cancelled) return
@@ -1606,6 +1606,32 @@ export default function MobileNavigationPreview() {
   }
 
   const selectedShiftHasStarted = Boolean(selectedShift?.startDateTime && shiftHasStarted(selectedShift.startDateTime))
+  const selectedShiftPermissions = new Set(
+    user?.domain_access.find((access) => (
+      access.active && access.domain_id === selectedShift?.domainId
+    ))?.permissions ?? [],
+  )
+  const hasSelectedShiftPermission = (permission: string) => Boolean(
+    user?.is_org_admin || selectedShiftPermissions.has(permission)
+  )
+  const canPostSelectedShift = Boolean(selectedShift?.assignmentId != null && (
+    (selectedShift.isMine && hasSelectedShiftPermission('post_own_shifts'))
+    || hasSelectedShiftPermission('manage_any_shift_posting')
+  ))
+  const canSplitSelectedShift = Boolean(selectedShift?.assignmentId != null && (
+    (selectedShift.isMine && hasSelectedShiftPermission('split_own_shift'))
+    || hasSelectedShiftPermission('split_any_published_shift')
+  ))
+  const canProposeSelectedTrade = Boolean(
+    selectedShift?.isMine && hasSelectedShiftPermission('propose_trade')
+  )
+  const canManagePublishedAssignment = hasSelectedShiftPermission('manage_published_assignments')
+  const canModifyAnyShiftTimes = hasSelectedShiftPermission('modify_any_published_shift_times')
+  const hasSelectedShiftSchedulerActions = Boolean(
+    canManagePublishedAssignment
+    || canModifyAnyShiftTimes
+    || (!selectedShift?.isMine && (canPostSelectedShift || canSplitSelectedShift))
+  )
   const tradePartners = Array.from(new Map(tradeOptions.map((option) => [option.physicianId, option.physicianName])).entries())
     .sort((left, right) => left[1].localeCompare(right[1]))
   const selectedPartnerTradeOptions = tradePartner === '' ? [] : tradeOptions.filter((option) => option.physicianId === tradePartner)
@@ -1834,34 +1860,52 @@ export default function MobileNavigationPreview() {
                   <button type="button" className="mobile-workflow-primary" disabled={tradeOfferAssignmentId === '' || isLoadingTradeOffers || isTradeOfferSaving} onClick={submitTradeOffer}>{isTradeOfferSaving ? 'Sending…' : tradeOfferRequiresForce ? 'Send trade request anyway' : 'Send trade request'}</button>
                   {workflowMessage && <div className="mobile-workflow-message">{workflowMessage}</div>}
                 </div>
-              ) : user?.can_manage_schedules && !testUserView && selectedShift.tone === 'open' ? (
-                <div className="mobile-shift-actions"><strong>Manage open shift</strong><button type="button" onClick={() => showWorkflow('assign')}>Assign user <span>›</span></button></div>
-              ) : user?.can_manage_schedules && !testUserView ? (
-                <div className="mobile-shift-actions">
-                  <strong>Manage this shift</strong>
-                  <button type="button" onClick={() => showWorkflow('reassign')}>Change scheduled user <span>›</span></button>
-                  <button type="button" onClick={() => showWorkflow('times')}>Adjust actual times <span>›</span></button>
-                  <button type="button" onClick={() => showWorkflow('swap')}>Swap scheduled users <span>›</span></button>
-                  <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
-                  {selectedShift.isSplit && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
-                  <button type="button" className="caution" disabled={isOpenShiftSaving} onClick={openScheduledShift}>{isOpenShiftSaving ? 'Opening…' : 'Open shift'} <span>›</span></button>
-                  {openShiftFeedback && <div className="mobile-workflow-message error">{openShiftFeedback}</div>}
-                </div>
-              ) : selectedShift.isMine ? (
-                <div className="mobile-shift-actions">
-                  <strong>Shift actions</strong>
-                  {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.postingMode ? 'Review posting' : 'Post this shift'} <span>›</span></button>}
-                  {!selectedShiftHasStarted && <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>}
-                  <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>
-                  {selectedShift.isSplit && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
-                </div>
-              ) : selectedShift.tone === 'open' && selectedShift.canPickUp === false ? (
-                <p className="mobile-shift-readonly">{selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.'}</p>
-              ) : selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open' ? (
-                <div className="mobile-shift-actions"><strong>{selectedShift.tone === 'open' ? 'Open shift' : 'Available shift'}</strong><button type="button" onClick={() => showWorkflow('pickup')}>Pickup Shift <span>›</span></button></div>
-              ) : selectedShift.postingMode === 'trade' ? (
-                <div className="mobile-shift-actions"><strong>Trade-only shift</strong><button type="button" onClick={() => showWorkflow('offer')}>Offer one of my shifts <span>›</span></button></div>
-              ) : <p className="mobile-shift-readonly">No actions are available for this shift.</p>}
+              ) : (
+                <>
+                  {selectedShift.isMine && (canPostSelectedShift || canProposeSelectedTrade || canSplitSelectedShift) && (
+                    <div className="mobile-shift-actions">
+                      <strong>Shift actions</strong>
+                      {!selectedShiftHasStarted && canPostSelectedShift && <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.postingMode ? 'Review posting' : 'Post this shift'} <span>›</span></button>}
+                      {!selectedShiftHasStarted && canProposeSelectedTrade && <button type="button" onClick={() => showWorkflow('trade')}>Propose a trade <span>›</span></button>}
+                      {canSplitSelectedShift && <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>}
+                      {selectedShift.isSplit && canSplitSelectedShift && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
+                    </div>
+                  )}
+
+                  {!selectedShift.isMine && selectedShift.tone === 'open' && selectedShift.canPickUp === false && (
+                    <p className="mobile-shift-readonly">{selectedShift.pickupIneligibilityReason || 'This shift is not currently eligible for pickup.'}</p>
+                  )}
+                  {!selectedShift.isMine && selectedShift.canPickUp !== false && (selectedShift.postingMode === 'pickup' || selectedShift.tone === 'open') && (
+                    <div className="mobile-shift-actions"><strong>{selectedShift.tone === 'open' ? 'Open shift' : 'Available shift'}</strong><button type="button" onClick={() => showWorkflow('pickup')}>Pickup Shift <span>›</span></button></div>
+                  )}
+                  {!selectedShift.isMine && selectedShift.postingMode === 'trade' && (
+                    <div className="mobile-shift-actions"><strong>Trade-only shift</strong><button type="button" onClick={() => showWorkflow('offer')}>Offer one of my shifts <span>›</span></button></div>
+                  )}
+
+                  {selectedShift.tone === 'open' && canManagePublishedAssignment && (
+                    <div className="mobile-shift-actions"><strong>Scheduler actions</strong><button type="button" onClick={() => showWorkflow('assign')}>Assign user <span>›</span></button></div>
+                  )}
+                  {selectedShift.assignmentId != null && hasSelectedShiftSchedulerActions && (
+                    <div className="mobile-shift-actions">
+                      <strong>Scheduler actions</strong>
+                      {!selectedShift.isMine && !selectedShiftHasStarted && canPostSelectedShift && <button type="button" onClick={() => showWorkflow('post')}>{selectedShift.postingMode ? 'Review posting' : 'Post this shift'} <span>›</span></button>}
+                      {!selectedShift.isMine && canSplitSelectedShift && <button type="button" onClick={() => showWorkflow('split')}>Split shift <span>›</span></button>}
+                      {!selectedShift.isMine && selectedShift.isSplit && canSplitSelectedShift && <button type="button" disabled={isUnsplitSaving} onClick={unsplitShift}>{isUnsplitSaving ? 'Recombining…' : 'Unsplit shift'} <span>›</span></button>}
+                      {canModifyAnyShiftTimes && <button type="button" onClick={() => showWorkflow('times')}>Adjust actual times <span>›</span></button>}
+                      {canManagePublishedAssignment && <button type="button" onClick={() => showWorkflow('reassign')}>Change scheduled user <span>›</span></button>}
+                      {canManagePublishedAssignment && <button type="button" onClick={() => showWorkflow('swap')}>Swap scheduled users <span>›</span></button>}
+                      {canManagePublishedAssignment && <button type="button" className="caution" disabled={isOpenShiftSaving} onClick={openScheduledShift}>{isOpenShiftSaving ? 'Opening…' : 'Open shift'} <span>›</span></button>}
+                      {openShiftFeedback && <div className="mobile-workflow-message error">{openShiftFeedback}</div>}
+                    </div>
+                  )}
+
+                  {!selectedShift.isMine
+                    && selectedShift.tone !== 'open'
+                    && !selectedShift.postingMode
+                    && !hasSelectedShiftSchedulerActions
+                    && <p className="mobile-shift-readonly">No actions are available for this shift.</p>}
+                </>
+              )}
             </section>
           </div>
         )}

@@ -136,7 +136,7 @@ describe('mobile published schedule actions', () => {
 
   it('swaps scheduled users through the desktop trade-options and swap endpoints', () => {
     expect(mobileSource).toContain("showWorkflow('swap')")
-    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/trade-options/')
+    expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/trade-options/?purpose=scheduler_swap')
     expect(mobileSource).toContain('schedule-assignments/${selectedShift.assignmentId}/swap/')
     expect(mobileSource).toContain('target_assignment_id: swapTargetId')
     expect(mobileSource).toContain('setSwapRequiresForce(true)')
@@ -214,6 +214,15 @@ describe('mobile published schedule actions', () => {
     expect(mobileSource).toContain('note: tradeNote')
     expect(mobileSource).toContain('Trade proposal sent successfully.')
     expect(mobileSource).toContain('selectedPartnerTradeOptions')
+  })
+
+  it('shows personal and scheduler shift actions together according to permissions', () => {
+    expect(mobileSource).toContain("hasSelectedShiftPermission('propose_trade')")
+    expect(mobileSource).toContain("hasSelectedShiftPermission('manage_any_shift_posting')")
+    expect(mobileSource).toContain("hasSelectedShiftPermission('split_any_published_shift')")
+    expect(mobileSource).toContain("hasSelectedShiftPermission('manage_published_assignments')")
+    expect(mobileSource).toContain('<strong>Scheduler actions</strong>')
+    expect(mobileSource).not.toContain('user?.can_manage_schedules && !testUserView && selectedShift')
   })
 
   it('keeps selected-day priority highlights scoped to the month calendar', () => {

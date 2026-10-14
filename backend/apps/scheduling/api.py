@@ -1254,8 +1254,11 @@ def schedule_assignment_posting(request, assignment_id):
     expire_started_trade_activity()
     domain = assignment.shift_instance.schedule_version.domain
     owns_shift = assignment.physician.user_id == request.user.id
-    permission = 'post_own_shifts' if owns_shift else 'manage_any_shift_posting'
-    if not has_permission(request.user, permission, domain=domain):
+    can_post = (
+        owns_shift
+        and has_permission(request.user, 'post_own_shifts', domain=domain)
+    ) or has_permission(request.user, 'manage_any_shift_posting', domain=domain)
+    if not can_post:
         return Response({'detail': 'You do not have permission to manage this shift posting.'}, status=status.HTTP_403_FORBIDDEN)
     mode = request.data.get('mode')
     comment = str(request.data.get('comment', '')).strip()
@@ -1298,8 +1301,11 @@ def schedule_assignment_split(request, assignment_id):
     assignment = _published_assignment_or_404(assignment_id)
     domain = assignment.shift_instance.schedule_version.domain
     owns_shift = assignment.physician.user_id == request.user.id
-    permission = 'split_own_shift' if owns_shift else 'split_any_published_shift'
-    if not has_permission(request.user, permission, domain=domain):
+    can_split = (
+        owns_shift
+        and has_permission(request.user, 'split_own_shift', domain=domain)
+    ) or has_permission(request.user, 'split_any_published_shift', domain=domain)
+    if not can_split:
         return Response({'detail': 'You do not have permission to split this shift.'}, status=status.HTTP_403_FORBIDDEN)
     try:
         split_clock = datetime.strptime(str(request.data.get('split_time', '')), '%H:%M').time()
@@ -2191,8 +2197,20 @@ def schedule_assignment_trade_options(request, assignment_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
     domain = offered.shift_instance.schedule_version.domain
-    can_manage = has_permission(request.user, 'manage_user_offers_trades', domain=domain)
-    if offered.physician.user_id != request.user.id and not can_manage:
+    can_manage_trades = has_permission(
+        request.user, 'manage_user_offers_trades', domain=domain,
+    )
+    can_swap_assignments = has_permission(
+        request.user, 'manage_published_assignments', domain=domain,
+    )
+    is_scheduler_swap_request = (
+        request.query_params.get('purpose') == 'scheduler_swap'
+    )
+    if (
+        offered.physician.user_id != request.user.id
+        and not can_manage_trades
+        and not (is_scheduler_swap_request and can_swap_assignments)
+    ):
         return Response({'detail': 'You may only propose a trade from your own shift.'}, status=status.HTTP_403_FORBIDDEN)
     if offered.physician.user_id == request.user.id and not has_permission(
         request.user, 'propose_trade', domain=domain,
@@ -2200,7 +2218,7 @@ def schedule_assignment_trade_options(request, assignment_id):
         return Response({'detail': 'You do not have permission to propose a trade in this Domain.'}, status=status.HTTP_403_FORBIDDEN)
     return Response(_trade_options_for_assignment(
         offered,
-        allow_conflicts=can_manage,
+        allow_conflicts=is_scheduler_swap_request and can_swap_assignments,
     ))
 
 
