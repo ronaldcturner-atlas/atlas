@@ -1183,16 +1183,14 @@ export default function ContractsView() {
                           <div><strong>Penalty:</strong> min {rule.min_penalty_weight || '0'} / max {rule.max_penalty_weight || '0'}</div>
                           <div><strong>Effective behavior:</strong> {summary.behavior}</div>
                         </div>
-                        <div className="contract-minmax-columns">
-                          <div className="contract-minmax-column">
-                            <div className="contract-minmax-title">Min</div>
-                            <label className="facility-field"><span>Min value</span><input type="number" value={rule.min_value} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_value: event.target.value } : item) } }))} /></label>
-                            <label className="facility-field"><span>Min penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_penalty_weight: event.target.value } : item) } }))} /></label>
+                        <div className="contract-value-penalty-columns">
+                          <div className="contract-minmax-stack">
+                            <label className="facility-field"><span>Minimum value</span><input type="number" value={rule.min_value} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_value: event.target.value } : item) } }))} /></label>
+                            <label className="facility-field"><span>Maximum value</span><input type="number" value={rule.max_value} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_value: event.target.value } : item) } }))} /></label>
                           </div>
-                          <div className="contract-minmax-column">
-                            <div className="contract-minmax-title">Max</div>
-                            <label className="facility-field"><span>Max value</span><input type="number" value={rule.max_value} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_value: event.target.value } : item) } }))} /></label>
-                            <label className="facility-field"><span>Max penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_penalty_weight: event.target.value } : item) } }))} /></label>
+                          <div className="contract-minmax-stack">
+                            <label className="facility-field"><span>Minimum penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_penalty_weight: event.target.value } : item) } }))} /></label>
+                            <label className="facility-field"><span>Maximum penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, period_rules: current.workload_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_penalty_weight: event.target.value } : item) } }))} /></label>
                           </div>
                         </div>
                         <div className="contract-rule-controls-grid">
@@ -1308,16 +1306,14 @@ export default function ContractsView() {
                               ? sharedRule.shift_templates.map((template) => `${template.name} (${template.facility_name})`).join(', ')
                               : 'No eligible shifts in this contract.'}
                           </div>
-                          <div className="contract-minmax-columns">
-                            <div className="contract-minmax-column">
-                              <div className="contract-minmax-title">Min</div>
-                              <label className="facility-field"><span>Min value</span><input type="number" min="0" step="1" value={sharedRule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_value: event.target.value } : rule) }))} /></label>
-                              <label className="facility-field"><span>Min penalty</span><input type="number" min="0" step="1" value={sharedRule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_penalty_weight: event.target.value } : rule) }))} /></label>
+                          <div className="contract-value-penalty-columns">
+                            <div className="contract-minmax-stack">
+                              <label className="facility-field"><span>Minimum value</span><input type="number" min="0" step="1" value={sharedRule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_value: event.target.value } : rule) }))} /></label>
+                              <label className="facility-field"><span>Maximum value</span><input type="number" min="0" step="1" value={sharedRule.max_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_value: event.target.value } : rule) }))} /></label>
                             </div>
-                            <div className="contract-minmax-column">
-                              <div className="contract-minmax-title">Max</div>
-                              <label className="facility-field"><span>Max value</span><input type="number" min="0" step="1" value={sharedRule.max_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_value: event.target.value } : rule) }))} /></label>
-                              <label className="facility-field"><span>Max penalty</span><input type="number" min="0" step="1" value={sharedRule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_penalty_weight: event.target.value } : rule) }))} /></label>
+                            <div className="contract-minmax-stack">
+                              <label className="facility-field"><span>Minimum penalty</span><input type="number" min="0" step="1" value={sharedRule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_penalty_weight: event.target.value } : rule) }))} /></label>
+                              <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_penalty_weight: event.target.value } : rule) }))} /></label>
                             </div>
                           </div>
                         </div>
@@ -1411,16 +1407,14 @@ export default function ContractsView() {
                       <div className="contract-rule-grid">
                         {shiftRule.period_rules.map((rule, periodIndex) => (
                           <div key={rule.id} className="contract-rule-row">
-                            <div className="contract-minmax-columns">
-                              <div className="contract-minmax-column">
-                                <div className="contract-minmax-title">Min</div>
-                                <label className="facility-field"><span>Min value</span><input type="number" value={rule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, min_value: event.target.value } : periodRule) } : item) } }))} /></label>
-                                <label className="facility-field"><span>Min penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, min_penalty_weight: event.target.value } : periodRule) } : item) } }))} /></label>
+                            <div className="contract-value-penalty-columns">
+                              <div className="contract-minmax-stack">
+                                <label className="facility-field"><span>Minimum value</span><input type="number" value={rule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, min_value: event.target.value } : periodRule) } : item) } }))} /></label>
+                                <label className="facility-field"><span>Maximum value</span><input type="number" value={rule.max_value} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, max_value: event.target.value } : periodRule) } : item) } }))} /></label>
                               </div>
-                              <div className="contract-minmax-column">
-                                <div className="contract-minmax-title">Max</div>
-                                <label className="facility-field"><span>Max value</span><input type="number" value={rule.max_value} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, max_value: event.target.value } : periodRule) } : item) } }))} /></label>
-                                <label className="facility-field"><span>Max penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, max_penalty_weight: event.target.value } : periodRule) } : item) } }))} /></label>
+                              <div className="contract-minmax-stack">
+                                <label className="facility-field"><span>Minimum penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, min_penalty_weight: event.target.value } : periodRule) } : item) } }))} /></label>
+                                <label className="facility-field"><span>Maximum penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, max_penalty_weight: event.target.value } : periodRule) } : item) } }))} /></label>
                               </div>
                             </div>
                             <div className="contract-rule-controls-grid">
@@ -1465,16 +1459,14 @@ export default function ContractsView() {
                   <div className="contract-rule-grid">
                     {formState.night_settings.period_rules.map((rule, index) => (
                       <div key={rule.id} className="contract-rule-row">
-                        <div className="contract-minmax-columns">
-                          <div className="contract-minmax-column">
-                            <div className="contract-minmax-title">Min</div>
-                            <label className="facility-field"><span>Min night shifts</span><input type="number" value={rule.min_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_shifts: event.target.value } : item) } }))} /></label>
-                            <label className="facility-field"><span>Min penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_penalty_weight: event.target.value } : item) } }))} /></label>
+                        <div className="contract-value-penalty-columns">
+                          <div className="contract-minmax-stack">
+                            <label className="facility-field"><span>Minimum night shifts</span><input type="number" value={rule.min_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_shifts: event.target.value } : item) } }))} /></label>
+                            <label className="facility-field"><span>Maximum night shifts</span><input type="number" value={rule.max_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_shifts: event.target.value } : item) } }))} /></label>
                           </div>
-                          <div className="contract-minmax-column">
-                            <div className="contract-minmax-title">Max</div>
-                            <label className="facility-field"><span>Max night shifts</span><input type="number" value={rule.max_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_shifts: event.target.value } : item) } }))} /></label>
-                            <label className="facility-field"><span>Max penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_penalty_weight: event.target.value } : item) } }))} /></label>
+                          <div className="contract-minmax-stack">
+                            <label className="facility-field"><span>Minimum penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_penalty_weight: event.target.value } : item) } }))} /></label>
+                            <label className="facility-field"><span>Maximum penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: current.night_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_penalty_weight: event.target.value } : item) } }))} /></label>
                           </div>
                         </div>
                         <div className="contract-rule-controls-grid">
@@ -1487,15 +1479,33 @@ export default function ContractsView() {
                   </div>
                   <button type="button" className="primary-action" onClick={() => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, period_rules: [...current.night_settings.period_rules, makeNightRule('MONTH')] } }))}>Add Night Period Rule</button>
 
-                  <div className="contract-input-grid">
-                    <label className="facility-field"><span>Min consecutive night shifts</span><input type="number" value={formState.night_settings.min_consecutive_night_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, min_consecutive_night_shifts: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Min consecutive night shifts penalty</span><input type="number" value={formState.night_settings.min_consecutive_night_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, min_consecutive_night_shifts_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Max consecutive night shifts</span><input type="number" value={formState.night_settings.max_consecutive_night_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, max_consecutive_night_shifts: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Max consecutive night shifts penalty</span><input type="number" value={formState.night_settings.max_consecutive_night_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, max_consecutive_night_shifts_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Days off after night block before non-night</span><input type="number" value={formState.night_settings.days_off_after_night_block} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_after_night_block: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Non-night recovery penalty</span><input type="number" value={formState.night_settings.days_off_after_night_block_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_after_night_block_penalty_weight: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Days off after night block before next night block</span><input type="number" value={formState.night_settings.days_off_before_next_night_shift} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_before_next_night_shift: event.target.value } }))} /></label>
-                    <label className="facility-field"><span>Next night block recovery penalty</span><input type="number" value={formState.night_settings.days_off_before_next_night_shift_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_before_next_night_shift_penalty_weight: event.target.value } }))} /></label>
+                  <div className="contract-additional-workload-grid">
+                    <div className="contract-additional-workload-card">
+                      <div className="contract-minmax-title">Consecutive night shifts</div>
+                      <div className="contract-value-penalty-columns">
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum</span><input type="number" value={formState.night_settings.min_consecutive_night_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, min_consecutive_night_shifts: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.night_settings.max_consecutive_night_shifts} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, max_consecutive_night_shifts: event.target.value } }))} /></label>
+                        </div>
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum penalty</span><input type="number" value={formState.night_settings.min_consecutive_night_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, min_consecutive_night_shifts_penalty_weight: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.night_settings.max_consecutive_night_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, max_consecutive_night_shifts_penalty_weight: event.target.value } }))} /></label>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="contract-additional-workload-card">
+                      <div className="contract-minmax-title">Night-block recovery</div>
+                      <div className="contract-value-penalty-columns">
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Days before non-night shift</span><input type="number" value={formState.night_settings.days_off_after_night_block} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_after_night_block: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Days before next night block</span><input type="number" value={formState.night_settings.days_off_before_next_night_shift} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_before_next_night_shift: event.target.value } }))} /></label>
+                        </div>
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Non-night penalty</span><input type="number" value={formState.night_settings.days_off_after_night_block_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_after_night_block_penalty_weight: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Next night-block penalty</span><input type="number" value={formState.night_settings.days_off_before_next_night_shift_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_before_next_night_shift_penalty_weight: event.target.value } }))} /></label>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1506,16 +1516,14 @@ export default function ContractsView() {
                   <div className="contract-rule-grid">
                     {formState.weekend_settings.period_rules.map((rule, index) => (
                       <div key={rule.id} className="contract-rule-row">
-                        <div className="contract-minmax-columns">
-                          <div className="contract-minmax-column">
-                            <div className="contract-minmax-title">Min</div>
-                            <label className="facility-field"><span>Min weekend volume</span><input type="number" value={rule.min_volume} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_volume: event.target.value } : item) } }))} /></label>
-                            <label className="facility-field"><span>Min penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_penalty_weight: event.target.value } : item) } }))} /></label>
+                        <div className="contract-value-penalty-columns">
+                          <div className="contract-minmax-stack">
+                            <label className="facility-field"><span>Minimum weekend volume</span><input type="number" value={rule.min_volume} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_volume: event.target.value } : item) } }))} /></label>
+                            <label className="facility-field"><span>Maximum weekend volume</span><input type="number" value={rule.max_volume} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_volume: event.target.value } : item) } }))} /></label>
                           </div>
-                          <div className="contract-minmax-column">
-                            <div className="contract-minmax-title">Max</div>
-                            <label className="facility-field"><span>Max weekend volume</span><input type="number" value={rule.max_volume} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_volume: event.target.value } : item) } }))} /></label>
-                            <label className="facility-field"><span>Max penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_penalty_weight: event.target.value } : item) } }))} /></label>
+                          <div className="contract-minmax-stack">
+                            <label className="facility-field"><span>Minimum penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, min_penalty_weight: event.target.value } : item) } }))} /></label>
+                            <label className="facility-field"><span>Maximum penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, period_rules: current.weekend_settings.period_rules.map((item, itemIndex) => itemIndex === index ? { ...item, max_penalty_weight: event.target.value } : item) } }))} /></label>
                           </div>
                         </div>
                         <div className="contract-rule-controls-grid">
@@ -1531,32 +1539,28 @@ export default function ContractsView() {
                   <div className="contract-section-stack">
                     <h3>Consecutive Weekends</h3>
                     <div className="contract-rule-row">
-                      <div className="contract-minmax-columns">
-                        <div className="contract-minmax-column">
-                          <div className="contract-minmax-title">Min</div>
-                          <label className="facility-field"><span>Min consecutive weekends</span><input type="number" value={formState.weekend_settings.min_consecutive_weekends} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekends: event.target.value } }))} /></label>
-                          <label className="facility-field"><span>Min penalty</span><input type="number" value={formState.weekend_settings.min_consecutive_weekends_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekends_penalty_weight: event.target.value } }))} /></label>
+                      <div className="contract-value-penalty-columns">
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum consecutive weekends</span><input type="number" value={formState.weekend_settings.min_consecutive_weekends} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekends: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum consecutive weekends</span><input type="number" value={formState.weekend_settings.max_consecutive_weekends} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekends: event.target.value } }))} /></label>
                         </div>
-                        <div className="contract-minmax-column">
-                          <div className="contract-minmax-title">Max</div>
-                          <label className="facility-field"><span>Max consecutive weekends</span><input type="number" value={formState.weekend_settings.max_consecutive_weekends} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekends: event.target.value } }))} /></label>
-                          <label className="facility-field"><span>Max penalty</span><input type="number" value={formState.weekend_settings.max_consecutive_weekends_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekends_penalty_weight: event.target.value } }))} /></label>
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum penalty</span><input type="number" value={formState.weekend_settings.min_consecutive_weekends_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekends_penalty_weight: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.weekend_settings.max_consecutive_weekends_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekends_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
                     </div>
 
                     <h3>Consecutive Weekend Shifts</h3>
                     <div className="contract-rule-row">
-                      <div className="contract-minmax-columns">
-                        <div className="contract-minmax-column">
-                          <div className="contract-minmax-title">Min</div>
-                          <label className="facility-field"><span>Min consecutive weekend shifts</span><input type="number" value={formState.weekend_settings.min_consecutive_weekend_shifts} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekend_shifts: event.target.value } }))} /></label>
-                          <label className="facility-field"><span>Min penalty</span><input type="number" value={formState.weekend_settings.min_consecutive_weekend_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekend_shifts_penalty_weight: event.target.value } }))} /></label>
+                      <div className="contract-value-penalty-columns">
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum consecutive weekend shifts</span><input type="number" value={formState.weekend_settings.min_consecutive_weekend_shifts} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekend_shifts: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum consecutive weekend shifts</span><input type="number" value={formState.weekend_settings.max_consecutive_weekend_shifts} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekend_shifts: event.target.value } }))} /></label>
                         </div>
-                        <div className="contract-minmax-column">
-                          <div className="contract-minmax-title">Max</div>
-                          <label className="facility-field"><span>Max consecutive weekend shifts</span><input type="number" value={formState.weekend_settings.max_consecutive_weekend_shifts} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekend_shifts: event.target.value } }))} /></label>
-                          <label className="facility-field"><span>Max penalty</span><input type="number" value={formState.weekend_settings.max_consecutive_weekend_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekend_shifts_penalty_weight: event.target.value } }))} /></label>
+                        <div className="contract-minmax-stack">
+                          <label className="facility-field"><span>Minimum penalty</span><input type="number" value={formState.weekend_settings.min_consecutive_weekend_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, min_consecutive_weekend_shifts_penalty_weight: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.weekend_settings.max_consecutive_weekend_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekend_shifts_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
                     </div>
