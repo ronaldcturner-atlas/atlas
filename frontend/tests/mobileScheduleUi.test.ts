@@ -198,6 +198,14 @@ describe('mobile published schedule actions', () => {
     expect(mobileStyles).toContain('.mobile-users-page')
   })
 
+  it('restores the last permitted Users directory Domain after an app restart', () => {
+    expect(mobileSource).toContain("const DIRECTORY_DOMAIN_STORAGE_KEY = 'atlas.mobile-preview.directory-domain-id'")
+    expect(mobileSource).toContain('window.localStorage.getItem(DIRECTORY_DOMAIN_STORAGE_KEY)')
+    expect(mobileSource).toContain('window.localStorage.setItem(DIRECTORY_DOMAIN_STORAGE_KEY, String(nextDomainId))')
+    expect(mobileSource).toContain('if (domainId && response.status === 403)')
+    expect(mobileSource).toContain('window.localStorage.removeItem(DIRECTORY_DOMAIN_STORAGE_KEY)')
+  })
+
   it('loads authoritative trade-only offers and submits the selected exchange', () => {
     expect(mobileSource).toContain('schedule-assignments/${candidate.id}/trade-options/')
     expect(mobileSource).toContain('option.id === selectedShift.assignmentId')

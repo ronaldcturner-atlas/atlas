@@ -117,6 +117,7 @@ const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December',
 ]
+const DIRECTORY_DOMAIN_STORAGE_KEY = 'atlas.mobile-preview.directory-domain-id'
 
 function dateKey(value: Date) {
   return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`
@@ -278,7 +279,10 @@ export default function MobileNavigationPreview() {
   const [statsMonth, setStatsMonth] = React.useState(statsToday.getMonth())
   const [statsYear, setStatsYear] = React.useState(statsToday.getFullYear())
   const [directoryData, setDirectoryData] = React.useState<MobileDirectoryResponse | null>(null)
-  const [directoryDomainId, setDirectoryDomainId] = React.useState<number | null>(null)
+  const [directoryDomainId, setDirectoryDomainId] = React.useState<number | null>(() => {
+    const stored = Number(window.localStorage.getItem(DIRECTORY_DOMAIN_STORAGE_KEY))
+    return Number.isInteger(stored) && stored > 0 ? stored : null
+  })
   const [directorySearch, setDirectorySearch] = React.useState('')
   const [selectedDirectoryUser, setSelectedDirectoryUser] = React.useState<MobileDirectoryProfile | null>(null)
   const [isDirectoryLoading, setIsDirectoryLoading] = React.useState(false)
@@ -373,12 +377,23 @@ export default function MobileNavigationPreview() {
     setIsDirectoryLoading(true)
     setDirectoryError('')
     try {
-      const query = domainId ? `?domain=${domainId}` : ''
-      const response = await fetch(`${API_BASE}/user-directory/${query}`, { credentials: 'include', cache: 'no-store' })
-      const data = await response.json().catch(() => ({}))
+      const fetchDirectory = async (requestedDomainId?: number) => {
+        const query = requestedDomainId ? `?domain=${requestedDomainId}` : ''
+        const response = await fetch(`${API_BASE}/user-directory/${query}`, { credentials: 'include', cache: 'no-store' })
+        const data = await response.json().catch(() => ({}))
+        return { response, data }
+      }
+      let { response, data } = await fetchDirectory(domainId)
+      if (domainId && response.status === 403) {
+        window.localStorage.removeItem(DIRECTORY_DOMAIN_STORAGE_KEY)
+        ;({ response, data } = await fetchDirectory())
+      }
       if (!response.ok) throw new Error(data.detail || 'The user directory could not be loaded.')
       setDirectoryData(data)
-      setDirectoryDomainId(data.selected_domain_id ?? null)
+      const nextDomainId = data.selected_domain_id ?? null
+      setDirectoryDomainId(nextDomainId)
+      if (nextDomainId == null) window.localStorage.removeItem(DIRECTORY_DOMAIN_STORAGE_KEY)
+      else window.localStorage.setItem(DIRECTORY_DOMAIN_STORAGE_KEY, String(nextDomainId))
     } catch (error) {
       setDirectoryError(error instanceof Error ? error.message : 'The user directory could not be loaded.')
     } finally {
