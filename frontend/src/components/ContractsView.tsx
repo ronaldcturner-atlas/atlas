@@ -1338,7 +1338,6 @@ export default function ContractsView() {
                           {checked && facilityRule && <div className="contract-facility-periods">
                             {!facilityRule.period_rules.length && <div className="contract-facility-empty-target">Eligible with no minimum or maximum target.</div>}
                             {facilityRule.period_rules.map((rule, index) => {
-                              const summary = workloadRuleSummary(rule)
                               const updateRule = (changes: Partial<MinMaxRule>) => setFormState((current) => ({
                                 ...current,
                                 facility_settings: {
@@ -1348,23 +1347,13 @@ export default function ContractsView() {
                                 },
                               }))
                               return <div key={rule.id} className="contract-rule-row compact-facility-rule">
-                                <div className="contract-rule-summary">
-                                  <strong>{workloadPeriodLabels[rule.period_type]}</strong>
-                                  <span>{summary.units}</span>
-                                </div>
-                                <div className="contract-value-penalty-columns">
-                                  <div className="contract-minmax-stack">
-                                    <label className="facility-field"><span>Minimum</span><input type="number" min="0" value={rule.min_value} onChange={(event) => updateRule({ min_value: event.target.value })} /></label>
-                                    <label className="facility-field"><span>Maximum</span><input type="number" min="0" value={rule.max_value} onChange={(event) => updateRule({ max_value: event.target.value })} /></label>
-                                  </div>
-                                  <div className="contract-minmax-stack">
-                                    <label className="facility-field"><span>Minimum penalty</span><input type="number" min="0" value={rule.min_penalty_weight} onChange={(event) => updateRule({ min_penalty_weight: event.target.value })} /></label>
-                                    <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" value={rule.max_penalty_weight} onChange={(event) => updateRule({ max_penalty_weight: event.target.value })} /></label>
-                                  </div>
-                                </div>
-                                <div className="contract-rule-options compact-facility-options">
-                                  <label className="facility-field"><span>Period</span><select value={rule.period_type} onChange={(event) => updateRule({ period_type: event.target.value as PeriodType })}><option value="WEEK">Week</option><option value="MONTH">Month</option><option value="SCHEDULE_BLOCK">Schedule Block</option></select></label>
-                                  <label className="facility-field"><span>Units</span><select value={rule.units} onChange={(event) => updateRule({ units: event.target.value as RuleUnits })}><option value="SHIFTS">Shifts</option><option value="HOURS">Hours</option></select></label>
+                                <div className="contract-facility-target-grid">
+                                  <label className="facility-field facility-target-period"><span>Period</span><select value={rule.period_type} onChange={(event) => updateRule({ period_type: event.target.value as PeriodType })}><option value="WEEK">Week</option><option value="MONTH">Month</option><option value="SCHEDULE_BLOCK">Schedule Block</option></select></label>
+                                  <label className="facility-field facility-target-units"><span>Units</span><select value={rule.units} onChange={(event) => updateRule({ units: event.target.value as RuleUnits })}><option value="SHIFTS">Shifts</option><option value="HOURS">Hours</option></select></label>
+                                  <label className="facility-field facility-target-minimum"><span>Minimum</span><input type="number" min="0" value={rule.min_value} onChange={(event) => updateRule({ min_value: event.target.value })} /></label>
+                                  <label className="facility-field facility-target-minimum-penalty"><span>Minimum penalty</span><input type="number" min="0" value={rule.min_penalty_weight} onChange={(event) => updateRule({ min_penalty_weight: event.target.value })} /></label>
+                                  <label className="facility-field facility-target-maximum"><span>Maximum</span><input type="number" min="0" value={rule.max_value} onChange={(event) => updateRule({ max_value: event.target.value })} /></label>
+                                  <label className="facility-field facility-target-maximum-penalty"><span>Maximum penalty</span><input type="number" min="0" value={rule.max_penalty_weight} onChange={(event) => updateRule({ max_penalty_weight: event.target.value })} /></label>
                                   <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, facility_settings: { rules: current.facility_settings.rules.map((item) => item.facility_id === facility.id ? { ...item, period_rules: item.period_rules.filter((_, periodIndex) => periodIndex !== index) } : item) } }))}>Remove</button>
                                 </div>
                               </div>

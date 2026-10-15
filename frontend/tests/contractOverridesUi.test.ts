@@ -9,6 +9,10 @@ const overridesSource = readFileSync(
   new URL('../src/components/UserOverridesView.tsx', import.meta.url),
   'utf8',
 )
+const stylesSource = readFileSync(
+  new URL('../src/index.css', import.meta.url),
+  'utf8',
+)
 
 describe('Contract user overrides', () => {
   it('provides the User Overrides navigation beside Shared Rules', () => {
@@ -50,6 +54,12 @@ describe('Contract user overrides', () => {
     expect(contractsSource).toContain('<option value="HOURS">Hours</option>')
     expect(overridesSource).toContain("{ id: 'facility_settings', label: 'Facilities' }")
     expect(overridesSource).toContain("facility_settings: 'Facility Rules'")
+  })
+
+  it('keeps numeric Contract and User Override inputs compact', () => {
+    expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:120px')
+    expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:130px 145px')
+    expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,130px)')
   })
 })
 
