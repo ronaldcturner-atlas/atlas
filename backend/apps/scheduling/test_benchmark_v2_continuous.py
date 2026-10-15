@@ -338,6 +338,39 @@ class V2ContinuousCommandTests(SimpleTestCase):
         ])
         self.assertEqual(result['score_checkpoints'][0]['score'], 125.0)
 
+    def test_progress_starts_with_authoritative_checkpoint_and_only_improves(self):
+        results = [
+            self._kernel_result(
+                'a', self._transition(0), current_score=125.0,
+            ),
+        ]
+        progress = []
+
+        def fake_kernel(_name, **kwargs):
+            kwargs['stdout'].write(json.dumps(results.pop(0)))
+
+        command = Command()
+        command.stdout = io.StringIO()
+        with patch(
+            'apps.scheduling.management.commands.'
+            'benchmark_v2_continuous.call_command',
+            side_effect=fake_kernel,
+        ):
+            command.handle(
+                run_number=95, run_id=None, target_evaluations=1,
+                max_transitions=1, max_runtime_seconds=None,
+                minimum_rate=0, stress_contract_count=0,
+                validate_sample=0, checkpoint_interval=20,
+                initial_swap=[], as_json=True, stop_requested=None,
+                progress_callback=lambda score: progress.append(float(score)),
+                starting_score=100, distribution_focus=False,
+                soft_restart_moves=3, deep_restart_moves=8,
+                soft_restart_maximum_penalty=5000,
+                deep_restart_maximum_penalty=10000,
+            )
+
+        self.assertEqual(progress, [125.0, 115.0])
+
     def test_continuous_search_rejects_checkpoint_score_divergence(self):
         results = [
             self._kernel_result('a', self._transition(0)),

@@ -4449,6 +4449,24 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(compact_status.json()['live_best_score'], 12345.5)
         self.assertNotIn('optimizer_summary', compact_status.json())
 
+        from apps.scheduling.management.commands.run_optimizer_worker import (
+            Command as OptimizerWorkerCommand,
+        )
+        with patch(
+            'apps.scheduling.management.commands.'
+            'run_optimizer_worker.close_old_connections',
+        ):
+            OptimizerWorkerCommand._store_live_best_score(
+                control.pk, Decimal('13000'),
+            )
+            control.refresh_from_db()
+            self.assertEqual(control.live_best_score, Decimal('12345.50'))
+            OptimizerWorkerCommand._store_live_best_score(
+                control.pk, Decimal('12000'),
+            )
+        control.refresh_from_db()
+        self.assertEqual(control.live_best_score, Decimal('12000.00'))
+
         stopped = self.client.post(
             f'/api/schedule-versions/{version.id}/stop-optimizer/',
             data={'optimizer_run_id': run.id}, format='json',

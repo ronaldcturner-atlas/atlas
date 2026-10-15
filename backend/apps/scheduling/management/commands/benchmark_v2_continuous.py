@@ -607,6 +607,16 @@ class Command(BaseCommand):
                 current_score = authoritative_current
                 if best_score is None:
                     best_score = current_score
+                if (
+                    accepted_transition_count == 0
+                    and progress_callback is not None
+                    and best_score is not None
+                ):
+                    # The first authoritative checkpoint establishes the
+                    # displayable baseline. ``starting_score`` can be stale
+                    # while a source schedule is completed or rescored, so it
+                    # must never be presented as a verified best beforehand.
+                    progress_callback(best_score)
                 score_checkpoints.append({
                     'accepted_transitions': accepted_transition_count,
                     'score': current_score,
@@ -906,6 +916,7 @@ class Command(BaseCommand):
             'predicted_final_score': best_score,
             'score_checkpoint_interval': checkpoint_interval,
             'score_checkpoints': score_checkpoints,
+            'best_authoritative_checkpoint': best_authoritative_checkpoint,
             'stopped_reason': stopped_reason,
             'total_kernel_seconds': total_kernel_seconds,
             'aggregate_kernel_schedules_per_second': aggregate_kernel_rate,

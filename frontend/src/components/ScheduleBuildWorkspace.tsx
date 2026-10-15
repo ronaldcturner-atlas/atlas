@@ -2702,7 +2702,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                       {elapsedSeconds === null ? 'Queued' : `Elapsed: ${formatElapsedTime(elapsedSeconds)}`}
                     </span>
                     <span className="optimizer-live-best-score">
-                      Current best penalty: {run.live_best_score === null || run.live_best_score === undefined
+                      Best verified penalty: {run.live_best_score === null || run.live_best_score === undefined
                         ? run.run_kind === 'OPTIMIZER_V2' || run.run_kind === 'OPTIMIZER_V2_TEST'
                           ? run.start_mode === 'FRESH_FILL'
                             ? 'Building first complete schedule…'

@@ -44,22 +44,49 @@ V2_TEST_RUN_KIND = LEGACY_V2_TEST_RUN_KIND
 
 
 def _compact_search_summary(search_result):
-    """Keep useful completed-run metrics without retaining replay evidence."""
+    """Keep useful completed-run metrics and bounded score audit evidence."""
     keys = (
         'stage', 'wall_seconds', 'stopped_reason', 'total_evaluations',
         'unique_evaluated_states', 'unique_accepted_states',
         'accepted_transitions', 'improving_transitions',
         'diversification_transitions', 'primary_improvements',
         'proportionality_improvements', 'predicted_final_score',
+        'score_checkpoint_interval',
         'aggregate_kernel_schedules_per_second', 'restart_count',
         'search_generation', 'consecutive_unproductive_generations',
         'consecutive_exhausted_pipeline_epochs', 'distribution_focus',
     )
-    return {
+    compact = {
         key: search_result[key]
         for key in keys
         if key in search_result
     }
+    checkpoints = list(search_result.get('score_checkpoints') or [])
+    if checkpoints:
+        maximum_checkpoint_count = 256
+        if len(checkpoints) > maximum_checkpoint_count:
+            compact['score_checkpoints'] = [
+                checkpoints[0],
+                *checkpoints[-(maximum_checkpoint_count - 1):],
+            ]
+            compact['score_checkpoints_omitted'] = (
+                len(checkpoints) - maximum_checkpoint_count
+            )
+        else:
+            compact['score_checkpoints'] = checkpoints
+    best_checkpoint = search_result.get('best_authoritative_checkpoint')
+    if isinstance(best_checkpoint, dict):
+        compact['best_authoritative_checkpoint'] = {
+            key: best_checkpoint[key]
+            for key in (
+                'accepted_transitions', 'score', 'score_breakdown',
+                'schedule_fingerprint', 'epoch', 'restart_mode',
+                'selection_mode',
+                'operation_count',
+            )
+            if key in best_checkpoint
+        }
+    return compact
 
 
 def _compact_bootstrap_summary(summary):
@@ -408,6 +435,29 @@ def optimize_schedule_version_v2(
             raise ValueError('Atlas v2 source run belongs to another schedule version.')
 
     overall_started = monotonic()
+    verified_best_score = None
+
+    def publish_verified_best(score, *, force=False):
+        """Publish only complete, authoritative, monotonically better scores."""
+        nonlocal verified_best_score
+        if score is None:
+            return False
+        candidate = Decimal(str(score))
+        if (
+            verified_best_score is not None
+            and candidate > verified_best_score + Decimal('0.0001')
+        ):
+            return False
+        improved = (
+            verified_best_score is None
+            or candidate < verified_best_score - Decimal('0.0001')
+        )
+        if improved:
+            verified_best_score = candidate
+        if progress_callback is not None and (improved or force):
+            progress_callback(verified_best_score, force=force)
+        return improved
+
     bootstrap_summary = None
     if fresh_fill:
         bootstrap_summary = construct_complete_initial_schedule(
@@ -415,7 +465,9 @@ def optimize_schedule_version_v2(
             created_by=created_by,
             optimizer_run=optimizer_run,
             stop_requested=stop_requested,
-            progress_callback=progress_callback,
+            # Partial construction scores are not comparable to the score of
+            # a complete schedule and therefore are not a verified best.
+            progress_callback=None,
         )
         source_run = optimizer_run
     elif original_published:
@@ -434,9 +486,6 @@ def optimize_schedule_version_v2(
     initial_score = Decimal(str(source_report['total_score']))
     source_initial_score = initial_score
     source_initial_breakdown = source_report['score_breakdown']
-    if progress_callback is not None:
-        progress_callback(initial_score, force=True)
-
     source_completion_summary = None
     if (
         optimizer_run.start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
@@ -449,7 +498,8 @@ def optimize_schedule_version_v2(
             source_run=source_run,
             created_by=created_by,
             stop_requested=stop_requested,
-            progress_callback=progress_callback,
+            # Do not publish incomplete-source construction scores as best.
+            progress_callback=None,
         )
         source_run = optimizer_run
         source_report = build_violation_report(
@@ -569,7 +619,7 @@ def optimize_schedule_version_v2(
                     == OptimizerRun.OptimizationFocus.DISTRIBUTION
                 ),
                 stop_requested=stop_requested,
-                progress_callback=progress_callback,
+                progress_callback=publish_verified_best,
                 diagnostic_state=diagnostic_state,
                 as_json=True,
                 stdout=output,
@@ -638,6 +688,14 @@ def optimize_schedule_version_v2(
         final_score = Decimal(str(report['total_score']))
         _require_matching_final_score(final_score, search_result)
         _require_hard_valid_final_report(report)
+        if (
+            verified_best_score is not None
+            and final_score > verified_best_score + Decimal('0.0001')
+        ):
+            raise ValueError(
+                'Atlas v2 final penalty exceeded the lowest verified penalty; '
+                'the isolated result was not saved.'
+            )
         if final_score > source_initial_score + Decimal('0.0001'):
             raise ValueError(
                 'Atlas v2 test result worsened the authoritative penalty; '
@@ -681,6 +739,7 @@ def optimize_schedule_version_v2(
             ),
             'assignments_made': len(rows),
             'unfilled_shift_count': unfilled,
+            'best_verified_score': float(final_score),
             'v2_search': _compact_search_summary(search_result),
             'fresh_fill_bootstrap': _compact_bootstrap_summary(
                 bootstrap_summary
@@ -709,8 +768,7 @@ def optimize_schedule_version_v2(
             'optimizer_summary', 'optimizer_debug', 'score_is_stale',
             'is_active', 'notes',
         ])
-    if progress_callback is not None:
-        progress_callback(final_score, force=True)
+    publish_verified_best(final_score, force=True)
     return summary
 
 

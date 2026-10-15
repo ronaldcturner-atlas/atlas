@@ -32,6 +32,7 @@ from apps.scheduling.optimizer_v2 import (
 from apps.scheduling.optimizer_v2_runner import (
     _apply_search_operations,
     _authoritative_search_initial_score,
+    _compact_search_summary,
     _require_hard_valid_final_report,
     _require_matching_final_score,
 )
@@ -113,6 +114,37 @@ class V2SwapKernelCommandTests(SimpleTestCase):
 
 
 class V2FinalScoreGuardTests(SimpleTestCase):
+    def test_completed_summary_retains_bounded_score_audit(self):
+        checkpoints = [
+            {'accepted_transitions': index, 'score': 1000 - index}
+            for index in range(300)
+        ]
+        compact = _compact_search_summary({
+            'predicted_final_score': 701,
+            'score_checkpoint_interval': 20,
+            'score_checkpoints': checkpoints,
+            'best_authoritative_checkpoint': {
+                'accepted_transitions': 299,
+                'score': 701,
+                'schedule_fingerprint': 'verified-best',
+                'operation_count': 299,
+                'operation_chain': ['large replay evidence is omitted'],
+            },
+            'neighborhoods': [{'large': 'diagnostic payload'}],
+        })
+
+        self.assertEqual(len(compact['score_checkpoints']), 256)
+        self.assertEqual(compact['score_checkpoints'][0], checkpoints[0])
+        self.assertEqual(compact['score_checkpoints'][-1], checkpoints[-1])
+        self.assertEqual(compact['score_checkpoints_omitted'], 44)
+        self.assertEqual(compact['best_authoritative_checkpoint'], {
+            'accepted_transitions': 299,
+            'score': 701,
+            'schedule_fingerprint': 'verified-best',
+            'operation_count': 299,
+        })
+        self.assertNotIn('neighborhoods', compact)
+
     def test_opening_checkpoint_replaces_stale_bootstrap_score(self):
         self.assertEqual(
             _authoritative_search_initial_score({

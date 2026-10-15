@@ -9,6 +9,7 @@ from time import monotonic
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import close_old_connections, connection, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.scheduling.models import (
@@ -109,10 +110,12 @@ class Command(BaseCommand):
 
     @staticmethod
     def _store_live_best_score(control_id, score):
-        """Commit progress outside the optimizer's long schedule transaction."""
+        """Commit a monotonically improving best score outside the search transaction."""
         close_old_connections()
         try:
-            OptimizerControl.objects.filter(pk=control_id).update(
+            OptimizerControl.objects.filter(pk=control_id).filter(
+                Q(live_best_score__isnull=True) | Q(live_best_score__gt=score)
+            ).update(
                 live_best_score=score,
                 progress_updated_at=timezone.now(),
             )
