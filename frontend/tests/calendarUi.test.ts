@@ -17,6 +17,10 @@ const dashboardSource = readFileSync(
   new URL('../src/components/Dashboard.tsx', import.meta.url),
   'utf8',
 )
+const loginStyles = readFileSync(
+  new URL('../src/components/Login.css', import.meta.url),
+  'utf8',
+)
 
 describe('desktop calendar controls', () => {
   it('uses the compact current-month action without the obsolete Today and Month buttons', () => {
@@ -137,11 +141,17 @@ describe('calendar highlight styling', () => {
     expect(resolver.indexOf("if (isOwn) return 'shift-status-own'")).toBeLessThan(resolver.indexOf('shift.postingMode'))
   })
 
-  it('uses the approved light visual language only for the desktop Schedule experience', () => {
-    expect(dashboardSource).toContain("activeView === 'my-schedule' ? ' schedule-light-theme' : ''")
+  it('uses the approved light visual language throughout the desktop application', () => {
+    expect(dashboardSource).toContain('<div className="app-root schedule-light-theme">')
     expect(calendarStyles).toMatch(/\.schedule-light-theme\{[^}]*--app-bg:#f1f5f9;[^}]*--surface:#fff;[^}]*--muted:#64748b;/)
     expect(calendarStyles).toMatch(/\.schedule-light-theme \.calendar-card\{[^}]*background:#fff;/)
     expect(calendarStyles).toContain('.schedule-light-theme .day-cell{border:1px solid #dbe2ea;background:#fff}')
+    expect(calendarStyles).toMatch(/\.schedule-light-theme \.stats-page-card,[\s\S]*\.schedule-light-theme \.contract-page,[\s\S]*\.schedule-light-theme \.user-directory-card\{[^}]*background:#fff;/)
+    expect(calendarStyles).toContain('.schedule-light-theme .contract-page-tabs button.active{border-bottom-color:#4f46e5;color:#3730a3}')
+    expect(calendarStyles).toContain('.schedule-light-theme .user-name-button{color:#334155}')
+    expect(calendarStyles).toContain('.schedule-light-theme .feasibility-compact-summary{border-color:#dbe2ea;background:#fff}')
+    expect(loginStyles).toContain('background: linear-gradient(135deg, #eef2ff 0%, #f8fafc 55%, #e2e8f0 100%);')
+    expect(loginStyles).toContain('background: #fff;')
   })
 
   it('keeps the shared sidebar fixed while the page content scrolls', () => {

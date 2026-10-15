@@ -1,6 +1,6 @@
 .login-container {
   min-height: 100vh;
-  background: linear-gradient(135deg, #071022 0%, #0b1220 100%);
+  background: linear-gradient(135deg, #eef2ff 0%, #f8fafc 55%, #e2e8f0 100%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -8,10 +8,10 @@
 }
 
 .login-card {
-  background: var(--surface);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #fff;
+  border: 1px solid #dbe2ea;
   border-radius: 16px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.14);
   width: 100%;
   max-width: 420px;
   padding: 40px;
@@ -34,7 +34,7 @@
 .login-subtitle {
   font-size: 16px;
   font-weight: 600;
-  color: var(--sidebar-fg);
+  color: #475569;
   letter-spacing: 0.35px;
   margin: 0;
 }
@@ -55,36 +55,36 @@
 .form-label {
   font-size: 13px;
   font-weight: 500;
-  color: var(--sidebar-fg);
+  color: #334155;
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .form-input {
   padding: 12px 14px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #fff;
+  border: 1px solid #cbd5e1;
   border-radius: 8px;
-  color: var(--sidebar-fg);
+  color: #172033;
   font-size: 14px;
   font-family: inherit;
   transition: all 0.2s ease;
 }
 
 .form-input:hover {
-  border-color: rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.06);
+  border-color: #94a3b8;
+  background: #f8fafc;
 }
 
 .form-input:focus {
   outline: none;
   border-color: var(--accent);
-  background: rgba(255, 255, 255, 0.08);
+  background: #fff;
   box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
 }
 
 .form-input::placeholder {
-  color: var(--muted);
+  color: #94a3b8;
 }
 
 .form-input:disabled {
@@ -97,7 +97,7 @@
   background: rgba(239, 68, 68, 0.1);
   border: 1px solid rgba(239, 68, 68, 0.3);
   border-radius: 8px;
-  color: #fca5a5;
+  color: #b91c1c;
   font-size: 13px;
   margin-bottom: 8px;
 }
@@ -132,11 +132,11 @@
 
 .demo-credentials {
   padding: 16px;
-  background: rgba(255, 255, 255, 0.02);
+  background: #f8fafc;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.04);
+  border: 1px solid #e2e8f0;
   font-size: 12px;
-  color: var(--muted);
+  color: #64748b;
   text-align: center;
 }
 
@@ -146,7 +146,7 @@
 
 .demo-credentials code {
   background: rgba(79, 70, 229, 0.1);
-  color: #a5f3fc;
+  color: #3730a3;
   padding: 2px 6px;
   border-radius: 3px;
   font-family: 'Courier New', monospace;
@@ -155,7 +155,7 @@
 .password-change-card .login-header { margin-bottom: 20px; }
 .password-change-card .login-header h1 { margin: 0; font-size: 22px; }
 .password-change-form { margin-bottom: 0; }
-.password-change-form small { color: var(--muted); font-size: 11px; }
-.password-change-message { margin: 0; color: var(--sidebar-fg); font-size: 14px; }
+.password-change-form small { color: #64748b; font-size: 11px; }
+.password-change-message { margin: 0; color: #334155; font-size: 14px; }
 .password-change-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .password-change-actions .login-button { min-width: 150px; }

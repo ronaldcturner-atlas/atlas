@@ -1435,8 +1435,8 @@ select option {
 .backdate-transfer-choice{display:grid;gap:4px;margin-top:7px}.backdate-transfer-choice select{min-width:0;padding:6px;border:1px solid var(--border);border-radius:6px;background:#fff;color:#111}
 .backdate-batch-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px;border:1px solid rgba(240,180,41,.35);border-radius:8px;background:rgba(240,180,41,.07)}.backdate-batch-actions>span{margin-right:auto;color:var(--muted);font-size:12px;font-weight:700}
 
-/* Desktop Schedule light theme. Mobile keeps its separately approved layout
-   and simplified two-dot calendar language. */
+/* Atlas desktop light theme. Mobile keeps its separately approved layout and
+   simplified two-dot calendar language. */
 .schedule-light-theme{
   --app-bg:#f1f5f9;
   --sidebar-bg:#fff;
@@ -1513,3 +1513,173 @@ select option {
 .topbar-logout:hover{background:rgba(255,255,255,.12)}
 .schedule-light-theme .topbar-logout{border-color:#cbd5e1;background:#fff;color:#334155}
 .schedule-light-theme .topbar-logout:hover{background:#f1f5f9}
+
+/* Application-wide surfaces and controls. These rules intentionally remain
+   scoped to the authenticated desktop shell so the mobile PWA keeps its own
+   approved presentation. */
+.schedule-light-theme .topbar{border-bottom-color:#dbe2ea;background:#fff;color:#172033}
+.schedule-light-theme .content{background:#f1f5f9;color:#172033}
+.schedule-light-theme .page-title{color:#172033}
+.schedule-light-theme .scheduler-view-card,
+.schedule-light-theme .facilities-view-card,
+.schedule-light-theme .stats-page-card,
+.schedule-light-theme .contract-page,
+.schedule-light-theme .organization-view,
+.schedule-light-theme .user-self-profile,
+.schedule-light-theme .user-directory-card{border-color:#dbe2ea;background:#fff;color:#172033;box-shadow:0 10px 28px rgba(15,23,42,.07)}
+.schedule-light-theme input:not([type="checkbox"]):not([type="radio"]),
+.schedule-light-theme textarea{border-color:#cbd5e1;background:#fff;color:#172033}
+.schedule-light-theme input::placeholder,
+.schedule-light-theme textarea::placeholder{color:#94a3b8}
+.schedule-light-theme .stats-scope-controls,
+.schedule-light-theme .stats-filters,
+.schedule-light-theme .stats-group-manager,
+.schedule-light-theme .request-builder-calendar,
+.schedule-light-theme .request-editor,
+.schedule-light-theme .request-bulk-panel,
+.schedule-light-theme .build-workspace-controls,
+.schedule-light-theme .optimizer-run-selector-panel,
+.schedule-light-theme .optimizer-summary-card{border-color:#dbe2ea;background:#f8fafc;box-shadow:none}
+.schedule-light-theme .stats-totals,
+.schedule-light-theme .stats-shift-list,
+.schedule-light-theme .group-stats-list,
+.schedule-light-theme .scheduler-table-wrap,
+.schedule-light-theme .roles-table,
+.schedule-light-theme .user-directory-table,
+.schedule-light-theme .schedule-blocks-table{border-color:#dbe2ea;background:#fff;color:#172033}
+.schedule-light-theme .stats-shift-row,
+.schedule-light-theme .group-stats-row,
+.schedule-light-theme .scheduler-table th,
+.schedule-light-theme .scheduler-table td,
+.schedule-light-theme .roles-table-row,
+.schedule-light-theme .user-directory-row{border-color:#e2e8f0;color:#172033}
+.schedule-light-theme .group-stats-heading,
+.schedule-light-theme .scheduler-table th,
+.schedule-light-theme .roles-table-header,
+.schedule-light-theme .user-directory-table-head{background:#f8fafc;color:#64748b}
+.schedule-light-theme .scheduler-table tbody tr:hover,
+.schedule-light-theme .user-directory-row:not(.user-directory-table-head):hover{background:#f1f5f9}
+.schedule-light-theme .stats-totals,
+.schedule-light-theme .user-self-access>div,
+.schedule-light-theme .organization-admin-section,
+.schedule-light-theme .organization-admin-list>div,
+.schedule-light-theme .role-permission-groups section{border-color:#dbe2ea;background:#f8fafc}
+.schedule-light-theme .role-permission-group-header{background:#eef2f7}
+.schedule-light-theme .role-permission-group-header button,
+.schedule-light-theme .facility-actions button,
+.schedule-light-theme .build-calendar-toolbar button,
+.schedule-light-theme .request-builder-month-nav button,
+.schedule-light-theme .request-scope-toggle button,
+.schedule-light-theme .request-pattern-grid button,
+.schedule-light-theme .schedule-block-modal-tabs button,
+.schedule-light-theme .user-self-actions>button{border-color:#cbd5e1;background:#fff;color:#334155}
+.schedule-light-theme .role-permission-group-header button:hover,
+.schedule-light-theme .facility-actions button:hover,
+.schedule-light-theme .build-calendar-toolbar button:hover,
+.schedule-light-theme .request-builder-month-nav button:hover,
+.schedule-light-theme .user-self-actions>button:hover{background:#eef2ff}
+.schedule-light-theme .roles-scope-controls select,
+.schedule-light-theme .roles-single-region strong,
+.schedule-light-theme .user-directory-domain strong,
+.schedule-light-theme .build-calendar-physician-filter select{border-color:#cbd5e1;background:#fff;color:#172033}
+.schedule-light-theme .shift-modal,
+.schedule-light-theme .contract-modal,
+.schedule-light-theme .role-modal,
+.schedule-light-theme .user-directory-modal,
+.schedule-light-theme .organization-modal,
+.schedule-light-theme .schedule-block-modal,
+.schedule-light-theme .request-builder-modal,
+.schedule-light-theme .assignment-modal,
+.schedule-light-theme .backdate-modal,
+.schedule-light-theme .temporary-password-modal{border-color:#cbd5e1;background:#fff;color:#172033;box-shadow:0 22px 60px rgba(15,23,42,.24)}
+.schedule-light-theme .build-calendar{border-color:#dbe2ea;background:#f8fafc}
+.schedule-light-theme .build-calendar-weekdays{color:#64748b}
+.schedule-light-theme .build-day,
+.schedule-light-theme .request-day-cell{border-color:#dbe2ea;background:#fff;color:#172033}
+.schedule-light-theme .build-day-disabled,
+.schedule-light-theme .request-day-cell-disabled{background:#f1f5f9;color:#94a3b8}
+.schedule-light-theme .build-day-empty,
+.schedule-light-theme .request-day-cell-empty{background:transparent}
+.schedule-light-theme .assignment-popover,
+.schedule-light-theme .build-request-popover,
+.schedule-light-theme .build-violation-popover,
+.schedule-light-theme .request-chip-popover{border-color:#cbd5e1;background:#fff;color:#172033;box-shadow:0 16px 40px rgba(15,23,42,.2)}
+.schedule-light-theme .assignment-popover-header,
+.schedule-light-theme .assignment-popover-current,
+.schedule-light-theme .build-request-item,
+.schedule-light-theme .build-violation-item{border-color:#e2e8f0}
+.schedule-light-theme .assignment-popover-header button,
+.schedule-light-theme .assignment-popover-assignment button{border-color:#cbd5e1;background:#f8fafc;color:#334155}
+.schedule-light-theme .assignment-popover-options>button{color:#334155}
+.schedule-light-theme .assignment-popover-options>button:hover,
+.schedule-light-theme .assignment-popover-options>button:focus-visible{background:#eef2ff}
+.schedule-light-theme .optimizer-summary-grid>div,
+.schedule-light-theme .optimizer-extra-grid>div,
+.schedule-light-theme .optimizer-workload-item,
+.schedule-light-theme .request-counter-card,
+.schedule-light-theme .violation-summary-total,
+.schedule-light-theme .violation-user-section{border-color:#dbe2ea;background:#fff;color:#172033}
+.schedule-light-theme .optimizer-debug-details{background:#eef2f7;color:#334155}
+.schedule-light-theme .optimizer-active-run{border-color:#cbd5e1;background:#eef2ff;color:#172033}
+.schedule-light-theme .optimizer-active-run strong{color:#172033}
+.schedule-light-theme .optimizer-active-run span{color:#475569}
+.schedule-light-theme .optimizer-elapsed-time{color:#1e3a8a}
+.schedule-light-theme .optimizer-live-best-score{color:#166534}
+.schedule-light-theme .night-feasibility-card,
+.schedule-light-theme .weekend-feasibility-card,
+.schedule-light-theme .workload-feasibility-card,
+.schedule-light-theme .night-period-card{border-color:#dbe2ea;background:#fff;color:#172033}
+.schedule-light-theme .night-period-card dl div{background:#f8fafc}
+.schedule-light-theme .night-feasibility-heading span,
+.schedule-light-theme .night-feasibility-card small,
+.schedule-light-theme .night-period-card p,
+.schedule-light-theme .night-feasibility-fixed-summary span{color:#64748b}
+.schedule-light-theme .violation-report-tabs button.active{border-color:#dbe2ea;border-bottom-color:#fff;background:#fff;color:#172033}
+.schedule-light-theme .violation-report-tabs button:hover{color:#172033}
+.schedule-light-theme .proportionality-context-grid strong{color:#1d4ed8}
+.schedule-light-theme .temporary-password-modal p{color:#172033}
+.schedule-light-theme .temporary-password-value code{color:#92400e}
+.schedule-light-theme .contract-page-tabs{border-bottom-color:#dbe2ea}
+.schedule-light-theme .contract-page-tabs button{color:#64748b}
+.schedule-light-theme .contract-page-tabs button:hover{color:#3730a3}
+.schedule-light-theme .contract-page-tabs button.active{border-bottom-color:#4f46e5;color:#3730a3}
+.schedule-light-theme .user-name-button{color:#334155}
+.schedule-light-theme .user-name-button:hover{color:#4338ca}
+.schedule-light-theme .user-domain-filters button{border-color:#cbd5e1;background:#fff;color:#475569}
+.schedule-light-theme .user-domain-filters button:hover{border-color:#818cf8;background:#eef2ff;color:#3730a3}
+.schedule-light-theme .user-domain-filters button.active{border-color:#4f46e5;background:#4f46e5;color:#fff}
+.schedule-light-theme .contract-additional-workload-card,
+.schedule-light-theme .contract-rule-row,
+.schedule-light-theme .contract-minmax-column,
+.schedule-light-theme .contract-facility-rule-card,
+.schedule-light-theme .contract-shift-card,
+.schedule-light-theme .contract-request-group,
+.schedule-light-theme .contract-request-allowed-item,
+.schedule-light-theme .user-override-rule-group,
+.schedule-light-theme .user-override-rule-card{border-color:#dbe2ea;background:#f8fafc;color:#172033}
+.schedule-light-theme .contract-facility-rule-card.selected{border-color:#818cf8;background:#eef2ff}
+.schedule-light-theme .contract-facility-periods{border-top-color:#dbe2ea}
+.schedule-light-theme .contract-remove-button{border-color:#cbd5e1;background:#fff;color:#475569}
+.schedule-light-theme .contract-remove-button:hover:not(:disabled){background:#f1f5f9}
+.schedule-light-theme .contract-saved-banner{background:#dcfce7;color:#166534}
+.schedule-light-theme .contract-setup-banner{background:#fffbeb;color:#92400e}
+.schedule-light-theme .user-override-eyebrow{color:#4f46e5}
+.schedule-light-theme .user-override-default-field div{border-color:#dbe2ea;background:#eef2f7;color:#64748b}
+.schedule-light-theme .shared-rule-contract-chips span{border-color:#cbd5e1;background:#eef2ff;color:#3730a3}
+.schedule-light-theme .shared-rule-step,
+.schedule-light-theme .shared-rule-contract-grid label,
+.schedule-light-theme .shared-rule-template-grid label{border-color:#dbe2ea;background:#f8fafc;color:#172033}
+.schedule-light-theme .shared-rule-contract-grid small,
+.schedule-light-theme .shared-rule-template-grid small{color:#64748b}
+.schedule-light-theme .shared-rule-compatibility>div{background:#f8fafc}
+.schedule-light-theme .build-workspace-scope{color:#64748b}
+.schedule-light-theme .build-workspace-fixed-domain strong{border-color:#cbd5e1;background:#fff;color:#172033}
+.schedule-light-theme .optimizer-action-message{color:#92400e}
+.schedule-light-theme .feasibility-compact-summary{border-color:#dbe2ea;background:#fff}
+.schedule-light-theme .feasibility-hover-panel{border-color:#cbd5e1;background:#fff;color:#172033;box-shadow:0 18px 45px rgba(15,23,42,.18)}
+.schedule-light-theme .feasibility-hover-panel dl div,
+.schedule-light-theme .workload-adjustment-hover-list article{border-color:#dbe2ea;background:#f8fafc}
+.schedule-light-theme .feasibility-hover-panel p,
+.schedule-light-theme .feasibility-hover-panel small,
+.schedule-light-theme .weekend-feasibility-card small,
+.schedule-light-theme .weekend-feasibility-card dt{color:#64748b}

@@ -150,7 +150,7 @@ export default function Dashboard() {
   }, [])
 
   return (
-    <div className={`app-root${activeView === 'my-schedule' ? ' schedule-light-theme' : ''}`}>
+    <div className="app-root schedule-light-theme">
       <Sidebar
         activeView={activeView}
         onSelectView={(view) => navigate(VIEW_PATHS[view])}
