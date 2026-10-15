@@ -757,6 +757,7 @@ class ScheduleRequestSerializer(serializers.ModelSerializer):
                 'id': template.id,
                 'name': template.generated_name(),
                 'facility_name': template.facility.name,
+                'weekend_days': template.weekend_days or [],
             }
             for template in templates
         ]

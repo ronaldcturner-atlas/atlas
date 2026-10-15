@@ -356,6 +356,8 @@ select option:checked{
 .request-counter-card{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 9px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:rgba(255,255,255,0.025)}
 .request-counter-card span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em}
 .request-counter-card strong{font-size:13px}
+.request-counter-card-over{border-color:#f87171;background:rgba(127,29,29,.22)}
+.request-counter-card-over span,.request-counter-card-over strong{color:#fecaca}
 .request-total-summary{display:grid;gap:6px;padding:8px 10px;border:1px solid rgba(255,255,255,.1);border-radius:9px;background:rgba(255,255,255,.02)}
 .request-total-summary h3{margin:0;font-size:12px}
 .request-total-summary>small{color:var(--muted);font-size:10px}

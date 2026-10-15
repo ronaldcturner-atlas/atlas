@@ -34,6 +34,7 @@ type RequestItem = {
     id: number
     name: string
     facility_name: string
+    weekend_days: string[]
   }>
 }
 
@@ -615,66 +616,104 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     ))
   }, [contextData?.request_policy?.allowed_request_types])
 
-  const requestLimitMessage = useMemo(() => {
-    if (!contextData || selectedScope !== 'USER' || requestType === 'NONE') {
+  const projectedRequestCounters = useMemo(() => {
+    if (!contextData) {
       return null
     }
 
-    // Multi-date saves are validated atomically by the server against all
-    // request and weekend limits. The single-date preview below remains useful
-    // without presenting an incomplete projection for a batch.
-    if (individualSelectedDates.length > 1) {
-      return null
+    const projected = Object.fromEntries(
+      (['HIGH', 'MEDIUM', 'LOW', 'WEEKEND'] as RequestCounterKey[]).map((key) => [
+        key,
+        { ...contextData.request_counters[key], pending: 0, overLimit: false },
+      ]),
+    ) as Record<RequestCounterKey, RequestCounter & { pending: number; overLimit: boolean }>
+
+    if (selectedScope !== 'USER' || requestType === 'NONE' || !individualSelectedDates.length) {
+      return projected
     }
 
-    const existing = existingForSelectedDate.userRequest
-    const counters = contextData.request_counters
-    const counterKey = weight === 'FIXED' ? null : weight
-
-    if (counterKey) {
-      const counter = counters[counterKey]
-      const replacingSameWeight = existing?.weight === weight
-      const projected = counter.used + (replacingSameWeight ? 0 : 1)
-      if (!counter.unlimited && counter.limit !== null && projected > counter.limit) {
-        const label = `${counterKey.charAt(0)}${counterKey.slice(1).toLowerCase()}`
-        return `${label} request limit of ${counter.limit} has been reached.`
-      }
-    }
-
-    const selectedDayName = DAY_NAMES[selectedDateUtc.getUTCDay()]
-    const templateById = new Map((contextData.shift_templates ?? []).map((template) => [template.id, template]))
-    const isWeekendRequest = (type: StoredRequestType, templateIds: number[]) => {
+    const templates = contextData.shift_templates ?? []
+    const templateById = new Map(templates.map((template) => [template.id, template]))
+    const isWeekendRequest = (dateValue: string, type: StoredRequestType, templateIds: number[]) => {
+      const dayName = DAY_NAMES[parseIsoDateToUtc(dateValue).getUTCDay()]
       if (type === 'DAY_OFF') {
-        return availableTemplatesForSelectedDate.some((template) => template.weekend_days.includes(selectedDayName))
+        return templates.some((template) => (
+          template.active_days_of_week.includes(dayName)
+          && template.weekend_days.includes(dayName)
+        ))
       }
       if (type === 'SHIFT_OFF') {
-        return templateIds.some((templateId) => templateById.get(templateId)?.weekend_days.includes(selectedDayName))
+        return templateIds.some((templateId) => {
+          const template = templateById.get(templateId)
+          return Boolean(
+            template
+            && template.active_days_of_week.includes(dayName)
+            && template.weekend_days.includes(dayName)
+          )
+        })
       }
       return false
     }
 
-    const nextWeekend = isWeekendRequest(requestType, selectedShiftTemplateIds)
-    const existingWeekend = existing
-      ? isWeekendRequest(existing.request_type, existing.shift_template_ids)
-      : false
-    const weekendCounter = counters.WEEKEND
-    const projectedWeekend = weekendCounter.used + (nextWeekend ? 1 : 0) - (existingWeekend ? 1 : 0)
-    if (weekendCounter.limit !== null && projectedWeekend > weekendCounter.limit) {
-      return `Weekend request limit of ${weekendCounter.limit} has been reached.`
+    const existingIsWeekendRequest = (dateValue: string, existing: RequestItem) => {
+      const dayName = DAY_NAMES[parseIsoDateToUtc(dateValue).getUTCDay()]
+      if (existing.request_type === 'DAY_OFF') {
+        return isWeekendRequest(dateValue, existing.request_type, existing.shift_template_ids)
+      }
+      if (existing.request_type === 'SHIFT_OFF') {
+        return existing.shift_template_details.some((template) => template.weekend_days.includes(dayName))
+      }
+      return false
     }
 
-    return null
+    for (const dateValue of individualSelectedDates) {
+      const existing = requestsByDateAndScope.get(`${dateValue}-USER`)
+      if (existing?.weight && existing.weight !== 'FIXED') {
+        projected[existing.weight].used -= 1
+      }
+      if (existing && existingIsWeekendRequest(dateValue, existing)) {
+        projected.WEEKEND.used -= 1
+      }
+
+      if (weight !== 'FIXED') {
+        projected[weight].used += 1
+      }
+      if (isWeekendRequest(dateValue, requestType, selectedShiftTemplateIds)) {
+        projected.WEEKEND.used += 1
+      }
+    }
+
+    for (const key of ['HIGH', 'MEDIUM', 'LOW', 'WEEKEND'] as RequestCounterKey[]) {
+      const counter = projected[key]
+      counter.used = Math.max(0, counter.used)
+      counter.pending = counter.used - contextData.request_counters[key].used
+      counter.overLimit = !counter.unlimited && counter.limit !== null && counter.used > counter.limit
+    }
+    return projected
   }, [
-    availableTemplatesForSelectedDate,
     contextData,
-    existingForSelectedDate.userRequest,
-    individualSelectedDates.length,
+    individualSelectedDates,
     requestType,
-    selectedDateUtc,
+    requestsByDateAndScope,
     selectedScope,
     selectedShiftTemplateIds,
     weight,
   ])
+
+  const requestLimitMessage = useMemo(() => {
+    if (!projectedRequestCounters) {
+      return null
+    }
+    const exceededKey = (['HIGH', 'MEDIUM', 'LOW', 'WEEKEND'] as RequestCounterKey[]).find((key) => (
+      projectedRequestCounters[key].overLimit
+    ))
+    if (!exceededKey) {
+      return null
+    }
+    const counter = projectedRequestCounters[exceededKey]
+    const label = `${exceededKey.charAt(0)}${exceededKey.slice(1).toLowerCase()}`
+    return `${label} requests would be ${counter.used}/${counter.limit}. Remove ${counter.used - (counter.limit ?? 0)} selected date${counter.used - (counter.limit ?? 0) === 1 ? '' : 's'} before saving.`
+  }, [projectedRequestCounters])
 
   const handlePhysicianChange = async (nextPhysicianId: number) => {
     setSelectedPhysicianId(nextPhysicianId)
@@ -1044,12 +1083,15 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
 
       <div className="request-counter-row">
         {(['HIGH', 'MEDIUM', 'LOW', 'WEEKEND'] as RequestCounterKey[]).map((key) => {
-          const counter = contextData.request_counters[key]
+          const counter = projectedRequestCounters?.[key] ?? contextData.request_counters[key]
+          const showingProjection = selectedScope === 'USER' && requestType !== 'NONE'
           const counterLabel = counter.unlimited
-            ? 'Unlimited'
-            : `${counter.used}/${counter.limit ?? '—'}`
+            ? showingProjection
+              ? `${counter.used} projected · Unlimited`
+              : 'Unlimited'
+            : `${counter.used}/${counter.limit ?? '—'}${showingProjection ? ' projected' : ''}`
           return (
-            <div key={key} className="request-counter-card">
+            <div key={key} className={`request-counter-card ${'overLimit' in counter && counter.overLimit ? 'request-counter-card-over' : ''}`}>
               <span>{key.charAt(0)}{key.slice(1).toLowerCase()}</span>
               <strong>{counterLabel}</strong>
             </div>

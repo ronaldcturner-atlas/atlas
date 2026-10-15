@@ -41,4 +41,12 @@ describe('Schedule Block request overview', () => {
     expect(requestBuilderSource).toContain('const nextDate = nextIndividualRequestDate(savedDate, block.end_date)')
     expect(requestBuilderSource).toContain('setIndividualSelectedDates([nextDate])')
   })
+
+  it('projects request and weekend allowances while dates are selected', () => {
+    expect(requestBuilderSource).toContain('const projectedRequestCounters = useMemo')
+    expect(requestBuilderSource).toContain("`${counter.used}/${counter.limit ?? '—'}${showingProjection ? ' projected' : ''}`")
+    expect(requestBuilderSource).toContain('projected.WEEKEND.used += 1')
+    expect(requestBuilderSource).toContain('request-counter-card-over')
+    expect(requestBuilderSource).toContain('Remove ${counter.used - (counter.limit ?? 0)} selected date')
+  })
 })
