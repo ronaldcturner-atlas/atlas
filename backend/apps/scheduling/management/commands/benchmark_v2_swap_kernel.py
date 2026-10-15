@@ -143,7 +143,7 @@ def _structural_focus_family(violation_type):
         return 'weekend'
     if value == 'SAME_SHIFT_STREAK':
         return 'same_shift'
-    if value.startswith('SHIFT_GROUP_'):
+    if value.startswith(('SHIFT_GROUP_', 'FACILITY_RULE_')):
         return 'shift_rule'
     if 'CONSECUTIVE_DAY' in value or value == 'MAX_DAYS_IN_ROW':
         return 'consecutive'
@@ -416,21 +416,30 @@ def _prepare_shift_rule_kernel(
     shift_templates = np.asarray(
         [instance.shift_template_id for instance in instances], dtype=np.int32,
     )
+    shift_facilities = np.asarray(
+        [instance.facility_id for instance in instances], dtype=np.int32,
+    )
     replacement_by_assignment = np.zeros(
         (len(shift_for_assignment), len(instances)), dtype=np.float64,
     )
     for physician_idx, physician_id in enumerate(physician_ids):
         contract = contracts[physician_id]
-        settings = (
+        shift_settings = (
             contract.shift_settings
             if isinstance(contract.shift_settings, dict) else {}
+        )
+        facility_settings = (
+            contract.facility_settings
+            if isinstance(getattr(contract, 'facility_settings', None), dict)
+            else {}
         )
         increments = []
         minimums = []
         maximums = []
         minimum_weights = []
         maximum_weights = []
-        for group in settings.get('rules') or ():
+        group_masks = []
+        for group in shift_settings.get('rules') or ():
             if not isinstance(group, dict):
                 continue
             template_ids = {
@@ -440,10 +449,25 @@ def _prepare_shift_rule_kernel(
             }
             if not template_ids:
                 continue
-            template_mask = np.isin(
-                shift_templates,
-                np.fromiter(template_ids, dtype=np.int32),
-            )
+            group_masks.append((
+                group,
+                np.isin(
+                    shift_templates,
+                    np.fromiter(template_ids, dtype=np.int32),
+                ),
+            ))
+        for group in facility_settings.get('rules') or ():
+            if not isinstance(group, dict):
+                continue
+            try:
+                facility_id = int(group.get('facility_id') or 0)
+            except (TypeError, ValueError):
+                continue
+            if facility_id <= 0:
+                continue
+            group_masks.append((group, shift_facilities == facility_id))
+
+        for group, group_mask in group_masks:
             for rule in group.get('period_rules') or ():
                 if not isinstance(rule, dict):
                     continue
@@ -479,7 +503,7 @@ def _prepare_shift_rule_kernel(
                         normalized, window_start, window_end,
                     )
                     increment = (
-                        template_mask
+                        group_mask
                         & (shift_dates >= window_start.toordinal())
                         & (shift_dates <= window_end.toordinal())
                     ).astype(np.float64)
