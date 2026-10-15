@@ -3188,7 +3188,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                   </>
                 )}
                 {context.schedule_block.published_at && !selectedRunForActions.is_published ? (
-                  <button type="button" className="secondary" disabled title="Only the frozen published-run report is available for a published schedule.">
+                  <button type="button" className="secondary build-violations-link" disabled title="Only the frozen published-run report is available for a published schedule.">
                     Violations
                   </button>
                 ) : (

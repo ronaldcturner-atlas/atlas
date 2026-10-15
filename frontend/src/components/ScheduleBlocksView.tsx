@@ -920,7 +920,7 @@ export default function ScheduleBlocksView({
                       </>
                     )}
                     {block.can_manage_build_workspace && !block.published_at && (
-                      <button type="button" onClick={() => deleteBlock(block)}>Delete</button>
+                      <button type="button" className="danger" onClick={() => deleteBlock(block)}>Delete</button>
                     )}
                     {block.can_manage_build_workspace && block.build_status === 'PREVIEW' && (
                       <button type="button" onClick={() => moveBackToBuild(block)}>Move Back to Build</button>

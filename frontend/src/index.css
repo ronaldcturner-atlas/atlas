@@ -1683,3 +1683,67 @@ select option {
 .schedule-light-theme .feasibility-hover-panel small,
 .schedule-light-theme .weekend-feasibility-card small,
 .schedule-light-theme .weekend-feasibility-card dt{color:#64748b}
+
+/* High-contrast action colors for the light theme. Keep destructive and
+   warning actions unmistakable, including while an optimizer run disables
+   them. */
+.schedule-light-theme .build-workspace-maintenance-actions .secondary:not(.danger-action){
+  border:1px solid #64748b;
+  background:#fff;
+  color:#1e293b;
+  font-weight:700;
+}
+.schedule-light-theme .build-workspace-maintenance-actions .secondary:not(.danger-action):hover:not(:disabled){
+  border-color:#334155;
+  background:#e2e8f0;
+}
+.schedule-light-theme .build-workspace-maintenance-actions .secondary:not(.danger-action):disabled{
+  border-color:#94a3b8;
+  background:#e2e8f0;
+  color:#475569;
+  opacity:1;
+}
+.schedule-light-theme .danger-action,
+.schedule-light-theme .facility-actions button.danger,
+.schedule-light-theme .stats-group-manager button.danger,
+.schedule-light-theme .calendar-comment-actions .danger{
+  border:1px solid #991b1b!important;
+  background:#b91c1c!important;
+  color:#fff!important;
+  font-weight:800;
+  box-shadow:none;
+}
+.schedule-light-theme .danger-action:hover:not(:disabled),
+.schedule-light-theme .facility-actions button.danger:hover:not(:disabled),
+.schedule-light-theme .stats-group-manager button.danger:hover:not(:disabled),
+.schedule-light-theme .calendar-comment-actions .danger:hover:not(:disabled){
+  border-color:#7f1d1d!important;
+  background:#991b1b!important;
+}
+.schedule-light-theme .danger-action:disabled,
+.schedule-light-theme .facility-actions button.danger:disabled,
+.schedule-light-theme .stats-group-manager button.danger:disabled,
+.schedule-light-theme .calendar-comment-actions .danger:disabled{
+  border-color:#dc2626!important;
+  background:#fee2e2!important;
+  color:#991b1b!important;
+  opacity:1;
+  cursor:not-allowed;
+}
+.schedule-light-theme .build-violations-link{
+  border-color:#92400e!important;
+  background:#f59e0b!important;
+  color:#451a03!important;
+  box-shadow:0 2px 6px rgba(146,64,14,.2);
+}
+.schedule-light-theme .build-violations-link:hover{
+  border-color:#78350f!important;
+  background:#d97706!important;
+  color:#fff!important;
+}
+.schedule-light-theme .build-violations-link:disabled{
+  border-color:#d97706;
+  background:#fef3c7;
+  color:#92400e;
+  opacity:1;
+}
