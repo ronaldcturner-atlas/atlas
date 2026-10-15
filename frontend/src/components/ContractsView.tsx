@@ -60,6 +60,7 @@ type ContractRecord = {
   name: string
   active: boolean
   facility_ids: number[]
+  facility_settings: FacilitySettings
   workload_settings: WorkloadSettings
   shift_settings: ShiftSettings
   night_settings: NightSettings
@@ -100,6 +101,15 @@ type MinMaxRule = {
   min_penalty_weight: string
   max_penalty_weight: string
   spread_violations: boolean
+}
+
+type FacilityRule = {
+  facility_id: number
+  period_rules: MinMaxRule[]
+}
+
+type FacilitySettings = {
+  rules: FacilityRule[]
 }
 
 type ShiftRule = {
@@ -213,6 +223,7 @@ type ContractFormState = {
   active: boolean
   manual_assignment_only: boolean
   facility_ids: number[]
+  facility_settings: FacilitySettings
   assigned_user_ids: number[]
   workload_settings: WorkloadSettings
   shift_settings: ShiftSettings
@@ -277,6 +288,13 @@ function makeShiftRule(): ShiftRule {
   }
 }
 
+function makeFacilityRule(facilityId: number): FacilityRule {
+  return {
+    facility_id: facilityId,
+    period_rules: [],
+  }
+}
+
 function emptyFormState(): ContractFormState {
   return {
     name: '',
@@ -284,6 +302,7 @@ function emptyFormState(): ContractFormState {
     active: true,
     manual_assignment_only: false,
     facility_ids: [],
+    facility_settings: { rules: [] },
     assigned_user_ids: [],
     workload_settings: {
       period_rules: [makeMinMaxRule('WEEK')],
@@ -398,6 +417,7 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
   const nightSettings = contract.night_settings || fallback.night_settings
   const weekendSettings = contract.weekend_settings || fallback.weekend_settings
   const requestSettings = contract.request_settings || fallback.request_settings
+  const facilitySettings = contract.facility_settings || fallback.facility_settings
   const legacyNightPenalty = (nightSettings as Record<string, unknown>).consecutive_penalty_weight
   const legacyWeekendPenalty = (weekendSettings as Record<string, unknown>).consecutive_penalty_weight
 
@@ -435,6 +455,20 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
     active: contract.active,
     manual_assignment_only: Boolean(contract.manual_assignment_only),
     facility_ids: Array.isArray(contract.facility_ids) ? contract.facility_ids : [],
+    facility_settings: {
+      rules: (Array.isArray(contract.facility_ids) ? contract.facility_ids : [])
+        .map((facilityId) => {
+          const rule = (Array.isArray(facilitySettings.rules) ? facilitySettings.rules : [])
+            .find((candidate) => Number(candidate.facility_id) === facilityId)
+          return {
+            facility_id: facilityId,
+            period_rules: (rule && Array.isArray(rule.period_rules)
+              ? rule.period_rules
+              : [])
+              .map((periodRule) => normalizeMinMaxRule(periodRule as Partial<MinMaxRule> & Record<string, unknown>)),
+          }
+        }),
+    },
     assigned_user_ids: contract.assigned_users.map((user) => user.id),
     workload_settings: {
       ...fallback.workload_settings,
@@ -487,6 +521,14 @@ function sanitizeFormPayload(formState: ContractFormState) {
     active: formState.active,
     manual_assignment_only: formState.manual_assignment_only,
     facility_ids: formState.facility_ids,
+    facility_settings: {
+      rules: formState.facility_settings.rules
+        .filter((rule) => formState.facility_ids.includes(rule.facility_id))
+        .map((rule) => ({
+          facility_id: rule.facility_id,
+          period_rules: rule.period_rules.map(({ id, ...periodRule }) => periodRule),
+        })),
+    },
     assigned_user_ids: formState.assigned_user_ids,
     workload_settings: {
       ...formState.workload_settings,
@@ -927,6 +969,7 @@ export default function ContractsView() {
       domainName: selectedDomain?.name || '-',
       regionName: selectedDomain?.region_name || '-',
       facilityCount: formState.facility_ids.length,
+      facilityRuleCount: formState.facility_settings.rules.reduce((count, rule) => count + rule.period_rules.length, 0),
       usersCount: formState.assigned_user_ids.length,
       workloadRuleCount: formState.workload_settings.period_rules.length,
       shiftRuleCount: formState.shift_settings.rules.length + formState.shared_rules.filter((rule) => rule.active && rule.enabled).length,
@@ -1167,6 +1210,7 @@ export default function ContractsView() {
                   <div className="request-existing-note">Status: {formState.active ? 'Active' : 'Inactive'}</div>
                   <div className="request-existing-note">Scheduling: {formState.manual_assignment_only ? 'Manual assignment only' : 'Optimizer managed'}</div>
                   <div className="request-existing-note">Facilities selected: {summaryLabel.facilityCount}</div>
+                  <div className="request-existing-note">Facility target rules: {summaryLabel.facilityRuleCount}</div>
                   <div className="request-existing-note">Users assigned: {summaryLabel.usersCount}</div>
                   <div className="request-existing-note">Workload period rules: {summaryLabel.workloadRuleCount}</div>
                   <div className="request-existing-note">Shift groups: {summaryLabel.shiftRuleCount}</div>
@@ -1259,30 +1303,75 @@ export default function ContractsView() {
 
               {activeTab === 'facilities' && (
                 <div className="contract-section-stack">
-                  <h3>Allowed Facilities</h3>
-                  <div className="days-grid">
+                  <h3>Facility Eligibility and Targets</h3>
+                  <div className="request-existing-note">Selecting a Facility allows these Contract users to work there. Optional target rules guide how many shifts or hours each user should receive at that Facility.</div>
+                  <div className="contract-facility-rule-list">
                     {activeFacilities.map((facility) => {
                       const checked = formState.facility_ids.includes(facility.id)
+                      const facilityRule = formState.facility_settings.rules.find((rule) => rule.facility_id === facility.id)
                       return (
-                        <label key={facility.id} className="day-option">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(event) => {
-                              const nextIds = new Set(formState.facility_ids)
-                              if (event.target.checked) {
-                                nextIds.add(facility.id)
-                              } else {
-                                nextIds.delete(facility.id)
-                              }
-                              setFormState((current) => ({
+                        <section key={facility.id} className={`contract-facility-rule-card${checked ? ' selected' : ''}`}>
+                          <label className="contract-facility-select">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(event) => {
+                                const isSelected = event.target.checked
+                                setFormState((current) => ({
+                                  ...current,
+                                  facility_ids: isSelected
+                                    ? [...new Set([...current.facility_ids, facility.id])].sort((a, b) => a - b)
+                                    : current.facility_ids.filter((id) => id !== facility.id),
+                                  facility_settings: {
+                                    rules: isSelected
+                                      ? current.facility_settings.rules.some((rule) => rule.facility_id === facility.id)
+                                        ? current.facility_settings.rules
+                                        : [...current.facility_settings.rules, makeFacilityRule(facility.id)]
+                                      : current.facility_settings.rules.filter((rule) => rule.facility_id !== facility.id),
+                                  },
+                                }))
+                              }}
+                            />
+                            <span>{facility.name}</span>
+                            <small>{checked ? 'Eligible' : 'Not eligible'}</small>
+                          </label>
+                          {checked && facilityRule && <div className="contract-facility-periods">
+                            {!facilityRule.period_rules.length && <div className="contract-facility-empty-target">Eligible with no minimum or maximum target.</div>}
+                            {facilityRule.period_rules.map((rule, index) => {
+                              const summary = workloadRuleSummary(rule)
+                              const updateRule = (changes: Partial<MinMaxRule>) => setFormState((current) => ({
                                 ...current,
-                                facility_ids: Array.from(nextIds).sort((a, b) => a - b),
+                                facility_settings: {
+                                  rules: current.facility_settings.rules.map((item) => item.facility_id === facility.id
+                                    ? { ...item, period_rules: item.period_rules.map((periodRule, periodIndex) => periodIndex === index ? { ...periodRule, ...changes } : periodRule) }
+                                    : item),
+                                },
                               }))
-                            }}
-                          />
-                          <span>{facility.name}</span>
-                        </label>
+                              return <div key={rule.id} className="contract-rule-row compact-facility-rule">
+                                <div className="contract-rule-summary">
+                                  <strong>{workloadPeriodLabels[rule.period_type]}</strong>
+                                  <span>{summary.units}</span>
+                                </div>
+                                <div className="contract-value-penalty-columns">
+                                  <div className="contract-minmax-stack">
+                                    <label className="facility-field"><span>Minimum</span><input type="number" min="0" value={rule.min_value} onChange={(event) => updateRule({ min_value: event.target.value })} /></label>
+                                    <label className="facility-field"><span>Maximum</span><input type="number" min="0" value={rule.max_value} onChange={(event) => updateRule({ max_value: event.target.value })} /></label>
+                                  </div>
+                                  <div className="contract-minmax-stack">
+                                    <label className="facility-field"><span>Minimum penalty</span><input type="number" min="0" value={rule.min_penalty_weight} onChange={(event) => updateRule({ min_penalty_weight: event.target.value })} /></label>
+                                    <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" value={rule.max_penalty_weight} onChange={(event) => updateRule({ max_penalty_weight: event.target.value })} /></label>
+                                  </div>
+                                </div>
+                                <div className="contract-rule-options compact-facility-options">
+                                  <label className="facility-field"><span>Period</span><select value={rule.period_type} onChange={(event) => updateRule({ period_type: event.target.value as PeriodType })}><option value="WEEK">Week</option><option value="MONTH">Month</option><option value="SCHEDULE_BLOCK">Schedule Block</option></select></label>
+                                  <label className="facility-field"><span>Units</span><select value={rule.units} onChange={(event) => updateRule({ units: event.target.value as RuleUnits })}><option value="SHIFTS">Shifts</option><option value="HOURS">Hours</option></select></label>
+                                  <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, facility_settings: { rules: current.facility_settings.rules.map((item) => item.facility_id === facility.id ? { ...item, period_rules: item.period_rules.filter((_, periodIndex) => periodIndex !== index) } : item) } }))}>Remove</button>
+                                </div>
+                              </div>
+                            })}
+                            <button type="button" className="primary-action contract-add-facility-period" onClick={() => setFormState((current) => ({ ...current, facility_settings: { rules: current.facility_settings.rules.map((item) => item.facility_id === facility.id ? { ...item, period_rules: [...item.period_rules, { ...makeMinMaxRule('MONTH'), units: 'SHIFTS' }] } : item) } }))}>Add Period Rule</button>
+                          </div>}
+                        </section>
                       )
                     })}
                   </div>

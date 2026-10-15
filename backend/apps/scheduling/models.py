@@ -882,6 +882,7 @@ class Contract(models.Model):
     active = models.BooleanField(default=True)
     manual_assignment_only = models.BooleanField(default=False)
     facilities = models.ManyToManyField(Facility, blank=True, related_name='contracts')
+    facility_settings = models.JSONField(default=dict, blank=True)
     workload_settings = models.JSONField(default=dict, blank=True)
     shift_settings = models.JSONField(default=dict, blank=True)
     night_settings = models.JSONField(default=dict, blank=True)

@@ -801,6 +801,7 @@ class ContractSerializer(serializers.ModelSerializer):
             'active',
             'manual_assignment_only',
             'facility_ids',
+            'facility_settings',
             'workload_settings',
             'shift_settings',
             'night_settings',
@@ -931,6 +932,10 @@ class ContractSerializer(serializers.ModelSerializer):
 
     def _normalize_contract_rule_numbers(self, attrs):
         period_field_sets = {
+            'facility_settings': (
+                'min_value', 'max_value',
+                'min_penalty_weight', 'max_penalty_weight',
+            ),
             'workload_settings': (
                 'min_value', 'max_value',
                 'min_penalty_weight', 'max_penalty_weight',
@@ -948,11 +953,17 @@ class ContractSerializer(serializers.ModelSerializer):
             settings = attrs.get(settings_name)
             if not isinstance(settings, dict):
                 continue
-            for row in settings.get('period_rules') or []:
+            rows = settings.get('period_rules') or []
+            if settings_name == 'facility_settings':
+                rows = [
+                    row
+                    for group in settings.get('rules') or []
+                    if isinstance(group, dict)
+                    for row in (group.get('period_rules') or [])
+                ]
+            for row in rows:
                 if isinstance(row, dict):
-                    self._normalize_whole_number_fields(
-                        row, fields, settings_name,
-                    )
+                    self._normalize_whole_number_fields(row, fields, settings_name)
 
         shift_settings = attrs.get('shift_settings')
         if isinstance(shift_settings, dict):
@@ -1041,6 +1052,66 @@ class ContractSerializer(serializers.ModelSerializer):
                         f'Invalid: {", ".join(sorted(invalid_facilities))}.'
                     ),
                 })
+
+        facility_settings = attrs.get('facility_settings')
+        if isinstance(facility_settings, dict):
+            selected_facilities = (
+                list(next_facilities)
+                if next_facilities is not None
+                else list(self.instance.facilities.all()) if self.instance else []
+            )
+            selected_by_id = {facility.id: facility for facility in selected_facilities}
+            seen_facility_ids = set()
+            for group_index, group in enumerate(facility_settings.get('rules') or [], start=1):
+                if not isinstance(group, dict):
+                    raise serializers.ValidationError({
+                        'facility_settings': f'Facility rule {group_index} must be an object.',
+                    })
+                try:
+                    facility_id = int(group.get('facility_id') or 0)
+                except (TypeError, ValueError):
+                    facility_id = 0
+                if facility_id not in selected_by_id:
+                    raise serializers.ValidationError({
+                        'facility_settings': (
+                            f'Facility rule {group_index} must reference a selected Facility.'
+                        ),
+                    })
+                if facility_id in seen_facility_ids:
+                    raise serializers.ValidationError({
+                        'facility_settings': 'Each selected Facility may appear only once.',
+                    })
+                seen_facility_ids.add(facility_id)
+                group['facility_id'] = facility_id
+                period_rules = group.get('period_rules') or []
+                if not isinstance(period_rules, list):
+                    raise serializers.ValidationError({
+                        'facility_settings': f'Facility rule {group_index} requires a period rule list.',
+                    })
+                for rule_index, rule in enumerate(period_rules, start=1):
+                    if not isinstance(rule, dict):
+                        raise serializers.ValidationError({
+                            'facility_settings': (
+                                f'Facility rule {group_index}, period {rule_index} must be an object.'
+                            ),
+                        })
+                    if rule.get('period_type') not in {'WEEK', 'MONTH', 'SCHEDULE_BLOCK'}:
+                        raise serializers.ValidationError({
+                            'facility_settings': 'Facility rule period must be Week, Month, or Schedule Block.',
+                        })
+                    if rule.get('units') not in {'HOURS', 'SHIFTS'}:
+                        raise serializers.ValidationError({
+                            'facility_settings': 'Facility rule units must be Hours or Shifts.',
+                        })
+                    minimum = rule.get('min_value')
+                    maximum = rule.get('max_value')
+                    if minimum not in (None, '') and maximum not in (None, ''):
+                        if Decimal(str(minimum)) > Decimal(str(maximum)):
+                            raise serializers.ValidationError({
+                                'facility_settings': (
+                                    f'Facility rule {group_index}, period {rule_index} has a minimum greater than its maximum.'
+                                ),
+                            })
 
         if assigned_user_ids:
             has_facilities = (

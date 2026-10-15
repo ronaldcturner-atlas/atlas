@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 
 
 CONTRACT_SETTING_FIELDS = (
+    'facility_settings',
     'workload_settings',
     'shift_settings',
     'night_settings',
@@ -17,6 +18,7 @@ STRUCTURAL_RULE_KEYS = {
     'units',
     'shared_rule_id',
     'shift_template_ids',
+    'facility_id',
     'spread_violations',
     # Retained only for backward-compatible parsing of older contracts.
     'penalty_weight',

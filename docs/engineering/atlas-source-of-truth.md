@@ -288,12 +288,14 @@ Each Contract has:
 - one Domain;
 - active/inactive status;
 - one or more selected Facilities in the current UI;
+- optional per-Facility minimum and maximum scheduling targets;
 - configurable workload, shift, night, weekend, and request settings;
 - zero or more assigned physicians.
 
 The supported rule configuration includes:
 
 - workload minimums and maximums by week, month, or Schedule Block, measured in hours or shifts;
+- per-Facility minimums and maximums by week, month, or Schedule Block, measured in hours or shifts, with separate minimum and maximum penalty weights;
 - separate minimum and maximum penalty weights and optional spreading of violations;
 - minimum time off, circadian handling, days-in-row, and same-shifts-in-row settings;
 - named Shift Template groups with their own period rules;
@@ -318,6 +320,8 @@ Domain-specific user membership is modeled separately from Contract assignment. 
 ### Current enforcement
 
 Contract rules are persisted as structured JSON configuration. Request Builder consumes the applicable Contract's Facility eligibility, allowed request types, configurable request limits, request weights, and unlimited-Low setting. Optimizer V2 and its authoritative scorer evaluate the configured coverage, workload, shift-group, night, weekend, request, overlap, rest, eligibility, and distribution rules that apply to the Run. Violation reporting must reconcile to the same authoritative score used to accept or reject schedules.
+
+Facility selection remains the hard eligibility boundary for a Contract. A selected Facility may additionally carry one or more soft minimum/maximum target rules measured in hours or shifts for a week, month, or Schedule Block. These targets have separate minimum and maximum penalty weights and are evaluated by the authoritative optimizer and violation report. A user-specific Contract override may change a Facility rule's minimum, maximum, or penalty weights while continuing to inherit Facility eligibility, period, units, and every unmodified value from the parent Contract.
 
 Atlas enforces at most one default Contract per physician per Domain. Policy from another Domain must never be silently merged into the selected Domain. When no active applicable Contract exists, the workflow must stop or limit itself to explicitly safe administrative, removal, or read-only behavior.
 

@@ -48,6 +48,7 @@ from .optimizer import (
     _night_violation_report,
     _score_schedule,
     _selected_physician_score_delta,
+    _shift_period_report,
     _shift_hours,
     _validated_night_report_for_current_assignments,
     _validate_schedule,
@@ -10964,6 +10965,20 @@ class ContractApiTests(TestCase):
             'manual_assignment_only': False,
             'facility_ids': [self.facility.id],
             'assigned_user_ids': [self.physician.id],
+            'facility_settings': {
+                'rules': [{
+                    'facility_id': self.facility.id,
+                    'period_rules': [{
+                        'period_type': 'MONTH',
+                        'units': 'SHIFTS',
+                        'min_value': '4',
+                        'max_value': '6',
+                        'min_penalty_weight': '10',
+                        'max_penalty_weight': '20',
+                        'spread_violations': False,
+                    }],
+                }],
+            },
             'workload_settings': {
                 'period_rules': [
                     {
@@ -11043,6 +11058,52 @@ class ContractApiTests(TestCase):
             ['SCHEDULE_BLOCK', 'MONTH', 'WEEK'],
         )
         self.assertEqual(payload['assigned_users_count'], 1)
+        self.assertEqual(
+            payload['facility_settings']['rules'][0]['period_rules'][0]['min_value'],
+            '4',
+        )
+
+    def test_facility_period_rule_scores_each_users_assignments(self):
+        response = self.client.post(
+            '/api/contracts/', data=self._build_payload(), format='json',
+        )
+        contract = Contract.objects.get(id=response.json()['id'])
+        assigned_instances = [
+            SimpleNamespace(
+                id=index,
+                facility_id=self.facility.id,
+                shift_template_id=index,
+                date=date(2026, 10, 5 + index),
+            )
+            for index in (1, 2)
+        ]
+        instances = [
+            SimpleNamespace(
+                id=3, facility_id=self.facility.id,
+                shift_template_id=3, date=date(2026, 10, 1),
+            ),
+            *assigned_instances,
+            SimpleNamespace(
+                id=4, facility_id=self.facility.id,
+                shift_template_id=4, date=date(2026, 10, 31),
+            ),
+        ]
+
+        report = _shift_period_report(
+            instances,
+            [self.physician],
+            {instance.id: (self.physician.id,) for instance in assigned_instances},
+            {self.physician.id: contract},
+            details=True,
+        )
+
+        self.assertEqual(report['score'], Decimal('20'))
+        self.assertEqual(len(report['violations']), 1)
+        self.assertEqual(
+            report['violations'][0]['violation_type'],
+            'FACILITY_RULE_UNDER_MINIMUM',
+        )
+        self.assertEqual(report['violations'][0]['shift_rule_label'], self.facility.name)
 
     def test_user_rule_override_inherits_unmodified_parent_rules(self):
         create_response = self.client.post(
@@ -11056,6 +11117,7 @@ class ContractApiTests(TestCase):
             data={'overrides': {
                 'workload_settings.period_rules.0.max_value': '450.5',
                 'request_settings.high_request_limit': '8',
+                'facility_settings.rules.0.period_rules.0.min_value': '5',
             }},
             format='json',
         )
@@ -11077,6 +11139,14 @@ class ContractApiTests(TestCase):
                 'effective_value'
             ],
             '415',
+        )
+        self.assertEqual(
+            rules['facility_settings.rules.0.period_rules.0.min_value']['effective_value'],
+            '5',
+        )
+        self.assertIn(
+            self.facility.name,
+            rules['facility_settings.rules.0.period_rules.0.min_value']['label'],
         )
         contract = Contract.objects.get(id=contract_payload['id'])
         self.assertEqual(

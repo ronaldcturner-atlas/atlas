@@ -122,6 +122,7 @@ def _failure_configuration_snapshot(schedule_version):
             'facility_ids': list(
                 contract.facilities.order_by('id').values_list('id', flat=True)
             ),
+            'facility_settings': contract.facility_settings,
             'workload_settings': contract.workload_settings,
             'shift_settings': contract.shift_settings,
             'night_settings': contract.night_settings,

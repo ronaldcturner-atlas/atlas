@@ -8009,6 +8009,12 @@ def _contract_rule_path_label(contract, path):
         else:
             current = {}
         if isinstance(current, dict):
+            if current.get('facility_id'):
+                facility = contract.facilities.filter(
+                    id=current['facility_id'],
+                ).first()
+                if facility:
+                    context.append(facility.name)
             if current.get('label'):
                 context.append(str(current['label']))
             if current.get('period_type'):
@@ -8328,6 +8334,10 @@ def contract_duplicate(request, contract_id):
     shift_settings = _copy_json_dict(source_contract.shift_settings)
     if cross_region_copy:
         shift_settings['rules'] = []
+    facility_settings = (
+        {} if cross_region_copy
+        else _copy_json_dict(source_contract.facility_settings)
+    )
     source_template_ids = {
         int(template_id)
         for rule in shift_settings.get('rules', [])
@@ -8412,6 +8422,7 @@ def contract_duplicate(request, contract_id):
             name=_build_duplicate_contract_name(source_contract, target_domain),
             active=True,
             manual_assignment_only=source_contract.manual_assignment_only,
+            facility_settings=facility_settings,
             workload_settings=_copy_json_dict(source_contract.workload_settings),
             shift_settings=shift_settings,
             night_settings=_copy_json_dict(source_contract.night_settings),

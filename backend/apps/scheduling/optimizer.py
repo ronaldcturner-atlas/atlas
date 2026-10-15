@@ -3928,7 +3928,7 @@ def _weekend_support_cycle_candidates(
 
 
 def _shift_period_report(instances, physicians, state, contracts, details=False):
-    """Score contract shift-group rules in their configured period windows."""
+    """Score contract shift-group and Facility rules in configured windows."""
     assigned_by_physician = defaultdict(list)
     for instance in instances:
         for physician_id in state.get(instance.id, ()):
@@ -3941,6 +3941,7 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
         contract = contracts.get(physician.id)
         if contract is None:
             continue
+        group_specs = []
         raw_settings = getattr(contract, 'shift_settings', {})
         settings = raw_settings if isinstance(raw_settings, dict) else {}
         for group_index, group in enumerate(settings.get('rules') or []):
@@ -3953,7 +3954,50 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
             }
             if not template_ids:
                 continue
-            group_label = group.get('label') or f'Shift rule group {group_index + 1}'
+            group_specs.append({
+                'group': group,
+                'group_label': group.get('label') or f'Shift rule group {group_index + 1}',
+                'rule_area': 'Shifts',
+                'violation_prefix': 'SHIFT_GROUP',
+                'template_ids': template_ids,
+                'facility_id': None,
+            })
+
+        raw_facility_settings = getattr(contract, 'facility_settings', {})
+        facility_settings = (
+            raw_facility_settings
+            if isinstance(raw_facility_settings, dict) else {}
+        )
+        facility_groups = facility_settings.get('rules') or []
+        facilities_relation = getattr(contract, 'facilities', None)
+        facility_names = (
+            {facility.id: facility.name for facility in facilities_relation.all()}
+            if details and facility_groups and facilities_relation is not None
+            else {}
+        )
+        for group in facility_groups:
+            if not isinstance(group, dict):
+                continue
+            try:
+                facility_id = int(group.get('facility_id') or 0)
+            except (TypeError, ValueError):
+                continue
+            group_specs.append({
+                'group': group,
+                'group_label': (
+                    facility_names.get(facility_id)
+                    or group.get('label')
+                    or f'Facility {facility_id}'
+                ),
+                'rule_area': 'Facilities',
+                'violation_prefix': 'FACILITY_RULE',
+                'template_ids': set(),
+                'facility_id': facility_id,
+            })
+
+        for group_spec in group_specs:
+            group = group_spec['group']
+            group_label = group_spec['group_label']
             for rule in group.get('period_rules') or []:
                 if not isinstance(rule, dict):
                     continue
@@ -3986,7 +4030,11 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
                     matching = [
                         instance
                         for instance in assigned_by_physician[physician.id]
-                        if instance.shift_template_id in template_ids
+                        if (
+                            instance.facility_id == group_spec['facility_id']
+                            if group_spec['facility_id'] is not None
+                            else instance.shift_template_id in group_spec['template_ids']
+                        )
                         and window_start <= instance.date <= window_end
                     ]
                     actual = (
@@ -3995,8 +4043,8 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
                         else sum((_shift_hours(instance) for instance in matching), Decimal('0'))
                     )
                     for side, kind in (
-                        ('min', 'SHIFT_GROUP_UNDER_MINIMUM'),
-                        ('max', 'SHIFT_GROUP_OVER_MAXIMUM'),
+                        ('min', f"{group_spec['violation_prefix']}_UNDER_MINIMUM"),
+                        ('max', f"{group_spec['violation_prefix']}_OVER_MAXIMUM"),
                     ):
                         limit = effective[f'{side}_value']
                         if limit is None:
@@ -4020,8 +4068,10 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
                                     instance.date.isoformat() for instance in matching
                                 ],
                                 'shift_instance_ids': [instance.id for instance in matching],
-                                'shift_template_ids': sorted(template_ids),
+                                'shift_template_ids': sorted(group_spec['template_ids']),
+                                'facility_id': group_spec['facility_id'],
                                 'shift_rule_label': group_label,
+                                'rule_area': group_spec['rule_area'],
                                 'configured_limit': float(limit),
                                 'actual_value': float(actual),
                                 'units': units,
@@ -9024,6 +9074,8 @@ def _violation_explanation(violation_type):
         'OVERSTAFFED_SHIFT': 'This assignment exceeds the shift\'s required staffing.',
         'INACTIVE_PHYSICIAN_ASSIGNMENT': 'Shift is assigned to an inactive physician.',
         'FACILITY_INELIGIBLE_ASSIGNMENT': 'Physician is assigned at an ineligible facility.',
+        'FACILITY_RULE_UNDER_MINIMUM': 'Physician is below the configured Facility minimum for the period.',
+        'FACILITY_RULE_OVER_MAXIMUM': 'Physician is above the configured Facility maximum for the period.',
         'NIGHT_UNDER_MINIMUM': 'Physician is below the configured minimum night-shift count for the period.',
         'NIGHT_OVER_MAXIMUM': 'Physician is above the configured maximum night-shift count for the period.',
         'MIN_CONSECUTIVE_NIGHTS': 'Physician is assigned to fewer consecutive night shifts than configured.',
@@ -9059,6 +9111,8 @@ def _violation_score_component(violation_type):
     }:
         return 'invalid_assignment_score'
     if violation_type.startswith('SHIFT_GROUP_'):
+        return 'shift_rule_score'
+    if violation_type.startswith('FACILITY_RULE_'):
         return 'shift_rule_score'
     if violation_type.startswith('REQUEST_'):
         return 'request_score'
@@ -9212,6 +9266,8 @@ def _report_violation_row(violation, violation_type=None):
         'contract_id': violation.get('contract_id'),
         'contract_name': violation.get('contract_name'),
         'shift_rule_label': violation.get('shift_rule_label'),
+        'rule_area': violation.get('rule_area'),
+        'facility_id': violation.get('facility_id'),
         'units': violation.get('units'),
         'request_id': violation.get('request_id'),
         'request_type': violation.get('request_type'),
@@ -9410,6 +9466,43 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
                         configured=configured,
                     )
 
+        facility_settings = (
+            contract.facility_settings
+            if isinstance(getattr(contract, 'facility_settings', None), dict)
+            else {}
+        )
+        facility_groups = facility_settings.get('rules') or []
+        facilities_relation = getattr(contract, 'facilities', None)
+        facility_names = (
+            {facility.id: facility.name for facility in facilities_relation.all()}
+            if facility_groups and facilities_relation is not None else {}
+        )
+        for group in facility_groups:
+            if not isinstance(group, dict):
+                continue
+            try:
+                facility_id = int(group.get('facility_id') or 0)
+            except (TypeError, ValueError):
+                continue
+            facility_name = facility_names.get(facility_id)
+            if not facility_name:
+                continue
+            for rule in group.get('period_rules') or []:
+                if not isinstance(rule, dict):
+                    continue
+                period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+                units = 'SHIFTS' if rule.get('units') == 'SHIFTS' else 'HOURS'
+                for side in ('min', 'max'):
+                    configured = limit_text(rule.get(f'{side}_value'), units)
+                    if configured is None:
+                        continue
+                    add_row(
+                        ('shift_rule_score', contract.name, 'Facilities', facility_name, period_type, configured),
+                        'shift_rule_score', 'Facilities', facility_name, 0,
+                        contract_name=contract.name, scope=period_type,
+                        configured=configured,
+                    )
+
         night_settings = contract.night_settings if isinstance(contract.night_settings, dict) else {}
         for rule in night_settings.get('period_rules') or []:
             if not isinstance(rule, dict):
@@ -9510,6 +9603,7 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
             violation_type = violation.get('violation_type') or 'UNSPECIFIED_RULE'
             component = _violation_score_component(violation_type)
             area, _fallback_name = component_details[component]
+            area = violation.get('rule_area') or area
             rule_name = violation.get('shift_rule_label') or violation_type.replace('_', ' ').title()
             violation_contract_name = violation.get('contract_name') or contract_name
             configured_limit = violation.get('configured_limit')

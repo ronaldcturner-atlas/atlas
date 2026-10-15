@@ -41,5 +41,15 @@ describe('Contract user overrides', () => {
     expect(overridesSource).toContain('user-override-tab-count')
     expect(overridesSource).toContain("className={`${activeTab === tab.id ? 'active' : ''}${overrideCount ? ' has-override' : ''}`}")
   })
+
+  it('configures compact per-Facility targets and exposes them to user overrides', () => {
+    expect(contractsSource).toContain('Facility Eligibility and Targets')
+    expect(contractsSource).toContain('facility_settings: {')
+    expect(contractsSource).toContain('Add Period Rule')
+    expect(contractsSource).toContain('<option value="SHIFTS">Shifts</option>')
+    expect(contractsSource).toContain('<option value="HOURS">Hours</option>')
+    expect(overridesSource).toContain("{ id: 'facility_settings', label: 'Facilities' }")
+    expect(overridesSource).toContain("facility_settings: 'Facility Rules'")
+  })
 })
 

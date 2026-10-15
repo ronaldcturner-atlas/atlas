@@ -30,10 +30,11 @@ type OverrideDetail = OverrideRow & {
   facilities: { id: number; name: string }[]
 }
 
-type OverrideTab = 'summary' | 'workload_settings' | 'facilities' | 'shift_settings' | 'night_settings' | 'weekend_settings' | 'request_settings'
+type OverrideTab = 'summary' | 'workload_settings' | 'facility_settings' | 'shift_settings' | 'night_settings' | 'weekend_settings' | 'request_settings'
 
 const sectionLabels: Record<string, string> = {
   workload_settings: 'Workload Rules',
+  facility_settings: 'Facility Rules',
   shift_settings: 'Shift Rules',
   night_settings: 'Night Rules',
   weekend_settings: 'Weekend Rules',
@@ -43,7 +44,7 @@ const sectionLabels: Record<string, string> = {
 const overrideTabs: { id: OverrideTab; label: string }[] = [
   { id: 'summary', label: 'Summary' },
   { id: 'workload_settings', label: 'Workload' },
-  { id: 'facilities', label: 'Facilities' },
+  { id: 'facility_settings', label: 'Facilities' },
   { id: 'shift_settings', label: 'Shifts' },
   { id: 'night_settings', label: 'Nights' },
   { id: 'weekend_settings', label: 'Weekends' },
@@ -278,17 +279,9 @@ export function UserOverrideModal({
             </div>
           </div>
           }
-          {activeTab === 'facilities' && <div className="contract-section-stack">
-            <h3>Allowed Facilities</h3>
-            <div className="request-existing-note">Facilities are inherited from {detail.contract_name}. Change them in the parent contract.</div>
-            <div className="shared-rule-contract-chips user-override-facilities">
-              {detail.facilities.map((facility) => <span key={facility.id}>{facility.name}</span>)}
-            </div>
-            {!detail.facilities.length && <div className="empty-state">No facilities are assigned to this contract.</div>}
-          </div>}
-          {activeTab !== 'summary' && activeTab !== 'facilities' && <section className="contract-section-stack user-override-section">
+          {activeTab !== 'summary' && <section className="contract-section-stack user-override-section">
             <h3>{sectionLabels[activeTab] || activeTab}</h3>
-            <div className="request-existing-note">Gray values are the current contract defaults. Enter only the values that should be different for {detail.user_name}.</div>
+            <div className="request-existing-note">{activeTab === 'facility_settings' ? `Facility eligibility, periods, and units remain inherited from ${detail.contract_name}. ` : ''}Gray values are the current contract defaults. Enter only the values that should be different for {detail.user_name}.</div>
             <div className="user-override-rule-groups">
               {activeRuleGroups.map((group) => <div key={group.key} className="user-override-rule-group">
                 <h4>{group.title}</h4>
