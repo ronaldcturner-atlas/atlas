@@ -393,6 +393,33 @@ The mobile surface never substitutes demonstration schedule data when authoritat
 
 Other destinations or controls that have not been connected to an authoritative API remain preview-only. A visible mobile control is not evidence that its persistence or backend workflow is complete.
 
+## Production Resilience and Disaster Recovery (Future Implementation)
+
+Before Atlas becomes a production dependency at scale, it must have a tested recovery path that does not depend on the continued availability or integrity of the active Railway project or Railway account. This is an approved future production requirement, not a claim that the complete recovery system is currently implemented. Provider-specific commands, responsible personnel, credentials, and incident procedures belong in a separately maintained disaster-recovery runbook.
+
+Atlas must maintain an independently stored full-system recovery package outside Railway. That package must be sufficient to recreate the running product in a clean environment and must include the versioned source repository, exact known-good release identity and build inputs, dependency locks, database migrations, infrastructure and service configuration, an inventory of required secrets without exposed secret values, encrypted verified database backups, and recovery instructions. Railway is replaceable infrastructure and must not be the only location of any irreplaceable product or recovery material.
+
+Recovery material is immutable input and is never made public or executed in place. A golden recovery package is used to create a new isolated recovery candidate; the candidate is verified before traffic is redirected to it. The failed or potentially compromised environment is preserved separately when needed for investigation. A warm standby may shorten recovery time, but it does not replace historical immutable backups because corruption or malicious changes may replicate into the standby.
+
+Maintaining a current copy of the authoritative published schedule is the highest continuity priority. Every committed mutation of a published schedule, including publication, trade completion, pickup, posting or opening, reassignment, split or recombination, actual-time adjustment, Backdate Shift change, and an operational calendar-comment change, must atomically record a durable continuity event. The schedule mutation and its pending continuity event must commit together, such as through a transactional outbox, so a successful schedule change cannot silently omit its recovery record. A worker copies those events to encrypted, versioned, append-only storage outside Railway.
+
+At scale, Atlas does not create a complete database backup after every change. It maintains a near-continuous change journal, consolidates recent changes into a complete verified read-only published-schedule snapshot within an initial target of one to five minutes, and periodically reconciles that snapshot against the live authoritative schedule. Complete portable database backups continue on a slower schedule. The latest verified schedule snapshot for each Domain is retained at all times and includes its Domain, coverage period, facilities, shifts, current assignments, creation time, sequence or version identity, and an integrity checksum or signature.
+
+During a catastrophic outage Atlas may direct users to an independently hosted emergency schedule viewer created from a verified recovery candidate. That viewer is read-only and clearly identifies the exact verification time and the possibility of later unrecorded changes. It must not permit trades, pickups, postings, schedule edits, password changes, or administrative mutations. The normal mobile offline state remains non-authoritative and read-only; an emergency continuity snapshot must not silently present itself as live production data.
+
+The initial retention policy for future implementation is:
+
+- individual published-schedule continuity events: 14 to 30 days;
+- consolidated near-real-time schedule snapshots: 7 days;
+- daily full database backups: 35 days;
+- weekly database backups: 12 weeks;
+- monthly database backups: 12 months;
+- latest verified published-schedule snapshot for every Domain: always retained while the Domain is operational.
+
+Continuity events or backups may be compacted or deleted only after the succeeding backup has completed, passed its integrity verification, been copied outside Railway, passed the required restore validation, and has overlapping recovery coverage. A daily backup does not authorize immediate deletion of the preceding 24 hours of change history. Retention and deletion controls must prevent an ordinary Atlas or compromised production administrator from prematurely erasing the protected recovery history.
+
+Production readiness requires documented recovery-point and recovery-time targets, point-in-time database recovery, health-checked rollback, least-privilege administrative access, independent control of DNS, external monitoring, periodic isolated restore tests, and rehearsed crash and cyber-incident procedures. A cyber recovery restores into a clean environment from a known-clean point, rotates credentials and sessions, validates the authoritative schedule, and removes the access path used in the incident before normal writes resume.
+
 ## What Atlas Explicitly Should Not Build
 
 Atlas should not build:
