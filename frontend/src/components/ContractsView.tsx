@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import SharedRulesView from './SharedRulesView'
+import UserOverridesView, { UserOverrideModal } from './UserOverridesView'
 import { readSessionString, writeSessionSelection } from '../utils/sessionSelection'
 import { API_BASE } from '../api'
 
@@ -64,7 +65,7 @@ type ContractRecord = {
   night_settings: NightSettings
   weekend_settings: WeekendSettings
   request_settings: RequestSettings
-  assigned_users: Array<{ id: number; name: string }>
+  assigned_users: Array<{ id: number; assignment_id: number; name: string; has_overrides: boolean; override_count: number }>
   assigned_users_count: number
   shared_rules: SharedContractRule[]
   setup_required?: boolean
@@ -568,7 +569,7 @@ function isActiveValue(value: unknown) {
 }
 
 export default function ContractsView() {
-  const [pageTab, setPageTab] = useState<'contracts' | 'shared_rules'>('contracts')
+  const [pageTab, setPageTab] = useState<'contracts' | 'shared_rules' | 'user_overrides'>('contracts')
   const [contracts, setContracts] = useState<ContractRecord[]>([])
   const [domains, setDomains] = useState<Domain[]>([])
   const [facilities, setFacilities] = useState<Facility[]>([])
@@ -593,6 +594,7 @@ export default function ContractsView() {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<ContractTab>('summary')
   const [formState, setFormState] = useState<ContractFormState>(emptyFormState)
+  const [overrideAssignmentId, setOverrideAssignmentId] = useState<number | null>(null)
 
   const loadContracts = async (includeInactive: boolean, selectedRegion: string, selectedDomain: string) => {
     const params = new URLSearchParams()
@@ -938,7 +940,11 @@ export default function ContractsView() {
   }
 
   if (pageTab === 'shared_rules') {
-    return <SharedRulesView onShowContracts={() => setPageTab('contracts')} />
+    return <SharedRulesView onShowContracts={() => setPageTab('contracts')} onShowUserOverrides={() => setPageTab('user_overrides')} />
+  }
+
+  if (pageTab === 'user_overrides') {
+    return <UserOverridesView onShowContracts={() => setPageTab('contracts')} onShowSharedRules={() => setPageTab('shared_rules')} />
   }
 
   return (
@@ -946,6 +952,7 @@ export default function ContractsView() {
       <div className="contract-page-tabs" role="tablist">
         <button type="button" className="active" aria-selected="true">Contracts</button>
         <button type="button" onClick={() => setPageTab('shared_rules')}>Shared Rules</button>
+        <button type="button" onClick={() => setPageTab('user_overrides')}>User Overrides</button>
       </div>
       <div className="facilities-header contracts-header">
         <h2>Contracts</h2>
@@ -1579,28 +1586,39 @@ export default function ContractsView() {
                   <div className="request-template-list">
                     {usersForSelectedDomain.map((physician) => {
                       const checked = formState.assigned_user_ids.includes(physician.id)
+                      const assignedUser = editingContractId === null
+                        ? undefined
+                        : contracts.find((contract) => contract.id === editingContractId)?.assigned_users.find((user) => user.id === physician.id)
+                      const checkboxId = `contract-user-${physician.id}`
                       return (
-                        <label key={physician.id} className="day-option">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(event) => {
-                              setFormState((current) => {
-                                const next = new Set(current.assigned_user_ids)
-                                if (event.target.checked) {
-                                  next.add(physician.id)
-                                } else {
-                                  next.delete(physician.id)
-                                }
-                                return {
-                                  ...current,
-                                  assigned_user_ids: Array.from(next).sort((a, b) => a - b),
-                                }
-                              })
-                            }}
-                          />
-                          <span>{physicianLabel(physician)}</span>
-                        </label>
+                        <div key={physician.id} className="contract-user-assignment-row">
+                          <div className="day-option">
+                            <input
+                              id={checkboxId}
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(event) => {
+                                setFormState((current) => {
+                                  const next = new Set(current.assigned_user_ids)
+                                  if (event.target.checked) {
+                                    next.add(physician.id)
+                                  } else {
+                                    next.delete(physician.id)
+                                  }
+                                  return {
+                                    ...current,
+                                    assigned_user_ids: Array.from(next).sort((a, b) => a - b),
+                                  }
+                                })
+                              }}
+                            />
+                            {assignedUser?.assignment_id
+                              ? <button type="button" className="link-button" onClick={() => setOverrideAssignmentId(assignedUser.assignment_id)}>{physicianLabel(physician)}</button>
+                              : <label htmlFor={checkboxId}>{physicianLabel(physician)}</label>}
+                          </div>
+                          {assignedUser?.has_overrides && <span className="contract-override-badge">{assignedUser.override_count} override{assignedUser.override_count === 1 ? '' : 's'}</span>}
+                          {checked && assignedUser?.assignment_id && <button type="button" className="secondary" onClick={() => setOverrideAssignmentId(assignedUser.assignment_id)}>{assignedUser.has_overrides ? 'View / Edit Overrides' : 'Add Override'}</button>}
+                        </div>
                       )
                     })}
                   </div>
@@ -1654,6 +1672,13 @@ export default function ContractsView() {
             </div>
           </div>
         </div>
+      )}
+      {overrideAssignmentId !== null && (
+        <UserOverrideModal
+          assignmentId={overrideAssignmentId}
+          onClose={() => setOverrideAssignmentId(null)}
+          onSaved={() => loadContracts(showInactive, regionFilter, domainFilter)}
+        />
       )}
     </div>
   )

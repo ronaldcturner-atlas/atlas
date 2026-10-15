@@ -2,6 +2,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal
 
 from . import optimizer
+from .contract_overrides import apply_effective_contracts
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
 from .run_state import assignments_for_viewed_run
 
@@ -30,6 +31,7 @@ def _context(version, optimizer_run):
         .select_related('physician__user', 'contract')
         .prefetch_related('contract__facilities')
     )
+    contract_assignments = apply_effective_contracts(contract_assignments)
     physicians = [row.physician for row in contract_assignments]
     contracts = {row.physician_id: row.contract for row in contract_assignments}
     eligible = {

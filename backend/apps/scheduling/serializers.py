@@ -23,6 +23,7 @@ from .models import (
 from .models import (
     Contract, ContractUserAssignment, SharedRule, SharedRuleContract,
 )
+from .contract_overrides import override_differences
 from .shared_rules import sync_shared_rule_contract_settings
 
 
@@ -831,15 +832,19 @@ class ContractSerializer(serializers.ModelSerializer):
 
     def get_assigned_users(self, obj):
         assignments = obj.user_assignments.select_related('physician__user').all()
-        return [
-            {
+        rows = []
+        for assignment in assignments:
+            differences = override_differences(assignment)
+            rows.append({
                 'id': assignment.physician_id,
+                'assignment_id': assignment.id,
                 'name': assignment.physician.display_name
                 or assignment.physician.user.get_full_name()
                 or assignment.physician.user.username,
-            }
-            for assignment in assignments
-        ]
+                'has_overrides': bool(differences),
+                'override_count': len(differences),
+            })
+        return rows
 
     def get_assigned_users_count(self, obj):
         return obj.user_assignments.count()

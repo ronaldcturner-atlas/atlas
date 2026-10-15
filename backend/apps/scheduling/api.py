@@ -63,6 +63,12 @@ from .models import (
     SharedRule,
     SharedRuleContract,
 )
+from .contract_overrides import (
+    contract_rule_values,
+    effective_contract_for_assignment,
+    normalized_rule_overrides,
+    override_differences,
+)
 from .optimizer import (
     build_violation_report,
     canonical_assignment_snapshot,
@@ -2926,21 +2932,24 @@ def _working_request_physicians(block):
 
 def _get_request_contract(physician, domain=None):
     """Return the single active contract when Request Builder can resolve one unambiguously."""
-    contracts_query = Contract.objects.filter(
-        active=True,
-        user_assignments__physician=physician,
+    assignments_query = ContractUserAssignment.objects.filter(
+        contract__active=True,
+        physician=physician,
     )
     if domain is not None:
-        domain_contracts = contracts_query.filter(domain=domain)
-        if domain_contracts.exists() or _domain_has_memberships(domain):
-            contracts_query = domain_contracts
+        domain_assignments = assignments_query.filter(domain=domain)
+        if domain_assignments.exists() or _domain_has_memberships(domain):
+            assignments_query = domain_assignments
 
-    contracts = list(
-        contracts_query
-        .prefetch_related('facilities')
-        .distinct()[:2]
+    assignments = list(
+        assignments_query
+        .select_related('contract')
+        .prefetch_related('contract__facilities')[:2]
     )
-    return contracts[0] if len(contracts) == 1 else None
+    return (
+        effective_contract_for_assignment(assignments[0])
+        if len(assignments) == 1 else None
+    )
 
 
 def _parse_request_limit(value):
@@ -7933,6 +7942,165 @@ def contracts_list_create(request):
     contract = serializer.save()
     _mark_contract_domain_scores_stale(contract)
     return Response(ContractSerializer(contract).data, status=status.HTTP_201_CREATED)
+
+
+def _contract_user_override_payload(assignment, *, include_rules=False):
+    physician = assignment.physician
+    user = physician.user
+    differences = override_differences(assignment)
+    payload = {
+        'id': assignment.id,
+        'physician_id': physician.id,
+        'user_name': (
+            physician.display_name or user.get_full_name() or user.username
+        ),
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'contract_id': assignment.contract_id,
+        'contract_name': assignment.contract.name,
+        'domain_id': assignment.domain_id,
+        'domain_name': assignment.domain.name,
+        'region_id': assignment.domain.region_id,
+        'region_name': assignment.domain.region.name,
+        'override_count': len(differences),
+        'overrides_updated_at': assignment.overrides_updated_at,
+        'overrides_updated_by': (
+            assignment.overrides_updated_by.get_full_name()
+            or assignment.overrides_updated_by.username
+            if assignment.overrides_updated_by_id else None
+        ),
+    }
+    if include_rules:
+        payload['facilities'] = [
+            {'id': facility.id, 'name': facility.name}
+            for facility in assignment.contract.facilities.all()
+        ]
+        parent_values = contract_rule_values(assignment.contract)
+        overrides = normalized_rule_overrides(
+            assignment.contract, assignment.rule_overrides,
+        )
+        effective = effective_contract_for_assignment(assignment)
+        effective_values = contract_rule_values(effective)
+        payload['rules'] = [
+            {
+                'path': path,
+                'section': path.split('.', 1)[0],
+                'label': _contract_rule_path_label(
+                    assignment.contract, path,
+                ),
+                'parent_value': parent_value,
+                'effective_value': effective_values.get(path, parent_value),
+                'overridden': path in overrides,
+            }
+            for path, parent_value in parent_values.items()
+        ]
+    return payload
+
+
+def _contract_rule_path_label(contract, path):
+    parts = path.split('.')
+    current = getattr(contract, parts[0], {})
+    context = []
+    for part in parts[1:-1]:
+        if isinstance(current, list):
+            current = current[int(part)]
+        elif isinstance(current, dict):
+            current = current.get(part, {})
+        else:
+            current = {}
+        if isinstance(current, dict):
+            if current.get('label'):
+                context.append(str(current['label']))
+            if current.get('period_type'):
+                context.append(
+                    str(current['period_type']).replace('_', ' ').title()
+                )
+    field_label = parts[-1].replace('_', ' ').title()
+    return ' · '.join([*dict.fromkeys(context), field_label])
+
+
+def _contract_user_override_queryset(user):
+    return (
+        ContractUserAssignment.objects
+        .filter(domain_id__in=permitted_domain_ids(user, 'manage_build_workspace'))
+        .select_related(
+            'contract', 'domain__region', 'physician__user',
+            'overrides_updated_by',
+        )
+        .prefetch_related('contract__facilities')
+        .order_by(
+            'physician__user__last_name', 'physician__user__first_name',
+            'physician__display_name', 'physician_id',
+        )
+    )
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contract_user_overrides_list(request):
+    assignments = _contract_user_override_queryset(request.user)
+    domain_id = request.query_params.get('domain')
+    region_id = request.query_params.get('region')
+    if domain_id:
+        assignments = assignments.filter(domain_id=domain_id)
+    elif region_id:
+        assignments = assignments.filter(domain__region_id=region_id)
+    return Response([
+        _contract_user_override_payload(assignment)
+        for assignment in assignments
+        if override_differences(assignment)
+    ])
+
+
+@api_view(['GET', 'PATCH', 'DELETE'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def contract_user_override_detail(request, assignment_id):
+    assignment = get_object_or_404(
+        _contract_user_override_queryset(request.user), id=assignment_id,
+    )
+    if request.method == 'GET':
+        return Response(_contract_user_override_payload(
+            assignment, include_rules=True,
+        ))
+
+    raw_overrides = {} if request.method == 'DELETE' else request.data.get(
+        'overrides', {},
+    )
+    if not isinstance(raw_overrides, dict):
+        return Response(
+            {'overrides': 'Overrides must be supplied as rule paths and values.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    unknown_paths = sorted(
+        set(raw_overrides) - set(contract_rule_values(assignment.contract))
+    )
+    if unknown_paths:
+        return Response(
+            {'overrides': f'Unknown or structural rule: {unknown_paths[0]}.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        overrides = normalized_rule_overrides(
+            assignment.contract, raw_overrides,
+        )
+    except ValueError as exc:
+        return Response(
+            {'overrides': str(exc)}, status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    assignment.rule_overrides = overrides
+    assignment.overrides_updated_by = request.user
+    assignment.overrides_updated_at = timezone.now()
+    assignment.save(update_fields=[
+        'rule_overrides', 'overrides_updated_by', 'overrides_updated_at',
+        'updated_at',
+    ])
+    _mark_contract_domain_scores_stale(assignment.contract)
+    return Response(_contract_user_override_payload(
+        assignment, include_rules=True,
+    ))
 
 
 def _shared_rule_queryset():

@@ -9013,6 +9013,37 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(volume_row['shift_instance_ids'], [night.id for night in nights])
 
+        contract_assignment = ContractUserAssignment.objects.get(
+            physician=physician,
+        )
+        contract_assignment.rule_overrides = {
+            'night_settings.max_consecutive_night_shifts': '6',
+        }
+        from .contract_overrides import effective_contract_for_assignment
+        effective_contract = effective_contract_for_assignment(
+            contract_assignment,
+        )
+        overridden_report = _night_violation_report(
+            nights,
+            [physician],
+            state,
+            {physician.id: effective_contract},
+        )
+        self.assertFalse(any(
+            violation['violation_type'] == 'MAX_CONSECUTIVE_NIGHTS'
+            for violation in overridden_report['night_violations']
+        ))
+        self.assertEqual(
+            effective_contract.night_settings[
+                'max_consecutive_night_shifts'
+            ],
+            '6',
+        )
+        self.assertEqual(
+            contract.night_settings['max_consecutive_night_shifts'],
+            '2',
+        )
+
     def test_post_night_recovery_uses_each_physician_contract(self):
         version = self._create_build_version(date(2026, 7, 1), date(2026, 7, 4))
         night_template = ShiftTemplate.objects.create(
@@ -11012,6 +11043,125 @@ class ContractApiTests(TestCase):
             ['SCHEDULE_BLOCK', 'MONTH', 'WEEK'],
         )
         self.assertEqual(payload['assigned_users_count'], 1)
+
+    def test_user_rule_override_inherits_unmodified_parent_rules(self):
+        create_response = self.client.post(
+            '/api/contracts/', data=self._build_payload(), format='json',
+        )
+        contract_payload = create_response.json()
+        assignment_id = contract_payload['assigned_users'][0]['assignment_id']
+
+        response = self.client.patch(
+            f'/api/contract-user-overrides/{assignment_id}/',
+            data={'overrides': {
+                'workload_settings.period_rules.0.max_value': '450.5',
+                'request_settings.high_request_limit': '8',
+            }},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()['facilities'],
+            [{'id': self.facility.id, 'name': self.facility.name}],
+        )
+        rules = {row['path']: row for row in response.json()['rules']}
+        self.assertEqual(
+            rules['workload_settings.period_rules.0.max_value'][
+                'effective_value'
+            ],
+            '450.5',
+        )
+        self.assertEqual(
+            rules['workload_settings.period_rules.0.min_value'][
+                'effective_value'
+            ],
+            '415',
+        )
+        contract = Contract.objects.get(id=contract_payload['id'])
+        self.assertEqual(
+            contract.workload_settings['period_rules'][0]['max_value'],
+            '425',
+        )
+        assignment = ContractUserAssignment.objects.get(id=assignment_id)
+        self.assertEqual(assignment.overrides_updated_by, self.user)
+        self.assertIsNotNone(assignment.overrides_updated_at)
+
+        policy = api._get_request_policy(
+            self.physician, domain=self.domain,
+        )
+        self.assertEqual(policy['limits']['HIGH'], 8)
+        self.assertEqual(policy['limits']['MEDIUM'], 7)
+
+    def test_user_overrides_list_flags_only_effective_differences(self):
+        create_response = self.client.post(
+            '/api/contracts/', data=self._build_payload(), format='json',
+        )
+        assignment_id = create_response.json()['assigned_users'][0][
+            'assignment_id'
+        ]
+        self.client.patch(
+            f'/api/contract-user-overrides/{assignment_id}/',
+            data={'overrides': {
+                'workload_settings.period_rules.0.max_value': '450',
+            }},
+            format='json',
+        )
+
+        list_response = self.client.get(
+            f'/api/contract-user-overrides/?domain={self.domain.id}',
+        )
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(
+            [(row['user_name'], row['override_count'])
+             for row in list_response.json()],
+            [('Casey Ng', 1)],
+        )
+        contracts_response = self.client.get(
+            f'/api/contracts/?domain={self.domain.id}',
+        )
+        assigned_user = contracts_response.json()[0]['assigned_users'][0]
+        self.assertTrue(assigned_user['has_overrides'])
+        self.assertEqual(assigned_user['override_count'], 1)
+
+        restore_response = self.client.delete(
+            f'/api/contract-user-overrides/{assignment_id}/',
+        )
+        self.assertEqual(restore_response.status_code, 200)
+        self.assertEqual(restore_response.json()['override_count'], 0)
+        self.assertEqual(
+            self.client.get('/api/contract-user-overrides/').json(), [],
+        )
+
+    def test_user_override_rejects_structural_or_unknown_rule_paths(self):
+        create_response = self.client.post(
+            '/api/contracts/', data=self._build_payload(), format='json',
+        )
+        assignment_id = create_response.json()['assigned_users'][0][
+            'assignment_id'
+        ]
+
+        response = self.client.patch(
+            f'/api/contract-user-overrides/{assignment_id}/',
+            data={'overrides': {
+                'workload_settings.period_rules.0.period_type': 'MONTH',
+            }},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Unknown or structural rule', response.json()['overrides'])
+        detail = self.client.get(
+            f'/api/contract-user-overrides/{assignment_id}/',
+        ).json()
+        self.assertNotIn(
+            'workload_settings.period_rules.0.hard_soft',
+            {rule['path'] for rule in detail['rules']},
+        )
+        self.assertNotIn(
+            'workload_settings.period_rules.0.spread_violations',
+            {rule['path'] for rule in detail['rules']},
+        )
 
     def test_contract_assignment_uses_role_in_contract_domain_only(self):
         membership = DomainMembership.objects.get(

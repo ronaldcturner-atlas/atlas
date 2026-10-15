@@ -17,6 +17,7 @@ from .initial_schedule import (
     complete_initial_schedule_from_source,
     construct_complete_initial_schedule,
 )
+from .contract_overrides import apply_effective_contracts
 from .models import (
     ContractUserAssignment,
     OptimizerRun,
@@ -104,7 +105,7 @@ def _failure_configuration_snapshot(schedule_version):
     """Capture the mutable inputs used to launch one optimizer run."""
     block = schedule_version.schedule_block
     contract_rows = []
-    assignments = (
+    assignments = apply_effective_contracts(
         ContractUserAssignment.objects
         .filter(domain=schedule_version.domain, contract__active=True)
         .select_related('contract')
@@ -126,6 +127,11 @@ def _failure_configuration_snapshot(schedule_version):
             'night_settings': contract.night_settings,
             'weekend_settings': contract.weekend_settings,
             'request_settings': contract.request_settings,
+            'user_rule_overrides': assignment.rule_overrides,
+            'user_overrides_updated_at': (
+                assignment.overrides_updated_at.isoformat()
+                if assignment.overrides_updated_at else None
+            ),
             'contract_updated_at': contract.updated_at.isoformat(),
         })
     request_rows = []

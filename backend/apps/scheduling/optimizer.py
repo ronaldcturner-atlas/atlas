@@ -10,6 +10,7 @@ import random
 from time import monotonic
 from ortools.sat.python import cp_model
 from .search_budget import SearchBudget
+from .contract_overrides import apply_effective_contracts
 
 from django.db import transaction
 from django.db.models import Q
@@ -9637,6 +9638,9 @@ def build_violation_report(schedule_version, optimizer_run=None):
         .prefetch_related('contract__facilities')
         .order_by('physician__display_name', 'physician__user__last_name', 'physician__user__first_name', 'physician_id')
     )
+    active_contract_assignments = apply_effective_contracts(
+        active_contract_assignments,
+    )
     physicians = [assignment.physician for assignment in active_contract_assignments]
     contract_by_physician = {
         assignment.physician_id: assignment.contract
@@ -10796,6 +10800,9 @@ def optimize_schedule_version(
             .select_related('physician__user', 'contract')
             .prefetch_related('contract__facilities')
             .order_by('physician__user__last_name', 'physician__user__first_name', 'physician_id')
+        )
+        active_contract_assignments = apply_effective_contracts(
+            active_contract_assignments,
         )
         physicians = [assignment.physician for assignment in active_contract_assignments]
         physicians_by_id = {physician.id: physician for physician in physicians}

@@ -629,6 +629,46 @@ select option:checked{
 .shared-rule-contract-chips{display:flex;flex-wrap:wrap;gap:5px}
 .shared-rule-contract-chips span{background:#263d5b;border:1px solid #49617f;border-radius:999px;padding:3px 8px;font-size:12px}
 .shared-rule-contract-card{border-color:#6f5ce7}
+.contract-user-assignment-row{display:grid;grid-template-columns:minmax(220px,1fr) auto auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid #dbe3ee}
+.contract-user-assignment-row .day-option{margin:0}
+.contract-override-badge{display:inline-flex;align-items:center;border:1px solid #d6a21f;background:#fff7d6;color:#73510a;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700;white-space:nowrap}
+.link-button{border:0;background:transparent;color:#1f65a6;padding:0;font:inherit;font-weight:700;text-decoration:underline;cursor:pointer}
+.user-override-modal{max-width:min(1400px,96vw)}
+.user-override-header{align-items:center;padding-bottom:12px}
+.user-override-identity{display:grid;gap:3px}
+.user-override-identity h2{margin:0;font-size:27px;line-height:1.1}
+.user-override-identity p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.user-override-eyebrow{color:#b9afff;font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
+.user-override-tabs{padding:0 20px 8px;margin:0}
+.user-override-tabs button{display:inline-flex;align-items:center;gap:6px}
+.user-override-tabs button.has-override{border-color:#d6a21f;background:rgba(214,162,31,.1)}
+.user-override-tabs button.has-override.active{background:rgba(214,162,31,.2);box-shadow:inset 0 -2px 0 #f2cc61}
+.user-override-tab-count{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:17px;padding:0 5px;border-radius:999px;background:#d6a21f;color:#172033;font-size:10px;font-weight:900}
+.user-override-body{display:flex;flex-direction:column;gap:12px;max-height:68vh;overflow:auto;padding-top:12px}
+.user-override-body h3{margin:0}
+.user-override-guidance{border-left:3px solid var(--accent);font-size:12px;padding:9px 11px}
+.user-override-body .contract-summary-grid .request-existing-note{display:grid;gap:3px;min-height:58px;padding:10px 12px}
+.user-override-body .contract-summary-grid .request-existing-note strong{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.user-override-body .contract-summary-grid .request-existing-note span{color:var(--sidebar-fg);font-size:14px;font-weight:700}
+.user-override-rule-groups{display:grid;gap:12px}
+.user-override-rule-group{display:grid;gap:8px;padding:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.02)}
+.user-override-rule-group h4{margin:0;color:var(--sidebar-fg);font-size:13px;text-transform:uppercase;letter-spacing:.04em}
+.user-override-group-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+.user-override-group-columns.single-column{grid-template-columns:minmax(0,1fr)}
+.user-override-rule-column{display:grid;gap:7px;min-width:0}
+.user-override-column-label{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
+.user-override-rule-card{display:grid;gap:8px;padding:10px;border:1px solid rgba(255,255,255,.11);border-radius:10px;background:rgba(255,255,255,.02)}
+.user-override-rule-card.active{border-color:#d6a21f;background:rgba(214,162,31,.08)}
+.user-override-rule-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:18px}
+.user-override-rule-heading strong{font-size:13px}
+.user-override-rule-heading>span{color:#f2cc61;font-size:10px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+.user-override-value-pair{display:grid;grid-template-columns:minmax(130px,.8fr) minmax(180px,1.2fr);gap:9px;align-items:end}
+.user-override-default-field{display:grid;gap:4px;color:var(--muted);font-size:11px}
+.user-override-default-field div{display:flex;align-items:center;min-height:36px;padding:7px 10px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(181,192,208,.12);color:#aebbd0;font-size:13px;font-weight:700}
+.user-override-entry-field input,.user-override-entry-field select{width:100%}
+.user-override-facilities{padding:6px 0}
+@media(max-width:900px){.user-override-group-columns{grid-template-columns:1fr}}
+@media(max-width:620px){.user-override-value-pair{grid-template-columns:1fr}.user-override-tabs{overflow-x:auto}.user-override-header{align-items:flex-start}.user-override-identity h2{font-size:23px}}
 .shared-rule-readonly-badge{align-self:flex-start;padding:4px 9px;border:1px solid #8274ee;border-radius:999px;background:rgba(111,92,231,.16);color:#d9d4ff;font-size:12px;font-weight:700;white-space:nowrap}
 .table-subtext{font-size:12px;color:#aebbd0;margin-top:3px}
 .shared-rule-modal{width:min(1180px,94vw);max-height:92vh;overflow:auto}

@@ -14,6 +14,7 @@ from apps.scheduling.models import (
     OptimizerRun,
     ScheduleRequest,
 )
+from apps.scheduling.contract_overrides import apply_effective_contracts
 from apps.scheduling.optimizer import (
     DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT,
     DEFAULT_TIME_PROPORTIONALITY_WEIGHT,
@@ -2197,6 +2198,9 @@ class Command(BaseCommand):
                 .select_related('physician', 'contract')
                 .prefetch_related('contract__facilities')
                 .order_by('physician_id')
+            )
+            contract_assignments = apply_effective_contracts(
+                contract_assignments,
             )
             if runtime_cache is not None:
                 runtime_cache['database_inputs'] = {

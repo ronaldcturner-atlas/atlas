@@ -909,6 +909,15 @@ class ContractUserAssignment(models.Model):
     contract = models.ForeignKey(Contract, on_delete=models.CASCADE, related_name='user_assignments')
     domain = models.ForeignKey(Domain, on_delete=models.CASCADE, related_name='contract_user_assignments')
     physician = models.ForeignKey(Physician, on_delete=models.CASCADE, related_name='contract_assignments')
+    rule_overrides = models.JSONField(default=dict, blank=True)
+    overrides_updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name='updated_contract_user_overrides',
+        null=True,
+        blank=True,
+    )
+    overrides_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

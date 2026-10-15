@@ -33,7 +33,7 @@ async function apiError(response: Response) {
   } catch { return '' }
 }
 
-export default function SharedRulesView({ onShowContracts }: { onShowContracts: () => void }) {
+export default function SharedRulesView({ onShowContracts, onShowUserOverrides }: { onShowContracts: () => void; onShowUserOverrides: () => void }) {
   const [rules, setRules] = useState<SharedRule[]>([])
   const [contracts, setContracts] = useState<Contract[]>([])
   const [domainRows, setDomainRows] = useState<Domain[]>([])
@@ -176,7 +176,7 @@ export default function SharedRulesView({ onShowContracts }: { onShowContracts: 
   }
 
   return <div className="facilities-view-card">
-    <div className="contract-page-tabs" role="tablist"><button type="button" onClick={onShowContracts}>Contracts</button><button type="button" className="active" aria-selected="true">Shared Rules</button></div>
+    <div className="contract-page-tabs" role="tablist"><button type="button" onClick={onShowContracts}>Contracts</button><button type="button" className="active" aria-selected="true">Shared Rules</button><button type="button" onClick={onShowUserOverrides}>User Overrides</button></div>
     <div className="facilities-header contracts-header"><div><h2>Shared Rules</h2><p className="section-help">Custom rules used across multiple contracts.</p></div><div className="contracts-toolbar">
       <div className="shared-rule-status-filter" role="radiogroup" aria-label="Shared Rule status"><label><input type="radio" checked={view === 'active'} onChange={() => setView('active')} /> Active</label><label><input type="radio" checked={view === 'inactive'} onChange={() => setView('inactive')} /> Inactive</label></div>
       {regions.length > 1 ? <label className="facility-field contracts-domain-filter"><span>Region</span><select value={regionFilter} onChange={(event) => { setRegionFilter(event.target.value); setDomainFilter('') }}>{regions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label> : <div className="context-static-field contracts-domain-filter"><span>Region</span><strong>{regions[0]?.[1] ?? '—'}</strong></div>}
