@@ -284,8 +284,12 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
 
       {error && <div className="facilities-error">{error}</div>}
       {isLoading ? <div className="scheduler-loading">Loading statistics...</div> : activeStats === 'mine' ? (
-        <div className={`stats-layout${limitedToHours ? ' stats-layout-summary-only' : ''}`}>
-          {!limitedToHours && <div className="stats-shift-list">
+        <div className="stats-layout">
+          <aside className="stats-totals">
+            <div><span>Total hours</span><strong>{displayHours(totalHours)}</strong></div>
+            <div><span>Night hours</span><strong>{displayHours(nightHours)}</strong></div>
+          </aside>
+          <div className="stats-shift-list">
             {visibleShifts.map((shift) => (
               <div className="stats-shift-row" key={shift.id}>
                 <span>{shift.facility_short_name || shift.facility_name} {displayClock(shift.start_time)}-{displayClock(shift.end_time)}</span>
@@ -294,11 +298,7 @@ export default function StatsView({ limitedToHours = false }: StatsViewProps) {
               </div>
             ))}
             {!visibleShifts.length && <div className="empty-state">No shifts in this date range.</div>}
-          </div>}
-          <aside className="stats-totals">
-            <div><span>Total hours</span><strong>{displayHours(totalHours)}</strong></div>
-            <div><span>Night hours</span><strong>{displayHours(nightHours)}</strong></div>
-          </aside>
+          </div>
         </div>
       ) : (
         <>
