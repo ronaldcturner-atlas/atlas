@@ -2322,6 +2322,87 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(response.json()['saved_count'], 4)
         self.assertEqual(ScheduleRequest.objects.filter(schedule_block=self.block).count(), 4)
 
+    def test_regular_user_can_save_multiple_own_request_dates_atomically(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'medium_request_limit': '5',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={
+                'physician_ids': [self.physician.id],
+                'dates': ['2026-07-01', '2026-07-02'],
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['saved_count'], 2)
+        self.assertEqual(
+            list(
+                ScheduleRequest.objects.filter(schedule_block=self.block)
+                .order_by('date')
+                .values_list('date', flat=True)
+            ),
+            [date(2026, 7, 1), date(2026, 7, 2)],
+        )
+
+    def test_regular_user_multi_date_save_cannot_target_another_user(self):
+        self._assign_contract({'allow_day_off': True, 'low_request_unlimited': True})
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={
+                'physician_ids': [self.physician.id + 1000],
+                'dates': ['2026-07-01', '2026-07-02'],
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'LOW',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(ScheduleRequest.objects.count(), 0)
+
+    def test_regular_user_multi_date_limit_failure_saves_nothing(self):
+        self._assign_contract(
+            {
+                'allow_day_off': True,
+                'high_request_limit': '1',
+                'low_request_unlimited': True,
+            }
+        )
+        self.client.force_authenticate(user=self.physician_user)
+
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={
+                'physician_ids': [self.physician.id],
+                'dates': ['2026-07-01', '2026-07-02'],
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'HIGH',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('request_limit', response.json())
+        self.assertEqual(ScheduleRequest.objects.count(), 0)
+
     def test_bulk_request_rejects_any_date_outside_schedule_block(self):
         self.client.force_authenticate(user=self.scheduler_user)
 

@@ -342,6 +342,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
 
   const [visibleMonth, setVisibleMonth] = useState<Date>(startOfMonthUtc(blockStart))
   const [selectedDate, setSelectedDate] = useState<string>(block.start_date)
+  const [individualSelectedDates, setIndividualSelectedDates] = useState<string[]>([block.start_date])
 
   const [requestType, setRequestType] = useState<RequestType>('NONE')
   const [weight, setWeight] = useState<Weight>('MEDIUM')
@@ -428,6 +429,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
   useEffect(() => {
     setVisibleMonth(startOfMonthUtc(parseIsoDateToUtc(block.start_date)))
     setSelectedDate(block.start_date)
+    setIndividualSelectedDates([block.start_date])
     setBulkSelectedDates([])
     setBulkPendingDates([])
     setCalendarRequestView('INDIVIDUAL')
@@ -504,6 +506,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
   }, [contextData?.physicians, physicianSearch])
 
   useEffect(() => {
+    if (individualSelectedDates.length > 1) {
+      return
+    }
     const key = `${selectedDate}-${selectedScope}`
     const existing = requestsByDateAndScope.get(key)
     if (!existing) {
@@ -524,7 +529,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
         ))
         : existing.shift_template_ids,
     )
-  }, [contextData?.shift_templates, nightsOnly, requestsByDateAndScope, selectedDate, selectedScope])
+  }, [contextData?.shift_templates, individualSelectedDates.length, nightsOnly, requestsByDateAndScope, selectedDate, selectedScope])
 
   useEffect(() => {
     if (!contextData) {
@@ -554,11 +559,23 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
       !nightsOnly || template.night_shift
     ))
     if (requestType === 'SHIFT_ON') {
-      const availableIds = new Set(availableTemplatesForSelectedDate.map((template) => template.id))
-      return templates.filter((template) => availableIds.has(template.id))
+      const targetDayNames = individualSelectedDates.map((dateValue) => (
+        DAY_NAMES[parseIsoDateToUtc(dateValue).getUTCDay()]
+      ))
+      return templates.filter((template) => (
+        targetDayNames.every((dayName) => template.active_days_of_week.includes(dayName))
+      ))
     }
     return templates
-  }, [availableTemplatesForSelectedDate, contextData?.shift_templates, nightsOnly, requestType])
+  }, [contextData?.shift_templates, individualSelectedDates, nightsOnly, requestType])
+
+  useEffect(() => {
+    if (requestType !== 'SHIFT_ON') {
+      return
+    }
+    const visibleTemplateIds = new Set(individualShiftTemplateOptions.map((template) => template.id))
+    setSelectedShiftTemplateIds((current) => current.filter((templateId) => visibleTemplateIds.has(templateId)))
+  }, [individualShiftTemplateOptions, requestType])
 
   const bulkShiftTemplateOptions = useMemo(() => {
     const templates = contextData?.shift_templates ?? []
@@ -603,6 +620,13 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
       return null
     }
 
+    // Multi-date saves are validated atomically by the server against all
+    // request and weekend limits. The single-date preview below remains useful
+    // without presenting an incomplete projection for a batch.
+    if (individualSelectedDates.length > 1) {
+      return null
+    }
+
     const existing = existingForSelectedDate.userRequest
     const counters = contextData.request_counters
     const counterKey = weight === 'FIXED' ? null : weight
@@ -644,6 +668,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     availableTemplatesForSelectedDate,
     contextData,
     existingForSelectedDate.userRequest,
+    individualSelectedDates.length,
     requestType,
     selectedDateUtc,
     selectedScope,
@@ -655,6 +680,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     setSelectedPhysicianId(nextPhysicianId)
     setCalendarRequestView('INDIVIDUAL')
     setBulkPendingDates([])
+    setIndividualSelectedDates([selectedDate])
     await fetchContext(nextPhysicianId)
     setRequestType('NONE')
     setWeight(selectedScope === 'ADMIN' ? 'FIXED' : 'MEDIUM')
@@ -696,8 +722,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
       return
     }
 
-    if (!isDateWithinBlock(selectedDate, block.start_date, block.end_date)) {
-      setError('Select a date within this Schedule Block.')
+    const targetDates = requestType === 'NONE' ? [selectedDate] : individualSelectedDates
+    if (!targetDates.length || targetDates.some((dateValue) => !isDateWithinBlock(dateValue, block.start_date, block.end_date))) {
+      setError('Select one or more dates within this Schedule Block.')
       return
     }
 
@@ -716,9 +743,15 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
         setError('Select one or more shifts for a Shift Off request.')
         return
       }
-      const availableIds = new Set(availableTemplatesForSelectedDate.map((template) => template.id))
-      if (!selectedShiftTemplateIds.some((templateId) => availableIds.has(templateId))) {
-        setError('At least one selected Shift Off shift must occur on this date.')
+      const templateById = new Map((contextData?.shift_templates ?? []).map((template) => [template.id, template]))
+      const uncoveredDate = targetDates.find((dateValue) => {
+        const dayName = DAY_NAMES[parseIsoDateToUtc(dateValue).getUTCDay()]
+        return !selectedShiftTemplateIds.some((templateId) => (
+          templateById.get(templateId)?.active_days_of_week.includes(dayName)
+        ))
+      })
+      if (uncoveredDate) {
+        setError(`At least one selected Shift Off shift must occur on ${formatDisplayDate(parseIsoDateToUtc(uncoveredDate))}.`)
         return
       }
     }
@@ -728,20 +761,30 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
       setError(null)
       const savedDate = selectedDate
 
-      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/requests/upsert/`, {
+      const isMultiDateSave = requestType !== 'NONE' && targetDates.length > 1
+      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/requests/${isMultiDateSave ? 'bulk/' : 'upsert/'}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         credentials: 'include',
-        body: JSON.stringify({
-          physician_id: selectedPhysicianId,
-          date: selectedDate,
-          request_scope: selectedScope,
-          request_type: requestType,
-          weight,
-          shift_template_ids: selectedShiftTemplateIds,
-        }),
+        body: JSON.stringify(isMultiDateSave
+          ? {
+            physician_ids: [selectedPhysicianId],
+            dates: targetDates,
+            request_scope: selectedScope,
+            request_type: requestType,
+            weight,
+            shift_template_ids: selectedShiftTemplateIds,
+          }
+          : {
+            physician_id: selectedPhysicianId,
+            date: selectedDate,
+            request_scope: selectedScope,
+            request_type: requestType,
+            weight,
+            shift_template_ids: selectedShiftTemplateIds,
+          }),
       })
 
       if (!response.ok) {
@@ -759,6 +802,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
         // Do not override a date the user selected while the save request was
         // in flight. This advances only the individual request workflow.
         setSelectedDate((current) => current === savedDate ? nextDate : current)
+        setIndividualSelectedDates([nextDate])
+      } else {
+        setIndividualSelectedDates([savedDate])
       }
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save request.')
@@ -1107,6 +1153,10 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                 && patternMode === 'SELECTED'
                 && bulkPendingDates.includes(dateKey)
               )
+              const isIndividualPending = (
+                calendarRequestView === 'INDIVIDUAL'
+                && individualSelectedDates.includes(dateKey)
+              )
 
               if (cell.key.startsWith('empty-leading-')) {
                 return <div key={cell.key} className="request-day-cell request-day-cell-empty" />
@@ -1116,25 +1166,39 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                 <button
                   type="button"
                   key={cell.key}
-                  className={`request-day-cell ${isSelected ? 'request-day-selected' : ''} ${isBulkPending ? 'request-day-bulk-pending' : ''}`}
+                  className={`request-day-cell ${isSelected ? 'request-day-selected' : ''} ${isBulkPending ? 'request-day-bulk-pending' : ''} ${isIndividualPending ? 'request-day-multi-selected' : ''}`}
                   onClick={() => {
-                    setSelectedDate(dateKey)
                     if (
                       isSchedulerMode
                       && calendarRequestView === 'BULK'
                       && patternMode === 'SELECTED'
                     ) {
+                      setSelectedDate(dateKey)
                       setBulkPendingDates((current) => (
                         current.includes(dateKey)
                           ? current.filter((value) => value !== dateKey)
                           : [...current, dateKey].sort()
                       ))
+                    } else if (calendarRequestView === 'INDIVIDUAL' && requestType !== 'NONE') {
+                      setIndividualSelectedDates((current) => {
+                        if (current.includes(dateKey)) {
+                          if (current.length === 1) return current
+                          const next = current.filter((value) => value !== dateKey)
+                          if (selectedDate === dateKey) setSelectedDate(next[next.length - 1])
+                          return next
+                        }
+                        setSelectedDate(dateKey)
+                        return [...current, dateKey].sort()
+                      })
+                    } else {
+                      setSelectedDate(dateKey)
+                      setIndividualSelectedDates([dateKey])
                     }
                   }}
                 >
                   <div className="request-day-header">
                     <span>{cell.date.getUTCDate()}</span>
-                    {isBulkPending && <span className="bulk-date-selection-indicator">Selected</span>}
+                    {(isBulkPending || isIndividualPending) && <span className="bulk-date-selection-indicator">Selected</span>}
                   </div>
                   {dateRequests.map((item) => (
                     <RequestCalendarChip key={item.id} item={item} />
@@ -1146,7 +1210,11 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
         </section>
 
         <section className="request-editor">
-          <h3>{formatDisplayDate(selectedDateUtc)}</h3>
+          <h3>
+            {individualSelectedDates.length > 1
+              ? `${individualSelectedDates.length} dates selected`
+              : formatDisplayDate(selectedDateUtc)}
+          </h3>
           {isSchedulerMode && (
             <div className="request-scope-toggle">
               <button
@@ -1190,7 +1258,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
             </div>
           )}
 
-          {!isSchedulerMode && existingForSelectedDate.userRequest && (
+          {!isSchedulerMode && individualSelectedDates.length === 1 && existingForSelectedDate.userRequest && (
             <div className="request-existing-note">Your existing request for this date is loaded below.</div>
           )}
 
@@ -1201,6 +1269,11 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
               onChange={(event) => {
                 const nextType = event.target.value as RequestType
                 setRequestType(nextType)
+                if (nextType === 'NONE') {
+                  setIndividualSelectedDates([selectedDate])
+                } else if (!individualSelectedDates.length) {
+                  setIndividualSelectedDates([selectedDate])
+                }
                 if (nextType === 'NONE' || nextType === 'DAY_OFF' || nextType === 'DAY_ON') {
                   setSelectedShiftTemplateIds([])
                 }
@@ -1220,7 +1293,13 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
 
           {shiftSelectionMode !== 'none' && (
             <fieldset className="days-fieldset">
-              <legend>{requestType === 'SHIFT_ON' ? 'Available Shifts On This Date' : 'Shift Templates'}</legend>
+              <legend>
+                {requestType === 'SHIFT_ON'
+                  ? individualSelectedDates.length > 1
+                    ? 'Available Shifts On Every Selected Date'
+                    : 'Available Shifts On This Date'
+                  : 'Shift Templates'}
+              </legend>
               <div className="request-template-list">
                 {individualShiftTemplateOptions.map((template) => (
                   <label key={template.id} className="day-option">
@@ -1237,7 +1316,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                 {!individualShiftTemplateOptions.length && (
                   <div className="empty-state">
                     {requestType === 'SHIFT_ON'
-                      ? 'No shift templates are available on this date.'
+                      ? individualSelectedDates.length > 1
+                        ? 'No single shift template is available on every selected date.'
+                        : 'No shift templates are available on this date.'
                       : 'No shift templates are available.'}
                   </div>
                 )}
@@ -1267,14 +1348,26 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
                     : 'Fixed is a high-penalty preference, not a hard constraint.'}
                 </div>
               )}
+              <div className="request-existing-note request-date-selection-note">
+                Select additional calendar dates before saving. Click a selected date again to remove it.
+              </div>
+              <div className="request-selected-date-summary">
+                {individualSelectedDates.map((dateValue) => (
+                  <span key={dateValue}>{formatDisplayDate(parseIsoDateToUtc(dateValue))}</span>
+                ))}
+              </div>
             </>
           )}
 
           {requestLimitMessage && <div className="facilities-error">{requestLimitMessage}</div>}
 
           <div className="request-editor-actions">
-            <button type="button" onClick={saveRequest} disabled={!canEdit || isSaving || Boolean(requestLimitMessage) || fixedRequestIsReadOnly}>
-              {isSaving ? 'Saving...' : 'Save'}
+            <button type="button" onClick={saveRequest} disabled={!canEdit || isSaving || Boolean(requestLimitMessage) || fixedRequestIsReadOnly || individualSelectedDates.length === 0}>
+              {isSaving
+                ? 'Saving...'
+                : individualSelectedDates.length > 1
+                  ? `Save ${individualSelectedDates.length} Requests`
+                  : 'Save'}
             </button>
           </div>
         </section>

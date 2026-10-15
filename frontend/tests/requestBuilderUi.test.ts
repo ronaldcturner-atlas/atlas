@@ -28,4 +28,17 @@ describe('Schedule Block request overview', () => {
     expect(requestBuilderSource).toContain("data.requests.filter((item) => item.request_scope === 'USER')")
     expect(requestBuilderSource).toContain("data.visible_requests.filter((item) => item.request_scope === 'USER')")
   })
+
+  it('lets the individual request workflow select and save multiple dates', () => {
+    expect(requestBuilderSource).toContain('individualSelectedDates.includes(dateKey)')
+    expect(requestBuilderSource).toContain("dates: targetDates")
+    expect(requestBuilderSource).toContain("'bulk/' : 'upsert/'")
+    expect(requestBuilderSource).toContain('Select additional calendar dates before saving.')
+    expect(requestBuilderSource).toContain('Save ${individualSelectedDates.length} Requests')
+  })
+
+  it('keeps the post-save automatic date advance for a multi-date save', () => {
+    expect(requestBuilderSource).toContain('const nextDate = nextIndividualRequestDate(savedDate, block.end_date)')
+    expect(requestBuilderSource).toContain('setIndividualSelectedDates([nextDate])')
+  })
 })

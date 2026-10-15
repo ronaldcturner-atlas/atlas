@@ -380,6 +380,9 @@ select option:checked{
 .request-day-bulk-pending{background:#075985;border-color:#38bdf8;color:#fff;box-shadow:inset 0 0 0 2px #38bdf8}
 .request-day-bulk-pending:hover{background:#0369a1}
 .request-day-bulk-pending .request-day-header{color:#fff;font-weight:800}
+.request-day-multi-selected{background:#3730a3;border-color:#a5b4fc;color:#fff;box-shadow:inset 0 0 0 2px #818cf8}
+.request-day-multi-selected:hover{background:#4338ca}
+.request-day-multi-selected .request-day-header{color:#fff;font-weight:800}
 .bulk-date-selection-indicator{padding:2px 5px;border-radius:999px;background:#e0f2fe;color:#075985;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.03em}
 .request-day-cell-disabled{background:rgba(255,255,255,0.01);border-style:dashed;cursor:not-allowed}
 .request-day-cell-empty{background:transparent;border:0;cursor:default}
@@ -404,6 +407,9 @@ select option:checked{
 .request-editor-actions{display:flex;justify-content:flex-end;margin-top:6px}
 .request-editor-actions button{padding:7px 13px;border-radius:8px;border:0;background:var(--accent);color:#fff;cursor:pointer}
 .request-editor-actions button:disabled{opacity:0.6;cursor:not-allowed}
+.request-date-selection-note{margin-top:6px}
+.request-selected-date-summary{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.request-selected-date-summary span{padding:3px 6px;border:1px solid rgba(165,180,252,.5);border-radius:999px;background:rgba(79,70,229,.18);color:#e0e7ff;font-size:10px;font-weight:650}
 
 .request-bulk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
 .request-bulk-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}

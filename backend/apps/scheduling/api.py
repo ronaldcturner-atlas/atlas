@@ -3692,13 +3692,26 @@ def schedule_block_bulk_requests(request, block_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    if not _can_manage_requests(request.user, block.domain):
-        return Response({'detail': 'Only admin/scheduler users can create bulk requests.'}, status=status.HTTP_403_FORBIDDEN)
+    can_manage = _can_manage_requests(request.user, block.domain)
+    can_manage_fixed = _can_manage_fixed_requests(request.user, block.domain)
+    self_physician = _resolve_self_physician(request.user)
+    if not can_manage and not has_permission(request.user, 'submit_own_requests', domain=block.domain):
+        return Response(
+            {'detail': 'Request submission permission is required for this Domain.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not can_manage and not _request_window_is_open(block):
+        return Response(
+            {'detail': 'The request window for this Schedule Block is not open.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     request_scope = str(request.data.get('request_scope') or ScheduleRequest.RequestScope.USER).upper()
     allowed_scopes = {choice[0] for choice in ScheduleRequest.RequestScope.choices}
     if request_scope not in allowed_scopes:
         return Response({'request_scope': 'Invalid request scope.'}, status=status.HTTP_400_BAD_REQUEST)
+    if request_scope == ScheduleRequest.RequestScope.ADMIN and not can_manage:
+        return Response({'detail': 'Only admin/scheduler users can create admin requests.'}, status=status.HTTP_403_FORBIDDEN)
 
     request_type = str(request.data.get('request_type') or '').upper()
     if request_type == 'NONE':
@@ -3711,7 +3724,7 @@ def schedule_block_bulk_requests(request, block_id):
                 {'weight': 'Fixed priority is only available for Admin requests.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not _can_manage_fixed_requests(request.user, block.domain):
+        if not can_manage_fixed:
             return Response(
                 {'detail': 'Fixed request management permission is required.'},
                 status=status.HTTP_403_FORBIDDEN,
@@ -3725,6 +3738,15 @@ def schedule_block_bulk_requests(request, block_id):
         physician_ids = sorted({int(physician_id) for physician_id in physician_ids})
     except (TypeError, ValueError):
         return Response({'physician_ids': 'physician_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not can_manage:
+        if self_physician is None:
+            return Response({'detail': 'Authenticated user is not linked to a physician profile.'}, status=status.HTTP_403_FORBIDDEN)
+        if physician_ids != [self_physician.id]:
+            return Response(
+                {'detail': 'You do not have permission to modify requests for another user.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
     physicians = list(_working_request_physicians(block).filter(id__in=physician_ids))
     if len(physicians) != len(physician_ids):
@@ -3749,7 +3771,7 @@ def schedule_block_bulk_requests(request, block_id):
     parsed_dates = sorted(set(parsed_dates))
 
     if (
-        not _can_manage_fixed_requests(request.user, block.domain)
+        not can_manage_fixed
         and ScheduleRequest.objects.filter(
             schedule_block=block,
             physician_id__in=physician_ids,
@@ -3774,7 +3796,12 @@ def schedule_block_bulk_requests(request, block_id):
 
     plans = {}
     for physician in physicians:
-        policy = _get_request_policy(physician, can_manage=True, domain=block.domain)
+        policy = _get_request_policy(physician, can_manage=can_manage, domain=block.domain)
+        if not can_manage and request_type not in policy['allowed_request_types']:
+            return Response(
+                {'request_type': 'This request type is not allowed by your contract.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         eligible_templates = _get_eligible_shift_templates(
             policy['eligible_facility_ids'],
             block.domain_id,
