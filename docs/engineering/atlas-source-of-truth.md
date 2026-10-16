@@ -199,6 +199,8 @@ Manual assignments record their source as `MANUAL`; optimizer assignments record
 
 Before every Run, Atlas snapshots the current authoritative inputs and reconciles the chosen source to them. The source schedule is authoritatively rescored before search. Missing current shift instances are represented explicitly, and newly valid open shifts receive a proven placement pass before V2 improvement begins. The vectorized search must periodically reconcile against the authoritative scorer, and a candidate may never be retained as an improvement when the authoritative score does not improve under the required ordering.
 
+Every completed V2 Run retains bounded production telemetry for optimizer health, comparison, and future capacity planning. Telemetry is accumulated in memory only at vectorized-neighborhood and existing authoritative-checkpoint boundaries; candidate evaluation performs no database, network, or per-candidate telemetry writes. The retained summary includes time to the first and best verified checkpoints, aggregate phase timings, cache use, stop reason, and attempts, acceptances, and authoritative penalty movement by selection mode, accepted operation, and structural rule family. Full neighborhood payloads and transition replay details remain temporary failure diagnostics rather than permanent completed-Run history. Production telemetry must remain below 1% overhead in representative benchmarks.
+
 The two focus modes are:
 
 - `STANDARD`, the default, which treats Facility and broad time-of-day proportionality as a score-neutral tie-breaker.

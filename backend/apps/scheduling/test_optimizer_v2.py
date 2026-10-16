@@ -36,6 +36,7 @@ from apps.scheduling.optimizer_v2_runner import (
     _require_hard_valid_final_report,
     _require_matching_final_score,
 )
+from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 
 
 class V2SwapKernelCommandTests(SimpleTestCase):
@@ -144,6 +145,116 @@ class V2FinalScoreGuardTests(SimpleTestCase):
             'operation_count': 299,
         })
         self.assertNotIn('neighborhoods', compact)
+
+    def test_completed_summary_retains_bounded_production_telemetry(self):
+        telemetry = {
+            'schema_version': 1,
+            'neighborhood_count': 12,
+            'phase_seconds': {'kernel_seconds': 4.5},
+        }
+
+        compact = _compact_search_summary({
+            'production_telemetry': telemetry,
+            'neighborhoods': [{'large': 'diagnostic payload'}],
+        })
+
+        self.assertEqual(compact['production_telemetry'], telemetry)
+        self.assertNotIn('neighborhoods', compact)
+
+
+class ProductionOptimizerTelemetryTests(SimpleTestCase):
+    def test_aggregates_only_neighborhood_boundary_metrics(self):
+        telemetry = ProductionOptimizerTelemetry()
+        transition = {
+            'operation': 'rotate',
+            'authoritative_official_delta': -2500,
+        }
+
+        telemetry.record_neighborhood(
+            kernel_result={
+                'engine_context_cache_hit': True,
+                'preparation_seconds': 1.0,
+                'elapsed_seconds': 4.0,
+                'authoritative_validation': {'elapsed_seconds': 2.0},
+                'in_process_transition': {'refresh_seconds': 0.5},
+            },
+            selection_mode='improve',
+            proposed_transition=transition,
+            accepted_transition=transition,
+            structural_attempt={
+                'selected_family': 'weekend',
+                'accepted': True,
+                'score_delta': -2500,
+            },
+            command_seconds=8.0,
+        )
+        telemetry.record_verified_checkpoint(
+            elapsed_seconds=8.0,
+            accepted_transitions=1,
+            score=7500,
+        )
+        telemetry.record_verified_checkpoint(
+            elapsed_seconds=14.0,
+            accepted_transitions=2,
+            score=7000,
+        )
+
+        summary = telemetry.summary(
+            wall_seconds=20.0,
+            total_evaluations=2_000_000,
+            stopped_reason='runtime_limit',
+        )
+
+        self.assertEqual(summary['neighborhood_count'], 1)
+        self.assertEqual(summary['engine_context_cache'], {
+            'hits': 1, 'misses': 0,
+        })
+        self.assertEqual(summary['phase_seconds'], {
+            'authoritative_validation_seconds': 2.0,
+            'command_overhead_seconds': 1.0,
+            'command_seconds': 8.0,
+            'kernel_seconds': 4.0,
+            'preparation_seconds': 1.0,
+            'transition_refresh_seconds': 0.5,
+        })
+        self.assertEqual(
+            summary['operations']['rotate']['official_penalty_reduction'],
+            2500.0,
+        )
+        self.assertEqual(summary['structural_families']['weekend']['accepted'], 1)
+        self.assertEqual(summary['first_verified_checkpoint_seconds'], 8.0)
+        self.assertEqual(summary['best_verified_score'], 7000.0)
+        self.assertEqual(summary['best_verified_seconds'], 14.0)
+        self.assertEqual(summary['end_to_end_evaluations_per_second'], 100000.0)
+
+    def test_failed_structural_attempt_does_not_claim_vector_acceptance(self):
+        telemetry = ProductionOptimizerTelemetry()
+        vector_transition = {
+            'operation': 'swap',
+            'authoritative_official_delta': -100,
+        }
+
+        telemetry.record_neighborhood(
+            kernel_result={},
+            selection_mode='diversify',
+            proposed_transition=vector_transition,
+            accepted_transition=vector_transition,
+            structural_attempt={
+                'selected_family': 'night',
+                'accepted': False,
+                'score_delta': None,
+            },
+            command_seconds=1.0,
+        )
+        summary = telemetry.summary(
+            wall_seconds=1.0,
+            total_evaluations=10,
+            stopped_reason='runtime_limit',
+        )
+
+        self.assertEqual(summary['operations']['swap']['accepted'], 1)
+        self.assertEqual(summary['structural_families']['night']['attempts'], 1)
+        self.assertEqual(summary['structural_families']['night']['accepted'], 0)
 
     def test_opening_checkpoint_replaces_stale_bootstrap_score(self):
         self.assertEqual(

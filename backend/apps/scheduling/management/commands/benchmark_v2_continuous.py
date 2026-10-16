@@ -9,6 +9,7 @@ from apps.scheduling.optimizer import (
     _pipeline_epoch_is_productive,
     _pipeline_epoch_transition,
 )
+from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 
 
 class Command(BaseCommand):
@@ -142,6 +143,7 @@ class Command(BaseCommand):
         rolling_transitions = []
         best_authoritative_checkpoint = None
         last_authoritative_checkpoint = None
+        production_telemetry = ProductionOptimizerTelemetry()
         if isinstance(diagnostic_state, dict):
             diagnostic_state.update({
                 'schema_version': 1,
@@ -424,6 +426,7 @@ class Command(BaseCommand):
                 if epoch_kind == 'deep'
                 else float(options['soft_restart_maximum_penalty'])
             )
+            command_started = runtime_clock()
             call_command(
                 'benchmark_v2_swap_kernel',
                 run_id=options['run_id'],
@@ -461,6 +464,7 @@ class Command(BaseCommand):
                 as_json=True,
                 stdout=output,
             )
+            command_seconds = runtime_clock() - command_started
             reset_engine_context_pending = False
             lines = [line for line in output.getvalue().splitlines() if line.strip()]
             if not lines:
@@ -498,6 +502,7 @@ class Command(BaseCommand):
             transition = kernel_result.get(
                 'best_candidate_transition_validation'
             )
+            proposed_transition = transition
             rejected_transition = None
             rejection_reason = None
             if repeated_state:
@@ -533,6 +538,14 @@ class Command(BaseCommand):
                         last_rejected_candidate=rejected_transition,
                     )
                     transition = None
+            production_telemetry.record_neighborhood(
+                kernel_result=kernel_result,
+                selection_mode=selection_mode,
+                proposed_transition=proposed_transition,
+                accepted_transition=transition,
+                structural_attempt=structural_attempt,
+                command_seconds=command_seconds,
+            )
             authoritative_current = kernel_result.get(
                 'authoritative_current_score'
             )
@@ -620,6 +633,7 @@ class Command(BaseCommand):
                 score_checkpoints.append({
                     'accepted_transitions': accepted_transition_count,
                     'score': current_score,
+                    'elapsed_seconds': float(runtime_clock() - started),
                     'epoch': epoch_number,
                     'restart_mode': epoch_kind,
                     'selection_mode': selection_mode,
@@ -627,6 +641,7 @@ class Command(BaseCommand):
                 checkpoint_diagnostic = {
                     'accepted_transitions': accepted_transition_count,
                     'score': current_score,
+                    'elapsed_seconds': float(runtime_clock() - started),
                     'score_breakdown': kernel_result.get(
                         'authoritative_current_breakdown'
                     ),
@@ -645,6 +660,18 @@ class Command(BaseCommand):
                         **checkpoint_diagnostic,
                         'operation_chain': list(current_swaps),
                     }
+                production_telemetry.record_verified_checkpoint(
+                    elapsed_seconds=checkpoint_diagnostic['elapsed_seconds'],
+                    accepted_transitions=accepted_transition_count,
+                    score=current_score,
+                )
+                update_diagnostic_state(
+                    production_telemetry=production_telemetry.summary(
+                        wall_seconds=float(runtime_clock() - started),
+                        total_evaluations=total_evaluations,
+                        stopped_reason='running',
+                    ),
+                )
                 update_diagnostic_state(
                     last_authoritative_checkpoint=checkpoint_diagnostic,
                     best_authoritative_checkpoint=(
@@ -927,6 +954,11 @@ class Command(BaseCommand):
                 row['meets_minimum_rate'] for row in neighborhoods
             ),
             'wall_seconds': wall_seconds,
+            'production_telemetry': production_telemetry.summary(
+                wall_seconds=wall_seconds,
+                total_evaluations=total_evaluations,
+                stopped_reason=stopped_reason,
+            ),
             'swaps': best_swaps,
             'neighborhoods': neighborhoods,
             'pipeline_epochs': pipeline_epochs,

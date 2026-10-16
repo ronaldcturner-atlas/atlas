@@ -56,6 +56,7 @@ def _compact_search_summary(search_result):
         'aggregate_kernel_schedules_per_second', 'restart_count',
         'search_generation', 'consecutive_unproductive_generations',
         'consecutive_exhausted_pipeline_epochs', 'distribution_focus',
+        'production_telemetry',
     )
     compact = {
         key: search_result[key]
@@ -81,6 +82,7 @@ def _compact_search_summary(search_result):
             key: best_checkpoint[key]
             for key in (
                 'accepted_transitions', 'score', 'score_breakdown',
+                'elapsed_seconds',
                 'schedule_fingerprint', 'epoch', 'restart_mode',
                 'selection_mode',
                 'operation_count',
