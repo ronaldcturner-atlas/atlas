@@ -208,6 +208,9 @@ def fill_open_instances(context, ordered_instances, phase):
                         context['contract_by_physician'],
                         physician.id,
                         instance,
+                        assigned_night_instances=context[
+                            'initial_fill_night_instances'
+                        ][physician.id],
                     )
                     recovery_penalty = (
                         legacy._night_recovery_candidate_penalty(
@@ -217,6 +220,9 @@ def fill_open_instances(context, ordered_instances, phase):
                             context['contract_by_physician'],
                             physician.id,
                             instance,
+                            assigned_night_instances=context[
+                                'initial_fill_night_instances'
+                            ][physician.id],
                         )
                     )
                     if phase == 'night':
@@ -522,6 +528,9 @@ def fill_open_instances(context, ordered_instances, phase):
                 context['initial_fill_night_dates'][selected_physician.id].add(
                     instance.date
                 )
+                context['initial_fill_night_instances'][
+                    selected_physician.id
+                ].append(instance)
                 for row in context['night_ranges_by_physician'][
                     selected_physician.id
                 ]:

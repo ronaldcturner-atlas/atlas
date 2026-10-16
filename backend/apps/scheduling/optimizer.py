@@ -1887,16 +1887,28 @@ def _full_calendar_days_between(left_date, right_date):
     return max((right_date - left_date).days - 1, 0)
 
 
-def _night_block_extension_bonus(instances_by_id, state, contract_by_physician, physician_id, instance):
+def _night_block_extension_bonus(
+    instances_by_id,
+    state,
+    contract_by_physician,
+    physician_id,
+    instance,
+    *,
+    assigned_night_instances=None,
+):
     if not instance.shift_template.night_shift:
         return Decimal('0')
-    physician_nights = [
-        instances_by_id[assigned_instance_id]
-        for assigned_instance_id, physician_ids in state.items()
-        if physician_id in physician_ids
-        and assigned_instance_id in instances_by_id
-        and instances_by_id[assigned_instance_id].shift_template.night_shift
-    ]
+    physician_nights = (
+        list(assigned_night_instances)
+        if assigned_night_instances is not None
+        else [
+            instances_by_id[assigned_instance_id]
+            for assigned_instance_id, physician_ids in state.items()
+            if physician_id in physician_ids
+            and assigned_instance_id in instances_by_id
+            and instances_by_id[assigned_instance_id].shift_template.night_shift
+        ]
+    )
     if not physician_nights:
         return Decimal('0')
 
@@ -2674,7 +2686,16 @@ def _night_candidate_delta(instances, physicians, state, contract_by_physician, 
     return projected_report['score'] - current_report['score']
 
 
-def _night_recovery_candidate_penalty(instances, physicians, state, contract_by_physician, physician_id, instance):
+def _night_recovery_candidate_penalty(
+    instances,
+    physicians,
+    state,
+    contract_by_physician,
+    physician_id,
+    instance,
+    *,
+    assigned_night_instances=None,
+):
     if instance.shift_template.night_shift:
         return Decimal('0')
     contract = contract_by_physician.get(physician_id)
@@ -2690,14 +2711,17 @@ def _night_recovery_candidate_penalty(instances, physicians, state, contract_by_
     if days_after is None:
         return Decimal('0')
 
-    instances_by_id = {candidate.id: candidate for candidate in instances}
-    night_instances = [
-        instances_by_id[assigned_instance_id]
-        for assigned_instance_id, physician_ids in state.items()
-        if physician_id in physician_ids
-        and assigned_instance_id in instances_by_id
-        and instances_by_id[assigned_instance_id].shift_template.night_shift
-    ]
+    if assigned_night_instances is None:
+        instances_by_id = {candidate.id: candidate for candidate in instances}
+        night_instances = [
+            instances_by_id[assigned_instance_id]
+            for assigned_instance_id, physician_ids in state.items()
+            if physician_id in physician_ids
+            and assigned_instance_id in instances_by_id
+            and instances_by_id[assigned_instance_id].shift_template.night_shift
+        ]
+    else:
+        night_instances = list(assigned_night_instances)
     penalty = Decimal('0')
     for block in _night_blocks(night_instances):
         if days_after is not None:
@@ -11163,9 +11187,26 @@ def optimize_schedule_version(
             candidate_priority = _state_result_priority(
                 instances, candidate_state, candidate_scoring,
             )
-            valid = (candidate_priority[0] == 0
-                     and candidate_scoring.get('fixed_request_on_unmet', 0) == 0
-                     and all(pid in candidate_state[sid] for sid, pid in manual_pairs))
+            hard_valid = (
+                candidate_priority[0] == 0
+                and all(
+                    physician_id in candidate_state[instance_id]
+                    for instance_id, physician_id in manual_pairs
+                )
+            )
+            # Construction-only mode supplies V2 with its first complete,
+            # hard-legal schedule. FIXED requests are intentionally very
+            # high-priority preferences rather than hard constraints, so the
+            # constructor must not delay that handoff while trying to satisfy
+            # every FIXED request. The main optimizer continues from this
+            # state with the full request scoring model intact.
+            valid = (
+                hard_valid
+                and (
+                    construction_only
+                    or candidate_scoring.get('fixed_request_on_unmet', 0) == 0
+                )
+            )
             search_budget.observe(candidate_scoring['score'], valid=valid)
             if valid:
                 construction_complete = True
@@ -11456,6 +11497,7 @@ def optimize_schedule_version(
         initial_fill_template_indexes = defaultdict(list)
         initial_fill_intervals = defaultdict(_AssignmentIntervalIndex)
         initial_fill_night_dates = defaultdict(set)
+        initial_fill_night_instances = defaultdict(list)
         initial_fill_weekend_dates = defaultdict(set)
         initial_fill_weekend_weeks = defaultdict(set)
         initial_fill_assigned_dates = defaultdict(set)
@@ -11487,6 +11529,7 @@ def optimize_schedule_version(
             initial_fill_template_indexes.clear()
             initial_fill_intervals.clear()
             initial_fill_night_dates.clear()
+            initial_fill_night_instances.clear()
             initial_fill_weekend_dates.clear()
             initial_fill_weekend_weeks.clear()
             initial_fill_assigned_dates.clear()
@@ -11516,6 +11559,9 @@ def optimize_schedule_version(
                     initial_fill_assigned_dates[physician_id].add(assigned_instance.date)
                     if assigned_instance.shift_template.night_shift:
                         initial_fill_night_dates[physician_id].add(assigned_instance.date)
+                        initial_fill_night_instances[physician_id].append(
+                            assigned_instance
+                        )
                     if _is_weekend_designated(assigned_instance):
                         initial_fill_weekend_dates[physician_id].add(assigned_instance.date)
                         initial_fill_weekend_weeks[physician_id].add(
@@ -11701,6 +11747,7 @@ def optimize_schedule_version(
             'initial_fill_template_indexes': initial_fill_template_indexes,
             'initial_fill_intervals': initial_fill_intervals,
             'initial_fill_night_dates': initial_fill_night_dates,
+            'initial_fill_night_instances': initial_fill_night_instances,
             'initial_fill_weekend_dates': initial_fill_weekend_dates,
             'initial_fill_weekend_weeks': initial_fill_weekend_weeks,
             'initial_fill_assigned_dates': initial_fill_assigned_dates,
@@ -11798,6 +11845,13 @@ def optimize_schedule_version(
         initial_workload_range_counts = _workload_range_counts(initial_scoring)
         final_score = search_initial_score
         progress_ready = True
+        if construction_only:
+            # Publish/persist the first complete hard-legal construction
+            # before entering the legacy request-repair search. On large
+            # blocks that search can evaluate thousands of full schedules and
+            # previously prevented Fresh Fill from producing any visible
+            # starting result for several minutes.
+            observe_best(state, initial_scoring)
         improvement_count = 0
         iterations_run = 0
         max_passes = (
@@ -12676,12 +12730,15 @@ def optimize_schedule_version(
                     break
             return accepted
 
-        request_preflight_started = runtime_seconds_elapsed()
-        repair_requested_shift_blocks()
-        repair_requested_shifts_on(max(5000, max_candidates_per_repair * max(max_passes, 1)))
-        phase_runtime_seconds['request_on_preflight'] += (
-            runtime_seconds_elapsed() - request_preflight_started
-        )
+        if not (construction_only and construction_complete):
+            request_preflight_started = runtime_seconds_elapsed()
+            repair_requested_shift_blocks()
+            repair_requested_shifts_on(
+                max(5000, max_candidates_per_repair * max(max_passes, 1))
+            )
+            phase_runtime_seconds['request_on_preflight'] += (
+                runtime_seconds_elapsed() - request_preflight_started
+            )
 
         minimum_status = (
             _night_minimum_status(
@@ -15267,7 +15324,7 @@ def optimize_schedule_version(
             source_state_restored_as_best = True
         if adaptive_runtime:
             observe_best(state, final_scoring)
-            if search_budget.best_score is not None:
+            if search_budget.best_score is not None and not construction_only:
                 adaptive_continuation_started = True
                 state, final_scoring, adaptive_debug = _run_adaptive_search_rounds(
                     instances=instances, physicians=physicians,
@@ -15301,6 +15358,14 @@ def optimize_schedule_version(
             adaptive_debug['stopped_reason'] = stopped_reason
             adaptive_debug['runtime_seconds'] = runtime_seconds_elapsed()
             adaptive_debug['seconds_since_improvement'] = monotonic() - search_budget.last_improvement
+
+        if construction_only and construction_complete:
+            # The internal construction handoff uses the same stop callback as
+            # a user cancellation. Keep its diagnostics distinct so a healthy
+            # Fresh Fill bootstrap is not reported as timed out or user-stopped.
+            timed_out = False
+            stopped_reason = 'construction_complete'
+            adaptive_debug['stopped_reason'] = stopped_reason
 
         final_fixed_request_diagnostic = _fixed_shift_on_request_workload_floor(
             instances,

@@ -116,7 +116,7 @@ When a clinician posts their own shift for pickup or trade, they may include an 
 
 The Trade Requests control counts pending activity. A newly received, unseen request adds the request-open accent border; opening the trade list marks it seen and removes the border without requiring the user to accept, decline, or otherwise resolve the request. Sending a request does not mark the sender's own control as unseen. The Schedule page supports Group Schedule, My Schedule, and Mine & Available Shifts views. Resolved trades return to the ordinary ownership-based schedule colors.
 
-The desktop Schedule uses the approved light visual language while retaining its full desktop controls and six-color legend: My assigned shift blue (`#1f65a6`), Available for pickup green (`#34d399`), My posted shift amber (`#fbbf24`), Trade sent purple (`#c084fc`), Trade received pink (`#f472b6`), and Open shift red (`#f87171`). Current ownership has visual precedence: a shift assigned to the signed-in user remains blue even when it is posted or involved in a pending trade. The compact mobile two-dot calendar must not replace this desktop legend.
+The desktop application uses the approved light visual language with light surfaces, readable contrast, and consistent action hierarchy. The desktop Schedule retains its full controls and six-color legend: My assigned shift blue (`#1f65a6`), Available for pickup green (`#34d399`), My posted shift amber (`#fbbf24`), Trade sent purple (`#c084fc`), Trade received pink (`#f472b6`), and Open shift red (`#f87171`). Current ownership has visual precedence: a shift assigned to the signed-in user remains blue even when it is posted or involved in a pending trade. The compact mobile two-dot calendar must not replace this desktop legend.
 
 When a request window is open, a compact Requests Open control appears in the Schedule view for a clinically active user in the applicable Domain and links directly to that block's request entry workflow.
 
@@ -180,6 +180,8 @@ An optimizer Run executes in the background inside the selected `BUILD` Schedule
 The supported starting sources are:
 
 - **Fresh Fill**: build from the current valid staffing requirements with no prior schedule assignments.
+
+Fresh Fill construction ends when Atlas has produced a complete, hard-legal schedule. It must then hand that schedule to the primary optimization engine without waiting for every `FIXED` request to be satisfied. `FIXED` requests retain their full high-priority scoring and optimization treatment after the handoff, but—as documented below—are not hard scheduling constraints and must not prevent the first complete schedule from being published.
 - **Previous Optimizer Run**: copy a selected completed Run, snapshot the rules, requests, users, Facilities, templates, and other inputs that are valid now, authoritatively rescore the copied schedule, and use that current score as the new Run's starting point. The source Run is never modified.
 - **Current Schedule**: start from the current authoritative published schedule, including approved trades, posts, pickups, and scheduler edits that occurred after publication.
 - **Original Published Schedule**: start from the virgin schedule captured at the most recent publication, before subsequent Live Schedule changes.
@@ -244,6 +246,8 @@ Requests have separate `USER` and `ADMIN` scopes. Atlas permits one request of e
 - Users without a linked Physician profile receive a read-only calendar context rather than an invented clinician identity.
 
 Single and bulk request writes are allowed only while the block is `PRE_BUILD` or `BUILD`. `PREVIEW` and `ARCHIVE` requests are read-only.
+
+An ordinary clinician may select multiple dates and save the same permitted `USER` request across those dates in one atomic operation. The batch may target only that clinician, remains subject to the ordinary request window, applicable Contract request types, Shift Template weekday eligibility, and all priority and weekend limits, and saves nothing when any part of the batch is invalid. Request counters show the projected result while dates are selected and saving is blocked when the projected batch would exceed a configured limit. Choosing `None` remains a single-date removal workflow.
 
 Schedulers can bulk-apply a request to multiple physicians and dates. The UI includes date helpers for every occurrence of a weekday, remaining occurrences of a weekday, and the nth weekday of each month. These helpers select explicit dates; they do not create a permanently recurring request rule.
 
