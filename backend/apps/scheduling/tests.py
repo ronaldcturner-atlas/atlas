@@ -5960,6 +5960,80 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             rescore.json()['violation_report']['total_score'],
         )
 
+    def test_recalculate_completed_inactive_run_without_activating_it(self):
+        version = self._create_build_version()
+        self._create_shift_instance(version, self.day_template, self.block.start_date)
+        historical_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=False,
+            final_score=Decimal('999'),
+            optimizer_summary={'marker': 'historical'},
+            score_is_stale=True,
+        )
+        active_summary = {'marker': 'active'}
+        active_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=2,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+            final_score=Decimal('123'),
+            optimizer_summary=active_summary,
+        )
+        version.optimizer_summary = active_summary
+        version.save(update_fields=['optimizer_summary', 'updated_at'])
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/recalculate-score/',
+            data={'optimizer_run_id': historical_run.id},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        historical_run.refresh_from_db()
+        active_run.refresh_from_db()
+        version.refresh_from_db()
+        self.assertFalse(historical_run.is_active)
+        self.assertFalse(historical_run.score_is_stale)
+        self.assertNotEqual(historical_run.final_score, Decimal('999'))
+        self.assertTrue(active_run.is_active)
+        self.assertEqual(active_run.final_score, Decimal('123'))
+        self.assertEqual(version.optimizer_summary, active_summary)
+
+    def test_run_workspace_can_defer_then_fetch_workload_feasibility(self):
+        version = self._create_build_version()
+        self._create_shift_instance(version, self.day_template, self.block.start_date)
+        optimizer_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.COMPLETED,
+            is_active=True,
+        )
+
+        workspace = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/build/',
+            data={
+                'version_id': version.id,
+                'optimizer_run_id': optimizer_run.id,
+                'include_workload_feasibility': 'false',
+            },
+        )
+        self.assertEqual(workspace.status_code, 200)
+        self.assertIsNone(workspace.json()['workload_feasibility'])
+        self.assertEqual(len(workspace.json()['shift_instances']), 1)
+
+        feasibility = self.client.get(
+            f'/api/schedule-versions/{version.id}/workload-feasibility/',
+            data={'optimizer_run_id': optimizer_run.id},
+        )
+        self.assertEqual(feasibility.status_code, 200)
+        self.assertIn('status', feasibility.json())
+        self.assertIn('night_feasibility', feasibility.json())
+
     def test_unlock_all_physician_assignments_only_unlocks_selected_physician(self):
         version = self._create_build_version()
         day_instance = self._create_shift_instance(
@@ -10579,6 +10653,59 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             payload['score_breakdown']['request_score'],
         )
         self.assertEqual(payload['score_audit']['warnings'], [])
+
+    def test_violation_report_summarizes_request_outcomes_by_priority(self):
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        version = ScheduleVersion.objects.get(schedule_block=self.block)
+        shift_instance = ScheduleShiftInstance.objects.get(
+            schedule_version=version,
+            shift_template=self.day_template,
+        )
+        high_physician = self._create_assignment_physician(
+            'high.requests@example.com', 'High Requests', facilities=[self.facility],
+        )
+        medium_physician = self._create_assignment_physician(
+            'medium.requests@example.com', 'Medium Requests', facilities=[self.facility],
+        )
+        low_physician = self._create_assignment_physician(
+            'low.requests@example.com', 'Low Requests', facilities=[self.facility],
+        )
+        for physician in (high_physician, medium_physician):
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=shift_instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=ScheduleShiftAssignment.AssignmentSource.MANUAL,
+            )
+        for physician, request_type, weight in (
+            (high_physician, ScheduleRequest.RequestType.DAY_OFF, ScheduleRequest.Weight.HIGH),
+            (medium_physician, ScheduleRequest.RequestType.DAY_ON, ScheduleRequest.Weight.MEDIUM),
+            (low_physician, ScheduleRequest.RequestType.DAY_ON, ScheduleRequest.Weight.LOW),
+        ):
+            ScheduleRequest.objects.create(
+                schedule_block=self.block,
+                physician=physician,
+                date=shift_instance.date,
+                request_scope=ScheduleRequest.RequestScope.USER,
+                request_type=request_type,
+                weight=weight,
+                created_by=self.scheduler_user,
+            )
+
+        response = self.client.get(
+            f'/api/schedule-versions/{version.id}/violation-report/'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['request_priority_summary'], {
+            'HIGH': {'made': 1, 'granted': 0, 'denied': 1},
+            'MEDIUM': {'made': 1, 'granted': 1, 'denied': 0},
+            'LOW': {'made': 1, 'granted': 0, 'denied': 1},
+        })
 
     def test_violation_report_lists_consecutive_day_penalties_by_physician(self):
         version = self._create_build_version(

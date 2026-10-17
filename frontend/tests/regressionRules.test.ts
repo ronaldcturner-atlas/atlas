@@ -4,6 +4,7 @@ import {
   assignablePhysicians,
   calendarYearOptions,
   isVisibleInAvailableShifts,
+  optimizerRecalculateTarget,
   optimizerStartOptions,
   penaltyContributingRows,
   pendingTradeHighlights,
@@ -45,6 +46,18 @@ describe('optimizer schedule source selection', () => {
       'FRESH_FILL',
     ])
     expect(options.find((option) => option.value === 'ORIGINAL_PUBLISHED_SCHEDULE')?.disabled).toBe(false)
+  })
+
+  it('recalculates the selected starting Run without requiring it to be active', () => {
+    const startingRun = { id: 167 }
+    const viewedRun = { id: 159 }
+
+    expect(optimizerRecalculateTarget(
+      'PREVIOUS_OPTIMIZER_RUN', startingRun, viewedRun,
+    )).toBe(startingRun)
+    expect(optimizerRecalculateTarget(
+      'FRESH_FILL', startingRun, viewedRun,
+    )).toBe(viewedRun)
   })
 })
 

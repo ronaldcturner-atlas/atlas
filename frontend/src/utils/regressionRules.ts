@@ -33,6 +33,14 @@ export function optimizerStartOptions({
   ]
 }
 
+export function optimizerRecalculateTarget<T>(
+  startMode: OptimizerStartSelection,
+  startingRun: T | null,
+  viewedRun: T | null,
+) {
+  return startMode === 'PREVIOUS_OPTIMIZER_RUN' ? startingRun : viewedRun
+}
+
 export function assignablePhysicians<T extends { can_assign: boolean; already_assigned: boolean }>(
   physicians: T[],
 ) {

@@ -729,6 +729,48 @@ def _request_scoring_rows(
     return rows
 
 
+def _request_priority_summary(instances, state, requests_by_physician_date):
+    """Count submitted and denied requests once per Low/Medium/High request."""
+    outcomes = {
+        weight: {'made': 0, 'granted': 0, 'denied': 0}
+        for weight in (
+            ScheduleRequest.Weight.HIGH,
+            ScheduleRequest.Weight.MEDIUM,
+            ScheduleRequest.Weight.LOW,
+        )
+    }
+    assigned_templates_by_physician_date = defaultdict(set)
+    for instance in instances:
+        for physician_id in state.get(instance.id, ()):
+            assigned_templates_by_physician_date[
+                (physician_id, instance.date)
+            ].add(instance.shift_template_id)
+
+    for schedule_requests in requests_by_physician_date.values():
+        for schedule_request in schedule_requests:
+            if schedule_request.weight not in outcomes:
+                continue
+            outcome = outcomes[schedule_request.weight]
+            outcome['made'] += 1
+            assigned_template_ids = assigned_templates_by_physician_date.get(
+                (schedule_request.physician_id, schedule_request.date),
+                set(),
+            )
+            requested_template_ids = {
+                template.id for template in schedule_request.shift_templates.all()
+            }
+            if schedule_request.request_type == ScheduleRequest.RequestType.DAY_OFF:
+                denied = bool(assigned_template_ids)
+            elif schedule_request.request_type == ScheduleRequest.RequestType.SHIFT_OFF:
+                denied = bool(assigned_template_ids & requested_template_ids)
+            elif schedule_request.request_type == ScheduleRequest.RequestType.DAY_ON:
+                denied = not bool(assigned_template_ids)
+            else:
+                denied = not bool(assigned_template_ids & requested_template_ids)
+            outcome['denied' if denied else 'granted'] += 1
+    return outcomes
+
+
 def _workload_candidate_score(target, next_hours, next_shifts):
     target_value = target['target'] or Decimal('0')
     if target['units'] == 'SHIFTS':
@@ -10408,6 +10450,11 @@ def build_violation_report(schedule_version, optimizer_run=None):
         scoring_contract_by_physician,
         requests_by_physician_date,
     )
+    request_priority_summary = _request_priority_summary(
+        instances,
+        state,
+        requests_by_physician_date,
+    )
     score_audit = _score_audit(scoring, night_report, request_rows)
 
     users = {
@@ -10724,6 +10771,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
             key: float(value)
             for key, value in scoring['breakdown'].items()
         },
+        'request_priority_summary': request_priority_summary,
         'proportionality': {
             'total': float(scoring['proportionality_score']),
             **{
@@ -11303,11 +11351,14 @@ def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
 
     with transaction.atomic():
         version = ScheduleVersion.objects.select_for_update().get(id=schedule_version.id)
-        version.optimizer_summary = summary
-        version.score_is_stale = False
-        version.save(update_fields=['optimizer_summary', 'score_is_stale', 'updated_at'])
+        locked_run = None
         if run is not None:
             locked_run = OptimizerRun.objects.select_for_update().get(id=run.id)
+        if locked_run is None or locked_run.is_active:
+            version.optimizer_summary = summary
+            version.score_is_stale = False
+            version.save(update_fields=['optimizer_summary', 'score_is_stale', 'updated_at'])
+        if locked_run is not None:
             locked_run.final_score = report['total_score']
             locked_run.score_breakdown = breakdown
             locked_run.optimizer_summary = summary

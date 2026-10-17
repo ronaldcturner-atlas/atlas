@@ -129,6 +129,11 @@ type ViolationReport = {
   } | null
   total_score: number
   score_breakdown: Record<string, number>
+  request_priority_summary?: Record<RequestPriority, {
+    made: number
+    granted: number
+    denied: number
+  }>
   proportionality?: {
     total: number
     facility: number
@@ -160,6 +165,8 @@ type Props = {
   versionId: number
 }
 
+type RequestPriority = 'HIGH' | 'MEDIUM' | 'LOW'
+
 type PenaltyFilter =
   | 'total_score'
   | 'workload_score'
@@ -185,6 +192,12 @@ const PENALTY_FILTERS: Array<{ key: PenaltyFilter; label: string }> = [
   { key: 'consecutive_days_score', label: 'Consecutive days score' },
   { key: 'underutilization_score', label: 'Underutilization score' },
   { key: 'invalid_assignment_score', label: 'Invalid assignment score' },
+]
+
+const REQUEST_PRIORITIES: Array<{ key: RequestPriority; label: string }> = [
+  { key: 'HIGH', label: 'High priority' },
+  { key: 'MEDIUM', label: 'Medium priority' },
+  { key: 'LOW', label: 'Low priority' },
 ]
 
 
@@ -529,6 +542,15 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
             ).toFixed(1)}</strong>
           </button>
         ))}
+        {report.request_priority_summary && REQUEST_PRIORITIES.map((priority) => {
+          const outcome = report.request_priority_summary?.[priority.key]
+          return (
+            <div key={priority.key} className="request-priority-score">
+              <span>{priority.label} requests</span>
+              <strong>{outcome?.made ?? 0} made / {outcome?.denied ?? 0} denied</strong>
+            </div>
+          )
+        })}
       </div>
       <div className="violation-proportionality-scores" aria-label="Distribution measures">
         <div><span>Facility distribution</span><strong>{formatDistribution(report.proportionality?.facility ?? 0, report.proportionality?.unit)}</strong></div>

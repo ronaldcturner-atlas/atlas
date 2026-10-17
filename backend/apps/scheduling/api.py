@@ -4148,6 +4148,22 @@ def _shift_generation_required(block, version):
     ).exists()
 
 
+def _workload_feasibility_payload(version, optimizer_run=None):
+    feasibility_report = build_workload_feasibility(
+        version, optimizer_run, include_individual_diagnostics=False,
+    )
+    payload = {
+        **feasibility_report['aggregate_feasibility'],
+        'total_generated_shift_instances': feasibility_report['schedule_block'][
+            'total_generated_shift_instances'
+        ],
+    }
+    payload['night_feasibility'] = feasibility_report['night_feasibility']
+    payload['request_off_feasibility'] = feasibility_report['request_off_feasibility']
+    payload['weekend_feasibility'] = feasibility_report['weekend_feasibility']
+    return payload
+
+
 def _facility_timezone(facility):
     try:
         return ZoneInfo(facility.timezone)
@@ -4246,20 +4262,17 @@ def schedule_block_build_context(request, block_id):
         else []
     )
     workload_feasibility = None
-    if selected_version and block.published_at is None:
-        feasibility_report = build_workload_feasibility(
+    include_workload_feasibility = request.query_params.get(
+        'include_workload_feasibility', 'true',
+    ).lower() not in {'0', 'false', 'no'}
+    if (
+        selected_version
+        and block.published_at is None
+        and include_workload_feasibility
+    ):
+        workload_feasibility = _workload_feasibility_payload(
             selected_version, selected_optimizer_run,
-            include_individual_diagnostics=False,
         )
-        workload_feasibility = {
-            **feasibility_report['aggregate_feasibility'],
-            'total_generated_shift_instances': feasibility_report['schedule_block'][
-                'total_generated_shift_instances'
-            ],
-        }
-        workload_feasibility['night_feasibility'] = feasibility_report['night_feasibility']
-        workload_feasibility['request_off_feasibility'] = feasibility_report['request_off_feasibility']
-        workload_feasibility['weekend_feasibility'] = feasibility_report['weekend_feasibility']
 
     return Response(
         {
@@ -4335,6 +4348,28 @@ def schedule_block_build_context(request, block_id):
             'workload_feasibility': workload_feasibility,
         }
     )
+
+
+@api_view(['GET'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_version_workload_feasibility(request, version_id):
+    version = get_object_or_404(
+        ScheduleVersion.objects.select_related('schedule_block', 'domain'),
+        id=version_id,
+    )
+    if not _can_manage_build_workspace(request.user, version.domain):
+        return _build_workspace_forbidden_response()
+    requested_run_id = request.query_params.get('optimizer_run_id')
+    optimizer_run = get_viewed_optimizer_run(version, requested_run_id)
+    if requested_run_id not in (None, '') and (
+        optimizer_run is None or str(optimizer_run.id) != str(requested_run_id)
+    ):
+        return Response(
+            {'detail': 'The completed optimizer run was not found.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return Response(_workload_feasibility_payload(version, optimizer_run))
 
 
 @api_view(['GET'])
@@ -5125,12 +5160,27 @@ def schedule_version_recalculate_score(request, version_id):
             {'detail': 'Scores can only be recalculated in a BUILD Schedule Version.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
-    optimizer_run, run_error = _requested_editable_run(request, version)
-    if run_error:
-        return run_error
+    requested_run_id = request.data.get('optimizer_run_id')
+    if requested_run_id in (None, ''):
+        return Response(
+            {'detail': 'Select a completed optimizer run to recalculate its score.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        requested_run_id = int(requested_run_id)
+    except (TypeError, ValueError):
+        return Response(
+            {'optimizer_run_id': 'optimizer_run_id must be a valid optimizer run ID.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    optimizer_run = OptimizerRun.objects.filter(
+        id=requested_run_id,
+        schedule_version=version,
+        status=OptimizerRun.Status.COMPLETED,
+    ).first()
     if optimizer_run is None:
         return Response(
-            {'detail': 'Select the viewed active optimizer run to recalculate its score.'},
+            {'detail': 'Select a completed optimizer run from this Schedule Version.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
     preflight_response = _optimizer_preflight_response(

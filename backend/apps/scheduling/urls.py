@@ -53,6 +53,7 @@ urlpatterns = [
     path("schedule-versions/<int:version_id>/optimizer-preflight/", api.schedule_version_optimizer_preflight, name="schedule_version_optimizer_preflight"),
     path("schedule-versions/<int:version_id>/stop-optimizer/", api.schedule_version_stop_optimizer, name="schedule_version_stop_optimizer"),
     path("schedule-versions/<int:version_id>/recalculate-score/", api.schedule_version_recalculate_score, name="schedule_version_recalculate_score"),
+    path("schedule-versions/<int:version_id>/workload-feasibility/", api.schedule_version_workload_feasibility, name="schedule_version_workload_feasibility"),
     path("schedule-versions/<int:version_id>/workload-hour-adjustment/", api.schedule_version_workload_hour_adjustment, name="schedule_version_workload_hour_adjustment"),
     path("schedule-versions/<int:version_id>/physicians/<int:physician_id>/unlock-assignments/", api.schedule_version_unlock_physician_assignments, name="schedule_version_unlock_physician_assignments"),
     path("schedule-versions/<int:version_id>/violation-report/", api.schedule_version_violation_report, name="schedule_version_violation_report"),
