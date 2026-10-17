@@ -1285,13 +1285,9 @@ export default function ContractsView() {
                     </div>
                     <div className="contract-additional-workload-card">
                       <div className="contract-minmax-title">SAME SHIFT IN A ROW</div>
-                      <div className="contract-value-penalty-columns">
-                        <div className="contract-minmax-stack">
-                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row: event.target.value } }))} /></label>
-                        </div>
-                        <div className="contract-minmax-stack">
-                          <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
-                        </div>
+                      <div className="contract-value-penalty-row">
+                        <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row: event.target.value } }))} /></label>
+                        <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
                       </div>
                     </div>
                   </div>
