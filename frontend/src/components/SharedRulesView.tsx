@@ -163,14 +163,20 @@ export default function SharedRulesView({ onShowContracts, onShowUserOverrides }
     finally { setSaving(false) }
   }
   const setActive = async (rule: SharedRule, active: boolean) => {
-    const response = await fetch(`${API_BASE}/shared-rules/${rule.id}/`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ active }) })
+    if (!active) {
+      const names = rule.contracts.map((contract) => contract.name)
+      const confirmed = window.confirm(`Deactivate "${rule.name}"?\n\nAffected Contracts:\n${names.map((name) => `• ${name}`).join('\n')}\n\nThe rule will stop applying to every listed Contract. Acknowledge to proceed.`)
+      if (!confirmed) return
+    }
+    const acknowledgement = active ? '' : '?acknowledge_affected_contracts=true'
+    const response = await fetch(`${API_BASE}/shared-rules/${rule.id}/${acknowledgement}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ active }) })
     if (!response.ok) return setError((await apiError(response)) || 'Unable to update Shared Rule.')
     setNotice(active ? `${rule.name} reactivated.` : `${rule.name} deactivated.`); await loadRules()
   }
   const deleteRule = async (rule: SharedRule) => {
     const names = rule.contracts.map((contract) => contract.name).join(', ')
     if (!window.confirm(`Delete "${rule.name}"?\n\nIt will be removed from: ${names}.\n\nThis cannot be undone.`)) return
-    const response = await fetch(`${API_BASE}/shared-rules/${rule.id}/`, { method: 'DELETE', credentials: 'include' })
+    const response = await fetch(`${API_BASE}/shared-rules/${rule.id}/?acknowledge_affected_contracts=true`, { method: 'DELETE', credentials: 'include' })
     if (!response.ok) return setError((await apiError(response)) || 'Unable to delete Shared Rule.')
     setNotice(`Deleted ${rule.name}.`); await loadRules()
   }

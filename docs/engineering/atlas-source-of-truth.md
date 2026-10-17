@@ -181,7 +181,7 @@ The supported starting sources are:
 
 - **Fresh Fill**: build from the current valid staffing requirements with no prior schedule assignments.
 
-Fresh Fill construction ends when Atlas has produced a complete, hard-legal schedule. It must then hand that schedule to the primary optimization engine without waiting for every `FIXED` request to be satisfied. `FIXED` requests retain their full high-priority scoring and optimization treatment after the handoff, but—as documented below—are not hard scheduling constraints and must not prevent the first complete schedule from being published.
+Fresh Fill construction ends when Atlas has produced a complete, hard-legal schedule. It must then record that schedule as the Run's initial result and hand it to the primary optimization engine without waiting for every `FIXED` request to be satisfied. `FIXED` requests retain their full high-priority scoring and optimization treatment after the handoff, but—as documented below—are not hard scheduling constraints and must not prevent the first complete schedule from becoming available for optimization. Publication remains the separate explicit Schedule Block workflow described above.
 - **Previous Optimizer Run**: copy a selected completed Run, snapshot the rules, requests, users, Facilities, templates, and other inputs that are valid now, authoritatively rescore the copied schedule, and use that current score as the new Run's starting point. The source Run is never modified.
 - **Current Schedule**: start from the current authoritative published schedule, including approved trades, posts, pickups, and scheduler edits that occurred after publication.
 - **Original Published Schedule**: start from the virgin schedule captured at the most recent publication, before subsequent Live Schedule changes.
@@ -354,6 +354,8 @@ A Shift Template belongs to one Domain and one Facility. Its Facility must belon
 BUILD generation uses only active Shift Templates in the Schedule Version's Domain and active Facilities. Templates in any other Domain or Region must never leak into that schedule.
 
 Shared Rules do not follow a Contract across Regions. A scheduler may copy a Shared Rule separately into another Domain as an active setup draft. The draft preserves the source rule's name, period, units, source shift labels, and contract-specific limits as reference only; it has no destination Shift Templates or Contract links until the scheduler explicitly selects them. A Shared Rule may initially apply to one Contract and can be added to more Contracts later. Its Domain is fixed after creation, and its Contract and Shift choices are limited to that Domain. Completing and saving the copied rule replaces the source reference with valid destination relationships.
+
+Each Shared Rule–Contract relationship is the single authoritative record for that Contract's enabled state, minimum, maximum, minimum and maximum penalties, spreading behavior, and optional **Same shifts in a row** maximum and penalty. The Shared Rules editor and the individual Contract editor must read and update that same relationship so changes are immediately visible in both directions. Disabling a Shared Rule from within one Contract retains its settings and affects only that Contract. Global deactivation or deletion from the Shared Rules tab affects every associated Contract and requires an explicit warning that lists all affected Contracts before the action may proceed.
 
 ## Physicians
 

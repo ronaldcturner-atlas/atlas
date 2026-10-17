@@ -8146,6 +8146,17 @@ def _shared_rule_queryset():
     )
 
 
+def _shared_rule_change_acknowledged(request):
+    return str(request.query_params.get('acknowledge_affected_contracts', '')).lower() == 'true'
+
+
+def _shared_rule_affected_contracts(shared_rule):
+    return [
+        {'id': link.contract_id, 'name': link.contract.name}
+        for link in shared_rule.contract_links.select_related('contract').all()
+    ]
+
+
 @api_view(['GET', 'POST'])
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -8193,6 +8204,15 @@ def shared_rule_detail(request, shared_rule_id):
     if request.method == 'GET':
         return Response(SharedRuleSerializer(shared_rule).data)
     if request.method == 'DELETE':
+        affected_contracts = _shared_rule_affected_contracts(shared_rule)
+        if affected_contracts and not _shared_rule_change_acknowledged(request):
+            return Response({
+                'detail': (
+                    'Deleting this Shared Rule affects the listed contracts. '
+                    'Explicit acknowledgment is required.'
+                ),
+                'affected_contracts': affected_contracts,
+            }, status=status.HTTP_409_CONFLICT)
         with transaction.atomic():
             contract_ids = list(
                 shared_rule.contract_links.values_list('contract_id', flat=True)
@@ -8205,6 +8225,19 @@ def shared_rule_detail(request, shared_rule_id):
             if first_contract:
                 _mark_contract_domain_scores_stale(first_contract)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    requested_active = request.data.get('active', shared_rule.active)
+    deactivating = shared_rule.active and requested_active in (False, 0, '0', 'false', 'False')
+    if deactivating:
+        affected_contracts = _shared_rule_affected_contracts(shared_rule)
+        if affected_contracts and not _shared_rule_change_acknowledged(request):
+            return Response({
+                'detail': (
+                    'Deactivating this Shared Rule affects the listed contracts. '
+                    'Explicit acknowledgment is required.'
+                ),
+                'affected_contracts': affected_contracts,
+            }, status=status.HTTP_409_CONFLICT)
 
     serializer = SharedRuleSerializer(
         shared_rule,

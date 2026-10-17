@@ -544,6 +544,7 @@ function sanitizeFormPayload(formState: ContractFormState) {
     },
     shared_rule_settings: formState.shared_rules.map((rule) => ({
       shared_rule_id: rule.id,
+      enabled: rule.enabled,
       min_value: rule.min_value,
       max_value: rule.max_value,
       min_penalty_weight: rule.min_penalty_weight,
@@ -790,13 +791,23 @@ export default function ContractsView() {
     setIsModalOpen(true)
   }
 
-  const openEditModal = (contract: ContractRecord) => {
-    setEditingContractId(contract.id)
-    setActiveTab(contract.setup_required || !contract.facility_ids.length ? 'facilities' : 'summary')
-    setFormState(normalizeContractToForm(contract))
-    setError(null)
-    setSaveNotice(null)
-    setIsModalOpen(true)
+  const openEditModal = async (contract: ContractRecord) => {
+    try {
+      setError(null)
+      const response = await fetch(`${API_BASE}/contracts/${contract.id}/`, { credentials: 'include' })
+      if (!response.ok) {
+        const message = await getApiErrorMessage(response)
+        throw new Error(message ?? 'Unable to load the latest Contract settings.')
+      }
+      const currentContract = await response.json() as ContractRecord
+      setEditingContractId(currentContract.id)
+      setActiveTab(currentContract.setup_required || !currentContract.facility_ids.length ? 'facilities' : 'summary')
+      setFormState(normalizeContractToForm(currentContract))
+      setSaveNotice(null)
+      setIsModalOpen(true)
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Unable to load the latest Contract settings.')
+    }
   }
 
   const closeModal = () => {
@@ -986,7 +997,12 @@ export default function ContractsView() {
   }
 
   if (pageTab === 'shared_rules') {
-    return <SharedRulesView onShowContracts={() => setPageTab('contracts')} onShowUserOverrides={() => setPageTab('user_overrides')} />
+    return <SharedRulesView onShowContracts={() => {
+      setPageTab('contracts')
+      loadContracts(showInactive, regionFilter, domainFilter).catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : 'Unable to refresh contracts.')
+      })
+    }} onShowUserOverrides={() => setPageTab('user_overrides')} />
   }
 
   if (pageTab === 'user_overrides') {
@@ -1061,7 +1077,7 @@ export default function ContractsView() {
                 <td>{contract.assigned_users_count}</td>
                 <td>
                   <div className="facility-actions">
-                    <button type="button" onClick={() => openEditModal(contract)}>
+                    <button type="button" onClick={() => { void openEditModal(contract) }}>
                       Edit
                     </button>
                     <button
@@ -1381,7 +1397,15 @@ export default function ContractsView() {
                                 {sharedRule.active && sharedRule.enabled ? 'Active' : 'Inactive'} · {sharedRule.period_type === 'SCHEDULE_BLOCK' ? 'Schedule Block' : sharedRule.period_type === 'MONTH' ? 'Month' : 'Week'} · {sharedRule.units === 'HOURS' ? 'Hours' : 'Shifts'} · Spread {sharedRule.spread_violations ? 'on' : 'off'}
                               </div>
                             </div>
-                            <span className="shared-rule-readonly-badge">Shared Rule</span>
+                            <div className="shared-rule-contract-actions">
+                              <span className="shared-rule-readonly-badge">Shared Rule</span>
+                              <button type="button" onClick={() => setFormState((current) => ({
+                                ...current,
+                                shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id
+                                  ? { ...rule, enabled: !rule.enabled }
+                                  : rule),
+                              }))}>{sharedRule.enabled ? 'Disable for this Contract' : 'Enable for this Contract'}</button>
+                            </div>
                           </div>
                           <div className="request-existing-note">
                             {sharedRule.shift_templates.length

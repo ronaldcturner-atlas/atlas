@@ -207,14 +207,33 @@ class SharedRuleApiTests(TestCase):
             '/api/shared-rules/', self.payload(), format='json',
         )
         shared_rule_id = created.json()['id']
-        deactivated_payload = self.payload()
-        deactivated_payload['active'] = False
-        updated = self.client.patch(
+        blocked = self.client.patch(
             f'/api/shared-rules/{shared_rule_id}/',
-            deactivated_payload,
+            {'active': False},
+            format='json',
+        )
+        self.assertEqual(blocked.status_code, 409, blocked.json())
+        self.assertEqual(
+            {row['name'] for row in blocked.json()['affected_contracts']},
+            {'Full Time', 'Part Time'},
+        )
+
+        updated = self.client.patch(
+            f'/api/shared-rules/{shared_rule_id}/?acknowledge_affected_contracts=true',
+            {'active': False},
             format='json',
         )
         self.assertEqual(updated.status_code, 200, updated.json())
+        preserved = next(
+            row for row in updated.json()['contracts']
+            if row['id'] == self.full.id
+        )
+        self.assertEqual(preserved['min_value'], '3')
+        self.assertEqual(preserved['max_value'], '4')
+        self.assertEqual(preserved['max_same_shifts_in_row'], '1')
+        self.assertEqual(
+            preserved['max_same_shifts_in_row_penalty_weight'], '7500',
+        )
         self.assertEqual(self.client.get('/api/shared-rules/').json(), [])
         self.assertEqual(
             [row['id'] for row in self.client.get(
@@ -223,7 +242,14 @@ class SharedRuleApiTests(TestCase):
             [shared_rule_id],
         )
 
-        deleted = self.client.delete(f'/api/shared-rules/{shared_rule_id}/')
+        blocked_delete = self.client.delete(
+            f'/api/shared-rules/{shared_rule_id}/',
+        )
+        self.assertEqual(blocked_delete.status_code, 409, blocked_delete.json())
+
+        deleted = self.client.delete(
+            f'/api/shared-rules/{shared_rule_id}/?acknowledge_affected_contracts=true',
+        )
 
         self.assertEqual(deleted.status_code, 204)
         self.assertFalse(SharedRule.objects.filter(id=shared_rule_id).exists())
@@ -413,6 +439,7 @@ class SharedRuleApiTests(TestCase):
             f'/api/contracts/{self.full.id}/',
             {'shared_rule_settings': [{
                 'shared_rule_id': shared_rule_id,
+                'enabled': True,
                 'min_value': '4',
                 'max_value': '6',
                 'min_penalty_weight': '12000',
@@ -435,6 +462,23 @@ class SharedRuleApiTests(TestCase):
             shared_row['max_same_shifts_in_row_penalty_weight'], '9000',
         )
 
+        shared_response = self.client.get(
+            f'/api/shared-rules/{shared_rule_id}/',
+        )
+        self.assertEqual(shared_response.status_code, 200, shared_response.json())
+        shared_contract_row = next(
+            row for row in shared_response.json()['contracts']
+            if row['id'] == self.full.id
+        )
+        self.assertEqual(shared_contract_row['min_value'], '4')
+        self.assertEqual(shared_contract_row['max_value'], '6')
+        self.assertEqual(shared_contract_row['max_penalty_weight'], '18000')
+        self.assertEqual(shared_contract_row['max_same_shifts_in_row'], '2')
+        self.assertEqual(
+            shared_contract_row['max_same_shifts_in_row_penalty_weight'],
+            '9000',
+        )
+
         self.full.refresh_from_db()
         materialized = self.full.shift_settings['rules'][0]
         self.assertEqual(materialized['label'], '4p-1a')
@@ -452,3 +496,68 @@ class SharedRuleApiTests(TestCase):
         untouched = self.part.shift_settings['rules'][0]['period_rules'][0]
         self.assertEqual(untouched['min_value'], '2')
         self.assertEqual(untouched['max_value'], '3')
+
+        disabled = self.client.patch(
+            f'/api/contracts/{self.full.id}/',
+            {'shared_rule_settings': [{
+                'shared_rule_id': shared_rule_id,
+                'enabled': False,
+                'min_value': '4',
+                'max_value': '6',
+                'min_penalty_weight': '12000',
+                'max_penalty_weight': '18000',
+                'max_same_shifts_in_row': '2',
+                'max_same_shifts_in_row_penalty_weight': '9000',
+            }]},
+            format='json',
+        )
+        self.assertEqual(disabled.status_code, 200, disabled.json())
+        self.assertFalse(disabled.json()['shared_rules'][0]['enabled'])
+        self.full.refresh_from_db()
+        self.assertFalse(any(
+            row.get('shared_rule_id') == shared_rule_id
+            for row in self.full.shift_settings.get('rules', [])
+        ))
+        self.part.refresh_from_db()
+        self.assertTrue(any(
+            row.get('shared_rule_id') == shared_rule_id
+            for row in self.part.shift_settings.get('rules', [])
+        ))
+
+    def test_shared_rule_contract_changes_are_visible_from_contract_detail(self):
+        created = self.client.post(
+            '/api/shared-rules/', self.payload(), format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.json())
+        shared_rule_id = created.json()['id']
+        payload = self.payload()
+        full_settings = next(
+            row for row in payload['contract_settings']
+            if row['contract_id'] == self.full.id
+        )
+        full_settings.update({
+            'min_value': '5',
+            'max_value': '7',
+            'min_penalty_weight': '13000',
+            'max_penalty_weight': '19000',
+            'max_same_shifts_in_row': '2',
+            'max_same_shifts_in_row_penalty_weight': '9100',
+        })
+
+        updated = self.client.put(
+            f'/api/shared-rules/{shared_rule_id}/', payload, format='json',
+        )
+        self.assertEqual(updated.status_code, 200, updated.json())
+        contract_response = self.client.get(
+            f'/api/contracts/{self.full.id}/',
+        )
+        self.assertEqual(contract_response.status_code, 200, contract_response.json())
+        row = contract_response.json()['shared_rules'][0]
+        self.assertEqual(row['min_value'], '5')
+        self.assertEqual(row['max_value'], '7')
+        self.assertEqual(row['min_penalty_weight'], '13000')
+        self.assertEqual(row['max_penalty_weight'], '19000')
+        self.assertEqual(row['max_same_shifts_in_row'], '2')
+        self.assertEqual(
+            row['max_same_shifts_in_row_penalty_weight'], '9100',
+        )

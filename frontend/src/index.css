@@ -678,6 +678,8 @@ select option:checked{
 @media(max-width:900px){.user-override-group-columns{grid-template-columns:1fr}}
 @media(max-width:620px){.user-override-value-pair{grid-template-columns:1fr}.user-override-tabs{overflow-x:auto}.user-override-header{align-items:flex-start}.user-override-identity h2{font-size:23px}}
 .shared-rule-readonly-badge{align-self:flex-start;padding:4px 9px;border:1px solid #8274ee;border-radius:999px;background:rgba(111,92,231,.16);color:#d9d4ff;font-size:12px;font-weight:700;white-space:nowrap}
+.shared-rule-contract-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.shared-rule-contract-actions button{padding:5px 9px;border:1px solid #8274ee;border-radius:7px;background:transparent;color:inherit;font-size:12px;font-weight:700;cursor:pointer}
 .table-subtext{font-size:12px;color:#aebbd0;margin-top:3px}
 .shared-rule-modal{width:min(1180px,94vw);max-height:92vh;overflow:auto}
 .shared-rule-step{border:1px solid #41516a;border-radius:8px;padding:16px;margin:14px 0;background:#142238}

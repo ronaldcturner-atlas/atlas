@@ -1165,7 +1165,10 @@ class ContractSerializer(serializers.ModelSerializer):
                             ),
                         })
                     seen.add(shared_rule_id)
-                    values = {'shared_rule_id': shared_rule_id}
+                    values = {
+                        'shared_rule_id': shared_rule_id,
+                        'enabled': bool(row.get('enabled', links[shared_rule_id].enabled)),
+                    }
                     for field in (
                         'min_value', 'max_value',
                         'min_penalty_weight', 'max_penalty_weight',
@@ -1327,6 +1330,7 @@ class ContractSerializer(serializers.ModelSerializer):
             }
             for row in shared_rule_settings:
                 link = links[row['shared_rule_id']]
+                link.enabled = row['enabled']
                 for field in (
                     'min_value', 'max_value',
                     'min_penalty_weight', 'max_penalty_weight',
@@ -1335,6 +1339,7 @@ class ContractSerializer(serializers.ModelSerializer):
                 ):
                     setattr(link, field, row[field])
                 link.save(update_fields=[
+                    'enabled',
                     'min_value', 'max_value',
                     'min_penalty_weight', 'max_penalty_weight',
                     'max_same_shifts_in_row',
@@ -1438,12 +1443,22 @@ class SharedRuleSerializer(serializers.ModelSerializer):
             'shift_templates',
             list(self.instance.shift_templates.all()) if self.instance else [],
         )
+        supplied_contract_settings = 'contract_settings' in attrs
         contract_settings = attrs.get('contract_settings')
         if contract_settings is None and self.instance is not None:
-            contract_settings = [
-                {'contract_id': link.contract_id}
-                for link in self.instance.contract_links.all()
-            ]
+            contract_settings = [{
+                'contract_id': link.contract_id,
+                'enabled': link.enabled,
+                'min_value': link.min_value,
+                'max_value': link.max_value,
+                'min_penalty_weight': link.min_penalty_weight,
+                'max_penalty_weight': link.max_penalty_weight,
+                'max_same_shifts_in_row': link.max_same_shifts_in_row,
+                'max_same_shifts_in_row_penalty_weight': (
+                    link.max_same_shifts_in_row_penalty_weight
+                ),
+                'spread_violations': link.spread_violations,
+            } for link in self.instance.contract_links.all()]
         contract_settings = contract_settings or []
         normalized_settings = []
         for index, row in enumerate(contract_settings, start=1):
@@ -1497,7 +1512,8 @@ class SharedRuleSerializer(serializers.ModelSerializer):
                     })
             normalized_settings.append(normalized)
         contract_settings = normalized_settings
-        attrs['contract_settings'] = normalized_settings
+        if supplied_contract_settings:
+            attrs['contract_settings'] = normalized_settings
         contract_ids = [
             int(row.get('contract_id') or 0) for row in contract_settings
         ]

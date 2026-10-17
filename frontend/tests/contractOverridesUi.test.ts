@@ -9,6 +9,10 @@ const overridesSource = readFileSync(
   new URL('../src/components/UserOverridesView.tsx', import.meta.url),
   'utf8',
 )
+const sharedRulesSource = readFileSync(
+  new URL('../src/components/SharedRulesView.tsx', import.meta.url),
+  'utf8',
+)
 const stylesSource = readFileSync(
   new URL('../src/index.css', import.meta.url),
   'utf8',
@@ -60,6 +64,15 @@ describe('Contract user overrides', () => {
     expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:112px')
     expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:112px 120px')
     expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,112px)')
+  })
+
+  it('keeps Contract-level Shared Rule settings synchronized and scoped', () => {
+    expect(contractsSource).toContain('enabled: rule.enabled')
+    expect(contractsSource).toContain('Disable for this Contract')
+    expect(contractsSource).toContain('Enable for this Contract')
+    expect(contractsSource).toContain('Unable to load the latest Contract settings.')
+    expect(sharedRulesSource).toContain('Affected Contracts:')
+    expect(sharedRulesSource).toContain('acknowledge_affected_contracts=true')
   })
 })
 
