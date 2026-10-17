@@ -76,7 +76,7 @@ class ShiftTemplate(models.Model):
         'Friday',
         'Saturday',
     ]
-    WEEKEND_ALLOWED_DAYS = ['Friday', 'Saturday', 'Sunday']
+    WEEKEND_ALLOWED_DAYS = ['Friday', 'Saturday', 'Sunday', 'Monday']
 
     domain = models.ForeignKey(
         Domain,

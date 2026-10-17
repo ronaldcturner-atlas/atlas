@@ -61,9 +61,11 @@ describe('Contract user overrides', () => {
   })
 
   it('keeps numeric Contract and User Override inputs compact', () => {
-    expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:112px')
-    expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:112px 120px')
-    expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,112px)')
+    expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:calc(6ch + 22px)')
+    expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:calc(6ch + 22px) calc(6ch + 22px)')
+    expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,calc(6ch + 22px))')
+    expect(stylesSource).toContain('.contract-value-penalty-columns>.contract-minmax-stack{display:contents}')
+    expect(stylesSource).toContain('::-webkit-inner-spin-button')
   })
 
   it('keeps Contract-level Shared Rule settings synchronized and scoped', () => {

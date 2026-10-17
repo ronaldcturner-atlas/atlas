@@ -324,9 +324,7 @@ def fill_open_instances(context, ordered_instances, phase):
                     projected_weekend_run_length = (
                         previous_weekend_run_length + 1
                     )
-                    weekend_start = instance.date - timedelta(
-                        days=instance.date.weekday()
-                    )
+                    weekend_start = legacy._weekend_cycle_start(instance.date)
                     prior_weekend_weeks = context[
                         'initial_fill_weekend_weeks'
                     ][physician.id]
@@ -544,7 +542,7 @@ def fill_open_instances(context, ordered_instances, phase):
                     instance.date
                 )
                 context['initial_fill_weekend_weeks'][selected_physician.id].add(
-                    instance.date - timedelta(days=instance.date.weekday())
+                    legacy._weekend_cycle_start(instance.date)
                 )
             diagnostics['assignments_made'] += 1
             if phase == 'night':

@@ -5,10 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import SimpleTestCase, TestCase
+from rest_framework import serializers
 
 from . import optimizer as o
 from .management.commands.benchmark_optimizer_scale import Command, SCALE_PROFILES
 from .models import ContractUserAssignment, OptimizerRun, ScheduleShiftAssignment
+from .serializers import ShiftTemplateSerializer
 
 
 class WeekendVolumeTests(SimpleTestCase):
@@ -73,6 +75,33 @@ class WeekendVolumeTests(SimpleTestCase):
         self.assertFalse(o._is_weekend_designated(SimpleNamespace(
             date=date(2026, 12, 5), shift_template=saturday_template,
         )))
+
+    def test_shift_builder_accepts_monday_but_not_other_weekdays(self):
+        serializer = ShiftTemplateSerializer()
+        self.assertEqual(serializer.validate_weekend_days(['Monday']), ['Monday'])
+        with self.assertRaises(serializers.ValidationError):
+            serializer.validate_weekend_days(['Tuesday'])
+
+    def test_designated_monday_belongs_to_the_preceding_worked_weekend(self):
+        settings = {
+            'max_consecutive_weekends': '1',
+            'max_consecutive_weekends_penalty_weight': '3000',
+        }
+        same_weekend = self.report(
+            [date(2026, 12, 6), date(2026, 12, 7)],
+            [],
+            weekend_days=['Sunday', 'Monday'],
+            settings=settings,
+        )
+        next_weekend = self.report(
+            [date(2026, 12, 6), date(2026, 12, 7), date(2026, 12, 14)],
+            [],
+            weekend_days=['Sunday', 'Monday'],
+            settings=settings,
+        )
+        self.assertEqual(same_weekend['score'], 0)
+        self.assertEqual(next_weekend['score'], 3000)
+        self.assertEqual(next_weekend['violations'][0]['actual_value'], 2)
 
     def test_repair_targets_follow_each_templates_configured_weekend_days(self):
         block = SimpleNamespace(

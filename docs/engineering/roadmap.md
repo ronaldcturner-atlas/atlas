@@ -126,7 +126,7 @@ Reference: `docs/specifications/shift-builder-requirements.md`
 - Required template fields:
 	- facility, name, start_time, end_time
 	- active_days_of_week (Sunday through Saturday)
-	- weekend_days (Friday/Saturday/Sunday only)
+	- weekend_days (Friday/Saturday/Sunday/Monday only)
 	- night_shift (boolean)
 	- default_staffing_count (default 1)
 	- active (boolean)

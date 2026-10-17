@@ -40,7 +40,7 @@ type DayOfWeek =
   | 'Friday'
   | 'Saturday'
 
-type WeekendDay = 'Friday' | 'Saturday' | 'Sunday'
+type WeekendDay = 'Friday' | 'Saturday' | 'Sunday' | 'Monday'
 
 type ShiftTemplateFormState = {
   domain: string
@@ -65,7 +65,7 @@ const DAYS_OF_WEEK: DayOfWeek[] = [
   'Saturday',
 ]
 
-const WEEKEND_DAY_OPTIONS: WeekendDay[] = ['Friday', 'Saturday', 'Sunday']
+const WEEKEND_DAY_OPTIONS: WeekendDay[] = ['Friday', 'Saturday', 'Sunday', 'Monday']
 
 const defaultFormState: ShiftTemplateFormState = {
   domain: '',

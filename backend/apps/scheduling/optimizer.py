@@ -1474,6 +1474,7 @@ def _validate_schedule(
 
 
 def _streak_excess_score(sorted_dates, max_streak, penalty):
+    """Charge once for each adjacent-date streak above the maximum."""
     if not sorted_dates:
         return Decimal('0')
     score = Decimal('0')
@@ -1486,10 +1487,18 @@ def _streak_excess_score(sorted_dates, max_streak, penalty):
             streak += 1
         else:
             streak = 1
-        if streak > max_streak:
+        if streak == max_streak + 1:
             score += penalty
         previous_date = current_date
     return score
+
+
+def _streak_shortfall_score(sorted_dates, min_streak, penalty):
+    """Charge once for each adjacent-date streak below the minimum."""
+    return sum(
+        (penalty for streak in _adjacent_date_streaks(sorted_dates) if len(streak) < min_streak),
+        Decimal('0'),
+    )
 
 
 def _workload_rule_limit(contract, key, default):
@@ -2158,7 +2167,7 @@ def _night_violation_report(
                 and len(block) < min_consecutive
             ):
                 shortfall = min_consecutive - len(block)
-                penalty = Decimal(shortfall) * min_consecutive_penalty
+                penalty = min_consecutive_penalty
                 score += penalty
                 violations.append(
                     {
@@ -2190,7 +2199,7 @@ def _night_violation_report(
                 excess = max(len(block) - max_consecutive - prior_excess, 0)
                 if not excess:
                     continue
-                penalty = Decimal(excess) * consecutive_penalty
+                penalty = consecutive_penalty
                 score += penalty
                 violations.append(
                     {
@@ -2742,6 +2751,14 @@ def _is_weekend_designated(instance):
     return day.strftime('%A') in (getattr(template, 'weekend_days', None) or [])
 
 
+def _weekend_cycle_start(day):
+    """Group a designated Monday with the immediately preceding weekend."""
+    week_start = day - timedelta(days=day.weekday())
+    if day.weekday() == 0:
+        return week_start - timedelta(days=7)
+    return week_start
+
+
 def _published_weekend_lookback_days(contracts):
     """Return enough history to evaluate every configured weekend streak."""
     maximum_weeks = 1
@@ -3013,7 +3030,9 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                         actual - limit - max(prior_count - limit, 0),
                         0,
                     )
-                penalty = Decimal(deviation) * weight
+                # Adjacent weekend-shift blocks are streak rules: a short or
+                # long block is one violation regardless of its magnitude.
+                penalty = weight if deviation else Decimal('0')
                 score += penalty
                 if details and penalty:
                     violations.append({
@@ -3035,11 +3054,12 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                         ),
                     })
 
-        # A weekend is keyed by its Monday-starting calendar week. Multiple
-        # assignments during the same weekend count as one worked weekend.
+        # A weekend is keyed to the Monday before its Friday-Sunday dates. A
+        # designated Monday remains part of that immediately preceding
+        # weekend. Multiple assignments in the cycle count as one weekend.
         instances_by_weekend = defaultdict(list)
         for instance in streak_assignments:
-            weekend_start = instance.date - timedelta(days=instance.date.weekday())
+            weekend_start = _weekend_cycle_start(instance.date)
             instances_by_weekend[weekend_start].append(instance)
         weekend_streaks = []
         current_streak = []
@@ -3092,7 +3112,13 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                         - max(prior_weekend_count - limit, 0),
                         0,
                     )
-                penalty = Decimal(deviation) * weight
+                # A short completed weekend sequence is one minimum
+                # violation. Each additional weekend beyond the maximum is a
+                # separate maximum violation.
+                penalty = (
+                    weight if side == 'min' and deviation
+                    else Decimal(deviation) * weight
+                )
                 score += penalty
                 if details and penalty:
                     streak_instances = sorted(
@@ -4146,7 +4172,7 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
                     if len(streak_dates) <= maximum:
                         continue
                     excess = len(streak_dates) - maximum
-                    penalty = Decimal(excess) * same_shift_penalty
+                    penalty = same_shift_penalty
                     score += penalty
                     if details:
                         matching = [
@@ -4225,13 +4251,13 @@ def _same_shift_streak_score(occurrence_indexes, max_streak, penalty):
         else:
             if len(streak) > max_streak:
                 excess = len(streak) - max_streak
-                score += Decimal(excess) * penalty
+                score += penalty
                 streaks.append((list(streak), excess))
             streak = [occurrence_index]
         previous_index = occurrence_index
     if len(streak) > max_streak:
         excess = len(streak) - max_streak
-        score += Decimal(excess) * penalty
+        score += penalty
         streaks.append((list(streak), excess))
     return score, streaks
 
@@ -4298,7 +4324,7 @@ def _same_shift_violation_report(instances, physicians, state, contract_by_physi
                     'configured_limit': max_streak,
                     'actual_value': len(streak_instances),
                     'penalty_weight': float(penalty),
-                    'penalty': float(Decimal(excess_count) * penalty),
+                    'penalty': float(penalty),
                 }
             )
     return score, violations
@@ -4891,14 +4917,20 @@ def _distribution_score(
             if isinstance(contract.workload_settings, dict)
             else {}
         )
+        min_days = _decimal_or_none(workload_settings.get('min_days_in_row'))
+        min_days_penalty = _decimal_or_none(
+            workload_settings.get('min_days_in_row_penalty_weight')
+        )
         max_days = _decimal_or_none(workload_settings.get('max_days_in_row'))
         max_days_penalty = _decimal_or_none(
             workload_settings.get('max_days_in_row_penalty_weight')
         )
-        if (
+        if any((
+            min_days is not None and min_days >= 2
+            and min_days_penalty is not None and min_days_penalty > 0,
             max_days is not None and max_days > 0
-            and max_days_penalty is not None and max_days_penalty > 0
-        ):
+            and max_days_penalty is not None and max_days_penalty > 0,
+        )):
             current_dates = {instance.date for instance in physician_instances}
             prior_dates = {
                 instance.date
@@ -4908,16 +4940,22 @@ def _distribution_score(
             }
             # Charge only the incremental excess introduced inside this block.
             # A prior-block excess is context, not a debt transferred forward.
-            combined_score = _streak_excess_score(
-                sorted(current_dates | prior_dates),
-                max(int(max_days), 1),
-                max_days_penalty,
-            )
-            prior_score = _streak_excess_score(
-                sorted(prior_dates),
-                max(int(max_days), 1),
-                max_days_penalty,
-            )
+            combined_score = Decimal('0')
+            prior_score = Decimal('0')
+            if min_days is not None and min_days >= 2 and min_days_penalty:
+                combined_score += _streak_shortfall_score(
+                    sorted(current_dates | prior_dates), int(min_days), min_days_penalty,
+                )
+                prior_score += _streak_shortfall_score(
+                    sorted(prior_dates), int(min_days), min_days_penalty,
+                )
+            if max_days is not None and max_days > 0 and max_days_penalty:
+                combined_score += _streak_excess_score(
+                    sorted(current_dates | prior_dates), max(int(max_days), 1), max_days_penalty,
+                )
+                prior_score += _streak_excess_score(
+                    sorted(prior_dates), max(int(max_days), 1), max_days_penalty,
+                )
             consecutive_days_score += max(
                 combined_score - prior_score,
                 Decimal('0'),
@@ -7629,15 +7667,19 @@ def _solve_bounded_multi_physician_neighborhood(
                 model.add(excess >= sum(values) - len(values) + 1)
                 objective_terms.append(int(max_weekend_shift_weight * 60) * excess)
 
+        weekend_candidate_dates = sorted({
+            instance.date for instance in instances
+            if _is_weekend_designated(instance)
+        })
         weekend_starts = sorted({
-            day - timedelta(days=day.weekday())
-            for day in all_dates
+            _weekend_cycle_start(day) for day in weekend_candidate_dates
         })
         worked_weekend = {
             weekend_start: model_or(
                 [
-                    weekend_by_date.get(weekend_start + timedelta(days=offset), 0)
-                    for offset in range(7)
+                    weekend_by_date.get(day, 0)
+                    for day in weekend_candidate_dates
+                    if _weekend_cycle_start(day) == weekend_start
                 ],
                 f'worked_weekend_{physician_id}_{weekend_start.isoformat()}',
             )
@@ -9248,17 +9290,22 @@ def _consecutive_day_violation_rows(
             if isinstance(contract.workload_settings, dict)
             else {}
         )
-        configured_limit = _decimal_or_none(settings.get('max_days_in_row'))
-        penalty_weight = _decimal_or_none(
-            settings.get('max_days_in_row_penalty_weight')
-        )
-        if (
-            configured_limit is None or configured_limit <= 0
-            or penalty_weight is None or penalty_weight <= 0
+        limits = {
+            'min': (
+                _decimal_or_none(settings.get('min_days_in_row')),
+                _decimal_or_none(settings.get('min_days_in_row_penalty_weight')),
+            ),
+            'max': (
+                _decimal_or_none(settings.get('max_days_in_row')),
+                _decimal_or_none(settings.get('max_days_in_row_penalty_weight')),
+            ),
+        }
+        if not any(
+            limit is not None and limit > (1 if side == 'min' else 0)
+            and weight is not None and weight > 0
+            for side, (limit, weight) in limits.items()
         ):
             continue
-
-        limit = max(int(configured_limit), 1)
         current_instances = current_by_physician.get(physician.id, [])
         current_dates = {instance.date for instance in current_instances}
         prior_instances = list(boundary_context.get(physician.id, ()))
@@ -9282,65 +9329,73 @@ def _consecutive_day_violation_rows(
             instances_by_date[instance.date].append(instance)
 
         for streak_dates in streaks:
-            combined_excess = max(len(streak_dates) - limit, 0)
-            streak_prior_dates = sorted(
-                assigned_date
-                for assigned_date in streak_dates
-                if assigned_date in prior_dates
-            )
-            prior_excess = int(
-                _streak_excess_score(
-                    streak_prior_dates,
-                    limit,
-                    Decimal('1'),
+            for side, (configured_limit, penalty_weight) in limits.items():
+                if (
+                    configured_limit is None
+                    or configured_limit <= (1 if side == 'min' else 0)
+                    or penalty_weight is None or penalty_weight <= 0
+                ):
+                    continue
+                limit = int(configured_limit)
+                violates = (
+                    len(streak_dates) < limit
+                    if side == 'min'
+                    else len(streak_dates) > limit
                 )
-            )
-            charged_excess = combined_excess - prior_excess
-            if charged_excess <= 0:
-                continue
+                if not violates:
+                    continue
 
-            involved_instances = sorted(
-                (
-                    instance
-                    for assigned_date in streak_dates
-                    for instance in instances_by_date[assigned_date]
-                ),
-                key=lambda instance: (
-                    instance.date, instance.start_datetime, instance.id,
-                ),
-            )
-            penalty = Decimal(charged_excess) * penalty_weight
-            rows.append({
-                'physician_id': physician.id,
-                'physician': _physician_display_name(physician),
-                **_contract_rule_identity(contract),
-                'violation_type': 'MAX_CONSECUTIVE_DAYS',
-                'period_type': 'SCHEDULE_BLOCK',
-                'period_start': instances[0].schedule_block.start_date.isoformat()
-                if instances else None,
-                'period_end': instances[0].schedule_block.end_date.isoformat()
-                if instances else None,
-                'dates_involved': [
-                    assigned_date.isoformat() for assigned_date in streak_dates
-                ],
-                'assignment_details': [
-                    _assignment_debug_payload(instance)
-                    for instance in involved_instances
-                ],
-                'shift_instance_ids': [
-                    instance.id for instance in involved_instances
-                ],
-                'configured_limit': limit,
-                'actual_value': len(streak_dates),
-                'units': 'DAYS',
-                'penalty_weight': float(penalty_weight),
-                'penalty': float(penalty),
-                'explanation': (
-                    f'Physician worked {len(streak_dates)} consecutive days, '
-                    f'exceeding the configured maximum of {limit} by '
-                    f'{charged_excess} day(s).'
-                ),
-            })
+                streak_prior_dates = sorted(
+                    assigned_date for assigned_date in streak_dates
+                    if assigned_date in prior_dates
+                )
+                prior_violated = bool(streak_prior_dates) and (
+                    len(streak_prior_dates) < limit
+                    if side == 'min'
+                    else len(streak_prior_dates) > limit
+                )
+                if prior_violated:
+                    continue
+
+                involved_instances = sorted(
+                    (
+                        instance
+                        for assigned_date in streak_dates
+                        for instance in instances_by_date[assigned_date]
+                    ),
+                    key=lambda instance: (
+                        instance.date, instance.start_datetime, instance.id,
+                    ),
+                )
+                rows.append({
+                    'physician_id': physician.id,
+                    'physician': _physician_display_name(physician),
+                    **_contract_rule_identity(contract),
+                    'violation_type': f'{side.upper()}_CONSECUTIVE_DAYS',
+                    'period_type': 'SCHEDULE_BLOCK',
+                    'period_start': instances[0].schedule_block.start_date.isoformat()
+                    if instances else None,
+                    'period_end': instances[0].schedule_block.end_date.isoformat()
+                    if instances else None,
+                    'dates_involved': [
+                        assigned_date.isoformat() for assigned_date in streak_dates
+                    ],
+                    'assignment_details': [
+                        _assignment_debug_payload(instance)
+                        for instance in involved_instances
+                    ],
+                    'shift_instance_ids': [instance.id for instance in involved_instances],
+                    'configured_limit': limit,
+                    'actual_value': len(streak_dates),
+                    'units': 'DAYS',
+                    'penalty_weight': float(penalty_weight),
+                    'penalty': float(penalty_weight),
+                    'explanation': (
+                        f'Physician worked {len(streak_dates)} consecutive days; '
+                        f'the configured {"minimum" if side == "min" else "maximum"} '
+                        f'is {limit}. This streak is penalized once.'
+                    ),
+                })
     return rows
 
 
@@ -11624,8 +11679,7 @@ def optimize_schedule_version(
                     if _is_weekend_designated(prior_instance):
                         initial_fill_weekend_dates[physician_id].add(prior_instance.date)
                         initial_fill_weekend_weeks[physician_id].add(
-                            prior_instance.date
-                            - timedelta(days=prior_instance.date.weekday())
+                            _weekend_cycle_start(prior_instance.date)
                         )
             for assigned_instance in instances:
                 position = initial_fill_template_positions.get(assigned_instance.id)
@@ -11644,8 +11698,7 @@ def optimize_schedule_version(
                     if _is_weekend_designated(assigned_instance):
                         initial_fill_weekend_dates[physician_id].add(assigned_instance.date)
                         initial_fill_weekend_weeks[physician_id].add(
-                            assigned_instance.date
-                            - timedelta(days=assigned_instance.date.weekday())
+                            _weekend_cycle_start(assigned_instance.date)
                         )
                     if position is not None:
                         template_id, occurrence_index = position

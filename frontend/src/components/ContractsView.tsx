@@ -143,14 +143,18 @@ type WorkloadSettings = {
   period_rules: MinMaxRule[]
   min_time_off_hours: string
   min_time_off_penalty_weight: string
+  min_time_off_spread_violations: boolean
   circadian_enabled: boolean
   circadian_penalty_weight: string
+  circadian_spread_violations: boolean
   min_days_in_row: string
   min_days_in_row_penalty_weight: string
   max_days_in_row: string
   max_days_in_row_penalty_weight: string
+  days_in_row_spread_violations: boolean
   max_same_shifts_in_row: string
   max_same_shifts_in_row_penalty_weight: string
+  same_shifts_in_row_spread_violations: boolean
 }
 
 type ShiftSettings = {
@@ -180,10 +184,12 @@ type NightSettings = {
   min_consecutive_night_shifts_penalty_weight: string
   max_consecutive_night_shifts: string
   max_consecutive_night_shifts_penalty_weight: string
+  consecutive_night_shifts_spread_violations: boolean
   days_off_after_night_block: string
   days_off_after_night_block_penalty_weight: string
   days_off_before_next_night_shift: string
   days_off_before_next_night_shift_penalty_weight: string
+  night_block_recovery_spread_violations: boolean
 }
 
 type WeekendSettings = {
@@ -192,12 +198,15 @@ type WeekendSettings = {
   min_consecutive_weekends_penalty_weight: string
   max_consecutive_weekends: string
   max_consecutive_weekends_penalty_weight: string
+  consecutive_weekends_spread_violations: boolean
   min_consecutive_weekend_shifts: string
   min_consecutive_weekend_shifts_penalty_weight: string
   max_consecutive_weekend_shifts: string
   max_consecutive_weekend_shifts_penalty_weight: string
+  consecutive_weekend_shifts_spread_violations: boolean
   block_friday_night_before_weekend_off: boolean
   block_friday_night_before_weekend_off_penalty_weight: string
+  friday_night_before_weekend_off_spread_violations: boolean
 }
 
 type RequestSettings = {
@@ -308,14 +317,18 @@ function emptyFormState(): ContractFormState {
       period_rules: [makeMinMaxRule('WEEK')],
       min_time_off_hours: '',
       min_time_off_penalty_weight: '',
+      min_time_off_spread_violations: false,
       circadian_enabled: false,
       circadian_penalty_weight: '',
+      circadian_spread_violations: false,
       min_days_in_row: '',
       min_days_in_row_penalty_weight: '',
       max_days_in_row: '',
       max_days_in_row_penalty_weight: '',
+      days_in_row_spread_violations: false,
       max_same_shifts_in_row: '',
       max_same_shifts_in_row_penalty_weight: '',
+      same_shifts_in_row_spread_violations: false,
     },
     shift_settings: {
       rules: [],
@@ -327,10 +340,12 @@ function emptyFormState(): ContractFormState {
       min_consecutive_night_shifts_penalty_weight: '',
       max_consecutive_night_shifts: '',
       max_consecutive_night_shifts_penalty_weight: '',
+      consecutive_night_shifts_spread_violations: false,
       days_off_after_night_block: '',
       days_off_after_night_block_penalty_weight: '',
       days_off_before_next_night_shift: '',
       days_off_before_next_night_shift_penalty_weight: '',
+      night_block_recovery_spread_violations: false,
     },
     weekend_settings: {
       period_rules: [makeWeekendRule('MONTH')],
@@ -338,12 +353,15 @@ function emptyFormState(): ContractFormState {
       min_consecutive_weekends_penalty_weight: '',
       max_consecutive_weekends: '',
       max_consecutive_weekends_penalty_weight: '',
+      consecutive_weekends_spread_violations: false,
       min_consecutive_weekend_shifts: '',
       min_consecutive_weekend_shifts_penalty_weight: '',
       max_consecutive_weekend_shifts: '',
       max_consecutive_weekend_shifts_penalty_weight: '',
+      consecutive_weekend_shifts_spread_violations: false,
       block_friday_night_before_weekend_off: false,
       block_friday_night_before_weekend_off_penalty_weight: '',
+      friday_night_before_weekend_off_spread_violations: false,
     },
     request_settings: {
       allow_day_off: true,
@@ -551,6 +569,7 @@ function sanitizeFormPayload(formState: ContractFormState) {
       max_penalty_weight: rule.max_penalty_weight,
       max_same_shifts_in_row: rule.max_same_shifts_in_row,
       max_same_shifts_in_row_penalty_weight: rule.max_same_shifts_in_row_penalty_weight,
+      spread_violations: rule.spread_violations,
     })),
     night_settings: {
       ...formState.night_settings,
@@ -826,6 +845,13 @@ export default function ContractsView() {
 
     if (!formState.facility_ids.length) {
       setError('Select at least one facility.')
+      return
+    }
+
+    const minimumDays = formState.workload_settings.min_days_in_row.trim()
+    if (minimumDays && Number(minimumDays) < 2) {
+      setError('Minimum Days in a Row must be blank or at least 2.')
+      setActiveTab('workload')
       return
     }
 
@@ -1282,6 +1308,7 @@ export default function ContractsView() {
                         <label className="facility-field"><span>Minimum hours</span><input type="number" value={formState.workload_settings.min_time_off_hours} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_hours: event.target.value } }))} /></label>
                         <label className="facility-field"><span>Penalty weight</span><input type="number" value={formState.workload_settings.min_time_off_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_penalty_weight: event.target.value } }))} /></label>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.workload_settings.min_time_off_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_time_off_spread_violations: event.target.checked } }))} /></label>
                     </div>
                     <div className="contract-additional-workload-card">
                       <div className="contract-minmax-title">Circadian rhythm</div>
@@ -1289,12 +1316,13 @@ export default function ContractsView() {
                         <label className="contract-toggle-field contract-workload-toggle"><span>Enabled</span><input type="checkbox" checked={formState.workload_settings.circadian_enabled} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_enabled: event.target.checked } }))} /></label>
                         <label className="facility-field"><span>Penalty weight</span><input type="number" value={formState.workload_settings.circadian_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_penalty_weight: event.target.value } }))} /></label>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.workload_settings.circadian_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_spread_violations: event.target.checked } }))} /></label>
                     </div>
                     <div className="contract-additional-workload-card">
                       <div className="contract-minmax-title">Days in a row</div>
                       <div className="contract-value-penalty-columns">
                         <div className="contract-minmax-stack">
-                          <label className="facility-field"><span>Minimum</span><input type="number" value={formState.workload_settings.min_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_days_in_row: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Minimum</span><input type="number" min="2" value={formState.workload_settings.min_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_days_in_row: event.target.value } }))} /></label>
                           <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_days_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_days_in_row: event.target.value } }))} /></label>
                         </div>
                         <div className="contract-minmax-stack">
@@ -1302,6 +1330,8 @@ export default function ContractsView() {
                           <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_days_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_days_in_row_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
+                      <div className="contract-rule-help">Leave Minimum blank to allow solitary shifts. Enter 2 or more to penalize each work streak shorter than the selected minimum once.</div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.workload_settings.days_in_row_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, days_in_row_spread_violations: event.target.checked } }))} /></label>
                     </div>
                     <div className="contract-additional-workload-card">
                       <div className="contract-minmax-title">SAME SHIFT IN A ROW</div>
@@ -1309,6 +1339,7 @@ export default function ContractsView() {
                         <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row: event.target.value } }))} /></label>
                         <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.workload_settings.same_shifts_in_row_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, same_shifts_in_row_spread_violations: event.target.checked } }))} /></label>
                     </div>
                   </div>
                 </div>
@@ -1367,6 +1398,7 @@ export default function ContractsView() {
                                   <label className="facility-field facility-target-minimum-penalty"><span>Minimum penalty</span><input type="number" min="0" value={rule.min_penalty_weight} onChange={(event) => updateRule({ min_penalty_weight: event.target.value })} /></label>
                                   <label className="facility-field facility-target-maximum"><span>Maximum</span><input type="number" min="0" value={rule.max_value} onChange={(event) => updateRule({ max_value: event.target.value })} /></label>
                                   <label className="facility-field facility-target-maximum-penalty"><span>Maximum penalty</span><input type="number" min="0" value={rule.max_penalty_weight} onChange={(event) => updateRule({ max_penalty_weight: event.target.value })} /></label>
+                                  <label className="inline-checkbox-field facility-target-spread"><span>Spread violations</span><input type="checkbox" checked={rule.spread_violations} onChange={(event) => updateRule({ spread_violations: event.target.checked })} /></label>
                                   <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, facility_settings: { rules: current.facility_settings.rules.map((item) => item.facility_id === facility.id ? { ...item, period_rules: item.period_rules.filter((_, periodIndex) => periodIndex !== index) } : item) } }))}>Remove</button>
                                 </div>
                               </div>
@@ -1423,6 +1455,7 @@ export default function ContractsView() {
                               <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_penalty_weight: event.target.value } : rule) }))} /></label>
                             </div>
                           </div>
+                          <label className="inline-checkbox-field"><span>Spread violations across applicable users</span><input type="checkbox" checked={sharedRule.spread_violations} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, spread_violations: event.target.checked } : rule) }))} /></label>
                           <div className="shared-rule-optional-streak">
                             <div className="shared-rule-optional-heading"><strong>Same shifts in a row</strong><span>Optional</span></div>
                             <div className="contract-value-penalty-row">
@@ -1607,6 +1640,7 @@ export default function ContractsView() {
                           <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.night_settings.max_consecutive_night_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, max_consecutive_night_shifts_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.night_settings.consecutive_night_shifts_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, consecutive_night_shifts_spread_violations: event.target.checked } }))} /></label>
                     </div>
                     <div className="contract-additional-workload-card">
                       <div className="contract-minmax-title">Night-block recovery</div>
@@ -1620,6 +1654,7 @@ export default function ContractsView() {
                           <label className="facility-field"><span>Next night-block penalty</span><input type="number" value={formState.night_settings.days_off_before_next_night_shift_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, days_off_before_next_night_shift_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.night_settings.night_block_recovery_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, night_settings: { ...current.night_settings, night_block_recovery_spread_violations: event.target.checked } }))} /></label>
                     </div>
                   </div>
                 </div>
@@ -1664,6 +1699,7 @@ export default function ContractsView() {
                           <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.weekend_settings.max_consecutive_weekends_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekends_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.weekend_settings.consecutive_weekends_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, consecutive_weekends_spread_violations: event.target.checked } }))} /></label>
                     </div>
 
                     <h3>Consecutive Weekend Shifts</h3>
@@ -1678,11 +1714,13 @@ export default function ContractsView() {
                           <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.weekend_settings.max_consecutive_weekend_shifts_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, max_consecutive_weekend_shifts_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.weekend_settings.consecutive_weekend_shifts_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, consecutive_weekend_shifts_spread_violations: event.target.checked } }))} /></label>
                     </div>
 
                     <div className="contract-input-grid">
                       <label className="inline-checkbox-field"><span>Do not work Friday night before weekend off</span><input type="checkbox" checked={formState.weekend_settings.block_friday_night_before_weekend_off} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, block_friday_night_before_weekend_off: event.target.checked } }))} /></label>
                       <label className="facility-field"><span>Friday night weekend-off rule penalty</span><input type="number" value={formState.weekend_settings.block_friday_night_before_weekend_off_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, block_friday_night_before_weekend_off_penalty_weight: event.target.value } }))} /></label>
+                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.weekend_settings.friday_night_before_weekend_off_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, weekend_settings: { ...current.weekend_settings, friday_night_before_weekend_off_spread_violations: event.target.checked } }))} /></label>
                     </div>
                   </div>
                 </div>

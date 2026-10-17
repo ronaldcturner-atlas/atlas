@@ -1043,6 +1043,17 @@ class ContractSerializer(serializers.ModelSerializer):
         attrs = super().validate(attrs)
         attrs = self._normalize_contract_rule_numbers(attrs)
 
+        workload_settings = attrs.get('workload_settings')
+        if isinstance(workload_settings, dict):
+            minimum_days = workload_settings.get('min_days_in_row')
+            if minimum_days not in (None, '') and Decimal(str(minimum_days)) < 2:
+                raise serializers.ValidationError({
+                    'workload_settings': (
+                        'Minimum Days in a Row must be blank or at least 2. '
+                        'Leave it blank to allow solitary shifts.'
+                    ),
+                })
+
         assigned_user_ids = attrs.get('assigned_user_ids')
         next_active = attrs.get('active', self.instance.active if self.instance else True)
 
@@ -1168,6 +1179,10 @@ class ContractSerializer(serializers.ModelSerializer):
                     values = {
                         'shared_rule_id': shared_rule_id,
                         'enabled': bool(row.get('enabled', links[shared_rule_id].enabled)),
+                        'spread_violations': bool(row.get(
+                            'spread_violations',
+                            links[shared_rule_id].spread_violations,
+                        )),
                     }
                     for field in (
                         'min_value', 'max_value',
@@ -1331,6 +1346,7 @@ class ContractSerializer(serializers.ModelSerializer):
             for row in shared_rule_settings:
                 link = links[row['shared_rule_id']]
                 link.enabled = row['enabled']
+                link.spread_violations = row['spread_violations']
                 for field in (
                     'min_value', 'max_value',
                     'min_penalty_weight', 'max_penalty_weight',
@@ -1339,7 +1355,7 @@ class ContractSerializer(serializers.ModelSerializer):
                 ):
                     setattr(link, field, row[field])
                 link.save(update_fields=[
-                    'enabled',
+                    'enabled', 'spread_violations',
                     'min_value', 'max_value',
                     'min_penalty_weight', 'max_penalty_weight',
                     'max_same_shifts_in_row',

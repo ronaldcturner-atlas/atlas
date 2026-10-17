@@ -15,7 +15,7 @@ Define reusable shift templates using day-of-week rules only.
 - `active_days_of_week`
 	- Allowed values: `Sunday`, `Monday`, `Tuesday`, `Wednesday`, `Thursday`, `Friday`, `Saturday`
 - `weekend_days` (array/list)
-	- Allowed values only: `Friday`, `Saturday`, `Sunday`
+	- Allowed values only: `Friday`, `Saturday`, `Sunday`, `Monday`
 - `night_shift` (boolean)
 - `default_staffing_count` (integer, default `1`)
 - `active` (boolean)
@@ -25,12 +25,12 @@ Example templates:
 - Berkeley 7a-7p, active Mon Tue Wed Thu Fri, staffing 1
 - Berkeley 7p-7a, active all days, night yes, staffing 1
 - Berkeley Fast Track 1p-11p, active all days, staffing 1
-- A template can be active Friday/Saturday/Sunday, but weekend_days can be only Saturday/Sunday.
+- A template can be active Friday/Saturday/Sunday/Monday, while weekend_days may contain only the active start weekdays explicitly designated for that template.
 
 ## Field Guidance
 
 - Remove `weekend_shift` boolean.
-- Use `weekend_days` as Friday/Saturday/Sunday selections.
+- Use `weekend_days` as Friday/Saturday/Sunday/Monday selections.
 - Keep `night_shift` as a boolean.
 - Keep `default_staffing_count`.
 

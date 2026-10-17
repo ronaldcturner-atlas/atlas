@@ -1962,8 +1962,8 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(high_counter, {'used': 1, 'limit': 1, 'unlimited': False})
 
     def test_weekend_counter_uses_shift_template_weekend_designation(self):
-        self.shift_template.active_days_of_week = ['Friday']
-        self.shift_template.weekend_days = ['Friday']
+        self.shift_template.active_days_of_week = ['Friday', 'Monday']
+        self.shift_template.weekend_days = ['Friday', 'Monday']
         self.shift_template.save(update_fields=['active_days_of_week', 'weekend_days'])
         self._assign_contract(
             {
@@ -1989,10 +1989,23 @@ class ScheduleRequestApiTests(TestCase):
             },
             format='json',
         )
+        monday_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-06',
+                'request_scope': 'USER',
+                'request_type': 'DAY_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
         context_response = self.client.get(f'/api/schedule-blocks/{self.block.id}/requests/context/')
 
         self.assertEqual(save_response.status_code, 200)
-        self.assertEqual(context_response.json()['request_counters']['WEEKEND']['used'], 1)
+        self.assertEqual(monday_response.status_code, 200)
+        self.assertEqual(context_response.json()['request_counters']['WEEKEND']['used'], 2)
 
     def test_user_counters_increment_and_none_decrements_selected_scope_only(self):
         self._assign_contract(

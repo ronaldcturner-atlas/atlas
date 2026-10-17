@@ -12,6 +12,7 @@ from .optimizer import (
     _decimal_or_none,
     _effective_workload_rule,
     _is_weekend_designated,
+    _weekend_cycle_start,
     _configured_positive_int,
     _configured_positive_penalty,
     _minimum_rest_hours,
@@ -938,7 +939,7 @@ def _weekend_feasibility(
         # A locked streak beyond a configured maximum cannot be repaired.
         for field, label, dates in (
             ('max_consecutive_weekend_shifts', 'Consecutive weekend shifts', sorted(item.date for item in fixed)),
-            ('max_consecutive_weekends', 'Consecutive worked weekends', sorted({item.date - timedelta(days=item.date.weekday()) for item in fixed})),
+            ('max_consecutive_weekends', 'Consecutive worked weekends', sorted({_weekend_cycle_start(item.date) for item in fixed})),
         ):
             limit = _configured_positive_int(settings, field)
             weight = _configured_positive_penalty(settings, f'{field}_penalty_weight', Decimal('0'))
@@ -983,11 +984,11 @@ def _weekend_feasibility(
                 fixed_keys = {item.date for item in fixed}
             else:
                 potential = {
-                    day - timedelta(days=day.weekday()): 1
+                    _weekend_cycle_start(day): 1
                     for day, count in candidate_by_date.items() if count
                 }
                 fixed_keys = {
-                    item.date - timedelta(days=item.date.weekday()) for item in fixed
+                    _weekend_cycle_start(item.date) for item in fixed
                 }
             component = []
 

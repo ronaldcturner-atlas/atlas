@@ -47,14 +47,16 @@ Each Shift Template has:
 - one Facility;
 - start and end times;
 - one or more active days selected from Sunday through Saturday;
-- zero or more weekend designation days, limited to Friday, Saturday, and Sunday;
+- zero or more weekend designation days, limited to Friday, Saturday, Sunday, and Monday;
 - a `night_shift` flag;
 - a required staffing count, with a minimum and default of 1;
 - an active/disabled state.
 
 The template name is system-generated from the Facility short name and time range, for example `Berkeley 7a-4p`. Users do not supply an independent template name.
 
-A weekend designation is not the same as an active day. A day may be designated as a weekend day only when it is also active for that template. The old single `weekend_shift` boolean has been explicitly replaced by the `weekend_days` list.
+A weekend designation is not the same as an active day. A day may be designated as a weekend day only when it is also active for that template. Weekend status belongs to that specific Shift Template occurrence and is determined exclusively by the weekday on which the shift starts. The entire shift and all of its hours retain that status regardless of its end date or time; Atlas does not infer weekend status for other shifts on the same date or from colloquial labels such as "Sunday night." The old single `weekend_shift` boolean has been explicitly replaced by the `weekend_days` list.
+
+For worked-weekend streaks, a weekend-designated Monday belongs to the immediately preceding Friday-Sunday weekend. Consecutive weekend shifts remain based on actual assignments on adjacent start dates.
 
 Disabled templates remain historical records. Current selection workflows use active templates, and Request Builder further limits them to templates active on the selected weekday.
 
@@ -445,7 +447,7 @@ Atlas should not build:
 - organization-specific scheduling policy as hard-coded product behavior;
 - physician assignment, dated scheduling, or My Schedule integration inside Shift Builder;
 - a second editable name for Shift Templates or Schedule Blocks when the established name is generated;
-- a single `weekend_shift` flag in place of explicit Friday/Saturday/Sunday designations;
+- a single `weekend_shift` flag in place of explicit Friday/Saturday/Sunday/Monday designations;
 - hidden lifecycle edits that bypass Schedule Block transitions;
 - destructive deletion as the normal lifecycle for Facilities, Physicians, Shift Templates, Contracts, or published Schedule Blocks;
 - silent replacement of a published Live Schedule without explicit overlap acknowledgement;

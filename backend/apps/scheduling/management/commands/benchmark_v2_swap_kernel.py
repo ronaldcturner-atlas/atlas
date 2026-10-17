@@ -750,6 +750,12 @@ def _positive_int(value):
     return int(parsed) if parsed > 0 else None
 
 
+def _weekend_cycle_start_ordinal(day):
+    weekday = (day - 1) % 7
+    week_start = day - weekday
+    return week_start - 7 if weekday == 0 else week_start
+
+
 def _weekend_score_compact(current, prior, settings, windows, block_bounds, prior_bounds):
     """Mirror authoritative weekend scoring using compact immutable features."""
     current_weekend = [row for row in current if row[1]]
@@ -812,7 +818,7 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
 
     weekends = {}
     for day, is_current in combined_weekend:
-        week = day - ((day - 1) % 7)
+        week = _weekend_cycle_start_ordinal(day)
         weekends[week] = weekends.get(week, False) or is_current
     weekend_streaks = []
     streak = []

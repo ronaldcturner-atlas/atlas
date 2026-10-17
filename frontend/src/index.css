@@ -670,10 +670,10 @@ select option:checked{
 .user-override-rule-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:18px}
 .user-override-rule-heading strong{font-size:13px}
 .user-override-rule-heading>span{color:#f2cc61;font-size:10px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
-.user-override-value-pair{display:grid;grid-template-columns:112px 120px;gap:9px;align-items:end;justify-content:start}
+.user-override-value-pair{display:grid;grid-template-columns:calc(6ch + 22px) calc(6ch + 22px);gap:9px;align-items:end;justify-content:start}
 .user-override-default-field{display:grid;gap:4px;color:var(--muted);font-size:11px}
 .user-override-default-field div{display:flex;align-items:center;min-height:36px;padding:7px 10px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(181,192,208,.12);color:#aebbd0;font-size:13px;font-weight:700}
-.user-override-entry-field input,.user-override-entry-field select{width:120px;max-width:100%;box-sizing:border-box}
+.user-override-entry-field input,.user-override-entry-field select{width:calc(6ch + 22px);max-width:100%;box-sizing:border-box}
 .user-override-facilities{padding:6px 0}
 @media(max-width:900px){.user-override-group-columns{grid-template-columns:1fr}}
 @media(max-width:620px){.user-override-value-pair{grid-template-columns:1fr}.user-override-tabs{overflow-x:auto}.user-override-header{align-items:flex-start}.user-override-identity h2{font-size:23px}}
@@ -715,8 +715,14 @@ select option:checked{
 .contract-input-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,220px));gap:10px;align-items:end;justify-content:start}
 .contract-additional-workload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .contract-additional-workload-card{display:grid;gap:10px;min-width:0;padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.02)}
-.contract-value-penalty-row,.contract-value-penalty-columns{display:grid;grid-template-columns:96px 120px;gap:10px;align-items:end;justify-content:start}
+.contract-rule-help{max-width:430px;color:var(--muted);font-size:11px;line-height:1.35}
+.contract-value-penalty-row,.contract-value-penalty-columns{display:grid;grid-template-columns:calc(5ch + 22px) calc(6ch + 22px);gap:10px;align-items:end;justify-content:start}
 .contract-minmax-stack{display:grid;gap:10px;min-width:0}
+.contract-value-penalty-columns>.contract-minmax-stack{display:contents}
+.contract-value-penalty-columns>.contract-minmax-stack:first-child>.facility-field:first-child{grid-column:1;grid-row:1}
+.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2)>.facility-field:first-child{grid-column:2;grid-row:1}
+.contract-value-penalty-columns>.contract-minmax-stack:first-child>.facility-field:nth-child(2){grid-column:1;grid-row:2}
+.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2)>.facility-field:nth-child(2){grid-column:2;grid-row:2}
 .contract-workload-toggle{align-self:end;min-height:36px}
 .contract-rule-grid{display:grid;gap:10px}
 .contract-rule-row{display:grid;gap:12px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02);align-items:end}
@@ -725,9 +731,11 @@ select option:checked{
 .contract-minmax-column{display:grid;gap:8px;padding:10px;border-radius:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.08)}
 .contract-minmax-title{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em}
 .contract-rule-controls-grid{display:grid;grid-template-columns:190px 125px auto;gap:10px;align-items:end;justify-content:start}
-.contract-modal .facility-field input[type="number"]{width:112px;max-width:100%;box-sizing:border-box;font-variant-numeric:tabular-nums}
-.contract-value-penalty-row>.facility-field:first-child input[type="number"],.contract-value-penalty-columns>.contract-minmax-stack:first-child input[type="number"]{width:96px}
-.contract-value-penalty-row>.facility-field:nth-child(2) input[type="number"],.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2) input[type="number"]{width:120px}
+.contract-modal .facility-field input[type="number"]{width:calc(6ch + 22px);max-width:100%;box-sizing:border-box;font-variant-numeric:tabular-nums}
+.contract-value-penalty-row>.facility-field:first-child input[type="number"],.contract-value-penalty-columns>.contract-minmax-stack:first-child input[type="number"]{width:calc(5ch + 22px)}
+.contract-value-penalty-row>.facility-field:nth-child(2) input[type="number"],.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2) input[type="number"]{width:calc(6ch + 22px)}
+.contract-modal input[type="number"],.shared-rule-modal input[type="number"],.user-override-modal input[type="number"]{-moz-appearance:textfield;appearance:textfield}
+.contract-modal input[type="number"]::-webkit-inner-spin-button,.contract-modal input[type="number"]::-webkit-outer-spin-button,.shared-rule-modal input[type="number"]::-webkit-inner-spin-button,.shared-rule-modal input[type="number"]::-webkit-outer-spin-button,.user-override-modal input[type="number"]::-webkit-inner-spin-button,.user-override-modal input[type="number"]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .contract-remove-button{height:36px;align-self:end;border-radius:8px;border:1px solid rgba(255,255,255,0.16);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .contract-remove-button:disabled{opacity:0.6;cursor:not-allowed}
 .contract-facility-rule-list{display:grid;gap:10px}
@@ -742,17 +750,18 @@ select option:checked{
 .contract-rule-summary{display:flex;align-items:center;gap:8px;color:var(--sidebar-fg);font-size:13px}
 .contract-rule-summary span{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 .contract-rule-options{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:10px;align-items:end}
-.contract-facility-target-grid{display:grid;grid-template-columns:150px 96px 96px 120px auto;grid-template-areas:"period units minimum min-penalty remove" "period units maximum max-penalty remove";gap:8px 10px;align-items:end;justify-content:start}
+.contract-facility-target-grid{display:grid;grid-template-columns:150px 96px calc(5ch + 22px) calc(6ch + 22px) 125px auto;grid-template-areas:"period units minimum min-penalty spread remove" "period units maximum max-penalty spread remove";gap:8px 10px;align-items:end;justify-content:start}
 .contract-facility-target-grid .facility-target-period{grid-area:period;align-self:center}
 .contract-facility-target-grid .facility-target-units{grid-area:units;align-self:center}
 .contract-facility-target-grid .facility-target-minimum{grid-area:minimum}
 .contract-facility-target-grid .facility-target-minimum-penalty{grid-area:min-penalty}
 .contract-facility-target-grid .facility-target-maximum{grid-area:maximum}
 .contract-facility-target-grid .facility-target-maximum-penalty{grid-area:max-penalty}
+.contract-facility-target-grid .facility-target-spread{grid-area:spread;align-self:center}
 .contract-facility-target-grid .contract-remove-button{grid-area:remove;align-self:center;min-width:82px;padding:0 12px}
 .contract-facility-target-grid input{width:100%;font-variant-numeric:tabular-nums}
 .contract-add-facility-period{justify-self:start;padding:7px 11px}
-@media(max-width:900px){.contract-facility-target-grid{grid-template-columns:140px 96px 96px 120px;grid-template-areas:"period units minimum min-penalty" "period units maximum max-penalty" "remove remove remove remove"}.contract-facility-target-grid .contract-remove-button{justify-self:start}}
+@media(max-width:900px){.contract-facility-target-grid{grid-template-columns:140px 96px calc(5ch + 22px) calc(6ch + 22px);grid-template-areas:"period units minimum min-penalty" "period units maximum max-penalty" "spread spread remove remove"}.contract-facility-target-grid .contract-remove-button{justify-self:start}.contract-facility-target-grid .facility-target-spread{justify-self:start}}
 
 .contract-shift-card{display:grid;gap:10px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02)}
 .contract-shift-card-header{display:flex;justify-content:space-between;gap:10px;align-items:end;flex-wrap:wrap}
@@ -775,7 +784,7 @@ select option:checked{
 @media(max-width:800px){.stats-layout{grid-template-columns:1fr}.stats-shift-row{grid-template-columns:1fr auto}.stats-shift-row strong{grid-column:1/-1;text-align:left}.stats-month-filter,.stats-range-filter{width:100%;flex-wrap:wrap}.stats-scope-controls{align-items:stretch;flex-direction:column}.stats-scope-field{width:100%;min-width:0}}
 .contract-request-allowed-item input{width:16px;height:16px;flex-shrink:0}
 
-.contract-priority-grid{display:grid;grid-template-columns:repeat(5,112px);gap:10px;align-items:end;justify-content:start}
+.contract-priority-grid{display:grid;grid-template-columns:repeat(5,calc(6ch + 22px));gap:10px;align-items:end;justify-content:start}
 .contract-priority-header{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;padding:0 2px}
 .contract-priority-spacer{height:1px}
 .contract-priority-low-unlimited{height:36px;align-items:center}
@@ -783,13 +792,13 @@ select option:checked{
 @media (max-width: 900px){
   .contract-header-grid{grid-template-columns:1fr}
   .contract-additional-workload-grid{grid-template-columns:1fr}
-  .contract-priority-grid{grid-template-columns:repeat(2,112px)}
+  .contract-priority-grid{grid-template-columns:repeat(2,calc(6ch + 22px))}
   .contract-minmax-columns{grid-template-columns:1fr}
 }
 
 @media (max-width: 650px){
   .contract-header-toggles{align-items:flex-start;flex-direction:column;gap:10px}
-  .contract-value-penalty-row,.contract-value-penalty-columns{grid-template-columns:96px 120px}
+  .contract-value-penalty-row,.contract-value-penalty-columns{grid-template-columns:calc(5ch + 22px) calc(6ch + 22px)}
   .contract-priority-grid{grid-template-columns:1fr}
   .contract-rule-options{grid-template-columns:1fr}
   .contract-rule-controls-grid{grid-template-columns:1fr}
