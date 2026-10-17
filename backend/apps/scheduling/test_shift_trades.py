@@ -1038,10 +1038,10 @@ class ShiftTradeApiTests(TestCase):
         self.assertEqual(proposed.status_code, 201)
 
     def test_clinically_active_scheduler_gets_user_safe_trade_options(self):
-        scheduler_role = RoleTemplate.objects.get(
-            region=self.domain.region,
-            system_key='scheduler',
-        )
+        scheduler_role = DomainMembership.objects.get(
+            domain=self.domain,
+            user=self.scheduler_user,
+        ).role_template
         membership = DomainMembership.objects.get(
             domain=self.domain,
             user=self.owner_user,
@@ -1199,10 +1199,10 @@ class ShiftTradeApiTests(TestCase):
             domain=self.domain,
             user=second_user,
             role=DomainMembership.Role.STAFF_PHYSICIAN,
-            role_template=RoleTemplate.objects.get(
-                region=self.domain.region,
-                system_key='staff_physician',
-            ),
+            role_template=DomainMembership.objects.get(
+                domain=self.domain,
+                user=self.owner_user,
+            ).role_template,
             clinically_active=True,
         )
         contract = Contract.objects.get(name='Test')

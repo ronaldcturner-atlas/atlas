@@ -8955,7 +8955,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(after_violations[0]['night_block_dates'], ['2026-07-01', '2026-07-02'])
         self.assertEqual(after_violations[0]['next_assignment']['shift_instance_id'], day_one.id)
         self.assertEqual(after_violations[0]['actual_value'], 0)
-        self.assertEqual(after_violations[0]['penalty'], 2000.0)
+        self.assertEqual(after_violations[0]['penalty'], 1000.0)
         self.assertNotIn(day_two.id, after_violations[0]['shift_instance_ids'])
 
     def test_night_rules_are_evaluated_per_physician_contract(self):
@@ -9206,7 +9206,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(len(recovery_rows), 1)
         self.assertEqual(recovery_rows[0]['physician_id'], strict.id)
         self.assertEqual(recovery_rows[0]['contract_name'], 'Strict Recovery Contract')
-        self.assertEqual(recovery_rows[0]['penalty'], 3000.0)
+        self.assertEqual(recovery_rows[0]['penalty'], 1500.0)
         self.assertEqual(len(report['post_night_to_non_night_recovery_violations']), 1)
 
     def test_next_night_block_recovery_uses_physician_contract(self):
@@ -9253,7 +9253,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(len(recovery_rows), 1)
         self.assertEqual(recovery_rows[0]['contract_name'], 'Next Block Recovery Contract')
         self.assertEqual(recovery_rows[0]['actual_value'], 2)
-        self.assertEqual(recovery_rows[0]['penalty'], 3000.0)
+        self.assertEqual(recovery_rows[0]['penalty'], 1000.0)
         self.assertEqual(len(report['post_night_to_next_night_block_recovery_violations']), 1)
 
     def test_night_recovery_does_not_penalize_non_night_before_night_block(self):
@@ -9408,7 +9408,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(violations[0]['prior_night_block_dates'], ['2026-07-01'])
         self.assertEqual(violations[0]['next_night_block_dates'], ['2026-07-04'])
         self.assertEqual(violations[0]['actual_value'], 2)
-        self.assertEqual(violations[0]['penalty'], 3000.0)
+        self.assertEqual(violations[0]['penalty'], 1000.0)
 
     def test_consecutive_nights_do_not_trigger_next_night_block_recovery(self):
         self.block.start_date = date(2026, 7, 1)
@@ -10632,7 +10632,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(violations[0]['configured_limit'], 1)
         self.assertEqual(violations[0]['actual_value'], 3)
         self.assertEqual(violations[0]['penalty_weight'], 5000.0)
-        self.assertEqual(violations[0]['penalty_amount'], 10000.0)
+        self.assertEqual(violations[0]['penalty_amount'], 5000.0)
         self.assertEqual(
             violations[0]['dates_involved'],
             ['2026-07-06', '2026-07-07', '2026-07-08'],

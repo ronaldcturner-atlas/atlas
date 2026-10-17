@@ -814,7 +814,7 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
                 deviation = max(
                     actual - limit - max(prior_count - limit, 0), 0,
                 )
-            score += deviation * weight
+            score += weight if deviation else 0.0
 
     weekends = {}
     for day, is_current in combined_weekend:
@@ -850,7 +850,10 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
                 deviation = max(
                     actual - limit - max(prior_count - limit, 0), 0,
                 )
-            score += deviation * weight
+            score += (
+                weight if side == 'min' and deviation
+                else deviation * weight
+            )
 
     friday_weight = max(_number(
         settings.get('block_friday_night_before_weekend_off_penalty_weight'),
@@ -1065,7 +1068,7 @@ def _night_score_compact(current, prior, settings, windows):
         if not current_count:
             continue
         if minimum_consecutive is not None and minimum_weight > 0:
-            score += max(minimum_consecutive - len(block), 0) * minimum_weight
+            score += minimum_weight if len(block) < minimum_consecutive else 0.0
         if maximum_consecutive is not None and maximum_weight > 0:
             prior_count = len(block) - current_count
             excess = max(
@@ -1073,7 +1076,7 @@ def _night_score_compact(current, prior, settings, windows):
                 - max(prior_count - maximum_consecutive, 0),
                 0,
             )
-            score += excess * maximum_weight
+            score += maximum_weight if excess else 0.0
 
     assignments = sorted(
         [*prior, *current], key=lambda row: (row[1], row[2], str(row[4])),
@@ -1094,7 +1097,7 @@ def _night_score_compact(current, prior, settings, windows):
             if next_assignment is None or not next_assignment[5]:
                 continue
             actual = max(next_assignment[0] - block_end[0] - 1, 0)
-            score += max(days_after - actual, 0) * days_after_weight
+            score += days_after_weight if actual < days_after else 0.0
 
     days_between = _positive_int(settings.get('days_off_before_next_night_shift'))
     days_between_weight = max(_number(
@@ -1105,7 +1108,7 @@ def _night_score_compact(current, prior, settings, windows):
             if not any(row[5] for row in next_block):
                 continue
             actual = max(next_block[0][0] - prior_block[-1][0] - 1, 0)
-            score += max(days_between - actual, 0) * days_between_weight
+            score += days_between_weight if actual < days_between else 0.0
     return score
 
 
@@ -1403,7 +1406,9 @@ def _prepare_night_batch_kernel(instances, occupancy, physician_ids, contracts):
                 targets[3][physician_idx, block_idx] = row[5]
             if next_assignments and next_assignments[0][5]:
                 actual = max(next_assignments[0][0] - block_end[0] - 1, 0)
-                recovery_base_score[physician_idx] += max(days_after - actual, 0) * weight
+                recovery_base_score[physician_idx] += (
+                    weight if actual < days_after else 0.0
+                )
 
     max_minimum_rows = max(map(len, minimum_rows_by_physician), default=0)
     max_maximum_rows = max(map(len, maximum_rows_by_physician), default=0)
@@ -1538,22 +1543,22 @@ def _night_replacement_deltas_batch(kernel, physician_indexes, old_shifts, new_s
             continue
         applicable = ended & (run_current > 0)
         score[applicable] += (
-            np.maximum(min_consecutive[applicable] - run_length[applicable], 0.0)
+            (run_length[applicable] < min_consecutive[applicable])
             * min_weight[applicable]
         )
         score[applicable] += (
-            np.maximum(
+            (
                 run_length[applicable] - max_consecutive[applicable]
-                - np.maximum(run_prior[applicable] - max_consecutive[applicable], 0.0),
-                0.0,
-            ) * max_weight[applicable]
-        )
+                - np.maximum(
+                    run_prior[applicable] - max_consecutive[applicable], 0.0,
+                )
+            ) > 0
+        ) * max_weight[applicable]
         has_previous = applicable & (previous_block_end >= 0)
         actual_between = run_start - previous_block_end - 1
         score[has_previous] += (
-            np.maximum(days_between[has_previous] - actual_between[has_previous], 0.0)
-            * days_between_weight[has_previous]
-        )
+            actual_between[has_previous] < days_between[has_previous]
+        ) * days_between_weight[has_previous]
 
         recovery = ended & (days_after > 0) & (days_after_weight > 0)
         if np.any(recovery):
@@ -1586,9 +1591,8 @@ def _night_replacement_deltas_batch(kernel, physician_indexes, old_shifts, new_s
             actual_after = np.maximum(next_days - day - 1, 0)
             selected_rows = recovery_rows[applies]
             score[selected_rows] += (
-                np.maximum(days_after[selected_rows] - actual_after[applies], 0.0)
-                * days_after_weight[selected_rows]
-            )
+                actual_after[applies] < days_after[selected_rows]
+            ) * days_after_weight[selected_rows]
         previous_block_end[ended] = day
         run_length[ended] = 0
         run_current[ended] = 0
@@ -1638,9 +1642,7 @@ def _non_night_recovery_deltas(kernel, physician_indexes, old_shifts, new_shifts
     weights = kernel[
         'days_off_after_night_block_penalty_weight'
     ][physician_indexes][:, None]
-    after = (
-        np.maximum(limits - actual, 0.0) * weights * exists
-    ).sum(axis=1)
+    after = ((actual < limits) * weights * exists).sum(axis=1)
     return after - kernel['recovery_base_score'][physician_indexes]
 
 
@@ -1845,7 +1847,9 @@ def _request_reassignment_deltas(
     return result
 
 
-def _streak_penalty_from_days(days, maximum, weight):
+def _streak_penalty_from_days(
+    days, minimum, maximum, minimum_weight, maximum_weight,
+):
     score = 0.0
     run = 0
     previous = None
@@ -1853,10 +1857,15 @@ def _streak_penalty_from_days(days, maximum, weight):
         if previous is not None and day == previous + 1:
             run += 1
         else:
-            score += max(run - maximum, 0) * weight
+            if run:
+                score += minimum_weight if minimum and run < minimum else 0.0
+                score += maximum_weight if maximum and run > maximum else 0.0
             run = 1
         previous = day
-    return score + max(run - maximum, 0) * weight
+    if run:
+        score += minimum_weight if minimum and run < minimum else 0.0
+        score += maximum_weight if maximum and run > maximum else 0.0
+    return score
 
 
 def _prepare_consecutive_kernel(
@@ -1892,26 +1901,49 @@ def _prepare_consecutive_kernel(
         settings = contracts[physician_id].workload_settings
         if not isinstance(settings, dict):
             settings = {}
+        minimum = _positive_int(settings.get('min_days_in_row'))
+        if minimum is not None and minimum < 2:
+            minimum = None
         maximum = _positive_int(settings.get('max_days_in_row'))
-        weight = max(_number(settings.get('max_days_in_row_penalty_weight')), 0.0)
-        rule_by_physician.append((maximum, weight))
-        if maximum is None or weight <= 0:
+        minimum_weight = max(_number(
+            settings.get('min_days_in_row_penalty_weight'),
+        ), 0.0)
+        maximum_weight = max(_number(
+            settings.get('max_days_in_row_penalty_weight'),
+        ), 0.0)
+        rule_by_physician.append((
+            minimum, maximum, minimum_weight, maximum_weight,
+        ))
+        if (
+            (minimum is None or minimum_weight <= 0)
+            and (maximum is None or maximum_weight <= 0)
+        ):
             continue
         prior = prior_days[physician_id]
         current = {
             first_day + day for day in np.flatnonzero(current_counts[physician_idx])
         }
         base_scores[physician_idx] = max(
-            _streak_penalty_from_days(prior | current, maximum, weight)
-            - _streak_penalty_from_days(prior, maximum, weight),
+            _streak_penalty_from_days(
+                prior | current, minimum, maximum,
+                minimum_weight, maximum_weight,
+            )
+            - _streak_penalty_from_days(
+                prior, minimum, maximum, minimum_weight, maximum_weight,
+            ),
             0.0,
         )
     deltas = np.zeros((len(movable_pairs), day_count), dtype=np.float64)
     cache = {}
     for assignment_idx, (instance_id, physician_id) in enumerate(movable_pairs):
         physician_idx = physician_lookup[physician_id]
-        maximum, weight = rule_by_physician[physician_idx]
-        if maximum is None or weight <= 0:
+        minimum, maximum, minimum_weight, maximum_weight = (
+            rule_by_physician[physician_idx]
+        )
+        if (
+            (minimum is None or minimum_weight <= 0)
+            and (maximum is None or maximum_weight <= 0)
+        ):
             continue
         old_day = int(shift_days[instance_index[instance_id]])
         key = (physician_idx, old_day)
@@ -1928,8 +1960,12 @@ def _prepare_consecutive_kernel(
                 }
                 after = max(
                     _streak_penalty_from_days(
-                        prior | current, maximum, weight,
-                    ) - _streak_penalty_from_days(prior, maximum, weight),
+                        prior | current, minimum, maximum,
+                        minimum_weight, maximum_weight,
+                    ) - _streak_penalty_from_days(
+                        prior, minimum, maximum,
+                        minimum_weight, maximum_weight,
+                    ),
                     0.0,
                 )
                 cached[new_day] = after - base_scores[physician_idx]
@@ -1952,10 +1988,10 @@ def _same_shift_score(indexes, maximum, weight):
         if occurrence == previous + 1:
             run += 1
         else:
-            score += max(run - maximum, 0) * weight
+            score += weight if run > maximum else 0.0
             run = 1
         previous = occurrence
-    return score + max(run - maximum, 0) * weight
+    return score + (weight if run > maximum else 0.0)
 
 
 def _prepare_same_shift_kernel(
@@ -4708,15 +4744,15 @@ class Command(BaseCommand):
                     - sample['predicted_shift_rule_delta']
                 ) > 0.0001:
                     shift_rule_delta_mismatches += 1
+                predicted_validation_delta = (
+                    sample['predicted_overlap_delta']
+                    + sample['predicted_rest_delta']
+                )
                 if abs(
-                    component_deltas['overlap_score']
-                    - sample['predicted_overlap_delta']
+                    component_deltas['validation_score']
+                    - predicted_validation_delta
                 ) > 0.0001:
                     overlap_delta_mismatches += 1
-                if abs(
-                    component_deltas['rest_score']
-                    - sample['predicted_rest_delta']
-                ) > 0.0001:
                     rest_delta_mismatches += 1
                 predicted_official_delta = sum((
                     sample['predicted_workload_delta'],
@@ -4733,9 +4769,7 @@ class Command(BaseCommand):
                     official_delta_mismatches += 1
                 if any(
                     abs(component_deltas[key]) > 0.0001
-                    for key in (
-                        'underutilization_score', 'validation_score',
-                    )
+                    for key in ('underutilization_score', 'circadian_score')
                 ):
                     excluded_component_nonzero_candidates += 1
                 for key, delta in component_deltas.items():

@@ -2768,6 +2768,11 @@ def _weekend_anchor(day):
     return day - timedelta(days=(day.weekday() - 1) % 7)
 
 
+def _weekend_cycle_start(day):
+    """Backward-compatible name for the authoritative weekend anchor."""
+    return _weekend_anchor(day)
+
+
 def _published_weekend_lookback_days(contracts):
     """Return enough history to evaluate every configured weekend streak."""
     maximum_weeks = 1

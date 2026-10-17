@@ -10,6 +10,21 @@ This is a product-behavior summary, not a claim that every roadmap phase is comp
 
 This source of truth must be read and compared with the current codebase and settled product decisions at least once every 24 hours. If behavior, terminology, permissions, workflows, or known future work have changed, this document must be updated during that review. The reviewer must not add assumptions merely to make the document appear complete; unresolved questions remain explicit until the product owner settles them.
 
+### Authoritative development and deployment path
+
+Atlas is one responsive product, not separate desktop and mobile applications. Desktop, mobile-browser, and installed-PWA experiences must use the same backend, permissions, schedule data, and workflow decisions.
+
+The only authoritative development path is:
+
+1. the primary local checkout at `C:\Users\turne\Desktop\atlas`;
+2. the local `mobile-beta` branch in that checkout;
+3. the GitHub `mobile-beta` branch in `ronaldcturner-atlas/atlas`;
+4. every active Railway service in the `mobile-beta` environment deployed from that same GitHub branch and commit.
+
+Local Docker services must mount the primary checkout above. Additional worktrees, temporary branches, copied source trees, exported databases, and test snapshots may exist only for a bounded repair or verification task. They are never authoritative, must be clearly identified while in use, and must be removed after their verified changes have been incorporated into `mobile-beta`.
+
+The Railway `mobile-beta` database is the authoritative shared beta-test data store. A local database may be a disposable point-in-time clone for safe development and optimizer testing, but local and Railway databases are not bidirectionally synchronized. Local data must never overwrite Railway merely because it is newer locally. Production disaster-recovery backups are protected recovery artifacts, not alternate active development copies.
+
 ## Product Principles
 
 1. Atlas is a physician scheduling platform.

@@ -166,8 +166,19 @@ class V2ContinuousCommandTests(SimpleTestCase):
         result = json.loads(command.stdout.getvalue())
         self.assertEqual(checkpoint_flags, [True, False, True])
         self.assertEqual(result['predicted_final_score'], 80.0)
+        self.assertTrue(all(
+            checkpoint['elapsed_seconds'] >= 0
+            for checkpoint in result['score_checkpoints']
+        ))
         self.assertEqual(
-            result['score_checkpoints'],
+            [
+                {
+                    key: value
+                    for key, value in checkpoint.items()
+                    if key != 'elapsed_seconds'
+                }
+                for checkpoint in result['score_checkpoints']
+            ],
             [{
                 'accepted_transitions': 0,
                 'score': 100.0,

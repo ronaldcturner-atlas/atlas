@@ -9,7 +9,9 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     Command as SwapKernelCommand,
     _pair_validation_penalty_deltas,
     _request_reassignment_deltas,
+    _same_shift_score,
     _state_with_all_instances,
+    _streak_penalty_from_days,
 )
 from apps.scheduling.optimizer_v2 import (
     V2AssignmentRowCache,
@@ -40,6 +42,21 @@ from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 
 
 class V2SwapKernelCommandTests(SimpleTestCase):
+    def test_compiled_adjacent_streak_penalties_are_flat_per_streak(self):
+        self.assertEqual(
+            _streak_penalty_from_days(
+                {1, 2, 3, 4}, None, 2, 0.0, 100.0,
+            ),
+            100.0,
+        )
+        self.assertEqual(
+            _streak_penalty_from_days(
+                {1}, 2, None, 50.0, 0.0,
+            ),
+            50.0,
+        )
+        self.assertEqual(_same_shift_score([0, 1, 2, 3], 2, 100.0), 100.0)
+
     def test_newly_open_shift_survives_plain_dict_transition(self):
         state = _state_with_all_instances(
             {10: [1], 20: [2]},
