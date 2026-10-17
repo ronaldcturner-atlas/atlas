@@ -27,11 +27,16 @@ STRUCTURAL_RULE_KEYS = {
     'consecutive_penalty_weight',
 }
 
+LEGACY_UNSCORED_RULE_KEYS = {
+    'min_same_shifts_in_row',
+    'min_same_shifts_in_row_penalty_weight',
+}
+
 
 def _walk_rule_values(value, path=()):
     if isinstance(value, dict):
         for key, child in value.items():
-            if key in STRUCTURAL_RULE_KEYS:
+            if key in STRUCTURAL_RULE_KEYS or key in LEGACY_UNSCORED_RULE_KEYS:
                 continue
             yield from _walk_rule_values(child, (*path, str(key)))
         return

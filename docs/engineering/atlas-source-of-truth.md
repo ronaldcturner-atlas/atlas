@@ -303,7 +303,8 @@ The supported rule configuration includes:
 - workload minimums and maximums by week, month, or Schedule Block, measured in hours or shifts;
 - per-Facility minimums and maximums by week, month, or Schedule Block, measured in hours or shifts, with separate minimum and maximum penalty weights;
 - separate minimum and maximum penalty weights and optional spreading of violations;
-- minimum time off, circadian handling, days-in-row, and same-shifts-in-row settings;
+- minimum time off, circadian handling, and minimum/maximum days-in-row settings;
+- **SAME SHIFT IN A ROW**, which has only a maximum streak and its penalty; there is no minimum same-shift streak because Atlas never rewards or requires assigning a user repeatedly to one exact Shift Template;
 - named Shift Template groups with their own period rules;
 - night volume, consecutive-night, and recovery settings;
 - weekend volume, consecutive-weekend, consecutive-weekend-shift, and Friday-night-before-weekend-off settings;

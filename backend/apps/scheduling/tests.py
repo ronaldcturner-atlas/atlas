@@ -11143,6 +11143,13 @@ class ContractApiTests(TestCase):
             payload['facility_settings']['rules'][0]['period_rules'][0]['min_value'],
             '4',
         )
+        self.assertNotIn(
+            'min_same_shifts_in_row', payload['workload_settings'],
+        )
+        self.assertNotIn(
+            'min_same_shifts_in_row_penalty_weight',
+            payload['workload_settings'],
+        )
 
     def test_facility_period_rule_scores_each_users_assignments(self):
         response = self.client.post(
@@ -11311,6 +11318,14 @@ class ContractApiTests(TestCase):
         )
         self.assertNotIn(
             'workload_settings.period_rules.0.spread_violations',
+            {rule['path'] for rule in detail['rules']},
+        )
+        self.assertNotIn(
+            'workload_settings.min_same_shifts_in_row',
+            {rule['path'] for rule in detail['rules']},
+        )
+        self.assertNotIn(
+            'workload_settings.min_same_shifts_in_row_penalty_weight',
             {rule['path'] for rule in detail['rules']},
         )
 

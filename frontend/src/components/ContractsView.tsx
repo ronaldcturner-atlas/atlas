@@ -149,8 +149,6 @@ type WorkloadSettings = {
   min_days_in_row_penalty_weight: string
   max_days_in_row: string
   max_days_in_row_penalty_weight: string
-  min_same_shifts_in_row: string
-  min_same_shifts_in_row_penalty_weight: string
   max_same_shifts_in_row: string
   max_same_shifts_in_row_penalty_weight: string
 }
@@ -314,8 +312,6 @@ function emptyFormState(): ContractFormState {
       min_days_in_row_penalty_weight: '',
       max_days_in_row: '',
       max_days_in_row_penalty_weight: '',
-      min_same_shifts_in_row: '',
-      min_same_shifts_in_row_penalty_weight: '',
       max_same_shifts_in_row: '',
       max_same_shifts_in_row_penalty_weight: '',
     },
@@ -515,6 +511,9 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
 }
 
 function sanitizeFormPayload(formState: ContractFormState) {
+  const workloadSettings = { ...formState.workload_settings } as Record<string, unknown>
+  delete workloadSettings.min_same_shifts_in_row
+  delete workloadSettings.min_same_shifts_in_row_penalty_weight
   return {
     name: formState.name.trim(),
     domain: Number(formState.domain),
@@ -531,7 +530,7 @@ function sanitizeFormPayload(formState: ContractFormState) {
     },
     assigned_user_ids: formState.assigned_user_ids,
     workload_settings: {
-      ...formState.workload_settings,
+      ...workloadSettings,
       period_rules: formState.workload_settings.period_rules.map(({ id, ...rule }) => rule),
     },
     shift_settings: {
@@ -1285,14 +1284,12 @@ export default function ContractsView() {
                       </div>
                     </div>
                     <div className="contract-additional-workload-card">
-                      <div className="contract-minmax-title">Same shifts in a row</div>
+                      <div className="contract-minmax-title">SAME SHIFT IN A ROW</div>
                       <div className="contract-value-penalty-columns">
                         <div className="contract-minmax-stack">
-                          <label className="facility-field"><span>Minimum</span><input type="number" value={formState.workload_settings.min_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_same_shifts_in_row: event.target.value } }))} /></label>
                           <label className="facility-field"><span>Maximum</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row: event.target.value } }))} /></label>
                         </div>
                         <div className="contract-minmax-stack">
-                          <label className="facility-field"><span>Minimum penalty</span><input type="number" value={formState.workload_settings.min_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, min_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
                           <label className="facility-field"><span>Maximum penalty</span><input type="number" value={formState.workload_settings.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, max_same_shifts_in_row_penalty_weight: event.target.value } }))} /></label>
                         </div>
                       </div>

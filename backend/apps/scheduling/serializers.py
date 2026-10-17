@@ -932,6 +932,15 @@ class ContractSerializer(serializers.ModelSerializer):
             row[field] = str(int(decimal_value))
 
     def _normalize_contract_rule_numbers(self, attrs):
+        workload_settings = attrs.get('workload_settings')
+        if isinstance(workload_settings, dict):
+            # These legacy inputs were displayed but never scored.  Remove
+            # them whenever a Contract is saved so the API cannot imply that
+            # a minimum same-shift streak is an active rule.
+            workload_settings.pop('min_same_shifts_in_row', None)
+            workload_settings.pop(
+                'min_same_shifts_in_row_penalty_weight', None,
+            )
         period_field_sets = {
             'facility_settings': (
                 'min_value', 'max_value',
@@ -988,8 +997,6 @@ class ContractSerializer(serializers.ModelSerializer):
                 'circadian_penalty_weight',
                 'min_days_in_row', 'min_days_in_row_penalty_weight',
                 'max_days_in_row', 'max_days_in_row_penalty_weight',
-                'min_same_shifts_in_row',
-                'min_same_shifts_in_row_penalty_weight',
                 'max_same_shifts_in_row',
                 'max_same_shifts_in_row_penalty_weight',
             ),

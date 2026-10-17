@@ -96,6 +96,9 @@ function ruleGroup(rule: RuleRow) {
   let base = field.replace(/_penalty_weight$/, '').replace(/^(min|max)_/, '')
   if (base.startsWith('time_off')) base = 'time_off'
   if (base === 'circadian_enabled') base = 'circadian'
+  if (base === 'same_shifts_in_row') {
+    return { key: `${parentPath}.${base}`, title: 'SAME SHIFT IN A ROW' }
+  }
   return { key: `${parentPath}.${base}`, title: titleCase(base) }
 }
 
