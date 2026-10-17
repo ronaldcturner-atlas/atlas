@@ -1388,6 +1388,7 @@ export default function ContractsView() {
                               ? sharedRule.shift_templates.map((template) => `${template.name} (${template.facility_name})`).join(', ')
                               : 'No eligible shifts in this contract.'}
                           </div>
+                          <div className="shared-rule-contract-limits">
                           <div className="contract-value-penalty-columns">
                             <div className="contract-minmax-stack">
                               <label className="facility-field"><span>Minimum value</span><input type="number" min="0" step="1" value={sharedRule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_value: event.target.value } : rule) }))} /></label>
@@ -1404,6 +1405,7 @@ export default function ContractsView() {
                               <label className="facility-field"><span>Maximum</span><input type="number" min="1" step="1" value={sharedRule.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_same_shifts_in_row: event.target.value } : rule) }))} /></label>
                               <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_same_shifts_in_row_penalty_weight: event.target.value } : rule) }))} /></label>
                             </div>
+                          </div>
                           </div>
                         </div>
                       ))}

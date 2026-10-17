@@ -57,9 +57,9 @@ describe('Contract user overrides', () => {
   })
 
   it('keeps numeric Contract and User Override inputs compact', () => {
-    expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:120px')
-    expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:130px 145px')
-    expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,130px)')
+    expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:112px')
+    expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:112px 120px')
+    expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,112px)')
   })
 })
 
