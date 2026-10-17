@@ -8251,6 +8251,10 @@ def shared_rule_duplicate(request, shared_rule_id):
         'max_value': link.max_value,
         'min_penalty_weight': link.min_penalty_weight,
         'max_penalty_weight': link.max_penalty_weight,
+        'max_same_shifts_in_row': link.max_same_shifts_in_row,
+        'max_same_shifts_in_row_penalty_weight': (
+            link.max_same_shifts_in_row_penalty_weight
+        ),
         'spread_violations': link.spread_violations,
     } for link in source.contract_links.select_related('contract').all()]
     reference_shift_templates = [
@@ -8466,6 +8470,10 @@ def contract_duplicate(request, contract_id):
                 max_value=link.max_value,
                 min_penalty_weight=link.min_penalty_weight,
                 max_penalty_weight=link.max_penalty_weight,
+                max_same_shifts_in_row=link.max_same_shifts_in_row,
+                max_same_shifts_in_row_penalty_weight=(
+                    link.max_same_shifts_in_row_penalty_weight
+                ),
                 spread_violations=link.spread_violations,
             )
             for link in source_contract.shared_rule_links.select_related(

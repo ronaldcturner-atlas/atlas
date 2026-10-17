@@ -3951,6 +3951,22 @@ def _weekend_support_cycle_candidates(
     return candidates
 
 
+def _adjacent_date_streaks(dates):
+    ordered_dates = sorted(set(dates))
+    if not ordered_dates:
+        return []
+    streaks = []
+    streak = [ordered_dates[0]]
+    for current_date in ordered_dates[1:]:
+        if current_date == streak[-1] + timedelta(days=1):
+            streak.append(current_date)
+        else:
+            streaks.append(streak)
+            streak = [current_date]
+    streaks.append(streak)
+    return streaks
+
+
 def _shift_period_report(instances, physicians, state, contracts, details=False):
     """Score contract shift-group and Facility rules in configured windows."""
     assigned_by_physician = defaultdict(list)
@@ -4108,6 +4124,68 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
                                     f"for {window_start} through {window_end}."
                                 ),
                             })
+            max_same_shifts = _decimal_or_none(
+                group.get('max_same_shifts_in_row')
+            )
+            same_shift_penalty = _decimal_or_none(
+                group.get('max_same_shifts_in_row_penalty_weight')
+            )
+            if (
+                group_spec['rule_area'] == 'Shifts'
+                and max_same_shifts is not None
+                and max_same_shifts > 0
+                and same_shift_penalty is not None
+                and same_shift_penalty > 0
+            ):
+                maximum = int(max_same_shifts)
+                matching_by_date = defaultdict(list)
+                for instance in assigned_by_physician[physician.id]:
+                    if instance.shift_template_id in group_spec['template_ids']:
+                        matching_by_date[instance.date].append(instance)
+                for streak_dates in _adjacent_date_streaks(matching_by_date):
+                    if len(streak_dates) <= maximum:
+                        continue
+                    excess = len(streak_dates) - maximum
+                    penalty = Decimal(excess) * same_shift_penalty
+                    score += penalty
+                    if details:
+                        matching = [
+                            instance
+                            for streak_date in streak_dates
+                            for instance in matching_by_date[streak_date]
+                        ]
+                        violations.append({
+                            'physician_id': physician.id,
+                            **_contract_rule_identity(contract),
+                            'violation_type': 'SHIFT_GROUP_SAME_SHIFT_STREAK',
+                            'period_type': 'ADJACENT_DAYS',
+                            'period_start': streak_dates[0].isoformat(),
+                            'period_end': streak_dates[-1].isoformat(),
+                            'dates_involved': [
+                                streak_date.isoformat()
+                                for streak_date in streak_dates
+                            ],
+                            'shift_instance_ids': [
+                                instance.id for instance in matching
+                            ],
+                            'shift_template_ids': sorted(
+                                group_spec['template_ids']
+                            ),
+                            'facility_id': None,
+                            'shift_rule_label': group_label,
+                            'rule_area': 'Shifts',
+                            'configured_limit': maximum,
+                            'actual_value': len(streak_dates),
+                            'units': 'DAYS',
+                            'penalty_weight': float(same_shift_penalty),
+                            'penalty': float(penalty),
+                            'proration': 1.0,
+                            'explanation': (
+                                f'{group_label} shifts occur on '
+                                f'{len(streak_dates)} adjacent days; the '
+                                f'maximum is {maximum}.'
+                            ),
+                        })
     return {'score': score, 'violations': violations}
 
 
@@ -9091,6 +9169,7 @@ def _night_fix_sources(instances_by_id, physicians, state, manual_pairs, contrac
 def _violation_explanation(violation_type):
     explanations = {
         'SAME_SHIFT_STREAK': 'Physician is assigned to too many consecutive occurrences of the same shift template.',
+        'SHIFT_GROUP_SAME_SHIFT_STREAK': 'Physician is assigned to shifts from the selected Shift Group on too many adjacent calendar days.',
         'MAX_CONSECUTIVE_DAYS': 'Physician is assigned to more consecutive workdays than configured.',
         'INSUFFICIENT_REST': 'Physician has less time off between assignments than configured.',
         'OVERLAPPING_ASSIGNMENTS': 'Physician is assigned to shifts whose times overlap.',

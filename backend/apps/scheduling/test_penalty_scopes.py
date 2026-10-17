@@ -177,6 +177,76 @@ class PenaltyScopeTests(SimpleTestCase):
         self.assertEqual(report['score'], 0)
         self.assertEqual(report['violations'], [])
 
+    def test_shift_group_same_shift_limit_scores_adjacent_calendar_days(self):
+        instances = self.make_instances([
+            date(2026, 12, 5),
+            date(2026, 12, 6),
+            date(2026, 12, 8),
+        ])
+        physician = SimpleNamespace(id=1)
+        contract = SimpleNamespace(
+            id=18,
+            name='Adjacent group shifts',
+            shift_settings={
+                'rules': [{
+                    'label': 'Selected late shifts',
+                    'shift_template_ids': [10],
+                    'period_rules': [],
+                    'max_same_shifts_in_row': 1,
+                    'max_same_shifts_in_row_penalty_weight': 750,
+                }],
+            },
+        )
+
+        report = o._shift_period_report(
+            instances,
+            [physician],
+            {instance.id: [physician.id] for instance in instances},
+            {physician.id: contract},
+            details=True,
+        )
+
+        self.assertEqual(report['score'], 750)
+        self.assertEqual(len(report['violations']), 1)
+        self.assertEqual(
+            report['violations'][0]['violation_type'],
+            'SHIFT_GROUP_SAME_SHIFT_STREAK',
+        )
+        self.assertEqual(
+            report['violations'][0]['dates_involved'],
+            ['2026-12-05', '2026-12-06'],
+        )
+
+    def test_shift_group_same_shift_limit_is_inactive_when_blank(self):
+        instances = self.make_instances([
+            date(2026, 12, 5), date(2026, 12, 6),
+        ])
+        physician = SimpleNamespace(id=1)
+        contract = SimpleNamespace(
+            id=19,
+            name='Optional adjacent rule',
+            shift_settings={
+                'rules': [{
+                    'label': 'Selected late shifts',
+                    'shift_template_ids': [10],
+                    'period_rules': [],
+                    'max_same_shifts_in_row': '',
+                    'max_same_shifts_in_row_penalty_weight': '',
+                }],
+            },
+        )
+
+        self.assertEqual(
+            o._shift_period_report(
+                instances,
+                [physician],
+                {instance.id: [physician.id] for instance in instances},
+                {physician.id: contract},
+                details=True,
+            ),
+            {'score': 0, 'violations': []},
+        )
+
     def test_unconfigured_shift_group_has_no_implicit_penalty(self):
         instances = self.make_instances([date(2026, 12, 5)])
         physician = SimpleNamespace(id=1)

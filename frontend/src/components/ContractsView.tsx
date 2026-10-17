@@ -169,6 +169,8 @@ type SharedContractRule = {
   max_value: string
   min_penalty_weight: string
   max_penalty_weight: string
+  max_same_shifts_in_row: string
+  max_same_shifts_in_row_penalty_weight: string
   spread_violations: boolean
 }
 
@@ -546,6 +548,8 @@ function sanitizeFormPayload(formState: ContractFormState) {
       max_value: rule.max_value,
       min_penalty_weight: rule.min_penalty_weight,
       max_penalty_weight: rule.max_penalty_weight,
+      max_same_shifts_in_row: rule.max_same_shifts_in_row,
+      max_same_shifts_in_row_penalty_weight: rule.max_same_shifts_in_row_penalty_weight,
     })),
     night_settings: {
       ...formState.night_settings,
@@ -1392,6 +1396,13 @@ export default function ContractsView() {
                             <div className="contract-minmax-stack">
                               <label className="facility-field"><span>Minimum penalty</span><input type="number" min="0" step="1" value={sharedRule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, min_penalty_weight: event.target.value } : rule) }))} /></label>
                               <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_penalty_weight: event.target.value } : rule) }))} /></label>
+                            </div>
+                          </div>
+                          <div className="shared-rule-optional-streak">
+                            <div className="shared-rule-optional-heading"><strong>Same shifts in a row</strong><span>Optional</span></div>
+                            <div className="contract-value-penalty-row">
+                              <label className="facility-field"><span>Maximum</span><input type="number" min="1" step="1" value={sharedRule.max_same_shifts_in_row} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_same_shifts_in_row: event.target.value } : rule) }))} /></label>
+                              <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_same_shifts_in_row_penalty_weight: event.target.value } : rule) }))} /></label>
                             </div>
                           </div>
                         </div>

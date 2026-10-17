@@ -53,6 +53,15 @@ def sync_shared_rule_contract_settings(shared_rule, previous_contract_ids=()):
                 'shared_rule_id': shared_rule.id,
                 'label': shared_rule.name,
                 'shift_template_ids': eligible_template_ids,
+                'max_same_shifts_in_row': (
+                    str(int(link.max_same_shifts_in_row))
+                    if link.max_same_shifts_in_row is not None else ''
+                ),
+                'max_same_shifts_in_row_penalty_weight': (
+                    str(int(link.max_same_shifts_in_row_penalty_weight))
+                    if link.max_same_shifts_in_row_penalty_weight is not None
+                    else ''
+                ),
                 'period_rules': [{
                     'shared_rule_id': shared_rule.id,
                     'period_type': shared_rule.period_type,

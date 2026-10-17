@@ -893,6 +893,15 @@ class ContractSerializer(serializers.ModelSerializer):
                     str(int(link.max_penalty_weight))
                     if link.max_penalty_weight is not None else ''
                 ),
+                'max_same_shifts_in_row': (
+                    str(int(link.max_same_shifts_in_row))
+                    if link.max_same_shifts_in_row is not None else ''
+                ),
+                'max_same_shifts_in_row_penalty_weight': (
+                    str(int(link.max_same_shifts_in_row_penalty_weight))
+                    if link.max_same_shifts_in_row_penalty_weight is not None
+                    else ''
+                ),
                 'spread_violations': link.spread_violations,
             })
         return rows
@@ -1160,6 +1169,8 @@ class ContractSerializer(serializers.ModelSerializer):
                     for field in (
                         'min_value', 'max_value',
                         'min_penalty_weight', 'max_penalty_weight',
+                        'max_same_shifts_in_row',
+                        'max_same_shifts_in_row_penalty_weight',
                     ):
                         value = row.get(field)
                         if value in (None, ''):
@@ -1195,11 +1206,15 @@ class ContractSerializer(serializers.ModelSerializer):
                         })
                     if any(
                         values[field] is not None and values[field] < 0
-                        for field in ('min_penalty_weight', 'max_penalty_weight')
+                        for field in (
+                            'min_penalty_weight', 'max_penalty_weight',
+                            'max_same_shifts_in_row',
+                            'max_same_shifts_in_row_penalty_weight',
+                        )
                     ):
                         raise serializers.ValidationError({
                             'shared_rule_settings': (
-                                f'Shared Rule row {index} has a negative penalty.'
+                                f'Shared Rule row {index} requires nonnegative values.'
                             ),
                         })
                     normalized.append(values)
@@ -1315,11 +1330,15 @@ class ContractSerializer(serializers.ModelSerializer):
                 for field in (
                     'min_value', 'max_value',
                     'min_penalty_weight', 'max_penalty_weight',
+                    'max_same_shifts_in_row',
+                    'max_same_shifts_in_row_penalty_weight',
                 ):
                     setattr(link, field, row[field])
                 link.save(update_fields=[
                     'min_value', 'max_value',
-                    'min_penalty_weight', 'max_penalty_weight', 'updated_at',
+                    'min_penalty_weight', 'max_penalty_weight',
+                    'max_same_shifts_in_row',
+                    'max_same_shifts_in_row_penalty_weight', 'updated_at',
                 ])
         for shared_rule in instance.shared_rules.all():
             sync_shared_rule_contract_settings(shared_rule)
@@ -1384,6 +1403,15 @@ class SharedRuleSerializer(serializers.ModelSerializer):
                 str(int(link.max_penalty_weight))
                 if link.max_penalty_weight is not None else ''
             ),
+            'max_same_shifts_in_row': (
+                str(int(link.max_same_shifts_in_row))
+                if link.max_same_shifts_in_row is not None else ''
+            ),
+            'max_same_shifts_in_row_penalty_weight': (
+                str(int(link.max_same_shifts_in_row_penalty_weight))
+                if link.max_same_shifts_in_row_penalty_weight is not None
+                else ''
+            ),
             'spread_violations': link.spread_violations,
         } for link in obj.contract_links.all()]
 
@@ -1423,6 +1451,8 @@ class SharedRuleSerializer(serializers.ModelSerializer):
             for field in (
                 'min_value', 'max_value',
                 'min_penalty_weight', 'max_penalty_weight',
+                'max_same_shifts_in_row',
+                'max_same_shifts_in_row_penalty_weight',
             ):
                 value = row.get(field)
                 if value in (None, ''):
@@ -1454,11 +1484,15 @@ class SharedRuleSerializer(serializers.ModelSerializer):
                         f'Contract row {index} has a minimum greater than its maximum.'
                     ),
                 })
-            for field in ('min_penalty_weight', 'max_penalty_weight'):
+            for field in (
+                'min_penalty_weight', 'max_penalty_weight',
+                'max_same_shifts_in_row',
+                'max_same_shifts_in_row_penalty_weight',
+            ):
                 if normalized[field] is not None and normalized[field] < 0:
                     raise serializers.ValidationError({
                         'contract_settings': (
-                            f'Contract row {index} has a negative penalty.'
+                            f'Contract row {index} requires nonnegative values.'
                         ),
                     })
             normalized_settings.append(normalized)
@@ -1538,6 +1572,12 @@ class SharedRuleSerializer(serializers.ModelSerializer):
                 ),
                 max_penalty_weight=self._number(
                     row.get('max_penalty_weight')
+                ),
+                max_same_shifts_in_row=self._number(
+                    row.get('max_same_shifts_in_row')
+                ),
+                max_same_shifts_in_row_penalty_weight=self._number(
+                    row.get('max_same_shifts_in_row_penalty_weight')
                 ),
                 spread_violations=bool(row.get('spread_violations', True)),
             )

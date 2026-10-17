@@ -1010,6 +1010,10 @@ class SharedRuleContract(models.Model):
     max_value = models.PositiveIntegerField(null=True, blank=True)
     min_penalty_weight = models.PositiveIntegerField(null=True, blank=True)
     max_penalty_weight = models.PositiveIntegerField(null=True, blank=True)
+    max_same_shifts_in_row = models.PositiveIntegerField(null=True, blank=True)
+    max_same_shifts_in_row_penalty_weight = models.PositiveIntegerField(
+        null=True, blank=True,
+    )
     spread_violations = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

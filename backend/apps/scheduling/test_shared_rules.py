@@ -87,6 +87,8 @@ class SharedRuleApiTests(TestCase):
                 'max_value': '3' if contract_id == self.part.id else '4',
                 'min_penalty_weight': '10000',
                 'max_penalty_weight': '10000',
+                'max_same_shifts_in_row': '1',
+                'max_same_shifts_in_row_penalty_weight': '7500',
                 'spread_violations': True,
             } for contract_id in contract_ids],
         }
@@ -124,6 +126,10 @@ class SharedRuleApiTests(TestCase):
             self.assertEqual(
                 rule['period_rules'][0]['max_value'],
                 str(int(float(expected_maximum))),
+            )
+            self.assertEqual(rule['max_same_shifts_in_row'], '1')
+            self.assertEqual(
+                rule['max_same_shifts_in_row_penalty_weight'], '7500',
             )
 
     def test_shared_rule_can_start_with_one_contract(self):
@@ -411,6 +417,8 @@ class SharedRuleApiTests(TestCase):
                 'max_value': '6',
                 'min_penalty_weight': '12000',
                 'max_penalty_weight': '18000',
+                'max_same_shifts_in_row': '2',
+                'max_same_shifts_in_row_penalty_weight': '9000',
             }]},
             format='json',
         )
@@ -422,6 +430,10 @@ class SharedRuleApiTests(TestCase):
         self.assertEqual(shared_row['max_value'], '6')
         self.assertEqual(shared_row['min_penalty_weight'], '12000')
         self.assertEqual(shared_row['max_penalty_weight'], '18000')
+        self.assertEqual(shared_row['max_same_shifts_in_row'], '2')
+        self.assertEqual(
+            shared_row['max_same_shifts_in_row_penalty_weight'], '9000',
+        )
 
         self.full.refresh_from_db()
         materialized = self.full.shift_settings['rules'][0]
@@ -430,6 +442,10 @@ class SharedRuleApiTests(TestCase):
         self.assertEqual(
             materialized['period_rules'][0]['max_penalty_weight'],
             '18000',
+        )
+        self.assertEqual(materialized['max_same_shifts_in_row'], '2')
+        self.assertEqual(
+            materialized['max_same_shifts_in_row_penalty_weight'], '9000',
         )
 
         self.part.refresh_from_db()

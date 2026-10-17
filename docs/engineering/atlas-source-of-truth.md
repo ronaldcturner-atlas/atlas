@@ -305,7 +305,7 @@ The supported rule configuration includes:
 - separate minimum and maximum penalty weights and optional spreading of violations;
 - minimum time off, circadian handling, and minimum/maximum days-in-row settings;
 - **SAME SHIFT IN A ROW**, which has only a maximum streak and its penalty; there is no minimum same-shift streak because Atlas never rewards or requires assigning a user repeatedly to one exact Shift Template;
-- named Shift Template groups with their own period rules;
+- named Shift Template groups with their own period rules and an optional per-Contract **Same shifts in a row** maximum plus penalty. This Shift Group control counts adjacent calendar dates on which the user is assigned any selected template: a maximum of `1` discourages selected-group assignments on adjacent days. It is distinct from the workload-level **SAME SHIFT IN A ROW** rule, which evaluates consecutive occurrences of one exact Shift Template;
 - night volume, consecutive-night, and recovery settings;
 - weekend volume, consecutive-weekend, consecutive-weekend-shift, and Friday-night-before-weekend-off settings;
 - allowed request types, request limits, and request weights.
