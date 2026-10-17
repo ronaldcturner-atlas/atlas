@@ -544,7 +544,7 @@ class PenaltyScopeTests(SimpleTestCase):
 
         self.assertNotIn('MAX_CONSECUTIVE_NIGHTS', types)
         self.assertEqual(types, ['INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT'])
-        self.assertEqual(report['score'], 200)
+        self.assertEqual(report['score'], 100)
 
     def test_boundary_consecutive_days_charges_only_new_incremental_excess(self):
         prior = [
@@ -576,3 +576,178 @@ class PenaltyScopeTests(SimpleTestCase):
             )
 
         self.assertEqual(scores['consecutive_days_score'], 100)
+
+    def test_adjacent_day_streak_penalties_are_flat_per_streak(self):
+        assigned_dates = [
+            date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3),
+            date(2026, 10, 4), date(2026, 10, 8), date(2026, 10, 9),
+            date(2026, 10, 10), date(2026, 10, 11),
+        ]
+        self.assertEqual(
+            o._streak_excess_score(assigned_dates, 2, o.Decimal('500')),
+            o.Decimal('1000'),
+        )
+
+    def test_short_adjacent_day_streak_penalties_are_flat_per_streak(self):
+        assigned_dates = [
+            date(2026, 10, 1),
+            date(2026, 10, 4), date(2026, 10, 5),
+        ]
+        self.assertEqual(
+            o._streak_shortfall_score(assigned_dates, 3, o.Decimal('500')),
+            o.Decimal('1000'),
+        )
+
+    def test_circadian_rule_allows_one_hour_earlier_start(self):
+        instances = [
+            self.make_assignment_instance(
+                date(2026, 10, 1), instance_id=1, start_hour=12, hours=10,
+            ),
+            self.make_assignment_instance(
+                date(2026, 10, 2), instance_id=2, start_hour=11, hours=8,
+            ),
+        ]
+        physician = SimpleNamespace(id=1, display_name='Test User')
+        contract = SimpleNamespace(
+            id=1,
+            name='Circadian contract',
+            workload_settings={
+                'circadian_enabled': True,
+                'circadian_penalty_weight': '400',
+            },
+        )
+
+        report = o._circadian_violation_report(
+            instances, [physician], {1: [1], 2: [1]}, {1: contract},
+            details=True,
+        )
+
+        self.assertEqual(report, {'score': 0, 'violations': []})
+
+    def test_minimum_rest_still_controls_when_it_is_later_than_circadian_floor(self):
+        instances = [
+            self.make_assignment_instance(
+                date(2026, 10, 1), instance_id=1, start_hour=12, hours=12,
+            ),
+            self.make_assignment_instance(
+                date(2026, 10, 2), instance_id=2, start_hour=11, hours=8,
+            ),
+        ]
+        physician = SimpleNamespace(id=1, active=True, display_name='Test User')
+        contract = SimpleNamespace(
+            id=1,
+            name='Circadian contract',
+            workload_settings={
+                'circadian_enabled': True,
+                'circadian_penalty_weight': '400',
+            },
+        )
+        state = {1: [1], 2: [1]}
+
+        circadian = o._circadian_violation_report(
+            instances, [physician], state, {1: contract}, details=True,
+        )
+        validation = o._validate_schedule(
+            instances,
+            [physician],
+            state,
+            {1: {20}},
+            {1: 12},
+            details=True,
+        )
+
+        self.assertEqual(circadian, {'score': 0, 'violations': []})
+        self.assertEqual(validation['final_rest_violations'], 1)
+        self.assertEqual(
+            validation['violations'][0]['violation_type'],
+            'INSUFFICIENT_REST',
+        )
+
+    def test_circadian_rule_penalizes_more_than_one_hour_backward_once(self):
+        instances = [
+            self.make_assignment_instance(
+                date(2026, 10, 1), instance_id=1, start_hour=12, hours=8,
+            ),
+            self.make_assignment_instance(
+                date(2026, 10, 2), instance_id=2, start_hour=10, hours=8,
+            ),
+        ]
+        physician = SimpleNamespace(id=1, display_name='Test User')
+        contract = SimpleNamespace(
+            id=1,
+            name='Circadian contract',
+            workload_settings={
+                'circadian_enabled': True,
+                'circadian_penalty_weight': '400',
+            },
+        )
+
+        report = o._circadian_violation_report(
+            instances, [physician], {1: [1], 2: [1]}, {1: contract},
+            details=True,
+        )
+
+        self.assertEqual(report['score'], 400)
+        self.assertEqual(len(report['violations']), 1)
+        self.assertEqual(
+            report['violations'][0]['violation_type'],
+            'CIRCADIAN_BACKWARD_ROTATION',
+        )
+        self.assertEqual(report['violations'][0]['actual_value'], 1.0)
+
+    def test_circadian_rule_resets_after_a_full_day_without_assignment(self):
+        instances = [
+            self.make_assignment_instance(
+                date(2026, 10, 1), instance_id=1, start_hour=12, hours=8,
+            ),
+            self.make_assignment_instance(
+                date(2026, 10, 3), instance_id=2, start_hour=7, hours=8,
+            ),
+        ]
+        physician = SimpleNamespace(id=1, display_name='Test User')
+        contract = SimpleNamespace(
+            id=1,
+            name='Circadian contract',
+            workload_settings={
+                'circadian_enabled': True,
+                'circadian_penalty_weight': '400',
+            },
+        )
+
+        report = o._circadian_violation_report(
+            instances, [physician], {1: [1], 2: [1]}, {1: contract},
+            details=True,
+        )
+
+        self.assertEqual(report, {'score': 0, 'violations': []})
+
+    def test_spread_priority_penalizes_repeat_tiers_not_first_violations(self):
+        contract = SimpleNamespace(
+            workload_settings={'days_in_row_spread_violations': True},
+            night_settings={}, weekend_settings={}, shift_settings={},
+            facility_settings={},
+        )
+        rows = [
+            {
+                'physician_id': 1,
+                'violation_type': 'MAX_CONSECUTIVE_DAYS',
+                'penalty_weight': 100,
+                'penalty': 100,
+            },
+            {
+                'physician_id': 1,
+                'violation_type': 'MAX_CONSECUTIVE_DAYS',
+                'penalty_weight': 100,
+                'penalty': 100,
+            },
+            {
+                'physician_id': 2,
+                'violation_type': 'MAX_CONSECUTIVE_DAYS',
+                'penalty_weight': 100,
+                'penalty': 100,
+            },
+        ]
+        self.assertEqual(
+            o._spread_priority_from_rows(rows, {1: contract, 2: contract}),
+            o.Decimal('1'),
+        )

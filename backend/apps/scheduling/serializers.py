@@ -1046,11 +1046,10 @@ class ContractSerializer(serializers.ModelSerializer):
         workload_settings = attrs.get('workload_settings')
         if isinstance(workload_settings, dict):
             minimum_days = workload_settings.get('min_days_in_row')
-            if minimum_days not in (None, '') and Decimal(str(minimum_days)) < 2:
+            if minimum_days not in (None, '') and int(minimum_days) < 2:
                 raise serializers.ValidationError({
                     'workload_settings': (
-                        'Minimum Days in a Row must be blank or at least 2. '
-                        'Leave it blank to allow solitary shifts.'
+                        'Minimum days in a row must be left blank or be 2 or greater.'
                     ),
                 })
 
@@ -1355,11 +1354,12 @@ class ContractSerializer(serializers.ModelSerializer):
                 ):
                     setattr(link, field, row[field])
                 link.save(update_fields=[
-                    'enabled', 'spread_violations',
+                    'enabled',
                     'min_value', 'max_value',
                     'min_penalty_weight', 'max_penalty_weight',
                     'max_same_shifts_in_row',
                     'max_same_shifts_in_row_penalty_weight', 'updated_at',
+                    'spread_violations',
                 ])
         for shared_rule in instance.shared_rules.all():
             sync_shared_rule_contract_settings(shared_rule)

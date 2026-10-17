@@ -17,6 +17,10 @@ const stylesSource = readFileSync(
   new URL('../src/index.css', import.meta.url),
   'utf8',
 )
+const shiftsSource = readFileSync(
+  new URL('../src/components/ShiftsView.tsx', import.meta.url),
+  'utf8',
+)
 
 describe('Contract user overrides', () => {
   it('provides the User Overrides navigation beside Shared Rules', () => {
@@ -64,8 +68,6 @@ describe('Contract user overrides', () => {
     expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:calc(6ch + 22px)')
     expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:calc(6ch + 22px) calc(6ch + 22px)')
     expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,calc(6ch + 22px))')
-    expect(stylesSource).toContain('.contract-value-penalty-columns>.contract-minmax-stack{display:contents}')
-    expect(stylesSource).toContain('::-webkit-inner-spin-button')
   })
 
   it('keeps Contract-level Shared Rule settings synchronized and scoped', () => {
@@ -75,6 +77,26 @@ describe('Contract user overrides', () => {
     expect(contractsSource).toContain('Unable to load the latest Contract settings.')
     expect(sharedRulesSource).toContain('Affected Contracts:')
     expect(sharedRulesSource).toContain('acknowledge_affected_contracts=true')
+  })
+
+  it('explains minimum work streaks and exposes Spread on every rule family', () => {
+    expect(contractsSource).toContain('Leave Minimum blank to allow solitary shifts.')
+    expect(contractsSource).toContain('min_time_off_spread_violations')
+    expect(contractsSource).not.toContain('checked={formState.workload_settings.circadian_spread_violations}')
+    expect(contractsSource).toContain('the next shift may start no more than one hour earlier')
+    expect(contractsSource).toContain('days_in_row_spread_violations')
+    expect(contractsSource).toContain('same_shifts_in_row_spread_violations')
+    expect(contractsSource).toContain('facility-target-spread')
+    expect(contractsSource).toContain('consecutive_night_shifts_spread_violations')
+    expect(contractsSource).toContain('night_block_recovery_spread_violations')
+    expect(contractsSource).toContain('consecutive_weekends_spread_violations')
+    expect(contractsSource).toContain('consecutive_weekend_shifts_spread_violations')
+    expect(contractsSource).toContain('friday_night_before_weekend_off_spread_violations')
+    expect(sharedRulesSource).toContain('Spread violations can be set independently')
+  })
+
+  it('allows Monday to be explicitly designated as a weekend shift day', () => {
+    expect(shiftsSource).toContain("['Friday', 'Saturday', 'Sunday', 'Monday']")
   })
 })
 

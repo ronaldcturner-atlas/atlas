@@ -262,6 +262,32 @@ class WeekendVolumeTests(SimpleTestCase):
         self.assertEqual(result['score'], 0)
         self.assertEqual(result['violations'], [])
 
+    def test_sunday_and_monday_designations_share_one_weekend(self):
+        result = self.report(
+            [date(2026, 12, 6), date(2026, 12, 7)],
+            [],
+            weekend_days=['Sunday', 'Monday'],
+            settings={
+                'max_consecutive_weekends': '1',
+                'max_consecutive_weekends_penalty_weight': '5000',
+            },
+        )
+        self.assertEqual(result['score'], 0)
+        self.assertEqual(result['violations'], [])
+
+    def test_sunday_and_monday_are_adjacent_weekend_shifts(self):
+        result = self.report(
+            [date(2026, 12, 6), date(2026, 12, 7)],
+            [],
+            weekend_days=['Sunday', 'Monday'],
+            settings={
+                'min_consecutive_weekend_shifts': '2',
+                'min_consecutive_weekend_shifts_penalty_weight': '5000',
+            },
+        )
+        self.assertEqual(result['score'], 0)
+        self.assertEqual(result['violations'], [])
+
     def test_minimum_consecutive_weekends_penalizes_each_short_streak(self):
         result = self.report(
             [date(2026, 12, 5), date(2026, 12, 19)],
@@ -290,6 +316,23 @@ class WeekendVolumeTests(SimpleTestCase):
         self.assertEqual(result['score'], 3000)
         self.assertEqual(result['violations'][0]['actual_value'], 3)
         self.assertEqual(result['violations'][0]['configured_limit'], 2)
+
+    def test_five_consecutive_weekends_against_maximum_three_scores_twice(self):
+        result = self.report(
+            [
+                date(2026, 10, 3), date(2026, 10, 10),
+                date(2026, 10, 17), date(2026, 10, 24),
+                date(2026, 10, 31),
+            ],
+            [],
+            settings={
+                'max_consecutive_weekends': '3',
+                'max_consecutive_weekends_penalty_weight': '4000',
+            },
+        )
+        self.assertEqual(result['score'], 8000)
+        self.assertEqual(result['violations'][0]['actual_value'], 5)
+        self.assertEqual(result['violations'][0]['configured_limit'], 3)
 
     def test_friday_night_before_complete_weekend_off_is_scored_per_weekend(self):
         result = self.report(

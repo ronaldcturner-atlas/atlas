@@ -146,7 +146,6 @@ type WorkloadSettings = {
   min_time_off_spread_violations: boolean
   circadian_enabled: boolean
   circadian_penalty_weight: string
-  circadian_spread_violations: boolean
   min_days_in_row: string
   min_days_in_row_penalty_weight: string
   max_days_in_row: string
@@ -320,7 +319,6 @@ function emptyFormState(): ContractFormState {
       min_time_off_spread_violations: false,
       circadian_enabled: false,
       circadian_penalty_weight: '',
-      circadian_spread_violations: false,
       min_days_in_row: '',
       min_days_in_row_penalty_weight: '',
       max_days_in_row: '',
@@ -534,6 +532,7 @@ function sanitizeFormPayload(formState: ContractFormState) {
   const workloadSettings = { ...formState.workload_settings } as Record<string, unknown>
   delete workloadSettings.min_same_shifts_in_row
   delete workloadSettings.min_same_shifts_in_row_penalty_weight
+  delete workloadSettings.circadian_spread_violations
   return {
     name: formState.name.trim(),
     domain: Number(formState.domain),
@@ -850,8 +849,8 @@ export default function ContractsView() {
 
     const minimumDays = formState.workload_settings.min_days_in_row.trim()
     if (minimumDays && Number(minimumDays) < 2) {
-      setError('Minimum Days in a Row must be blank or at least 2.')
       setActiveTab('workload')
+      setError('Minimum days in a row must be left blank or be 2 or greater.')
       return
     }
 
@@ -1316,7 +1315,7 @@ export default function ContractsView() {
                         <label className="contract-toggle-field contract-workload-toggle"><span>Enabled</span><input type="checkbox" checked={formState.workload_settings.circadian_enabled} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_enabled: event.target.checked } }))} /></label>
                         <label className="facility-field"><span>Penalty weight</span><input type="number" value={formState.workload_settings.circadian_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_penalty_weight: event.target.value } }))} /></label>
                       </div>
-                      <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={formState.workload_settings.circadian_spread_violations} onChange={(event) => setFormState((current) => ({ ...current, workload_settings: { ...current.workload_settings, circadian_spread_violations: event.target.checked } }))} /></label>
+                      <div className="contract-rule-help">On consecutive workdays, the next shift may start no more than one hour earlier than the prior day's shift. Minimum time off is evaluated separately.</div>
                     </div>
                     <div className="contract-additional-workload-card">
                       <div className="contract-minmax-title">Days in a row</div>
@@ -1455,7 +1454,6 @@ export default function ContractsView() {
                               <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_penalty_weight: event.target.value } : rule) }))} /></label>
                             </div>
                           </div>
-                          <label className="inline-checkbox-field"><span>Spread violations across applicable users</span><input type="checkbox" checked={sharedRule.spread_violations} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, spread_violations: event.target.checked } : rule) }))} /></label>
                           <div className="shared-rule-optional-streak">
                             <div className="shared-rule-optional-heading"><strong>Same shifts in a row</strong><span>Optional</span></div>
                             <div className="contract-value-penalty-row">
@@ -1463,6 +1461,7 @@ export default function ContractsView() {
                               <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" step="1" value={sharedRule.max_same_shifts_in_row_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, max_same_shifts_in_row_penalty_weight: event.target.value } : rule) }))} /></label>
                             </div>
                           </div>
+                          <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={sharedRule.spread_violations} onChange={(event) => setFormState((current) => ({ ...current, shared_rules: current.shared_rules.map((rule) => rule.id === sharedRule.id ? { ...rule, spread_violations: event.target.checked } : rule) }))} /></label>
                           </div>
                         </div>
                       ))}

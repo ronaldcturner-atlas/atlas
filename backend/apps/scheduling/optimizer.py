@@ -94,6 +94,7 @@ STRUCTURAL_DEEP_RESTART_MIN_REPAIRABLE_PENALTY = Decimal('10000')
 REPAIRABLE_SCORE_COMPONENTS = (
     'workload_score',
     'request_score',
+    'circadian_score',
     'same_shift_score',
     'shift_rule_score',
     'night_score',
@@ -1030,6 +1031,7 @@ def _workload_score_rows(physicians, instances, state, physician_hours, physicia
                         'penalty_weight': float(penalty_weight),
                         'score_contribution': float(contribution),
                         'score_contribution_exact': str(contribution),
+                        'spread_violations': bool(rule.get('spread_violations')),
                     }
                 )
         primary_rule = rule_rows[0] if rule_rows else None
@@ -1474,7 +1476,7 @@ def _validate_schedule(
 
 
 def _streak_excess_score(sorted_dates, max_streak, penalty):
-    """Charge once for each adjacent-date streak above the maximum."""
+    """Charge once for each adjacent-date streak longer than ``max_streak``."""
     if not sorted_dates:
         return Decimal('0')
     score = Decimal('0')
@@ -1494,11 +1496,24 @@ def _streak_excess_score(sorted_dates, max_streak, penalty):
 
 
 def _streak_shortfall_score(sorted_dates, min_streak, penalty):
-    """Charge once for each adjacent-date streak below the minimum."""
-    return sum(
-        (penalty for streak in _adjacent_date_streaks(sorted_dates) if len(streak) < min_streak),
-        Decimal('0'),
-    )
+    """Charge once for each completed adjacent-date streak below the minimum."""
+    ordered_dates = sorted(set(sorted_dates))
+    if not ordered_dates:
+        return Decimal('0')
+    score = Decimal('0')
+    streak = 1
+    previous_date = ordered_dates[0]
+    for current_date in ordered_dates[1:]:
+        if current_date == previous_date + timedelta(days=1):
+            streak += 1
+        else:
+            if streak < min_streak:
+                score += penalty
+            streak = 1
+        previous_date = current_date
+    if streak < min_streak:
+        score += penalty
+    return score
 
 
 def _workload_rule_limit(contract, key, default):
@@ -2166,7 +2181,6 @@ def _night_violation_report(
                 and min_consecutive_penalty > 0
                 and len(block) < min_consecutive
             ):
-                shortfall = min_consecutive - len(block)
                 penalty = min_consecutive_penalty
                 score += penalty
                 violations.append(
@@ -2266,8 +2280,7 @@ def _night_violation_report(
                     continue
                 actual_days_off = _full_calendar_days_between(block_end.date, next_assignment.date)
                 if actual_days_off < days_after:
-                    shortfall = days_after - actual_days_off
-                    penalty = Decimal(shortfall) * days_after_penalty
+                    penalty = days_after_penalty
                     score += penalty
                     violations.append(
                         {
@@ -2323,8 +2336,7 @@ def _night_violation_report(
                 next_block_start = next_block[0]
                 actual_days_off = _full_calendar_days_between(prior_block_end.date, next_block_start.date)
                 if actual_days_off < days_before_next_night_block:
-                    shortfall = days_before_next_night_block - actual_days_off
-                    penalty = Decimal(shortfall) * days_before_next_night_block_penalty
+                    penalty = days_before_next_night_block_penalty
                     score += penalty
                     violations.append(
                         {
@@ -2751,12 +2763,9 @@ def _is_weekend_designated(instance):
     return day.strftime('%A') in (getattr(template, 'weekend_days', None) or [])
 
 
-def _weekend_cycle_start(day):
-    """Group a designated Monday with the immediately preceding weekend."""
-    week_start = day - timedelta(days=day.weekday())
-    if day.weekday() == 0:
-        return week_start - timedelta(days=7)
-    return week_start
+def _weekend_anchor(day):
+    """Group an administrator-designated Friday-through-Monday weekend."""
+    return day - timedelta(days=(day.weekday() - 1) % 7)
 
 
 def _published_weekend_lookback_days(contracts):
@@ -2918,8 +2927,8 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
     Volume rules are evaluated once per configured calendar month or schedule
     block.  Consecutive-weekend-shift rules are evaluated once per contiguous
     block of weekend-designated shift dates.  Consecutive-weekend rules are
-    evaluated once per streak of calendar weekends containing at least one
-    weekend-designated assignment.
+    evaluated once per streak of Friday-through-Monday weekend anchors
+    containing at least one explicitly weekend-designated assignment.
     """
     assigned = defaultdict(list)
     for instance in instances:
@@ -3030,8 +3039,8 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                         actual - limit - max(prior_count - limit, 0),
                         0,
                     )
-                # Adjacent weekend-shift blocks are streak rules: a short or
-                # long block is one violation regardless of its magnitude.
+                # Adjacent weekend-shift blocks are streak rules: each short
+                # or long block is one violation, regardless of magnitude.
                 penalty = weight if deviation else Decimal('0')
                 score += penalty
                 if details and penalty:
@@ -3054,12 +3063,12 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                         ),
                     })
 
-        # A weekend is keyed to the Monday before its Friday-Sunday dates. A
-        # designated Monday remains part of that immediately preceding
-        # weekend. Multiple assignments in the cycle count as one weekend.
+        # A weekend is keyed by its Tuesday-starting seven-day frame so an
+        # explicitly designated Friday, Saturday, Sunday, or Monday belongs
+        # to the same weekend. Multiple assignments still count once.
         instances_by_weekend = defaultdict(list)
         for instance in streak_assignments:
-            weekend_start = _weekend_cycle_start(instance.date)
+            weekend_start = _weekend_anchor(instance.date)
             instances_by_weekend[weekend_start].append(instance)
         weekend_streaks = []
         current_streak = []
@@ -3112,9 +3121,9 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                         - max(prior_weekend_count - limit, 0),
                         0,
                     )
-                # A short completed weekend sequence is one minimum
-                # violation. Each additional weekend beyond the maximum is a
-                # separate maximum violation.
+                # A short completed weekend streak is one violation. A long
+                # streak remains cumulative: every additional weekend beyond
+                # the maximum is a new violation.
                 penalty = (
                     weight if side == 'min' and deviation
                     else Decimal(deviation) * weight
@@ -3337,10 +3346,10 @@ def _repair_weekend_support_swaps(
     def joins_configured_weekend(day, existing_days):
         if any(abs((day - other_day).days) == 1 for other_day in existing_days):
             return True
-        day_week = day - timedelta(days=day.weekday())
+        day_week = _weekend_anchor(day)
         return any(
             abs((day_week - (
-                other_day - timedelta(days=other_day.weekday())
+                _weekend_anchor(other_day)
             )).days) == 7
             for other_day in existing_days
         )
@@ -3527,11 +3536,9 @@ def _repair_weekend_support_swaps(
                     and (
                         not _is_weekend_designated(right_instance)
                         or abs((
-                            right_instance.date
-                            - timedelta(days=right_instance.date.weekday())
+                            _weekend_anchor(right_instance.date)
                             - (
-                                anchor_instance.date
-                                - timedelta(days=anchor_instance.date.weekday())
+                                _weekend_anchor(anchor_instance.date)
                             )
                         ).days) != 7
                     )
@@ -4171,7 +4178,6 @@ def _shift_period_report(instances, physicians, state, contracts, details=False)
                 for streak_dates in _adjacent_date_streaks(matching_by_date):
                     if len(streak_dates) <= maximum:
                         continue
-                    excess = len(streak_dates) - maximum
                     penalty = same_shift_penalty
                     score += penalty
                     if details:
@@ -4778,6 +4784,231 @@ def _proportionality_priority_value(scoring):
     )
 
 
+def _settings_have_spread_rule(value):
+    if isinstance(value, dict):
+        return any(
+            (
+                (
+                    key != 'circadian_spread_violations'
+                    and (key == 'spread_violations' or key.endswith('_spread_violations'))
+                )
+                and bool(item)
+            )
+            or _settings_have_spread_rule(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_settings_have_spread_rule(item) for item in value)
+    return False
+
+
+def _violation_spread_enabled(contract, violation):
+    """Resolve the Spread toggle for one authoritative violation row."""
+    violation_type = violation.get('violation_type') or ''
+    workload = contract.workload_settings if isinstance(contract.workload_settings, dict) else {}
+    nights = contract.night_settings if isinstance(contract.night_settings, dict) else {}
+    weekends = contract.weekend_settings if isinstance(contract.weekend_settings, dict) else {}
+
+    scalar_keys = {
+        'SAME_SHIFT_STREAK': ('workload', 'same_shifts_in_row_spread_violations'),
+        'MIN_CONSECUTIVE_DAYS': ('workload', 'days_in_row_spread_violations'),
+        'MAX_CONSECUTIVE_DAYS': ('workload', 'days_in_row_spread_violations'),
+        'INSUFFICIENT_REST': ('workload', 'min_time_off_spread_violations'),
+        'MIN_CONSECUTIVE_NIGHTS': ('nights', 'consecutive_night_shifts_spread_violations'),
+        'MAX_CONSECUTIVE_NIGHTS': ('nights', 'consecutive_night_shifts_spread_violations'),
+        'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NON_NIGHT': ('nights', 'night_block_recovery_spread_violations'),
+        'INSUFFICIENT_DAYS_OFF_AFTER_NIGHT_BEFORE_NEXT_NIGHT_BLOCK': ('nights', 'night_block_recovery_spread_violations'),
+        'MIN_CONSECUTIVE_WEEKENDS': ('weekends', 'consecutive_weekends_spread_violations'),
+        'MAX_CONSECUTIVE_WEEKENDS': ('weekends', 'consecutive_weekends_spread_violations'),
+        'MIN_CONSECUTIVE_WEEKEND_SHIFTS': ('weekends', 'consecutive_weekend_shifts_spread_violations'),
+        'MAX_CONSECUTIVE_WEEKEND_SHIFTS': ('weekends', 'consecutive_weekend_shifts_spread_violations'),
+        'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF': ('weekends', 'friday_night_before_weekend_off_spread_violations'),
+    }
+    setting = scalar_keys.get(violation_type)
+    if setting:
+        settings = {'workload': workload, 'nights': nights, 'weekends': weekends}[setting[0]]
+        return bool(settings.get(setting[1]))
+
+    if violation_type.startswith('NIGHT_'):
+        return any(
+            bool(rule.get('spread_violations'))
+            and (rule.get('period_type') or 'SCHEDULE_BLOCK') == violation.get('period_type')
+            for rule in nights.get('period_rules') or []
+            if isinstance(rule, dict)
+        )
+    if violation_type.startswith('WEEKEND_'):
+        return any(
+            bool(rule.get('spread_violations'))
+            and (rule.get('period_type') or 'SCHEDULE_BLOCK') == violation.get('period_type')
+            for rule in weekends.get('period_rules') or []
+            if isinstance(rule, dict)
+        )
+
+    if violation_type.startswith('FACILITY_RULE_'):
+        facility_settings = contract.facility_settings if isinstance(contract.facility_settings, dict) else {}
+        return any(
+            int(group.get('facility_id') or 0) == int(violation.get('facility_id') or 0)
+            and any(
+                bool(rule.get('spread_violations'))
+                and (rule.get('period_type') or 'SCHEDULE_BLOCK') == violation.get('period_type')
+                for rule in group.get('period_rules') or []
+                if isinstance(rule, dict)
+            )
+            for group in facility_settings.get('rules') or []
+            if isinstance(group, dict)
+        )
+    if violation_type.startswith('SHIFT_GROUP_'):
+        shift_settings = contract.shift_settings if isinstance(contract.shift_settings, dict) else {}
+        for group in shift_settings.get('rules') or []:
+            if not isinstance(group, dict):
+                continue
+            if (group.get('label') or '') != (violation.get('shift_rule_label') or ''):
+                continue
+            if violation_type == 'SHIFT_GROUP_SAME_SHIFT_STREAK':
+                return bool(group.get('spread_violations'))
+            return any(
+                bool(rule.get('spread_violations'))
+                and (rule.get('period_type') or 'SCHEDULE_BLOCK') == violation.get('period_type')
+                for rule in group.get('period_rules') or []
+                if isinstance(rule, dict)
+            )
+    return False
+
+
+def _spread_priority_from_rows(rows, contract_by_physician):
+    """Return repeat-violation depth without changing official penalties.
+
+    A physician's first violation for a rule contributes zero. The second
+    contributes one, the third contributes two more, and so on. Minimizing
+    this value therefore exhausts the first violation tier across applicable
+    users before assigning a second tier to any one user.
+    """
+    depths = defaultdict(lambda: defaultdict(Decimal))
+    for row in rows:
+        physician_id = row.get('physician_id')
+        contract = contract_by_physician.get(physician_id)
+        if contract is None or not (
+            bool(row.get('spread_violations'))
+            or _violation_spread_enabled(contract, row)
+        ):
+            continue
+        weight = Decimal(str(row.get('penalty_weight') or 0))
+        penalty = Decimal(str(
+            row.get('penalty') or row.get('penalty_amount')
+            or row.get('score_contribution') or 0
+        ))
+        if weight <= 0 or penalty <= 0:
+            continue
+        depth = max(penalty / weight, Decimal('1'))
+        group_key = (
+            row.get('violation_type'), row.get('period_type'),
+            row.get('rule_area'), row.get('facility_id'),
+            row.get('shift_rule_label'), row.get('units'),
+        )
+        depths[group_key][physician_id] += depth
+    return sum(
+        (depth * (depth - 1) / Decimal('2')
+         for users in depths.values() for depth in users.values()),
+        Decimal('0'),
+    )
+
+
+def _spread_priority_value(scoring):
+    return scoring.get('spread_priority_score', Decimal('0'))
+
+
+def _secondary_priority_value(scoring):
+    return (
+        _spread_priority_value(scoring),
+        _proportionality_priority_value(scoring),
+    )
+
+
+def _circadian_violation_report(
+    instances, physicians, state, contract_by_physician, *, details=False,
+):
+    """Score backward rotation beyond the fixed one-hour allowance.
+
+    The circadian floor is the prior assignment's start plus 23 hours. This
+    permits a shift on the next work date to start one hour earlier while
+    remaining independent of the separate minimum-rest rule. Same-date
+    assignments are not circadian transitions, and a long enough gap resets
+    the comparison naturally.
+    """
+    instances_by_id = {instance.id: instance for instance in instances}
+    current_by_physician = defaultdict(list)
+    for instance_id, physician_ids in state.items():
+        instance = instances_by_id.get(instance_id)
+        if instance is None:
+            continue
+        for physician_id in physician_ids:
+            current_by_physician[physician_id].append(instance)
+
+    boundary_context = _published_boundary_context(instances)
+    score = Decimal('0')
+    violations = []
+    for physician in physicians:
+        contract = contract_by_physician.get(physician.id)
+        if contract is None:
+            continue
+        settings = (
+            contract.workload_settings
+            if isinstance(contract.workload_settings, dict)
+            else {}
+        )
+        weight = _configured_positive_penalty(
+            settings, 'circadian_penalty_weight', Decimal('0'),
+        )
+        if not settings.get('circadian_enabled') or weight <= 0:
+            continue
+
+        current_instances = current_by_physician.get(physician.id, [])
+        current_ids = {instance.id for instance in current_instances}
+        ordered = sorted(
+            [*boundary_context.get(physician.id, ()), *current_instances],
+            key=lambda instance: (
+                instance.start_datetime, instance.end_datetime, instance.id,
+            ),
+        )
+        for left, right in zip(ordered, ordered[1:]):
+            if left.date == right.date or right.id not in current_ids:
+                continue
+            circadian_floor = left.start_datetime + timedelta(hours=23)
+            if right.start_datetime >= circadian_floor:
+                continue
+            score += weight
+            if not details:
+                continue
+            shortfall_hours = Decimal(str(
+                (circadian_floor - right.start_datetime).total_seconds() / 3600
+            ))
+            violations.append({
+                'physician_id': physician.id,
+                'physician': _physician_display_name(physician),
+                **_contract_rule_identity(contract),
+                'violation_type': 'CIRCADIAN_BACKWARD_ROTATION',
+                'period_type': 'SHIFT_TRANSITION',
+                'period_start': left.date.isoformat(),
+                'period_end': right.date.isoformat(),
+                'dates_involved': [left.date.isoformat(), right.date.isoformat()],
+                'assignment_details': [
+                    _assignment_debug_payload(left),
+                    _assignment_debug_payload(right),
+                ],
+                'shift_instance_ids': [left.id, right.id],
+                'configured_limit': '1-hour backward start-time allowance',
+                'actual_value': float(shortfall_hours),
+                'units': 'HOURS_BEFORE_CIRCADIAN_FLOOR',
+                'penalty_weight': float(weight),
+                'penalty': float(weight),
+                'explanation': (
+                    'The next assignment begins more than one hour earlier '
+                    'than the prior assignment\'s start-time phase.'
+                ),
+            })
+    return {'score': score, 'violations': violations}
+
+
 def _distribution_score(
     instances,
     physicians,
@@ -4925,12 +5156,12 @@ def _distribution_score(
         max_days_penalty = _decimal_or_none(
             workload_settings.get('max_days_in_row_penalty_weight')
         )
-        if any((
-            min_days is not None and min_days >= 2
-            and min_days_penalty is not None and min_days_penalty > 0,
-            max_days is not None and max_days > 0
-            and max_days_penalty is not None and max_days_penalty > 0,
-        )):
+        if (
+            (min_days is not None and min_days >= 2
+             and min_days_penalty is not None and min_days_penalty > 0)
+            or (max_days is not None and max_days > 0
+                and max_days_penalty is not None and max_days_penalty > 0)
+        ):
             current_dates = {instance.date for instance in physician_instances}
             prior_dates = {
                 instance.date
@@ -4940,26 +5171,31 @@ def _distribution_score(
             }
             # Charge only the incremental excess introduced inside this block.
             # A prior-block excess is context, not a debt transferred forward.
-            combined_score = Decimal('0')
-            prior_score = Decimal('0')
-            if min_days is not None and min_days >= 2 and min_days_penalty:
-                combined_score += _streak_shortfall_score(
+            if min_days is not None and min_days >= 2 and min_days_penalty and min_days_penalty > 0:
+                combined_minimum_score = _streak_shortfall_score(
                     sorted(current_dates | prior_dates), int(min_days), min_days_penalty,
                 )
-                prior_score += _streak_shortfall_score(
+                prior_minimum_score = _streak_shortfall_score(
                     sorted(prior_dates), int(min_days), min_days_penalty,
                 )
-            if max_days is not None and max_days > 0 and max_days_penalty:
-                combined_score += _streak_excess_score(
-                    sorted(current_dates | prior_dates), max(int(max_days), 1), max_days_penalty,
+                consecutive_days_score += max(
+                    combined_minimum_score - prior_minimum_score, Decimal('0'),
                 )
-                prior_score += _streak_excess_score(
-                    sorted(prior_dates), max(int(max_days), 1), max_days_penalty,
+            if max_days is not None and max_days > 0 and max_days_penalty and max_days_penalty > 0:
+                combined_score = _streak_excess_score(
+                    sorted(current_dates | prior_dates),
+                    max(int(max_days), 1),
+                    max_days_penalty,
                 )
-            consecutive_days_score += max(
-                combined_score - prior_score,
-                Decimal('0'),
-            )
+                prior_score = _streak_excess_score(
+                    sorted(prior_dates),
+                    max(int(max_days), 1),
+                    max_days_penalty,
+                )
+                consecutive_days_score += max(
+                    combined_score - prior_score,
+                    Decimal('0'),
+                )
 
         governed_ids = governed_template_ids(contract)
         unguided_assignments = [
@@ -5021,8 +5257,12 @@ def _distribution_score(
         include_internal_heuristics=False,
         default_target_override=default_night_target_override,
     )
+    circadian_report = _circadian_violation_report(
+        instances, physicians, state, contract_by_physician,
+    )
     return {
         'consecutive_days_score': consecutive_days_score,
+        'circadian_score': circadian_report['score'],
         'same_shift_score': same_shift_score,
         'shift_rule_score': _shift_period_report(
             instances, physicians, state, contract_by_physician,
@@ -5268,6 +5508,74 @@ def _score_schedule(
         state,
         scoring_contract_by_physician,
     )
+    spread_priority_score = Decimal('0')
+    if any(
+        _settings_have_spread_rule(settings)
+        for contract in scoring_contract_by_physician.values()
+        for settings in (
+            getattr(contract, 'workload_settings', {}),
+            getattr(contract, 'facility_settings', {}),
+            getattr(contract, 'shift_settings', {}),
+            getattr(contract, 'night_settings', {}),
+            getattr(contract, 'weekend_settings', {}),
+        )
+    ):
+        spread_rows = []
+        for workload_row in workload_score_rows:
+            for rule_row in workload_row.get('rule_rows') or []:
+                if Decimal(str(rule_row.get('score_contribution_exact') or 0)) <= 0:
+                    continue
+                spread_rows.append({
+                    **rule_row,
+                    'physician_id': workload_row['physician_id'],
+                    'violation_type': (
+                        'WORKLOAD_UNDER_MINIMUM'
+                        if rule_row.get('deviation_direction') == 'below_minimum'
+                        else 'WORKLOAD_OVER_MAXIMUM'
+                    ),
+                    'penalty': rule_row.get('score_contribution', 0),
+                    'rule_area': 'Workload',
+                })
+        spread_rows.extend(
+            {**row, 'violation_type': 'SAME_SHIFT_STREAK'}
+            for row in same_shift_violations
+        )
+        spread_rows.extend(
+            _shift_period_report(
+                instances, scoring_physicians, state,
+                scoring_contract_by_physician, details=True,
+            )['violations']
+        )
+        spread_rows.extend(
+            _night_violation_report(
+                instances, scoring_physicians, state,
+                scoring_contract_by_physician,
+            ).get('night_violations', ())
+        )
+        spread_rows.extend(
+            _weekend_volume_report(
+                instances, scoring_physicians, state,
+                scoring_contract_by_physician, details=True,
+            )['violations']
+        )
+        spread_rows.extend(
+            _consecutive_day_violation_rows(
+                instances, scoring_physicians, state,
+                scoring_contract_by_physician,
+            )
+        )
+        spread_rows.extend(_validate_schedule(
+            instances,
+            physicians,
+            state,
+            eligible_facilities_by_physician,
+            minimum_rest_by_physician,
+            manual_assignment_only_physician_ids,
+            details=True,
+        ).get('violations') or ())
+        spread_priority_score = _spread_priority_from_rows(
+            spread_rows, scoring_contract_by_physician,
+        )
     score = (
         coverage_score
         + workload_score
@@ -5301,6 +5609,9 @@ def _score_schedule(
         'workload_score_rows': workload_score_rows,
         'validation': validation,
         'same_shift_violations': same_shift_violations,
+        # Spread is a lexicographic fairness objective. It never changes the
+        # official penalty score and is considered before proportionality.
+        'spread_priority_score': spread_priority_score,
         # Proportionality is deliberately outside the authoritative penalty
         # breakdown.  It is a lexicographic tie-breaker only: optimizer moves
         # may lower it when, and only when, the official score does not rise.
@@ -5620,6 +5931,9 @@ def _selected_physician_score(
         'validation_score': validation_score,
         'consecutive_days_score': distribution_scores.get(
             'consecutive_days_score', Decimal('0'),
+        ),
+        'circadian_score': distribution_scores.get(
+            'circadian_score', Decimal('0'),
         ),
         'same_shift_score': distribution_scores.get(
             'same_shift_score', Decimal('0'),
@@ -7635,25 +7949,35 @@ def _solve_bounded_multi_physician_neighborhood(
                     1 - previous,
                     f'weekend_shift_start_{physician_id}_{day.isoformat()}',
                 )
+                complete = block_start
                 for offset in range(1, min_weekend_shifts):
-                    future = weekend_by_date.get(day + timedelta(days=offset), 0)
-                    missing = model_and(
-                        block_start,
-                        1 - future,
-                        f'weekend_shift_short_{physician_id}_{day.isoformat()}_{offset}',
+                    complete = model_and(
+                        complete,
+                        weekend_by_date.get(day + timedelta(days=offset), 0),
+                        f'weekend_shift_complete_{physician_id}_{day.isoformat()}_{offset}',
                     )
-                    objective_terms.append(
-                        int(min_weekend_shift_weight * 60) * missing
-                    )
+                short = model_and(
+                    block_start, 1 - complete,
+                    f'weekend_shift_short_{physician_id}_{day.isoformat()}',
+                )
+                objective_terms.append(int(min_weekend_shift_weight * 60) * short)
         if max_weekend_shifts and max_weekend_shift_weight > 0:
-            for start_index in range(max(len(all_dates) - max_weekend_shifts, 0)):
+            for start_index, start_day in enumerate(all_dates):
                 window = all_dates[start_index:start_index + max_weekend_shifts + 1]
+                if len(window) < max_weekend_shifts + 1:
+                    continue
                 if not all(
                     next_day == day + timedelta(days=1)
                     for day, next_day in zip(window, window[1:])
                 ):
                     continue
-                values = [weekend_by_date.get(day, 0) for day in window]
+                current = weekend_by_date.get(start_day, 0)
+                previous = weekend_by_date.get(start_day - timedelta(days=1), 0)
+                block_start = model_and(
+                    current, 1 - previous,
+                    f'weekend_shift_max_start_{physician_id}_{start_index}',
+                )
+                values = [block_start, *[weekend_by_date.get(day, 0) for day in window[1:]]]
                 if any(isinstance(value, int) and value == 0 for value in values):
                     continue
                 if all(isinstance(value, int) and value == 1 for value in values):
@@ -7667,19 +7991,15 @@ def _solve_bounded_multi_physician_neighborhood(
                 model.add(excess >= sum(values) - len(values) + 1)
                 objective_terms.append(int(max_weekend_shift_weight * 60) * excess)
 
-        weekend_candidate_dates = sorted({
-            instance.date for instance in instances
-            if _is_weekend_designated(instance)
-        })
         weekend_starts = sorted({
-            _weekend_cycle_start(day) for day in weekend_candidate_dates
+            _weekend_anchor(day)
+            for day in all_dates
         })
         worked_weekend = {
             weekend_start: model_or(
                 [
-                    weekend_by_date.get(day, 0)
-                    for day in weekend_candidate_dates
-                    if _weekend_cycle_start(day) == weekend_start
+                    weekend_by_date.get(weekend_start + timedelta(days=offset), 0)
+                    for offset in range(7)
                 ],
                 f'worked_weekend_{physician_id}_{weekend_start.isoformat()}',
             )
@@ -7710,16 +8030,20 @@ def _solve_bounded_multi_physician_neighborhood(
                     1 - previous,
                     f'weekend_streak_start_{physician_id}_{weekend_start.isoformat()}',
                 )
+                complete = streak_start
                 for offset in range(1, min_weekends):
-                    future = worked_weekend.get(
-                        weekend_start + timedelta(days=7 * offset), 0,
+                    complete = model_and(
+                        complete,
+                        worked_weekend.get(
+                            weekend_start + timedelta(days=7 * offset), 0,
+                        ),
+                        f'weekend_streak_complete_{physician_id}_{weekend_start.isoformat()}_{offset}',
                     )
-                    missing = model_and(
-                        streak_start,
-                        1 - future,
-                        f'weekend_streak_short_{physician_id}_{weekend_start.isoformat()}_{offset}',
-                    )
-                    objective_terms.append(int(min_weekends_weight * 60) * missing)
+                short = model_and(
+                    streak_start, 1 - complete,
+                    f'weekend_streak_short_{physician_id}_{weekend_start.isoformat()}',
+                )
+                objective_terms.append(int(min_weekends_weight * 60) * short)
         if max_weekends and max_weekends_weight > 0:
             for start_index in range(max(len(weekend_starts) - max_weekends, 0)):
                 window = weekend_starts[start_index:start_index + max_weekends + 1]
@@ -7787,9 +8111,7 @@ def _solve_bounded_multi_physician_neighborhood(
                 )
                 objective_terms.append(int(friday_weight * 60) * violation)
 
-    # Exact excess-day formulation: each fully worked window of max+1
-    # consecutive dates contributes one configured penalty, matching
-    # _streak_excess_score for longer streaks as overlapping windows.
+    # Each overlong adjacent-date streak contributes exactly one penalty.
     for physician_id in cohort_ids:
         if deadline_reached('create_consecutive_day_constraints'):
             return _copy_state(state), scoring, debug
@@ -7813,7 +8135,18 @@ def _solve_bounded_multi_physician_neighborhood(
                 for day, next_day in zip(window, window[1:])
             ):
                 continue
-            values = [worked_by_physician_date[physician_id, day] for day in window]
+            current = worked_by_physician_date[physician_id, window[0]]
+            previous = worked_by_physician_date.get(
+                (physician_id, window[0] - timedelta(days=1)), 0,
+            )
+            streak_start = model_and(
+                current, 1 - previous,
+                f'consecutive_day_start_{physician_id}_{start_index}',
+            )
+            values = [streak_start, *[
+                worked_by_physician_date[physician_id, day]
+                for day in window[1:]
+            ]]
             if all(isinstance(value, int) and value == 1 for value in values):
                 objective_terms.append(int(max_days_penalty * 60))
                 continue
@@ -7852,6 +8185,12 @@ def _solve_bounded_multi_physician_neighborhood(
                 assigned.append(sum(instance_vars) if instance_vars else 0)
             for start_index in range(max(len(assigned) - max_streak, 0)):
                 values = assigned[start_index:start_index + max_streak + 1]
+                previous = assigned[start_index - 1] if start_index else 0
+                streak_start = model_and(
+                    values[0], 1 - previous,
+                    f'same_shift_start_{physician_id}_{shift_template_id}_{start_index}',
+                )
+                values = [streak_start, *values[1:]]
                 if any(isinstance(value, int) and value == 0 for value in values):
                     continue
                 if all(isinstance(value, int) and value == 1 for value in values):
@@ -7966,11 +8305,18 @@ def _solve_bounded_multi_physician_neighborhood(
                 next_day == day + timedelta(days=1)
                 for day, next_day in zip(window, window[1:])
             ):
+                previous = night_by_date.get(window[0] - timedelta(days=1), 0)
+                block_start = model_and(
+                    night_by_date[window[0]], 1 - previous,
+                    f'night_max_start_{physician_id}_{start_index}',
+                )
                 excess = model.new_bool_var(
                     f'night_excess_{physician_id}_{start_index}'
                 )
                 model.add(
-                    excess >= sum(night_by_date[day] for day in window) - max_consecutive
+                    excess >= block_start + sum(
+                        night_by_date[day] for day in window[1:]
+                    ) - max_consecutive
                 )
                 objective_terms.append(
                     int(max_consecutive_penalty * 60) * excess
@@ -8008,40 +8354,41 @@ def _solve_bounded_multi_physician_neighborhood(
                 DEFAULT_CONSECUTIVE_NIGHTS_PENALTY,
             )
             for day, block_start in block_starts.items():
+                complete = block_start
                 for offset in range(1, min_consecutive):
-                    future = night_by_date.get(day + timedelta(days=offset), 0)
-                    missing = model.new_bool_var(
-                        f'night_short_{physician_id}_{day.isoformat()}_{offset}'
+                    complete = model_and(
+                        complete,
+                        night_by_date.get(day + timedelta(days=offset), 0),
+                        f'night_complete_{physician_id}_{day.isoformat()}_{offset}',
                     )
-                    model.add(missing >= block_start - future)
-                    objective_terms.append(
-                        int(min_consecutive_penalty * 60) * missing
-                    )
+                missing = model_and(
+                    block_start, 1 - complete,
+                    f'night_short_{physician_id}_{day.isoformat()}',
+                )
+                objective_terms.append(int(min_consecutive_penalty * 60) * missing)
 
-        # Model recovery penalties from the end of one night block. Summed
-        # threshold indicators reproduce the shortfall charged by the full
-        # scorer: the earlier the next assignment/block, the larger the cost.
+        # Recovery is an event rule: each too-early return is one violation,
+        # regardless of how many days short it is.
         days_after = _configured_positive_int(settings, 'days_off_after_night_block')
         days_after_weight = _configured_positive_penalty(
             settings, 'days_off_after_night_block_penalty_weight', Decimal('0'),
         )
         if days_after is not None and days_after_weight > 0:
             for day, block_end in block_ends.items():
-                for threshold in range(1, days_after + 1):
-                    nearby_non_night = model_or(
-                        [
-                            non_night_by_physician_date.get(
-                                (physician_id, day + timedelta(days=offset)), 0,
-                            )
-                            for offset in range(1, threshold + 1)
-                        ],
-                        f'non_night_within_{physician_id}_{day.isoformat()}_{threshold}',
-                    )
-                    violation = model_and(
-                        block_end, nearby_non_night,
-                        f'night_recovery_{physician_id}_{day.isoformat()}_{threshold}',
-                    )
-                    objective_terms.append(int(days_after_weight * 60) * violation)
+                nearby_non_night = model_or(
+                    [
+                        non_night_by_physician_date.get(
+                            (physician_id, day + timedelta(days=offset)), 0,
+                        )
+                        for offset in range(1, days_after + 1)
+                    ],
+                    f'non_night_within_{physician_id}_{day.isoformat()}',
+                )
+                violation = model_and(
+                    block_end, nearby_non_night,
+                    f'night_recovery_{physician_id}_{day.isoformat()}',
+                )
+                objective_terms.append(int(days_after_weight * 60) * violation)
 
         days_before = _configured_positive_int(
             settings, 'days_off_before_next_night_shift',
@@ -8051,19 +8398,18 @@ def _solve_bounded_multi_physician_neighborhood(
         )
         if days_before is not None and days_before_weight > 0:
             for day, block_end in block_ends.items():
-                for threshold in range(2, days_before + 1):
-                    nearby_block_start = model_or(
-                        [
-                            block_starts.get(day + timedelta(days=offset), 0)
-                            for offset in range(2, threshold + 1)
-                        ],
-                        f'next_night_within_{physician_id}_{day.isoformat()}_{threshold}',
-                    )
-                    violation = model_and(
-                        block_end, nearby_block_start,
-                        f'next_night_recovery_{physician_id}_{day.isoformat()}_{threshold}',
-                    )
-                    objective_terms.append(int(days_before_weight * 60) * violation)
+                nearby_block_start = model_or(
+                    [
+                        block_starts.get(day + timedelta(days=offset), 0)
+                        for offset in range(2, days_before + 1)
+                    ],
+                    f'next_night_within_{physician_id}_{day.isoformat()}',
+                )
+                violation = model_and(
+                    block_end, nearby_block_start,
+                    f'next_night_recovery_{physician_id}_{day.isoformat()}',
+                )
+                objective_terms.append(int(days_before_weight * 60) * violation)
 
     # Ordinary repair prefers assignment stability. During a diversified
     # restart, signed tie weights deliberately produce a different solution
@@ -9212,7 +9558,9 @@ def _violation_explanation(violation_type):
     explanations = {
         'SAME_SHIFT_STREAK': 'Physician is assigned to too many consecutive occurrences of the same shift template.',
         'SHIFT_GROUP_SAME_SHIFT_STREAK': 'Physician is assigned to shifts from the selected Shift Group on too many adjacent calendar days.',
+        'MIN_CONSECUTIVE_DAYS': 'Physician is assigned a work streak shorter than the configured minimum.',
         'MAX_CONSECUTIVE_DAYS': 'Physician is assigned to more consecutive workdays than configured.',
+        'CIRCADIAN_BACKWARD_ROTATION': 'The next assignment starts more than one hour earlier than the prior assignment\'s start-time phase.',
         'INSUFFICIENT_REST': 'Physician has less time off between assignments than configured.',
         'OVERLAPPING_ASSIGNMENTS': 'Physician is assigned to shifts whose times overlap.',
         'DUPLICATE_ASSIGNMENT': 'Physician is assigned more than once to the same shift.',
@@ -9242,8 +9590,10 @@ def _violation_score_component(violation_type):
     violation_type = violation_type or ''
     if violation_type == 'SAME_SHIFT_STREAK':
         return 'same_shift_score'
-    if violation_type == 'MAX_CONSECUTIVE_DAYS':
+    if violation_type in {'MIN_CONSECUTIVE_DAYS', 'MAX_CONSECUTIVE_DAYS'}:
         return 'consecutive_days_score'
+    if violation_type == 'CIRCADIAN_BACKWARD_ROTATION':
+        return 'circadian_score'
     if violation_type == 'INSUFFICIENT_REST':
         return 'rest_score'
     if violation_type == 'OVERLAPPING_ASSIGNMENTS':
@@ -9290,21 +9640,27 @@ def _consecutive_day_violation_rows(
             if isinstance(contract.workload_settings, dict)
             else {}
         )
-        limits = {
-            'min': (
-                _decimal_or_none(settings.get('min_days_in_row')),
-                _decimal_or_none(settings.get('min_days_in_row_penalty_weight')),
-            ),
-            'max': (
-                _decimal_or_none(settings.get('max_days_in_row')),
-                _decimal_or_none(settings.get('max_days_in_row_penalty_weight')),
-            ),
-        }
-        if not any(
-            limit is not None and limit > (1 if side == 'min' else 0)
-            and weight is not None and weight > 0
-            for side, (limit, weight) in limits.items()
-        ):
+        configured_minimum = _decimal_or_none(settings.get('min_days_in_row'))
+        minimum_penalty = _decimal_or_none(
+            settings.get('min_days_in_row_penalty_weight')
+        )
+        configured_maximum = _decimal_or_none(settings.get('max_days_in_row'))
+        maximum_penalty = _decimal_or_none(
+            settings.get('max_days_in_row_penalty_weight')
+        )
+        minimum = (
+            int(configured_minimum)
+            if configured_minimum is not None and configured_minimum >= 2
+            and minimum_penalty is not None and minimum_penalty > 0
+            else None
+        )
+        maximum = (
+            max(int(configured_maximum), 1)
+            if configured_maximum is not None and configured_maximum > 0
+            and maximum_penalty is not None and maximum_penalty > 0
+            else None
+        )
+        if minimum is None and maximum is None:
             continue
         current_instances = current_by_physician.get(physician.id, [])
         current_dates = {instance.date for instance in current_instances}
@@ -9329,73 +9685,88 @@ def _consecutive_day_violation_rows(
             instances_by_date[instance.date].append(instance)
 
         for streak_dates in streaks:
-            for side, (configured_limit, penalty_weight) in limits.items():
-                if (
-                    configured_limit is None
-                    or configured_limit <= (1 if side == 'min' else 0)
-                    or penalty_weight is None or penalty_weight <= 0
-                ):
-                    continue
-                limit = int(configured_limit)
-                violates = (
-                    len(streak_dates) < limit
-                    if side == 'min'
-                    else len(streak_dates) > limit
-                )
-                if not violates:
-                    continue
-
-                streak_prior_dates = sorted(
-                    assigned_date for assigned_date in streak_dates
-                    if assigned_date in prior_dates
-                )
-                prior_violated = bool(streak_prior_dates) and (
-                    len(streak_prior_dates) < limit
-                    if side == 'min'
-                    else len(streak_prior_dates) > limit
-                )
-                if prior_violated:
-                    continue
-
-                involved_instances = sorted(
-                    (
-                        instance
-                        for assigned_date in streak_dates
-                        for instance in instances_by_date[assigned_date]
-                    ),
-                    key=lambda instance: (
-                        instance.date, instance.start_datetime, instance.id,
-                    ),
-                )
+            actual = len(streak_dates)
+            streak_prior_dates = sorted(
+                assigned_date
+                for assigned_date in streak_dates
+                if assigned_date in prior_dates
+            )
+            involved_instances = sorted(
+                (
+                    instance
+                    for assigned_date in streak_dates
+                    for instance in instances_by_date[assigned_date]
+                ),
+                key=lambda instance: (
+                    instance.date, instance.start_datetime, instance.id,
+                ),
+            )
+            if minimum is not None and actual < minimum:
+                penalty = minimum_penalty
                 rows.append({
-                    'physician_id': physician.id,
-                    'physician': _physician_display_name(physician),
-                    **_contract_rule_identity(contract),
-                    'violation_type': f'{side.upper()}_CONSECUTIVE_DAYS',
-                    'period_type': 'SCHEDULE_BLOCK',
-                    'period_start': instances[0].schedule_block.start_date.isoformat()
-                    if instances else None,
-                    'period_end': instances[0].schedule_block.end_date.isoformat()
-                    if instances else None,
-                    'dates_involved': [
-                        assigned_date.isoformat() for assigned_date in streak_dates
-                    ],
-                    'assignment_details': [
-                        _assignment_debug_payload(instance)
-                        for instance in involved_instances
-                    ],
-                    'shift_instance_ids': [instance.id for instance in involved_instances],
-                    'configured_limit': limit,
-                    'actual_value': len(streak_dates),
-                    'units': 'DAYS',
-                    'penalty_weight': float(penalty_weight),
-                    'penalty': float(penalty_weight),
-                    'explanation': (
-                        f'Physician worked {len(streak_dates)} consecutive days; '
-                        f'the configured {"minimum" if side == "min" else "maximum"} '
-                        f'is {limit}. This streak is penalized once.'
-                    ),
-                })
+                'physician_id': physician.id,
+                'physician': _physician_display_name(physician),
+                **_contract_rule_identity(contract),
+                'violation_type': 'MIN_CONSECUTIVE_DAYS',
+                'period_type': 'SCHEDULE_BLOCK',
+                'period_start': instances[0].schedule_block.start_date.isoformat()
+                if instances else None,
+                'period_end': instances[0].schedule_block.end_date.isoformat()
+                if instances else None,
+                'dates_involved': [day.isoformat() for day in streak_dates],
+                'assignment_details': [_assignment_debug_payload(item) for item in involved_instances],
+                'shift_instance_ids': [item.id for item in involved_instances],
+                'configured_limit': minimum,
+                'actual_value': actual,
+                'units': 'DAYS',
+                'penalty_weight': float(minimum_penalty),
+                'penalty': float(penalty),
+                'explanation': (
+                    f'Work streak contains {actual} consecutive day(s); '
+                    f'the configured minimum is {minimum}.'
+                ),
+            })
+            if maximum is None or actual <= maximum:
+                continue
+            prior_violation = bool(
+                streak_prior_dates
+                and _streak_excess_score(
+                    streak_prior_dates, maximum, Decimal('1'),
+                )
+            )
+            if prior_violation:
+                continue
+            penalty = maximum_penalty
+            rows.append({
+                'physician_id': physician.id,
+                'physician': _physician_display_name(physician),
+                **_contract_rule_identity(contract),
+                'violation_type': 'MAX_CONSECUTIVE_DAYS',
+                'period_type': 'SCHEDULE_BLOCK',
+                'period_start': instances[0].schedule_block.start_date.isoformat()
+                if instances else None,
+                'period_end': instances[0].schedule_block.end_date.isoformat()
+                if instances else None,
+                'dates_involved': [
+                    assigned_date.isoformat() for assigned_date in streak_dates
+                ],
+                'assignment_details': [
+                    _assignment_debug_payload(instance)
+                    for instance in involved_instances
+                ],
+                'shift_instance_ids': [
+                    instance.id for instance in involved_instances
+                ],
+                'configured_limit': maximum,
+                'actual_value': actual,
+                'units': 'DAYS',
+                'penalty_weight': float(maximum_penalty),
+                'penalty': float(penalty),
+                'explanation': (
+                    f'Physician worked {actual} consecutive days, exceeding '
+                    f'the configured maximum of {maximum}.'
+                ),
+            })
     return rows
 
 
@@ -9560,6 +9931,7 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
     rows = {}
     component_details = {
         'workload_score': ('Workload', 'Workload range'),
+        'circadian_score': ('Workload', 'Circadian rhythm'),
         'same_shift_score': ('Workload', 'Maximum same shifts in a row'),
         'shift_rule_score': ('Shifts', 'Shift-group limits'),
         'night_score': ('Night', 'Night rules'),
@@ -9568,7 +9940,7 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
         'coverage_score': ('Schedule validity', 'Required staffing coverage'),
         'rest_score': ('Schedule validity', 'Minimum time off'),
         'overlap_score': ('Schedule validity', 'Overlapping assignments'),
-        'consecutive_days_score': ('Workload', 'Maximum consecutive days'),
+        'consecutive_days_score': ('Workload', 'Days in a row'),
         'underutilization_score': ('Schedule validity', 'Zero-shift underutilization'),
         'invalid_assignment_score': ('Schedule validity', 'Invalid assignments'),
     }
@@ -9603,6 +9975,26 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
     # Seed every configured Shifts- and Night-tab scoring rule, including
     # rules with a zero penalty in the viewed schedule block.
     for contract in contracts:
+        workload_settings = (
+            contract.workload_settings
+            if isinstance(contract.workload_settings, dict) else {}
+        )
+        if (
+            workload_settings.get('circadian_enabled')
+            and _configured_positive_penalty(
+                workload_settings, 'circadian_penalty_weight', Decimal('0'),
+            ) > 0
+        ):
+            configured = '1-hour backward start-time allowance'
+            add_row(
+                (
+                    'circadian_score', contract.name, 'Circadian rhythm',
+                    'SHIFT_TRANSITION', configured,
+                ),
+                'circadian_score', 'Workload', 'Circadian rhythm', 0,
+                contract_name=contract.name,
+                scope='SHIFT_TRANSITION', configured=configured,
+            )
         shift_settings = contract.shift_settings if isinstance(contract.shift_settings, dict) else {}
         for group_index, group in enumerate(shift_settings.get('rules') or []):
             if not isinstance(group, dict):
@@ -9763,6 +10155,8 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
             area, _fallback_name = component_details[component]
             area = violation.get('rule_area') or area
             rule_name = violation.get('shift_rule_label') or violation_type.replace('_', ' ').title()
+            if violation_type == 'CIRCADIAN_BACKWARD_ROTATION':
+                rule_name = 'Circadian rhythm'
             violation_contract_name = violation.get('contract_name') or contract_name
             configured_limit = violation.get('configured_limit')
             units = violation.get('units')
@@ -9782,7 +10176,7 @@ def _rule_summary_rows(users, score_breakdown, contracts=()):
     detailed_components = {
         'workload_score', 'same_shift_score', 'shift_rule_score',
         'night_score', 'weekend_score', 'request_score',
-        'consecutive_days_score', 'rest_score', 'overlap_score',
+        'consecutive_days_score', 'circadian_score', 'rest_score', 'overlap_score',
         'invalid_assignment_score',
     }
     for component, (area, rule_name) in component_details.items():
@@ -10165,6 +10559,33 @@ def build_violation_report(schedule_version, optimizer_run=None):
             'equal listed consecutive-day penalty rows.'
         )
 
+    circadian_report = _circadian_violation_report(
+        instances,
+        scoring_physicians,
+        state,
+        scoring_contract_by_physician,
+        details=True,
+    )
+    for violation in circadian_report['violations']:
+        physician_id = violation['physician_id']
+        if physician_id not in users:
+            continue
+        row = _report_violation_row(violation)
+        users[physician_id]['violations'].append(row)
+        users[physician_id]['total_score'] += row['penalty_amount'] or 0
+    score_audit['circadian_rows_total'] = float(circadian_report['score'])
+    score_audit['circadian_score'] = float(
+        scoring['breakdown']['circadian_score']
+    )
+    if (
+        abs(circadian_report['score'] - scoring['breakdown']['circadian_score'])
+        > Decimal('0.0001')
+    ):
+        score_audit['warnings'].append(
+            'Score/report mismatch detected: circadian_score does not equal '
+            'listed circadian penalty rows.'
+        )
+
     validation_report = _validate_schedule(
         instances,
         physicians,
@@ -10393,12 +10814,13 @@ def _should_preserve_timeout_result(
 
 
 def _result_priority(scoring, unfilled_shift_count):
-    """Rank validity and official score before proportional tie-breaking."""
+    """Rank validity, official score, Spread fairness, then proportionality."""
     complete_valid = unfilled_shift_count == 0 and not _has_hard_invalids(scoring)
     return (
         0 if complete_valid else 1,
         scoring.get('fixed_request_on_unmet', 0),
         scoring['score'],
+        _spread_priority_value(scoring),
         _proportionality_priority_value(scoring),
     )
 
@@ -10408,6 +10830,7 @@ def _optimization_priority(scoring):
     return (
         scoring.get('fixed_request_on_unmet', 0),
         scoring['score'],
+        _spread_priority_value(scoring),
         _proportionality_priority_value(scoring),
     )
 
@@ -10601,11 +11024,12 @@ def evaluate_plateau_pairwise_swap(
                 requests_by_physician_date, eligible_facilities_by_physician,
                 minimum_rest_by_physician,
             )
+        current_secondary = _secondary_priority_value(current_scoring)
+        trial_secondary = _secondary_priority_value(trial_scoring)
         proportionality_delta = (
-            _proportionality_priority_value(trial_scoring)
-            - _proportionality_priority_value(current_scoring)
+            trial_secondary[1] - current_secondary[1]
         )
-        proportionality_improved = proportionality_delta < 0
+        proportionality_improved = trial_secondary < current_secondary
     return {
         'legal': True,
         'improving': delta < 0 or proportionality_improved,
@@ -10716,11 +11140,12 @@ def evaluate_plateau_reassignment(
                 eligible_facilities_by_physician,
                 minimum_rest_by_physician,
             )
+        current_secondary = _secondary_priority_value(current_scoring)
+        trial_secondary = _secondary_priority_value(trial_scoring)
         proportionality_delta = (
-            _proportionality_priority_value(trial_scoring)
-            - _proportionality_priority_value(current_scoring)
+            trial_secondary[1] - current_secondary[1]
         )
-        proportionality_improved = proportionality_delta < 0
+        proportionality_improved = trial_secondary < current_secondary
     return {
         'legal': True,
         'improving': delta < 0 or proportionality_improved,
@@ -11679,7 +12104,7 @@ def optimize_schedule_version(
                     if _is_weekend_designated(prior_instance):
                         initial_fill_weekend_dates[physician_id].add(prior_instance.date)
                         initial_fill_weekend_weeks[physician_id].add(
-                            _weekend_cycle_start(prior_instance.date)
+                            _weekend_anchor(prior_instance.date)
                         )
             for assigned_instance in instances:
                 position = initial_fill_template_positions.get(assigned_instance.id)
@@ -11698,7 +12123,7 @@ def optimize_schedule_version(
                     if _is_weekend_designated(assigned_instance):
                         initial_fill_weekend_dates[physician_id].add(assigned_instance.date)
                         initial_fill_weekend_weeks[physician_id].add(
-                            _weekend_cycle_start(assigned_instance.date)
+                            _weekend_anchor(assigned_instance.date)
                         )
                     if position is not None:
                         template_id, occurrence_index = position
@@ -14629,10 +15054,10 @@ def optimize_schedule_version(
             def joins_configured_weekend(day, existing_days):
                 if any(abs((day - other_day).days) == 1 for other_day in existing_days):
                     return True
-                day_week = day - timedelta(days=day.weekday())
+                day_week = _weekend_anchor(day)
                 return any(
                     abs((day_week - (
-                        other_day - timedelta(days=other_day.weekday())
+                        _weekend_anchor(other_day)
                     )).days) == 7
                     for other_day in existing_days
                 )
@@ -14770,11 +15195,9 @@ def optimize_schedule_version(
                             and (
                                 not _is_weekend_designated(right_instance)
                                 or abs((
-                                    right_instance.date
-                                    - timedelta(days=right_instance.date.weekday())
+                                    _weekend_anchor(right_instance.date)
                                     - (
-                                        anchor_instance.date
-                                        - timedelta(days=anchor_instance.date.weekday())
+                                        _weekend_anchor(anchor_instance.date)
                                     )
                                 ).days) != 7
                             )

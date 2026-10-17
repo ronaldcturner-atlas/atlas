@@ -99,6 +99,14 @@ def normalized_rule_overrides(contract, overrides):
             continue
         parent_value = parent_values[path]
         normalized_value = normalize_override_value(parent_value, value)
+        if (
+            path == 'workload_settings.min_days_in_row'
+            and normalized_value not in ('',)
+            and Decimal(normalized_value) < 2
+        ):
+            raise ValueError(
+                'Minimum days in a row must be left blank or be 2 or greater.'
+            )
         normalized_parent = normalize_override_value(parent_value, parent_value)
         if normalized_value != normalized_parent:
             normalized[path] = normalized_value

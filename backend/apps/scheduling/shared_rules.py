@@ -62,6 +62,7 @@ def sync_shared_rule_contract_settings(shared_rule, previous_contract_ids=()):
                     if link.max_same_shifts_in_row_penalty_weight is not None
                     else ''
                 ),
+                'spread_violations': bool(link.spread_violations),
                 'period_rules': [{
                     'shared_rule_id': shared_rule.id,
                     'period_type': shared_rule.period_type,
