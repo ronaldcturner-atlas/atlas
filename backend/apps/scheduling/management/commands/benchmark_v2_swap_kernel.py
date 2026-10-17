@@ -65,6 +65,11 @@ from apps.scheduling.optimizer_v2 import (
     rotate_assignments,
     swap_assignments,
 )
+from apps.scheduling.optimizer_revisions import (
+    CIRCADIAN_V2_REVISION,
+    STABLE_V2_REVISION,
+    require_supported_v2_revision,
+)
 
 
 TIME_BANDS = ('BEFORE_9_AM', '9_AM_TO_9_59_AM', '10_AM_TO_1_59_PM', '2_PM_OR_LATER')
@@ -408,7 +413,8 @@ def _prepare_workload_reassignment_kernel(
 
 def _prepare_shift_rule_kernel(
     instances, occupancy, physician_ids, contracts,
-    shift_for_assignment, physician_for_assignment,
+    shift_for_assignment, physician_for_assignment, *,
+    include_group_streaks=False,
 ):
     """Compile contract shift-group rules into per-physician signature tables."""
     shift_dates = np.asarray([instance.date.toordinal() for instance in instances])
@@ -422,6 +428,12 @@ def _prepare_shift_rule_kernel(
     replacement_by_assignment = np.zeros(
         (len(shift_for_assignment), len(instances)), dtype=np.float64,
     )
+    streak_replacement_by_assignment = np.zeros_like(
+        replacement_by_assignment,
+    )
+    first_shift_day = int(shift_dates.min())
+    day_count = int(shift_dates.max()) - first_shift_day + 1
+    shift_day_indexes = (shift_dates - first_shift_day).astype(np.int16)
     for physician_idx, physician_id in enumerate(physician_ids):
         contract = contracts[physician_id]
         shift_settings = (
@@ -439,6 +451,7 @@ def _prepare_shift_rule_kernel(
         minimum_weights = []
         maximum_weights = []
         group_masks = []
+        shift_group_masks = []
         for group in shift_settings.get('rules') or ():
             if not isinstance(group, dict):
                 continue
@@ -449,13 +462,15 @@ def _prepare_shift_rule_kernel(
             }
             if not template_ids:
                 continue
-            group_masks.append((
+            group_mask_row = (
                 group,
                 np.isin(
                     shift_templates,
                     np.fromiter(template_ids, dtype=np.int32),
                 ),
-            ))
+            )
+            group_masks.append(group_mask_row)
+            shift_group_masks.append(group_mask_row)
         for group in facility_settings.get('rules') or ():
             if not isinstance(group, dict):
                 continue
@@ -466,6 +481,79 @@ def _prepare_shift_rule_kernel(
             if facility_id <= 0:
                 continue
             group_masks.append((group, shift_facilities == facility_id))
+
+        assignment_indexes = np.flatnonzero(
+            physician_for_assignment == physician_idx,
+        )
+        for group, group_mask in (
+            shift_group_masks if include_group_streaks else ()
+        ):
+            maximum = _positive_int(group.get('max_same_shifts_in_row'))
+            weight = max(_number(
+                group.get('max_same_shifts_in_row_penalty_weight'),
+            ), 0.0)
+            if maximum is None or weight <= 0 or not assignment_indexes.size:
+                continue
+            current_counts = np.zeros(day_count, dtype=np.int16)
+            governed_current = np.flatnonzero(
+                occupancy[physician_idx] & group_mask
+            )
+            np.add.at(
+                current_counts,
+                shift_day_indexes[governed_current],
+                1,
+            )
+            base_score = _streak_penalty_from_days(
+                set(np.flatnonzero(current_counts)),
+                None,
+                maximum,
+                0.0,
+                weight,
+            )
+            cached_rows = {}
+            for assignment_idx in assignment_indexes:
+                old_shift = int(shift_for_assignment[assignment_idx])
+                cache_key = (
+                    bool(group_mask[old_shift]),
+                    int(shift_day_indexes[old_shift]),
+                )
+                replacement_row = cached_rows.get(cache_key)
+                if replacement_row is None:
+                    counts_after_removal = current_counts.copy()
+                    if cache_key[0]:
+                        counts_after_removal[cache_key[1]] -= 1
+                    remaining_days = set(np.flatnonzero(counts_after_removal))
+                    no_addition_delta = _streak_penalty_from_days(
+                        remaining_days,
+                        None,
+                        maximum,
+                        0.0,
+                        weight,
+                    ) - base_score
+                    day_deltas = np.zeros(day_count, dtype=np.float64)
+                    for new_day in range(day_count):
+                        day_deltas[new_day] = (
+                            _streak_penalty_from_days(
+                                remaining_days | {new_day},
+                                None,
+                                maximum,
+                                0.0,
+                                weight,
+                            )
+                            - base_score
+                        )
+                    replacement_row = np.full(
+                        len(instances),
+                        no_addition_delta,
+                        dtype=np.float64,
+                    )
+                    replacement_row[group_mask] = day_deltas[
+                        shift_day_indexes[group_mask]
+                    ]
+                    cached_rows[cache_key] = replacement_row
+                streak_replacement_by_assignment[assignment_idx] += (
+                    replacement_row
+                )
 
         for group, group_mask in group_masks:
             for rule in group.get('period_rules') or ():
@@ -552,9 +640,6 @@ def _prepare_shift_rule_kernel(
                 minimum_weights[:, None],
                 maximum_weights[:, None],
             ).sum(axis=0) - base
-        assignment_indexes = np.flatnonzero(
-            physician_for_assignment == physician_idx,
-        )
         if assignment_indexes.size:
             old_signatures = shift_signatures[
                 shift_for_assignment[assignment_indexes]
@@ -562,7 +647,7 @@ def _prepare_shift_rule_kernel(
             replacement_by_assignment[assignment_indexes] = replacement[
                 old_signatures[:, None], shift_signatures[None, :]
             ]
-    return replacement_by_assignment
+    return replacement_by_assignment + streak_replacement_by_assignment
 
 
 def _pair_shift_rule_deltas(
@@ -2145,8 +2230,168 @@ def _pair_same_shift_deltas(
     )
 
 
+def _circadian_edge_score(left, right, weight):
+    """Return the authoritative flat circadian score for one adjacent edge."""
+    if left is None or right is None:
+        return 0.0
+    if not right[4] or left[3] == right[3]:
+        return 0.0
+    return float(weight) if right[1] < left[2] else 0.0
+
+
+def _prepare_circadian_kernel(
+    instances, occupancy, physician_ids, contracts, movable_pairs, instance_index,
+):
+    """Compile exact per-assignment circadian replacement deltas.
+
+    Rows include the immutable published boundary context. Only an edge whose
+    right-hand assignment belongs to the current block can score, matching the
+    authoritative report exactly.
+    """
+    boundary_context = _published_boundary_context(instances)
+    physician_lookup = {
+        physician_id: physician_idx
+        for physician_idx, physician_id in enumerate(physician_ids)
+    }
+    current_rows = [
+        (
+            (instance.start_datetime, instance.end_datetime, instance.id),
+            instance.start_datetime.timestamp(),
+            (instance.start_datetime + timedelta(hours=23)).timestamp(),
+            instance.date.toordinal(),
+            True,
+            shift_idx,
+        )
+        for shift_idx, instance in enumerate(instances)
+    ]
+    current_starts = np.asarray([row[1] for row in current_rows])
+    current_floors = np.asarray([row[2] for row in current_rows])
+    current_days = np.asarray([row[3] for row in current_rows])
+    rows_by_physician = {}
+    weights = np.zeros(len(physician_ids), dtype=np.float64)
+    for physician_idx, physician_id in enumerate(physician_ids):
+        settings = contracts[physician_id].workload_settings
+        if not isinstance(settings, dict):
+            settings = {}
+        weight = max(_number(settings.get('circadian_penalty_weight')), 0.0)
+        if not settings.get('circadian_enabled') or weight <= 0:
+            rows_by_physician[physician_id] = []
+            continue
+        weights[physician_idx] = weight
+        rows = [
+            (
+                (instance.start_datetime, instance.end_datetime, instance.id),
+                instance.start_datetime.timestamp(),
+                (instance.start_datetime + timedelta(hours=23)).timestamp(),
+                instance.date.toordinal(),
+                False,
+                None,
+            )
+            for instance in boundary_context.get(physician_id, ())
+        ]
+        rows.extend(
+            current_rows[shift_idx]
+            for shift_idx in np.flatnonzero(occupancy[physician_idx])
+        )
+        rows_by_physician[physician_id] = sorted(rows, key=lambda row: row[0])
+
+    replacement_by_assignment = np.zeros(
+        (len(movable_pairs), len(instances)), dtype=np.float64,
+    )
+    for assignment_idx, (instance_id, physician_id) in enumerate(movable_pairs):
+        physician_idx = physician_lookup[physician_id]
+        weight = weights[physician_idx]
+        if weight <= 0:
+            continue
+        old_shift = instance_index[instance_id]
+        rows = rows_by_physician[physician_id]
+        old_position = next(
+            position
+            for position, row in enumerate(rows)
+            if row[4] and row[5] == old_shift
+        )
+        previous_row = rows[old_position - 1] if old_position else None
+        old_row = rows[old_position]
+        next_row = rows[old_position + 1] if old_position + 1 < len(rows) else None
+        removal_delta = (
+            _circadian_edge_score(previous_row, next_row, weight)
+            - _circadian_edge_score(previous_row, old_row, weight)
+            - _circadian_edge_score(old_row, next_row, weight)
+        )
+        remaining = rows[:old_position] + rows[old_position + 1:]
+        if not remaining:
+            continue
+        remaining_starts = np.asarray(
+            [row[1] for row in remaining], dtype=np.float64,
+        )
+        remaining_floors = np.asarray(
+            [row[2] for row in remaining], dtype=np.float64,
+        )
+        remaining_days = np.asarray(
+            [row[3] for row in remaining], dtype=np.int32,
+        )
+        remaining_current = np.asarray(
+            [row[4] for row in remaining], dtype=np.bool_,
+        )
+        insertion_positions = np.searchsorted(
+            remaining_starts, current_starts, side='left',
+        )
+        insertion_deltas = np.full(
+            len(instances), removal_delta, dtype=np.float64,
+        )
+        has_previous = insertion_positions > 0
+        previous_positions = np.maximum(insertion_positions - 1, 0)
+        insertion_deltas += weight * (
+            has_previous
+            & (remaining_days[previous_positions] != current_days)
+            & (current_starts < remaining_floors[previous_positions])
+        )
+        has_next = insertion_positions < len(remaining)
+        next_positions = np.minimum(
+            insertion_positions, len(remaining) - 1,
+        )
+        insertion_deltas += weight * (
+            has_next
+            & remaining_current[next_positions]
+            & (current_days != remaining_days[next_positions])
+            & (remaining_starts[next_positions] < current_floors)
+        )
+        insertion_deltas -= weight * (
+            has_previous
+            & has_next
+            & remaining_current[next_positions]
+            & (
+                remaining_days[previous_positions]
+                != remaining_days[next_positions]
+            )
+            & (
+                remaining_starts[next_positions]
+                < remaining_floors[previous_positions]
+            )
+        )
+        insertion_deltas[old_shift] = 0.0
+        replacement_by_assignment[assignment_idx] = insertion_deltas
+    return {'replacement_by_assignment': replacement_by_assignment}
+
+
+def _pair_circadian_deltas(
+    kernel, shift_for_assignment, left_assignment_indexes,
+    right_assignment_indexes,
+):
+    left = np.asarray(left_assignment_indexes, dtype=np.int32)
+    right = np.asarray(right_assignment_indexes, dtype=np.int32)
+    return (
+        kernel['replacement_by_assignment'][
+            left, shift_for_assignment[right]
+        ]
+        + kernel['replacement_by_assignment'][
+            right, shift_for_assignment[left]
+        ]
+    )
+
+
 class Command(BaseCommand):
-    stealth_options = ('runtime_cache',)
+    stealth_options = ('runtime_cache', 'optimizer_revision')
     help = (
         'Read-only Atlas v2 stage-one benchmark for vectorized pair-swap '
         'generation, hard feasibility screening, and proportionality deltas.'
@@ -2214,6 +2459,12 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         command_started = perf_counter()
+        optimizer_revision = require_supported_v2_revision(
+            options.get('optimizer_revision') or STABLE_V2_REVISION
+        )
+        circadian_candidate_scoring = (
+            optimizer_revision == CIRCADIAN_V2_REVISION
+        )
         if options['reset_engine_context']:
             _ENGINE_CONTEXT_CACHE.clear()
         run_number = options['run_number']
@@ -2488,7 +2739,8 @@ class Command(BaseCommand):
         )
         current_fingerprint = schedule_fingerprint(state)
         engine_context_cache_key = (
-            run.id, stress_contract_count, swap_lineage, current_fingerprint,
+            run.id, optimizer_revision, stress_contract_count, swap_lineage,
+            current_fingerprint,
         )
         cached_engine_context = _ENGINE_CONTEXT_CACHE.pop(
             engine_context_cache_key, None,
@@ -2659,10 +2911,21 @@ class Command(BaseCommand):
             workload_kernel = cached_tables['workload']
             shift_rule_kernel = cached_tables['shift_rule']
             weekend_kernel = cached_tables['weekend']
+            circadian_kernel = {
+                'replacement_by_assignment': (
+                    cached_tables['circadian']
+                    if circadian_candidate_scoring
+                    else np.zeros(
+                        (len(movable_pairs), len(instances)),
+                        dtype=np.float64,
+                    )
+                ),
+            }
             for name in (
                 'consecutive', 'same_shift', 'workload', 'shift_rule', 'weekend',
             ):
                 preparation_breakdown[f'{name}_kernel_seconds'] = 0.0
+            preparation_breakdown['circadian_kernel_seconds'] = 0.0
         else:
             component_started = perf_counter()
             consecutive_kernel, consecutive_shift_days = _prepare_consecutive_kernel(
@@ -2689,6 +2952,27 @@ class Command(BaseCommand):
                 perf_counter() - component_started
             )
             component_started = perf_counter()
+            circadian_kernel = (
+                _prepare_circadian_kernel(
+                    instances,
+                    occupancy,
+                    physician_ids,
+                    contracts,
+                    movable_pairs,
+                    instance_index,
+                )
+                if circadian_candidate_scoring
+                else {
+                    'replacement_by_assignment': np.zeros(
+                        (len(movable_pairs), len(instances)),
+                        dtype=np.float64,
+                    ),
+                }
+            )
+            preparation_breakdown['circadian_kernel_seconds'] = (
+                perf_counter() - component_started
+            )
+            component_started = perf_counter()
             workload_kernel = _prepare_workload_kernel(
                 instances,
                 occupancy,
@@ -2708,6 +2992,7 @@ class Command(BaseCommand):
                 contracts,
                 shift_for_assignment,
                 physician_for_assignment,
+                include_group_streaks=circadian_candidate_scoring,
             )
             preparation_breakdown['shift_rule_kernel_seconds'] = (
                 perf_counter() - component_started
@@ -2932,28 +3217,33 @@ class Command(BaseCommand):
                     'The cached v2 engine context does not match the current state.'
                 )
         else:
+            assignment_tables = {
+                'workload': workload_kernel,
+                'shift_rule': shift_rule_kernel,
+                'consecutive': consecutive_kernel,
+                'weekend': weekend_kernel,
+                'same_shift': same_shift_kernel['replacement_by_assignment'],
+                'facility_proportionality_score': (
+                    facility_proportionality_kernel['score_delta']
+                ),
+                'facility_proportionality_baseline': (
+                    facility_proportionality_kernel['baseline_delta']
+                ),
+                'time_proportionality_score': (
+                    time_proportionality_kernel['score_delta']
+                ),
+                'time_proportionality_baseline': (
+                    time_proportionality_kernel['baseline_delta']
+                ),
+            }
+            if circadian_candidate_scoring:
+                assignment_tables['circadian'] = (
+                    circadian_kernel['replacement_by_assignment']
+                )
             engine_context = V2EngineContext.create(
                 state,
                 movable_pairs,
-                {
-                    'workload': workload_kernel,
-                    'shift_rule': shift_rule_kernel,
-                    'consecutive': consecutive_kernel,
-                    'weekend': weekend_kernel,
-                    'same_shift': same_shift_kernel['replacement_by_assignment'],
-                    'facility_proportionality_score': (
-                        facility_proportionality_kernel['score_delta']
-                    ),
-                    'facility_proportionality_baseline': (
-                        facility_proportionality_kernel['baseline_delta']
-                    ),
-                    'time_proportionality_score': (
-                        time_proportionality_kernel['score_delta']
-                    ),
-                    'time_proportionality_baseline': (
-                        time_proportionality_kernel['baseline_delta']
-                    ),
-                },
+                assignment_tables,
             )
         workload_kernel = engine_context.assignment_rows.tables['workload']
         shift_rule_kernel = engine_context.assignment_rows.tables['shift_rule']
@@ -2962,6 +3252,10 @@ class Command(BaseCommand):
         same_shift_kernel['replacement_by_assignment'] = (
             engine_context.assignment_rows.tables['same_shift']
         )
+        if circadian_candidate_scoring:
+            circadian_kernel['replacement_by_assignment'] = (
+                engine_context.assignment_rows.tables['circadian']
+            )
         facility_proportionality_kernel['score_delta'] = (
             engine_context.assignment_rows.tables[
                 'facility_proportionality_score'
@@ -3030,6 +3324,20 @@ class Command(BaseCommand):
             refresh_breakdown['same_shift_seconds'] = (
                 perf_counter() - refresh_component_started
             )
+            refreshed_circadian = None
+            if circadian_candidate_scoring:
+                refresh_component_started = perf_counter()
+                refreshed_circadian = _prepare_circadian_kernel(
+                    instances,
+                    affected_occupancy,
+                    affected_ids,
+                    contracts,
+                    refreshed_pairs,
+                    instance_index,
+                )
+                refresh_breakdown['circadian_seconds'] = (
+                    perf_counter() - refresh_component_started
+                )
             refresh_component_started = perf_counter()
             refreshed_workload = _prepare_workload_kernel(
                 instances, affected_occupancy, affected_ids, targets,
@@ -3044,6 +3352,7 @@ class Command(BaseCommand):
                 instances, affected_occupancy, affected_ids, contracts,
                 refreshed_shift_for_assignment,
                 refreshed_physician_for_assignment,
+                include_group_streaks=circadian_candidate_scoring,
             )
             refresh_breakdown['shift_rule_seconds'] = (
                 perf_counter() - refresh_component_started
@@ -3101,7 +3410,7 @@ class Command(BaseCommand):
             refresh_breakdown['time_proportionality_seconds'] = (
                 perf_counter() - refresh_component_started
             )
-            return refreshed_pairs, {
+            refreshed_tables = {
                 'workload': refreshed_workload,
                 'shift_rule': refreshed_shift_rule,
                 'consecutive': refreshed_consecutive,
@@ -3113,7 +3422,12 @@ class Command(BaseCommand):
                 ),
                 'time_proportionality_score': refreshed_time['score_delta'],
                 'time_proportionality_baseline': refreshed_time['baseline_delta'],
-            }, refresh_breakdown
+            }
+            if circadian_candidate_scoring:
+                refreshed_tables['circadian'] = (
+                    refreshed_circadian['replacement_by_assignment']
+                )
+            return refreshed_pairs, refreshed_tables, refresh_breakdown
 
         started = perf_counter()
         preparation_seconds = started - command_started
@@ -3129,6 +3443,7 @@ class Command(BaseCommand):
         request_neutral_states = 0
         consecutive_neutral_states = 0
         same_shift_neutral_states = 0
+        circadian_neutral_states = 0
         completed_components_nonworsening_improving_states = 0
         best_vectorized_candidate = None
         best_selection = None
@@ -3356,6 +3671,16 @@ class Command(BaseCommand):
                 night_left_assignments,
                 night_right_assignments,
             )
+            circadian_deltas = (
+                _pair_circadian_deltas(
+                    circadian_kernel,
+                    shift_for_assignment,
+                    night_left_assignments,
+                    night_right_assignments,
+                )
+                if circadian_candidate_scoring
+                else np.zeros_like(shift_rule_deltas)
+            )
             night_priorities = np.concatenate(night_priority_batches)
             night_partial_penalties = np.concatenate(night_partial_penalty_batches)
             overlap_deltas = np.concatenate(overlap_delta_batches)
@@ -3372,19 +3697,23 @@ class Command(BaseCommand):
             same_shift_neutral_states = int(np.count_nonzero(
                 np.abs(same_shift_deltas) <= 1e-9
             ))
+            circadian_neutral_states = int(np.count_nonzero(
+                np.abs(circadian_deltas) <= 1e-9
+            ))
             completed_components_nonworsening_improving_states = int(
                 np.count_nonzero(
                     (night_priorities < -1e-12)
                     & ((
                         night_partial_penalties + night_deltas + request_deltas
                         + consecutive_deltas + same_shift_deltas
-                        + shift_rule_deltas
+                        + shift_rule_deltas + circadian_deltas
                     ) <= 1e-9)
                 )
             )
             official_deltas = (
                 night_partial_penalties + night_deltas + request_deltas
                 + consecutive_deltas + same_shift_deltas + shift_rule_deltas
+                + circadian_deltas
             )
             excluded_instance_pairs = set()
             for raw_pair in options['exclude_instance_pair']:
@@ -3486,6 +3815,10 @@ class Command(BaseCommand):
                     },
                     'selection_mode': selection_mode,
                 }
+                if circadian_candidate_scoring:
+                    best_vectorized_candidate['predicted_component_deltas'][
+                        'circadian_score'
+                    ] = float(circadian_deltas[best_index])
 
         # Pair swaps preserve each physician's workload. When that neighborhood
         # is exhausted, expose the V1 request-repair tactic as a first-class V2
@@ -3792,6 +4125,20 @@ class Command(BaseCommand):
             affected_refresh_breakdown['same_shift_kernel_seconds'] = (
                 perf_counter() - component_started
             )
+            affected_circadian_kernel = None
+            if circadian_candidate_scoring:
+                component_started = perf_counter()
+                affected_circadian_kernel = _prepare_circadian_kernel(
+                    instances,
+                    affected_occupancy,
+                    affected_ids,
+                    contracts,
+                    affected_pairs,
+                    instance_index,
+                )
+                affected_refresh_breakdown['circadian_kernel_seconds'] = (
+                    perf_counter() - component_started
+                )
             component_started = perf_counter()
             affected_workload_kernel = _prepare_workload_kernel(
                 instances, affected_occupancy, affected_ids, targets,
@@ -3806,6 +4153,7 @@ class Command(BaseCommand):
                 instances, affected_occupancy, affected_ids, contracts,
                 affected_shift_for_assignment,
                 affected_physician_for_assignment,
+                include_group_streaks=circadian_candidate_scoring,
             )
             affected_refresh_breakdown['shift_rule_kernel_seconds'] = (
                 perf_counter() - component_started
@@ -3923,7 +4271,14 @@ class Command(BaseCommand):
                     ],
                 ),
             }
-            for name, current_rows, refreshed_rows in (
+            if circadian_candidate_scoring:
+                refresh_errors['circadian'] = max_abs_error(
+                    affected_circadian_kernel['replacement_by_assignment'],
+                    circadian_kernel['replacement_by_assignment'][
+                        affected_assignment_indexes
+                    ],
+                )
+            merged_refresh_rows = [
                 ('merged_workload', workload_kernel, affected_workload_kernel),
                 ('merged_shift_rule', shift_rule_kernel, affected_shift_rule_kernel),
                 ('merged_consecutive', consecutive_kernel, affected_consecutive_kernel),
@@ -3953,7 +4308,14 @@ class Command(BaseCommand):
                     time_proportionality_kernel['baseline_delta'],
                     affected_time_proportionality['baseline_delta'],
                 ),
-            ):
+            ]
+            if circadian_candidate_scoring:
+                merged_refresh_rows.append((
+                    'merged_circadian',
+                    circadian_kernel['replacement_by_assignment'],
+                    affected_circadian_kernel['replacement_by_assignment'],
+                ))
+            for name, current_rows, refreshed_rows in merged_refresh_rows:
                 refresh_errors[name] = max_abs_error(
                     merge_assignment_rows(
                         current_rows,
@@ -4069,19 +4431,35 @@ class Command(BaseCommand):
                 sampled_left,
                 sampled_right,
             )
-            for row, night_delta, request_delta, consecutive_delta, same_delta, shift_rule_delta in zip(
+            sampled_circadian_deltas = (
+                _pair_circadian_deltas(
+                    circadian_kernel,
+                    shift_for_assignment,
+                    sampled_left,
+                    sampled_right,
+                )
+                if circadian_candidate_scoring
+                else np.zeros(len(validation_sample), dtype=np.float64)
+            )
+            sampled_rows = zip(
                 validation_sample,
                 sampled_night_deltas,
                 sampled_request_deltas,
                 sampled_consecutive_deltas,
                 sampled_same_shift_deltas,
                 sampled_shift_rule_deltas,
-            ):
+                sampled_circadian_deltas,
+            )
+            for (
+                row, night_delta, request_delta, consecutive_delta,
+                same_delta, shift_rule_delta, circadian_delta,
+            ) in sampled_rows:
                 row['predicted_night_delta'] = float(night_delta)
                 row['predicted_request_delta'] = float(request_delta)
                 row['predicted_consecutive_delta'] = float(consecutive_delta)
                 row['predicted_same_shift_delta'] = float(same_delta)
                 row['predicted_shift_rule_delta'] = float(shift_rule_delta)
+                row['predicted_circadian_delta'] = float(circadian_delta)
         else:
             validation_sample = []
 
@@ -4098,10 +4476,12 @@ class Command(BaseCommand):
         consecutive_delta_mismatches = 0
         same_shift_delta_mismatches = 0
         shift_rule_delta_mismatches = 0
+        circadian_delta_mismatches = 0
         overlap_delta_mismatches = 0
         rest_delta_mismatches = 0
         official_delta_mismatches = 0
         excluded_component_nonzero_candidates = 0
+        parity_mismatch_examples = []
         component_delta_stats = defaultdict(lambda: {
             'nonzero_candidates': 0,
             'positive_candidates': 0,
@@ -4744,6 +5124,28 @@ class Command(BaseCommand):
                     - sample['predicted_shift_rule_delta']
                 ) > 0.0001:
                     shift_rule_delta_mismatches += 1
+                    if len(parity_mismatch_examples) < 10:
+                        parity_mismatch_examples.append({
+                            'component': 'shift_rule_score',
+                            'left_instance_id': sample['left_instance_id'],
+                            'left_physician_id': sample['left_physician_id'],
+                            'right_instance_id': sample['right_instance_id'],
+                            'right_physician_id': sample['right_physician_id'],
+                            'predicted_delta': sample[
+                                'predicted_shift_rule_delta'
+                            ],
+                            'authoritative_delta': component_deltas[
+                                'shift_rule_score'
+                            ],
+                        })
+                if (
+                    circadian_candidate_scoring
+                    and abs(
+                        component_deltas['circadian_score']
+                        - sample['predicted_circadian_delta']
+                    ) > 0.0001
+                ):
+                    circadian_delta_mismatches += 1
                 predicted_validation_delta = (
                     sample['predicted_overlap_delta']
                     + sample['predicted_rest_delta']
@@ -4765,11 +5167,19 @@ class Command(BaseCommand):
                     sample['predicted_overlap_delta'],
                     sample['predicted_rest_delta'],
                 ))
+                if circadian_candidate_scoring:
+                    predicted_official_delta += sample[
+                        'predicted_circadian_delta'
+                    ]
                 if abs(predicted_official_delta - float(score_delta)) > 0.0001:
                     official_delta_mismatches += 1
                 if any(
                     abs(component_deltas[key]) > 0.0001
-                    for key in ('underutilization_score', 'circadian_score')
+                    for key in (
+                        ('underutilization_score',)
+                        if circadian_candidate_scoring
+                        else ('underutilization_score', 'circadian_score')
+                    )
                 ):
                     excluded_component_nonzero_candidates += 1
                 for key, delta in component_deltas.items():
@@ -4964,6 +5374,7 @@ class Command(BaseCommand):
             _ENGINE_CONTEXT_CACHE.clear()
             _ENGINE_CONTEXT_CACHE[(
                 run.id,
+                optimizer_revision,
                 stress_contract_count,
                 next_swap_lineage,
                 next_engine_context.fingerprint,
@@ -4992,6 +5403,8 @@ class Command(BaseCommand):
         result = {
             'stage': 'V2_SWAP_KERNEL_STAGE_SEVEN_SHIFT_RULES',
             'read_only': True,
+            'optimizer_revision': optimizer_revision,
+            'circadian_candidate_scoring': circadian_candidate_scoring,
             'applied_in_memory_swaps': applied_in_memory_swaps,
             'run_number': run.run_number,
             'schedule_version_id': version.id,
@@ -5030,6 +5443,7 @@ class Command(BaseCommand):
             'request_neutral_schedules': request_neutral_states,
             'consecutive_day_neutral_schedules': consecutive_neutral_states,
             'same_shift_neutral_schedules': same_shift_neutral_states,
+            'circadian_neutral_schedules': circadian_neutral_states,
             'completed_components_nonworsening_distribution_improvements': (
                 completed_components_nonworsening_improving_states
             ),
@@ -5057,12 +5471,14 @@ class Command(BaseCommand):
                 'consecutive_delta_mismatches': consecutive_delta_mismatches,
                 'same_shift_delta_mismatches': same_shift_delta_mismatches,
                 'shift_rule_delta_mismatches': shift_rule_delta_mismatches,
+                'circadian_delta_mismatches': circadian_delta_mismatches,
                 'overlap_delta_mismatches': overlap_delta_mismatches,
                 'rest_delta_mismatches': rest_delta_mismatches,
                 'official_delta_mismatches': official_delta_mismatches,
                 'excluded_component_nonzero_candidates': (
                     excluded_component_nonzero_candidates
                 ),
+                'parity_mismatch_examples': parity_mismatch_examples,
                 'component_delta_stats': dict(component_delta_stats),
                 'score_delta_min': (
                     min(row['score_delta'] for row in exact_results if row['score_delta'] is not None)
@@ -5082,7 +5498,12 @@ class Command(BaseCommand):
                 'Vectorized fixed-state pair swaps with facility eligibility, '
                 'duplicate assignment, overlap/rest screening, exact workload, '
                 'shift-group, weekend, night, request, consecutive-day, and '
-                'same-shift penalty deltas, and normalized facility/time '
+                'same-shift penalty deltas, '
+                + (
+                    'exact circadian penalty deltas, '
+                    if circadian_candidate_scoring else ''
+                )
+                + 'and normalized facility/time '
                 'proportionality deltas for unguided shifts. Pair-swap local '
                 'optima also expose vectorized hard-feasible one-way '
                 'reassignments directed by V1 request, workload, weekend, '

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -8,6 +8,8 @@ from django.test import SimpleTestCase
 from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     Command as SwapKernelCommand,
     _pair_validation_penalty_deltas,
+    _prepare_circadian_kernel,
+    _prepare_shift_rule_kernel,
     _request_reassignment_deltas,
     _same_shift_score,
     _state_with_all_instances,
@@ -40,6 +42,7 @@ from apps.scheduling.optimizer_v2_runner import (
 )
 from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 from apps.scheduling.optimizer_revisions import (
+    CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     configuration_digest,
     require_supported_v2_revision,
@@ -78,8 +81,112 @@ class OptimizerRevisionTests(SimpleTestCase):
             STABLE_V2_REVISION,
         )
 
+    def test_circadian_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(CIRCADIAN_V2_REVISION),
+            CIRCADIAN_V2_REVISION,
+        )
+
 
 class V2SwapKernelCommandTests(SimpleTestCase):
+    @staticmethod
+    def _circadian_instance(instance_id, day, hour):
+        start = datetime(
+            day.year, day.month, day.day, hour, tzinfo=timezone.utc,
+        )
+        return SimpleNamespace(
+            id=instance_id,
+            date=day,
+            start_datetime=start,
+            end_datetime=start + timedelta(hours=8),
+        )
+
+    def test_circadian_kernel_scores_backward_replacement(self):
+        instances = [
+            self._circadian_instance(10, date(2026, 1, 1), 10),
+            self._circadian_instance(20, date(2026, 1, 2), 9),
+            self._circadian_instance(30, date(2026, 1, 2), 8),
+        ]
+        occupancy = np.asarray([[True, True, False]])
+        contract = SimpleNamespace(workload_settings={
+            'circadian_enabled': True,
+            'circadian_penalty_weight': 100,
+        })
+        kernel = _prepare_circadian_kernel(
+            instances,
+            occupancy,
+            [1],
+            {1: contract},
+            [(20, 1)],
+            {instance.id: index for index, instance in enumerate(instances)},
+        )
+
+        self.assertEqual(kernel['replacement_by_assignment'][0, 1], 0.0)
+        self.assertEqual(kernel['replacement_by_assignment'][0, 2], 100.0)
+
+    def test_circadian_kernel_removes_published_boundary_violation(self):
+        instances = [
+            self._circadian_instance(20, date(2026, 1, 2), 8),
+            self._circadian_instance(30, date(2026, 1, 2), 10),
+        ]
+        prior = self._circadian_instance(10, date(2026, 1, 1), 10)
+        instances[0]._published_boundary_context = {1: (prior,)}
+        occupancy = np.asarray([[True, False]])
+        contract = SimpleNamespace(workload_settings={
+            'circadian_enabled': True,
+            'circadian_penalty_weight': 100,
+        })
+        kernel = _prepare_circadian_kernel(
+            instances,
+            occupancy,
+            [1],
+            {1: contract},
+            [(20, 1)],
+            {instance.id: index for index, instance in enumerate(instances)},
+        )
+        self.assertEqual(kernel['replacement_by_assignment'][0, 1], -100.0)
+
+    def test_shift_rule_kernel_includes_group_same_shift_streak(self):
+        instances = [
+            self._circadian_instance(10, date(2026, 1, 1), 8),
+            self._circadian_instance(20, date(2026, 1, 2), 8),
+            self._circadian_instance(30, date(2026, 1, 3), 8),
+            self._circadian_instance(40, date(2026, 1, 3), 16),
+        ]
+        for index, instance in enumerate(instances):
+            instance.shift_template_id = 1 if index < 3 else 2
+            instance.facility_id = 1
+        occupancy = np.asarray([[True, True, True, False]])
+        contract = SimpleNamespace(
+            shift_settings={'rules': [{
+                'shift_template_ids': [1],
+                'max_same_shifts_in_row': 2,
+                'max_same_shifts_in_row_penalty_weight': 100,
+            }]},
+            facility_settings={},
+        )
+        kernel = _prepare_shift_rule_kernel(
+            instances,
+            occupancy,
+            [1],
+            {1: contract},
+            np.asarray([0, 1, 2], dtype=np.int32),
+            np.asarray([0, 0, 0], dtype=np.int16),
+            include_group_streaks=True,
+        )
+        stable_kernel = _prepare_shift_rule_kernel(
+            instances,
+            occupancy,
+            [1],
+            {1: contract},
+            np.asarray([0, 1, 2], dtype=np.int32),
+            np.asarray([0, 0, 0], dtype=np.int16),
+        )
+
+        self.assertEqual(kernel[2, 2], 0.0)
+        self.assertEqual(kernel[2, 3], -100.0)
+        self.assertEqual(stable_kernel[2, 3], 0.0)
+
     def test_compiled_adjacent_streak_penalties_are_flat_per_streak(self):
         self.assertEqual(
             _streak_penalty_from_days(

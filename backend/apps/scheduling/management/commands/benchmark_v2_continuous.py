@@ -443,6 +443,7 @@ class Command(BaseCommand):
                 validate_sample=max(int(options['validate_sample']), 0),
                 checkpoint_score=checkpoint_score,
                 runtime_cache=kernel_runtime_cache,
+                optimizer_revision=optimizer_revision,
                 stress_contract_count=max(
                     int(options['stress_contract_count']), 0,
                 ),
