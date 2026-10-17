@@ -39,6 +39,44 @@ from apps.scheduling.optimizer_v2_runner import (
     _require_matching_final_score,
 )
 from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
+from apps.scheduling.optimizer_revisions import (
+    STABLE_V2_REVISION,
+    configuration_digest,
+    require_supported_v2_revision,
+)
+
+
+class OptimizerRevisionTests(SimpleTestCase):
+    def test_configuration_digest_is_canonical(self):
+        left = configuration_digest({
+            'contracts': [{'id': 2, 'settings': {'b': 2, 'a': 1}}],
+            'seed': 9,
+            'captured_at': '2026-10-17T10:00:00Z',
+            'source_assignments': [{
+                'id': 100, 'shift_instance_id': 7, 'physician_id': 8,
+            }],
+        })
+        right = configuration_digest({
+            'seed': 9,
+            'contracts': [{'settings': {'a': 1, 'b': 2}, 'id': 2}],
+            'captured_at': '2026-10-17T11:00:00Z',
+            'source_assignments': [{
+                'id': 200, 'physician_id': 8, 'shift_instance_id': 7,
+            }],
+        })
+
+        self.assertEqual(left, right)
+        self.assertEqual(len(left), 64)
+
+    def test_unknown_revision_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, 'not supported'):
+            require_supported_v2_revision('v2.unapproved')
+
+    def test_stable_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(STABLE_V2_REVISION),
+            STABLE_V2_REVISION,
+        )
 
 
 class V2SwapKernelCommandTests(SimpleTestCase):

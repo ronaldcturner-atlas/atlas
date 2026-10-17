@@ -88,6 +88,17 @@ def clone_optimizer_run_canonical(*, version, source_run):
             score_is_stale=False,
             copied_from_run=locked_source,
             run_kind='COPY',
+            optimizer_revision=locked_source.optimizer_revision,
+            scoring_revision=locked_source.scoring_revision,
+            optimizer_commit=locked_source.optimizer_commit,
+            configuration_digest=locked_source.configuration_digest,
+            completion_score=locked_source.completion_score,
+            completion_score_breakdown=dict(
+                locked_source.completion_score_breakdown or {}
+            ),
+            completion_scoring_revision=(
+                locked_source.completion_scoring_revision
+            ),
             locked_open_shift_instance_ids=list(
                 locked_source.locked_open_shift_instance_ids or []
             ),

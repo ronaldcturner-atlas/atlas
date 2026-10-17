@@ -190,6 +190,13 @@ Runs created before an acknowledged template change remain available as optimize
 
 ### Optimizer V2 and Run history
 
+Optimizer behavior changes follow
+[`optimizer-change-control.md`](optimizer-change-control.md). New V2 runs pin
+their internal optimizer revision, scoring revision, deployment release, and
+canonical launch-configuration digest when they are queued or started. A
+worker must fail closed when its build does not support the pinned revision;
+it must never substitute the deployment default for an already pinned run.
+
 Optimizer V2 is the production optimizer. V1 remains an internal regression/compatibility reference and cannot be selected to launch a new production Run.
 
 An optimizer Run executes in the background inside the selected `BUILD` Schedule Version. The scheduler may leave the page or log out while it runs. The default maximum runtime is 120 minutes, the accepted range is 1 through 240 whole minutes, and the browser remembers the most recently selected valid value. The selected focus and initiating user are stored with the Run and shown in Run history.

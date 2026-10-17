@@ -45,6 +45,15 @@ ATLAS_V2_ENABLED = (
 )
 # Compatibility setting for older deployments during the product transition.
 ATLAS_V2_TEST_ENABLED = ATLAS_V2_ENABLED
+# Every queued V2 run snapshots this internal revision. Future optimizer
+# behavior ships under a new supported revision, allowing the deployment
+# default to roll back without changing or relabeling already queued runs.
+ATLAS_OPTIMIZER_REVISION = os.environ.get(
+    'ATLAS_OPTIMIZER_REVISION', 'v2.stable.2026-10-17',
+).strip()
+ATLAS_SCORING_REVISION = os.environ.get(
+    'ATLAS_SCORING_REVISION', 'score.2026-10-17.1',
+).strip()
 # The legacy V1 runner remains available only to internal development and
 # regression tests while V2 still reuses its proven construction primitives.
 # Production overrides this to False so no consumer request can launch V1.

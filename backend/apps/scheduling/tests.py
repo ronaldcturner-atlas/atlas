@@ -4936,6 +4936,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
     @override_settings(
         ATLAS_V2_ENABLED=True,
         ATLAS_LEGACY_V1_LAUNCH_ENABLED=False,
+        ATLAS_OPTIMIZER_REVISION='v2.stable.2026-10-17',
+        ATLAS_SCORING_REVISION='score.test.1',
     )
     def test_production_optimizer_defaults_new_runs_to_v2(self):
         version = self._create_build_version()
@@ -4952,6 +4954,35 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(response.status_code, 202)
         queued_run = OptimizerRun.objects.get(id=response.json()['id'])
         self.assertEqual(queued_run.run_kind, 'OPTIMIZER_V2')
+        self.assertEqual(
+            queued_run.optimizer_revision, 'v2.stable.2026-10-17',
+        )
+        self.assertEqual(queued_run.scoring_revision, 'score.test.1')
+        self.assertTrue(queued_run.optimizer_commit)
+        self.assertEqual(
+            response.json()['optimizer_revision'],
+            'v2.stable.2026-10-17',
+        )
+
+    @override_settings(
+        ATLAS_V2_ENABLED=True,
+        ATLAS_LEGACY_V1_LAUNCH_ENABLED=False,
+        ATLAS_OPTIMIZER_REVISION='v2.unapproved',
+    )
+    def test_production_optimizer_fails_closed_for_unknown_revision(self):
+        version = self._create_build_version()
+
+        response = self.client.post(
+            f'/api/schedule-versions/{version.id}/run-optimizer/',
+            data={'background': True, 'start_mode': 'FRESH_FILL'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn('not supported', response.json()['optimizer_engine'])
+        self.assertFalse(
+            OptimizerRun.objects.filter(schedule_version=version).exists(),
+        )
 
     @override_settings(
         ATLAS_V2_ENABLED=True,

@@ -425,6 +425,21 @@ class OptimizerRun(models.Model):
         choices=OptimizationFocus.choices,
         default=OptimizationFocus.STANDARD,
     )
+    # Blank identifies historical runs created before optimizer release
+    # pinning. New V2 runs always snapshot these values when queued.
+    optimizer_revision = models.CharField(max_length=64, blank=True, default='')
+    scoring_revision = models.CharField(max_length=64, blank=True, default='')
+    optimizer_commit = models.CharField(max_length=128, blank=True, default='')
+    configuration_digest = models.CharField(max_length=64, blank=True, default='')
+    # Immutable completion evidence. ``final_score`` may later be refreshed
+    # under a newer scoring revision; these fields are never recalculated.
+    completion_score = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+    )
+    completion_score_breakdown = models.JSONField(default=dict, blank=True)
+    completion_scoring_revision = models.CharField(
+        max_length=64, blank=True, default='',
+    )
 
     def __str__(self):
         return f'{self.schedule_version_id}: Run {self.run_number}'

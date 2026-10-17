@@ -396,7 +396,9 @@ class WeekendVolumeIntegrationTests(TestCase):
         after = o._score_schedule(instances, physicians, trial, *args)
         self.assertEqual(o._selected_physician_score_delta(instances, physicians, state, trial, {first.id, second.id}, *args), after['score']-before['score'])
         run = OptimizerRun.objects.create(schedule_version=version, run_number=1,
-            status=OptimizerRun.Status.COMPLETED, is_active=True, initial_score=123, final_score=123)
+            status=OptimizerRun.Status.COMPLETED, is_active=True, initial_score=123, final_score=123,
+            completion_score=123, completion_score_breakdown={'historical': 123},
+            completion_scoring_revision='score.original')
         for instance in instances:
             ScheduleShiftAssignment.objects.create(shift_instance=instance, physician=first, optimizer_run=run,
                 assignment_source=ScheduleShiftAssignment.AssignmentSource.OPTIMIZER)
@@ -412,6 +414,7 @@ class WeekendVolumeIntegrationTests(TestCase):
         self.assertEqual(run.assignments.count(), len(instances))
         saved_assignments = list(run.assignments.order_by('id').values_list('id', 'shift_instance_id', 'physician_id'))
         summary, _ = o.recalculate_schedule_version_score(version, run)
+        run.refresh_from_db()
         expected = o._build_workload_summary(
             physicians, before['physician_hours'], before['physician_shifts'],
             before['physician_night_shifts'], targets, before['workload_score_rows'],
@@ -422,4 +425,7 @@ class WeekendVolumeIntegrationTests(TestCase):
                 self.assertEqual(row[key], expected[row['physician_id']][key])
             self.assertIsNotNone(row['effective_workload_range'])
         self.assertEqual(summary['final_score'], report['total_score'])
+        self.assertEqual(run.completion_score, Decimal('123'))
+        self.assertEqual(run.completion_score_breakdown, {'historical': 123})
+        self.assertEqual(run.completion_scoring_revision, 'score.original')
         self.assertEqual(saved_assignments, list(run.assignments.order_by('id').values_list('id', 'shift_instance_id', 'physician_id')))

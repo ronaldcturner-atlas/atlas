@@ -76,6 +76,11 @@ from .optimizer import (
     recalculate_schedule_version_score,
 )
 from .optimizer_v2_runner import V2_RUN_KIND
+from .optimizer_revisions import (
+    code_release_identifier,
+    configured_scoring_revision,
+    configured_v2_revision,
+)
 from .run_state import (
     assignments_for_viewed_run,
     get_active_optimizer_run,
@@ -4823,6 +4828,15 @@ def _run_optimizer_response(request, version):
         return Response({
             'optimizer_engine': 'Atlas V2 is not available.',
         }, status=status.HTTP_409_CONFLICT)
+    try:
+        optimizer_revision = (
+            configured_v2_revision() if optimizer_engine == 'V2' else ''
+        )
+    except ValueError as revision_error:
+        return Response(
+            {'optimizer_engine': str(revision_error)},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     if optimizer_engine == 'V2':
         return Response({
             'optimizer_engine': 'Atlas V2 must run in the background.',
@@ -4992,6 +5006,16 @@ def schedule_version_run_optimizer(request, version_id):
         return Response({
             'optimizer_engine': 'Atlas V2 is not available.',
         }, status=status.HTTP_409_CONFLICT)
+    try:
+        optimizer_revision = (
+            configured_v2_revision() if optimizer_engine == 'V2' else ''
+        )
+        scoring_revision = configured_scoring_revision()
+    except ValueError as revision_error:
+        return Response(
+            {'optimizer_engine': str(revision_error)},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
     preflight_response = _optimizer_preflight_response(
         version, start_mode, source_run,
     )
@@ -5118,6 +5142,9 @@ def schedule_version_run_optimizer(request, version_id):
                     if optimizer_engine == 'V2'
                     else 'OPTIMIZER'
                 ),
+                optimizer_revision=optimizer_revision,
+                scoring_revision=scoring_revision,
+                optimizer_commit=code_release_identifier(),
                 locked_open_shift_instance_ids=locked_open_ids,
                 suppressed_shift_instance_ids=suppressed_ids,
                 backdated_shift_template_revisions=backdated_revisions,
@@ -5238,6 +5265,13 @@ def optimizer_run_save_copy(request, run_id):
             score_is_stale=source.score_is_stale,
             copied_from_run=source,
             run_kind='COPY',
+            optimizer_revision=source.optimizer_revision,
+            scoring_revision=source.scoring_revision,
+            optimizer_commit=source.optimizer_commit,
+            configuration_digest=source.configuration_digest,
+            completion_score=source.completion_score,
+            completion_score_breakdown=source.completion_score_breakdown,
+            completion_scoring_revision=source.completion_scoring_revision,
             locked_open_shift_instance_ids=locked_open_ids,
             suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
             backdated_shift_template_revisions=dict(source.backdated_shift_template_revisions or {}),
@@ -5395,6 +5429,15 @@ def optimizer_run_save_manual_changes_as_new(request, run_id):
             score_is_stale=True,
             copied_from_run=source,
             run_kind='COPY',
+            optimizer_revision=source.optimizer_revision,
+            scoring_revision=source.scoring_revision,
+            optimizer_commit=source.optimizer_commit,
+            configuration_digest=source.configuration_digest,
+            completion_score=source.completion_score,
+            completion_score_breakdown=copy.deepcopy(
+                source.completion_score_breakdown or {}
+            ),
+            completion_scoring_revision=source.completion_scoring_revision,
             locked_open_shift_instance_ids=edited_locked_open_ids,
             suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
             backdated_shift_template_revisions=dict(source.backdated_shift_template_revisions or {}),

@@ -4,6 +4,12 @@ from dataclasses import dataclass
 import secrets
 
 from .models import OptimizerRun, ScheduleShiftInstance, ScheduleVersion
+from .optimizer_revisions import (
+    V2_RUN_KINDS,
+    code_release_identifier,
+    configured_scoring_revision,
+    configured_v2_revision,
+)
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,11 @@ def prepare_optimizer_run(
             max_runtime_seconds=runtime_limit_seconds,
             optimization_focus=optimization_focus,
             run_kind=run_kind,
+            optimizer_revision=(
+                configured_v2_revision() if run_kind in V2_RUN_KINDS else ''
+            ),
+            scoring_revision=configured_scoring_revision(),
+            optimizer_commit=code_release_identifier(),
             locked_open_shift_instance_ids=source_locked_open_ids,
             suppressed_shift_instance_ids=source_suppressed_ids,
             backdated_shift_template_revisions=source_backdated_revisions,

@@ -34,12 +34,20 @@ from .optimizer_v2 import (
     rotate_assignments,
     swap_assignments,
 )
+from .optimizer_revisions import (
+    LEGACY_V2_TEST_RUN_KIND,
+    STABLE_V2_REVISION,
+    V2_RUN_KIND,
+    V2_RUN_KINDS,
+    code_release_identifier,
+    configured_scoring_revision,
+    configuration_digest,
+    optimizer_provenance,
+    require_supported_v2_revision,
+)
 from .run_state import assignments_for_viewed_run
 
 
-V2_RUN_KIND = 'OPTIMIZER_V2'
-LEGACY_V2_TEST_RUN_KIND = 'OPTIMIZER_V2_TEST'
-V2_RUN_KINDS = frozenset({V2_RUN_KIND, LEGACY_V2_TEST_RUN_KIND})
 # Compatibility import for older code and completed-run tests.
 V2_TEST_RUN_KIND = LEGACY_V2_TEST_RUN_KIND
 
@@ -47,7 +55,8 @@ V2_TEST_RUN_KIND = LEGACY_V2_TEST_RUN_KIND
 def _compact_search_summary(search_result):
     """Keep useful completed-run metrics and bounded score audit evidence."""
     keys = (
-        'stage', 'wall_seconds', 'stopped_reason', 'total_evaluations',
+        'stage', 'optimizer_revision', 'wall_seconds', 'stopped_reason',
+        'total_evaluations',
         'unique_evaluated_states', 'unique_accepted_states',
         'accepted_transitions', 'improving_transitions',
         'diversification_transitions', 'primary_improvements',
@@ -432,6 +441,18 @@ def optimize_schedule_version_v2(
     """Build or copy an isolated start, run v2, and save one result."""
     if optimizer_run.run_kind not in V2_RUN_KINDS:
         raise ValueError('Atlas V2 requires an Atlas V2 run record.')
+    # Runs are pinned before execution. A pre-versioning queued run is
+    # explicitly adopted by the frozen stable baseline; unsupported revisions
+    # fail closed instead of silently using whatever code is deployed.
+    optimizer_run.optimizer_revision = require_supported_v2_revision(
+        optimizer_run.optimizer_revision or STABLE_V2_REVISION
+    )
+    optimizer_run.scoring_revision = (
+        optimizer_run.scoring_revision or configured_scoring_revision()
+    )
+    optimizer_run.optimizer_commit = (
+        optimizer_run.optimizer_commit or code_release_identifier()
+    )
     fresh_fill = optimizer_run.start_mode == OptimizerRun.StartMode.FRESH_FILL
     original_published = (
         optimizer_run.start_mode
@@ -533,6 +554,7 @@ def optimize_schedule_version_v2(
         }
         for assignment in source_assignments
     ]
+    optimizer_run.configuration_digest = configuration_digest(launch_snapshot)
     source_rescore = {
         'source_run_id': selected_source_run.id,
         'source_run_number': selected_source_run.run_number,
@@ -547,11 +569,14 @@ def optimize_schedule_version_v2(
     optimizer_run.score_breakdown = source_initial_breakdown
     optimizer_run.optimizer_debug = {
         'optimizer_engine': 'V2',
+        **optimizer_provenance(optimizer_run),
         'launch_snapshot': launch_snapshot,
         'source_rescore': source_rescore,
     }
     optimizer_run.save(update_fields=[
         'initial_score', 'score_breakdown', 'optimizer_debug',
+        'optimizer_revision', 'scoring_revision', 'optimizer_commit',
+        'configuration_digest',
     ])
     has_movable_assignment = any(
         assignment.assignment_source
@@ -570,6 +595,7 @@ def optimize_schedule_version_v2(
         'search_started_at': timezone.now().isoformat(),
         'configuration_snapshot': launch_snapshot,
         'source_rescore': source_rescore,
+        **optimizer_provenance(optimizer_run),
     }
     remaining_runtime_seconds = max(
         float(optimizer_run.max_runtime_seconds) - (monotonic() - overall_started),
@@ -623,6 +649,7 @@ def optimize_schedule_version_v2(
                 checkpoint_interval=20,
                 starting_score=float(initial_score),
                 search_seed=int(optimizer_run.seed or optimizer_run.id),
+                optimizer_revision=optimizer_run.optimizer_revision,
                 distribution_focus=(
                     optimizer_run.optimization_focus
                     == OptimizerRun.OptimizationFocus.DISTRIBUTION
@@ -722,6 +749,7 @@ def optimize_schedule_version_v2(
         summary = {
             'message': 'Atlas V2 run completed.',
             'optimizer_engine': 'V2',
+            **optimizer_provenance(optimizer_run),
             'optimizer_run_id': optimizer_run.id,
             'optimizer_run_number': optimizer_run.run_number,
             'start_mode': optimizer_run.start_mode,
@@ -749,6 +777,9 @@ def optimize_schedule_version_v2(
             'assignments_made': len(rows),
             'unfilled_shift_count': unfilled,
             'best_verified_score': float(final_score),
+            'completion_score': float(final_score),
+            'completion_score_breakdown': report['score_breakdown'],
+            'completion_scoring_revision': optimizer_run.scoring_revision,
             'v2_search': _compact_search_summary(search_result),
             'fresh_fill_bootstrap': _compact_bootstrap_summary(
                 bootstrap_summary
@@ -761,6 +792,9 @@ def optimize_schedule_version_v2(
         optimizer_run.initial_score = source_initial_score
         optimizer_run.final_score = final_score
         optimizer_run.score_breakdown = report['score_breakdown']
+        optimizer_run.completion_score = final_score
+        optimizer_run.completion_score_breakdown = report['score_breakdown']
+        optimizer_run.completion_scoring_revision = optimizer_run.scoring_revision
         optimizer_run.optimizer_summary = summary
         # Detailed checkpoints and transition replay data are useful only
         # while a run is active or after an unexpected failure.
@@ -774,6 +808,8 @@ def optimize_schedule_version_v2(
         )
         optimizer_run.save(update_fields=[
             'status', 'initial_score', 'final_score', 'score_breakdown',
+            'completion_score', 'completion_score_breakdown',
+            'completion_scoring_revision',
             'optimizer_summary', 'optimizer_debug', 'score_is_stale',
             'is_active', 'notes',
         ])

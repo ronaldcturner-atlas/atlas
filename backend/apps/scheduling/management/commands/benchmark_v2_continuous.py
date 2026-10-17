@@ -10,12 +10,16 @@ from apps.scheduling.optimizer import (
     _pipeline_epoch_transition,
 )
 from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
+from apps.scheduling.optimizer_revisions import (
+    STABLE_V2_REVISION,
+    require_supported_v2_revision,
+)
 
 
 class Command(BaseCommand):
     stealth_options = (
         'stop_requested', 'progress_callback', 'runtime_clock',
-        'diagnostic_state',
+        'diagnostic_state', 'optimizer_revision',
     )
     help = (
         'Read-only continuous Atlas v2 benchmark. Repeatedly evaluates the '
@@ -65,6 +69,9 @@ class Command(BaseCommand):
         parser.add_argument('--json', action='store_true', dest='as_json')
 
     def handle(self, *args, **options):
+        optimizer_revision = require_supported_v2_revision(
+            options.get('optimizer_revision') or STABLE_V2_REVISION
+        )
         target_evaluations = max(int(options['target_evaluations']), 1)
         if options['run_id'] is None and options['run_number'] is None:
             raise CommandError('Provide --run-id or --run-number.')
@@ -147,6 +154,7 @@ class Command(BaseCommand):
         if isinstance(diagnostic_state, dict):
             diagnostic_state.update({
                 'schema_version': 1,
+                'optimizer_revision': optimizer_revision,
                 'phase': 'search_initializing',
                 'checkpoint_interval': checkpoint_interval,
                 'starting_score': current_score,
@@ -923,6 +931,7 @@ class Command(BaseCommand):
             'read_only': True,
             'run_id': options['run_id'],
             'run_number': resolved_run_number,
+            'optimizer_revision': optimizer_revision,
             'stress_contract_count': max(
                 int(options['stress_contract_count']), 0,
             ),

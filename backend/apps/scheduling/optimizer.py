@@ -34,6 +34,7 @@ from .optimizer_assignment_snapshot import (
     version_shift_instances_queryset as _version_shift_instances_queryset,
 )
 from .optimizer_run_context import prepare_optimizer_run
+from .optimizer_revisions import configured_scoring_revision
 from .optimizer_v1_constructor import (
     build_night_blocks as build_night_blocks_v1,
     fill_open_instances as fill_open_instances_v1,
@@ -11338,6 +11339,7 @@ def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
     debug['score_audit'] = report['score_audit']
     debug['score_recalculated_from_current_assignments'] = True
     breakdown = report['score_breakdown']
+    scoring_revision = configured_scoring_revision()
     summary = {
         **existing,
         'total_score': report['total_score'],
@@ -11346,6 +11348,7 @@ def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
         'proportionality': report['proportionality'],
         'unfilled_shift_count': int(breakdown.get('coverage_score', 0) / COVERAGE_PENALTY),
         'workload_summary': workload_summary,
+        'scoring_revision': scoring_revision,
         'debug': debug,
     }
 
@@ -11363,10 +11366,11 @@ def recalculate_schedule_version_score(schedule_version, optimizer_run=None):
             locked_run.score_breakdown = breakdown
             locked_run.optimizer_summary = summary
             locked_run.optimizer_debug = debug
+            locked_run.scoring_revision = scoring_revision
             locked_run.score_is_stale = False
             locked_run.save(update_fields=[
                 'final_score', 'score_breakdown', 'optimizer_summary',
-                'optimizer_debug', 'score_is_stale',
+                'optimizer_debug', 'scoring_revision', 'score_is_stale',
             ])
     return summary, report
 
