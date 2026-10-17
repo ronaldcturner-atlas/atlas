@@ -1,8 +1,6 @@
-version: "3.9"
-
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18-alpine
     restart: unless-stopped
     env_file:
       - .env
@@ -11,9 +9,9 @@ services:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
 
   backend:
     build:
@@ -90,3 +88,5 @@ services:
 
 volumes:
   postgres_data:
+    external: true
+    name: atlas_mobile_beta_clone_data
