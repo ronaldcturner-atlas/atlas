@@ -340,6 +340,7 @@ select option:checked{
 .schedule-block-modal-tabs{display:flex;gap:6px;padding:0 0 8px 0;border-bottom:1px solid rgba(255,255,255,0.08);margin-bottom:8px}
 .schedule-block-modal-tabs button{padding:6px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--sidebar-fg);cursor:pointer}
 .schedule-block-modal-tabs button.active{background:rgba(79,70,229,0.2);border-color:var(--accent)}
+.contract-modal .schedule-block-modal-tabs button.active{border-color:#7c6cf2;background:#5b4fe8;color:#fff;box-shadow:0 1px 3px rgba(30,41,59,.22)}
 
 .request-builder-root{display:flex;flex-direction:column;gap:8px}
 .request-builder-banner{padding:10px 12px;border-radius:8px;background:rgba(245,158,11,0.16);color:#fde68a;font-size:13px}
@@ -725,7 +726,7 @@ select option:checked{
 .contract-additional-workload-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .contract-additional-workload-card{display:grid;gap:10px;min-width:0;padding:12px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(255,255,255,.02)}
 .contract-rule-help{max-width:430px;color:var(--muted);font-size:11px;line-height:1.35}
-.contract-value-penalty-row,.contract-value-penalty-columns{display:grid;grid-template-columns:calc(5ch + 22px) calc(6ch + 22px);gap:10px;align-items:end;justify-content:start}
+.contract-value-penalty-row,.contract-value-penalty-columns{display:grid;grid-template-columns:96px 124px;gap:14px;align-items:end;justify-content:start}
 .contract-minmax-stack{display:grid;gap:10px;min-width:0}
 .contract-value-penalty-columns>.contract-minmax-stack{display:contents}
 .contract-value-penalty-columns>.contract-minmax-stack:first-child>.facility-field:first-child{grid-column:1;grid-row:1}
@@ -743,6 +744,8 @@ select option:checked{
 .contract-modal .facility-field input[type="number"]{width:calc(6ch + 22px);max-width:100%;box-sizing:border-box;font-variant-numeric:tabular-nums}
 .contract-value-penalty-row>.facility-field:first-child input[type="number"],.contract-value-penalty-columns>.contract-minmax-stack:first-child input[type="number"]{width:calc(5ch + 22px)}
 .contract-value-penalty-row>.facility-field:nth-child(2) input[type="number"],.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2) input[type="number"]{width:calc(6ch + 22px)}
+.contract-value-penalty-row>.facility-field:nth-child(2),.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2)>.facility-field,.contract-facility-target-grid .facility-target-minimum-penalty,.contract-facility-target-grid .facility-target-maximum-penalty{width:124px;justify-items:center}
+.contract-value-penalty-row>.facility-field:nth-child(2)>span,.contract-value-penalty-columns>.contract-minmax-stack:nth-child(2)>.facility-field>span,.contract-facility-target-grid .facility-target-minimum-penalty>span,.contract-facility-target-grid .facility-target-maximum-penalty>span{width:max-content;text-align:center;white-space:nowrap}
 .contract-modal input[type="number"],.shared-rule-modal input[type="number"],.user-override-modal input[type="number"]{-moz-appearance:textfield;appearance:textfield}
 .contract-modal input[type="number"]::-webkit-inner-spin-button,.contract-modal input[type="number"]::-webkit-outer-spin-button,.shared-rule-modal input[type="number"]::-webkit-inner-spin-button,.shared-rule-modal input[type="number"]::-webkit-outer-spin-button,.user-override-modal input[type="number"]::-webkit-inner-spin-button,.user-override-modal input[type="number"]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .contract-remove-button{height:36px;align-self:end;border-radius:8px;border:1px solid rgba(255,255,255,0.16);background:transparent;color:var(--sidebar-fg);cursor:pointer}
@@ -759,7 +762,7 @@ select option:checked{
 .contract-rule-summary{display:flex;align-items:center;gap:8px;color:var(--sidebar-fg);font-size:13px}
 .contract-rule-summary span{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 .contract-rule-options{display:grid;grid-template-columns:minmax(150px,1fr) minmax(150px,1fr) auto;gap:10px;align-items:end}
-.contract-facility-target-grid{display:grid;grid-template-columns:150px 96px calc(5ch + 22px) calc(6ch + 22px) 125px auto;grid-template-areas:"period units minimum min-penalty spread remove" "period units maximum max-penalty spread remove";gap:8px 10px;align-items:end;justify-content:start}
+.contract-facility-target-grid{display:grid;grid-template-columns:150px 96px 86px 124px 125px auto;grid-template-areas:"period units minimum min-penalty spread remove" "period units maximum max-penalty spread remove";gap:8px 12px;align-items:end;justify-content:start}
 .contract-facility-target-grid .facility-target-period{grid-area:period;align-self:center}
 .contract-facility-target-grid .facility-target-units{grid-area:units;align-self:center}
 .contract-facility-target-grid .facility-target-minimum{grid-area:minimum}
@@ -770,7 +773,7 @@ select option:checked{
 .contract-facility-target-grid .contract-remove-button{grid-area:remove;align-self:center;min-width:82px;padding:0 12px}
 .contract-facility-target-grid input{width:100%;font-variant-numeric:tabular-nums}
 .contract-add-facility-period{justify-self:start;padding:7px 11px}
-@media(max-width:900px){.contract-facility-target-grid{grid-template-columns:140px 96px calc(5ch + 22px) calc(6ch + 22px);grid-template-areas:"period units minimum min-penalty" "period units maximum max-penalty" "spread spread remove remove"}.contract-facility-target-grid .contract-remove-button{justify-self:start}.contract-facility-target-grid .facility-target-spread{justify-self:start}}
+@media(max-width:900px){.contract-facility-target-grid{grid-template-columns:140px 96px 86px 124px;grid-template-areas:"period units minimum min-penalty" "period units maximum max-penalty" "spread spread remove remove"}.contract-facility-target-grid .contract-remove-button{justify-self:start}.contract-facility-target-grid .facility-target-spread{justify-self:start}}
 
 .contract-shift-card{display:grid;gap:10px;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.02)}
 .contract-shift-card-header{display:flex;justify-content:space-between;gap:10px;align-items:end;flex-wrap:wrap}
@@ -811,7 +814,7 @@ select option:checked{
 
 @media (max-width: 650px){
   .contract-header-toggles{align-items:flex-start;flex-direction:column;gap:10px}
-  .contract-value-penalty-row,.contract-value-penalty-columns{grid-template-columns:calc(5ch + 22px) calc(6ch + 22px)}
+  .contract-value-penalty-row,.contract-value-penalty-columns{grid-template-columns:96px 124px}
   .contract-priority-admin-card{margin-left:0}
   .contract-rule-options{grid-template-columns:1fr}
   .contract-rule-controls-grid{grid-template-columns:1fr}
@@ -1605,6 +1608,7 @@ select option {
 .schedule-light-theme .request-pattern-grid button,
 .schedule-light-theme .schedule-block-modal-tabs button,
 .schedule-light-theme .user-self-actions>button{border-color:#cbd5e1;background:#fff;color:#334155}
+.schedule-light-theme .contract-modal .schedule-block-modal-tabs button.active{border-color:#4f46e5;background:#4f46e5;color:#fff;box-shadow:0 1px 3px rgba(30,41,59,.2)}
 .schedule-light-theme .role-permission-group-header button:hover,
 .schedule-light-theme .facility-actions button:hover,
 .schedule-light-theme .build-calendar-toolbar button:hover,

@@ -75,6 +75,12 @@ describe('Contract user overrides', () => {
     expect(contractsSource).toContain('<small>Admin only</small>')
     expect(stylesSource).toContain('.contract-priority-admin-card{margin-left:114px;border:2px solid #7c3aed')
     expect(stylesSource).toContain('.schedule-light-theme .contract-priority-admin-card{border-color:#7c3aed')
+    expect(stylesSource).toContain('.schedule-light-theme .contract-modal .schedule-block-modal-tabs button.active{border-color:#4f46e5;background:#4f46e5;color:#fff')
+    expect(contractsSource).not.toContain('Minimum value')
+    expect(contractsSource).not.toContain('Maximum value')
+    expect(stylesSource).toContain('grid-template-columns:96px 124px;gap:14px')
+    expect(stylesSource).toContain('width:124px;justify-items:center')
+    expect(stylesSource).toContain('width:max-content;text-align:center;white-space:nowrap')
   })
 
   it('keeps Contract-level Shared Rule settings synchronized and scoped', () => {
