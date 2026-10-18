@@ -78,6 +78,34 @@ Run 170 exercised the independent fresh-fill construction path.
 - Score-audit warnings: none
 - Run remained inactive; active Run 169 was preserved.
 
+## Confirmatory continuation evidence
+
+Run 171 provided the short post-promotion confirmation from Run 170.
+
+- Revision: `v2.circadian.1`
+- Configuration digest:
+  `7b0a57593365e6fb6bf5f41e4a04bb4d9adf9b0c7b20476dcb3b7b82f6001253`
+- Seed: `5529044935206496395`
+- Runtime limit: 600 seconds
+- Initial score: 629,000
+- Completion score: 626,000
+- Independent authoritative rescore: 626,000
+- Improvement: 3,000 (0.48%)
+- Assignments: 2,225
+- Unfilled shifts: zero
+- Evaluated candidates: 282,602,344
+- Accepted transitions: 147
+- Kernel rate: approximately 945,625 candidates/second
+- End-to-end rate: approximately 472,636 candidates/second
+- Coverage, overlap, rest, and invalid-assignment penalties: zero
+- Score-audit warnings: none
+- Run remained inactive; active Run 170 was preserved.
+
+Run 171 confirms that the promoted local revision can resume a completed fresh
+fill, preserve hard validity and assignment coverage, improve the official
+score, and reconcile exactly with the independent authoritative scorer during
+a short production-shaped run.
+
 ## Proportionate validation exception
 
 The standard five-seed paired study was waived for this local promotion. The
