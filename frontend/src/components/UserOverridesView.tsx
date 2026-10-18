@@ -106,7 +106,7 @@ function compactRuleLabel(rule: RuleRow, groupTitle: string) {
   const field = ruleField(rule)
   if (rule.section === 'request_settings') {
     if (field.startsWith('weight_')) return 'Request Weight'
-    if (field.endsWith('_request_limit')) return 'Request Limit'
+    if (field.endsWith('_request_limit')) return 'Maximum'
     if (field === 'low_request_unlimited') return 'Unlimited Requests'
   }
   const contextPrefix = `${groupTitle} · `
@@ -149,6 +149,7 @@ function ruleGroupSortValue(section: string, title: string) {
 
 function isSecondaryRule(rule: RuleRow) {
   const field = ruleField(rule)
+  if (rule.section === 'request_settings' && field === 'weight_weekend') return false
   return field.endsWith('_penalty_weight') || (rule.section === 'request_settings' && field.startsWith('weight_'))
 }
 

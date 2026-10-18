@@ -30,6 +30,7 @@ STRUCTURAL_RULE_KEYS = {
 LEGACY_UNSCORED_RULE_KEYS = {
     'min_same_shifts_in_row',
     'min_same_shifts_in_row_penalty_weight',
+    'weight_weekend',
 }
 
 

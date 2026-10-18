@@ -67,7 +67,14 @@ describe('Contract user overrides', () => {
   it('keeps numeric Contract and User Override inputs compact', () => {
     expect(stylesSource).toContain('.contract-modal .facility-field input[type="number"]{width:calc(6ch + 22px)')
     expect(stylesSource).toContain('.user-override-value-pair{display:grid;grid-template-columns:calc(6ch + 22px) calc(6ch + 22px)')
-    expect(stylesSource).toContain('.contract-priority-grid{display:grid;grid-template-columns:repeat(5,calc(6ch + 22px))')
+    expect(stylesSource).toContain('.contract-priority-grid{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}')
+    expect(contractsSource).toContain('<span>Maximum</span>')
+    expect(contractsSource).toContain('<span>Penalty</span>')
+    expect(contractsSource).not.toContain('value={formState.request_settings.weight_weekend}')
+    expect(contractsSource).toContain('Weekend has no separate penalty.')
+    expect(contractsSource).toContain('<small>Admin only</small>')
+    expect(stylesSource).toContain('.contract-priority-admin-card{margin-left:114px;border:2px solid #7c3aed')
+    expect(stylesSource).toContain('.schedule-light-theme .contract-priority-admin-card{border-color:#7c3aed')
   })
 
   it('keeps Contract-level Shared Rule settings synchronized and scoped', () => {

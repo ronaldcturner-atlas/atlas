@@ -301,6 +301,8 @@ Authorized request managers receive the request types allowed by their Domain pe
 
 Weekend counting follows Shift Template weekend designations. Day Off counts once when at least one eligible, active template designates that date's weekday as a weekend day. Shift Off counts once when at least one selected template carries that designation. Multiple selected shifts on the same request still count as one request.
 
+The Weekend request maximum is a quota overlay, not a separate request priority or penalty. A user-scope request that qualifies as a weekend request consumes one Weekend request and one request at its selected High, Medium, or Low priority. If that request is violated, its penalty comes only from the selected priority's configured weight; Weekend has no independent penalty weight.
+
 If the clinician has no active Contract in the selected Domain, Request Builder does not infer policy from another Domain. An ordinary user cannot create a new request until the applicable Contract is configured; they may still select `None` to remove an existing user request. An authorized request manager retains the options granted by Domain permissions.
 
 `FIXED` is an admin-only high-penalty instruction, not a hard scheduling constraint. It does not appear as an ordinary user's request option.
@@ -340,7 +342,7 @@ The supported rule configuration includes:
 - named Shift Template groups with their own period rules and an optional per-Contract **Same shifts in a row** maximum plus penalty. This Shift Group control counts adjacent calendar dates on which the user is assigned any selected template: a maximum of `1` discourages selected-group assignments on adjacent days. It is distinct from the workload-level **SAME SHIFT IN A ROW** rule, which evaluates consecutive occurrences of one exact Shift Template;
 - night volume, consecutive-night, and recovery settings;
 - weekend volume, consecutive-weekend, consecutive-weekend-shift, and Friday-night-before-weekend-off settings;
-- allowed request types, request limits, and request weights.
+- allowed request types, High/Medium/Low request maximums and weights, the Fixed request weight, and a Weekend request maximum without a separate weekend penalty;
 
 These are configurable mechanisms. Atlas must not hard-code a universal workload, night, weekend, or request policy.
 

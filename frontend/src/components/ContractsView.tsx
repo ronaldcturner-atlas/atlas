@@ -222,7 +222,6 @@ type RequestSettings = {
   weight_medium: string
   weight_high: string
   weight_fixed: string
-  weight_weekend: string
 }
 
 type ContractFormState = {
@@ -375,7 +374,6 @@ function emptyFormState(): ContractFormState {
       weight_medium: '',
       weight_high: '',
       weight_fixed: '',
-      weight_weekend: '',
     },
   }
 }
@@ -431,6 +429,11 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
   const nightSettings = contract.night_settings || fallback.night_settings
   const weekendSettings = contract.weekend_settings || fallback.weekend_settings
   const requestSettings = contract.request_settings || fallback.request_settings
+  const normalizedRequestSettings = {
+    ...fallback.request_settings,
+    ...requestSettings,
+  } as RequestSettings & { weight_weekend?: string }
+  delete normalizedRequestSettings.weight_weekend
   const facilitySettings = contract.facility_settings || fallback.facility_settings
   const legacyNightPenalty = (nightSettings as Record<string, unknown>).consecutive_penalty_weight
   const legacyWeekendPenalty = (weekendSettings as Record<string, unknown>).consecutive_penalty_weight
@@ -521,18 +524,17 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
         ? weekendSettings.period_rules
         : fallback.weekend_settings.period_rules).map((rule) => normalizeWeekendRule(rule as Partial<WeekendPeriodRule> & Record<string, unknown>)),
     },
-    request_settings: {
-      ...fallback.request_settings,
-      ...requestSettings,
-    },
+    request_settings: normalizedRequestSettings,
   }
 }
 
 function sanitizeFormPayload(formState: ContractFormState) {
   const workloadSettings = { ...formState.workload_settings } as Record<string, unknown>
+  const requestSettings = { ...formState.request_settings } as Record<string, unknown>
   delete workloadSettings.min_same_shifts_in_row
   delete workloadSettings.min_same_shifts_in_row_penalty_weight
   delete workloadSettings.circadian_spread_violations
+  delete requestSettings.weight_weekend
   return {
     name: formState.name.trim(),
     domain: Number(formState.domain),
@@ -578,7 +580,7 @@ function sanitizeFormPayload(formState: ContractFormState) {
       ...formState.weekend_settings,
       period_rules: formState.weekend_settings.period_rules.map(({ id, ...rule }) => rule),
     },
-    request_settings: formState.request_settings,
+    request_settings: requestSettings,
   }
 }
 
@@ -1782,30 +1784,39 @@ export default function ContractsView() {
                   <div className="contract-request-group">
                     <h4>Priority Settings</h4>
                     <div className="contract-priority-grid">
-                      <div className="contract-priority-header">Low</div>
-                      <div className="contract-priority-header">Medium</div>
-                      <div className="contract-priority-header">High</div>
-                      <div className="contract-priority-header">Fixed</div>
-                      <div className="contract-priority-header">Weekend</div>
-
-                      <label className="facility-field"><span>Request limit</span><input type="number" value={formState.request_settings.low_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, low_request_limit: event.target.value } }))} disabled={formState.request_settings.low_request_unlimited} /></label>
-                      <label className="facility-field"><span>Request limit</span><input type="number" value={formState.request_settings.medium_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, medium_request_limit: event.target.value } }))} /></label>
-                      <label className="facility-field"><span>Request limit</span><input type="number" value={formState.request_settings.high_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, high_request_limit: event.target.value } }))} /></label>
-                      <div className="contract-priority-spacer" aria-hidden="true" />
-                      <label className="facility-field"><span>Request limit</span><input type="number" value={formState.request_settings.weekend_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weekend_request_limit: event.target.value } }))} /></label>
-
-                      <label className="contract-request-allowed-item contract-priority-low-unlimited"><input type="checkbox" checked={formState.request_settings.low_request_unlimited} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, low_request_unlimited: event.target.checked } }))} /><span>Low unlimited</span></label>
-                      <div className="contract-priority-spacer" aria-hidden="true" />
-                      <div className="contract-priority-spacer" aria-hidden="true" />
-                      <div className="contract-priority-spacer" aria-hidden="true" />
-                      <div className="contract-priority-spacer" aria-hidden="true" />
-
-                      <label className="facility-field"><span>Request weight</span><input type="number" value={formState.request_settings.weight_low} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_low: event.target.value } }))} /></label>
-                      <label className="facility-field"><span>Request weight</span><input type="number" value={formState.request_settings.weight_medium} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_medium: event.target.value } }))} /></label>
-                      <label className="facility-field"><span>Request weight</span><input type="number" value={formState.request_settings.weight_high} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_high: event.target.value } }))} /></label>
-                      <label className="facility-field"><span>Request weight</span><input type="number" value={formState.request_settings.weight_fixed} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_fixed: event.target.value } }))} /></label>
-                      <label className="facility-field"><span>Request weight</span><input type="number" value={formState.request_settings.weight_weekend} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_weekend: event.target.value } }))} /></label>
+                      <section className="contract-priority-card">
+                        <h5>Low</h5>
+                        <div className="contract-value-penalty-row">
+                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.request_settings.low_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, low_request_limit: event.target.value } }))} disabled={formState.request_settings.low_request_unlimited} /></label>
+                          <label className="facility-field"><span>Penalty</span><input type="number" value={formState.request_settings.weight_low} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_low: event.target.value } }))} /></label>
+                        </div>
+                        <label className="contract-request-allowed-item contract-priority-low-unlimited"><input type="checkbox" checked={formState.request_settings.low_request_unlimited} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, low_request_unlimited: event.target.checked } }))} /><span>Unlimited</span></label>
+                      </section>
+                      <section className="contract-priority-card">
+                        <h5>Medium</h5>
+                        <div className="contract-value-penalty-row">
+                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.request_settings.medium_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, medium_request_limit: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Penalty</span><input type="number" value={formState.request_settings.weight_medium} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_medium: event.target.value } }))} /></label>
+                        </div>
+                      </section>
+                      <section className="contract-priority-card">
+                        <h5>High</h5>
+                        <div className="contract-value-penalty-row">
+                          <label className="facility-field"><span>Maximum</span><input type="number" value={formState.request_settings.high_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, high_request_limit: event.target.value } }))} /></label>
+                          <label className="facility-field"><span>Penalty</span><input type="number" value={formState.request_settings.weight_high} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_high: event.target.value } }))} /></label>
+                        </div>
+                      </section>
+                      <section className="contract-priority-card contract-priority-single-rule">
+                        <h5>Weekend</h5>
+                        <label className="facility-field"><span>Maximum</span><input type="number" value={formState.request_settings.weekend_request_limit} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weekend_request_limit: event.target.value } }))} /></label>
+                      </section>
+                      <section className="contract-priority-card contract-priority-single-rule contract-priority-admin-card">
+                        <h5>Fixed</h5>
+                        <label className="facility-field"><span>Penalty</span><input type="number" value={formState.request_settings.weight_fixed} onChange={(event) => setFormState((current) => ({ ...current, request_settings: { ...current.request_settings, weight_fixed: event.target.value } }))} /></label>
+                        <small>Admin only</small>
+                      </section>
                     </div>
+                    <p className="contract-rule-help contract-request-weekend-help">A weekend request also counts toward its selected priority maximum. Its penalty comes from that priority; Weekend has no separate penalty.</p>
                   </div>
                 </div>
               )}
