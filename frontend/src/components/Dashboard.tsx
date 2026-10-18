@@ -6,6 +6,7 @@ import Calendar from './Calendar'
 import ShiftsView from './ShiftsView'
 import ScheduleBuildWorkspace from './ScheduleBuildWorkspace'
 import ScheduleBlocksView from './ScheduleBlocksView'
+import ScheduleBlockUsersView from './ScheduleBlockUsersView'
 import ScheduleVersionViolationReport from './ScheduleVersionViolationReport'
 import ContractsView from './ContractsView'
 import FacilitiesView from './FacilitiesView'
@@ -43,6 +44,7 @@ function viewFromPath(pathname: string): AppView | null {
   if (
     pathname === '/schedule-blocks'
     || /^\/schedule-blocks\/\d+\/requests$/.test(pathname)
+    || /^\/schedule-blocks\/\d+\/users$/.test(pathname)
     || /^\/schedule-blocks\/\d+\/build$/.test(pathname)
     || /^\/schedule-versions\/\d+\/violations$/.test(pathname)
   ) {
@@ -75,6 +77,8 @@ export default function Dashboard() {
   const requestBlockId = requestBuilderMatch ? Number(requestBuilderMatch[1]) : null
   const buildWorkspaceMatch = location.pathname.match(/^\/schedule-blocks\/(\d+)\/build$/)
   const buildBlockId = buildWorkspaceMatch ? Number(buildWorkspaceMatch[1]) : null
+  const blockUsersMatch = location.pathname.match(/^\/schedule-blocks\/(\d+)\/users$/)
+  const blockUsersId = blockUsersMatch ? Number(blockUsersMatch[1]) : null
   const violationReportMatch = location.pathname.match(/^\/schedule-versions\/(\d+)\/violations$/)
   const violationVersionId = violationReportMatch ? Number(violationReportMatch[1]) : null
   const [facilitiesRefreshToken, setFacilitiesRefreshToken] = React.useState(0)
@@ -102,7 +106,9 @@ export default function Dashboard() {
   }, [])
 
   const pageTitle =
-    buildBlockId !== null
+    blockUsersId !== null
+      ? 'Schedule Block Users'
+      : buildBlockId !== null
       ? 'Schedule Build Workspace'
       : violationVersionId !== null
       ? 'Optimizer Violation Report'
@@ -132,7 +138,7 @@ export default function Dashboard() {
       return
     }
     const schedulerOnlyView = ['shift-builder', 'contracts', 'facilities', 'roles', 'organization'].includes(activeView)
-    if (effectiveUserView && (schedulerOnlyView || violationVersionId !== null)) {
+    if (effectiveUserView && (schedulerOnlyView || violationVersionId !== null || blockUsersId !== null)) {
       navigate('/', { replace: true })
       return
     }
@@ -143,7 +149,7 @@ export default function Dashboard() {
     ) {
       navigate('/', { replace: true })
     }
-  }, [activeView, buildBlockId, canManageContracts, canManageFacilities, canManageShiftTemplates, effectiveUserView, location.pathname, navigate, violationVersionId])
+  }, [activeView, blockUsersId, buildBlockId, canManageContracts, canManageFacilities, canManageShiftTemplates, effectiveUserView, location.pathname, navigate, violationVersionId])
 
   const handleFacilitiesChanged = React.useCallback(() => {
     setFacilitiesRefreshToken((current) => current + 1)
@@ -189,13 +195,16 @@ export default function Dashboard() {
           {!effectiveUserView && activeView === 'schedule-blocks' && violationVersionId !== null && (
             <ScheduleVersionViolationReport versionId={violationVersionId} />
           )}
-          {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId !== null && (
+          {!effectiveUserView && activeView === 'schedule-blocks' && violationVersionId === null && blockUsersId !== null && (
+            <ScheduleBlockUsersView blockId={blockUsersId} onBack={() => navigate('/schedule-blocks')} />
+          )}
+          {activeView === 'schedule-blocks' && violationVersionId === null && blockUsersId === null && buildBlockId !== null && (
             <ScheduleBuildWorkspace
               blockId={buildBlockId}
               onBack={() => navigate('/schedule-blocks')}
             />
           )}
-          {activeView === 'schedule-blocks' && violationVersionId === null && buildBlockId === null && (
+          {activeView === 'schedule-blocks' && violationVersionId === null && blockUsersId === null && buildBlockId === null && (
             <ScheduleBlocksView
               requestUserView={effectiveUserView}
               previewPhysicianId={effectiveUserView ? user?.physician_id ?? null : null}
@@ -203,6 +212,7 @@ export default function Dashboard() {
               onOpenRequests={(blockId) => navigate(`/schedule-blocks/${blockId}/requests`)}
               onCloseRequests={() => navigate('/schedule-blocks')}
               onOpenBuild={(blockId) => navigate(`/schedule-blocks/${blockId}/build`)}
+              onOpenUsers={(blockId) => navigate(`/schedule-blocks/${blockId}/users`)}
             />
           )}
           {!effectiveUserView && canManageContracts && activeView === 'contracts' && <ContractsView />}

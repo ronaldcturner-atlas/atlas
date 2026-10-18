@@ -1789,3 +1789,62 @@ select option {
   color:#92400e;
   opacity:1;
 }
+
+/* Schedule Block user planning */
+.block-users-view{gap:12px}
+.block-users-view .facilities-header h2{margin:0 0 3px}
+.block-users-view .muted{margin:0;color:#64748b;font-size:12px}
+.block-plan-tabs{display:flex;gap:6px;border-bottom:1px solid #dbe2ea;padding-bottom:7px;overflow-x:auto}
+.block-plan-tabs button{white-space:nowrap}
+.block-plan-tabs button.active{border-color:#4f46e5;background:#4f46e5;color:#fff;font-weight:700}
+.block-plan-tabs button.adjusted:not(.active){border-color:#7c3aed;background:#f5f3ff;color:#5b21b6}
+.block-plan-notice{border:1px solid #bfdbfe;background:#eff6ff;color:#1e3a8a;border-radius:7px;padding:8px 10px;font-size:12px}
+.block-plan-toolbar{display:flex;align-items:end;gap:7px;flex-wrap:wrap;border:1px solid #dbe2ea;background:#f8fafc;border-radius:8px;padding:8px}
+.block-plan-toolbar label{display:grid;gap:3px;font-size:11px;color:#475569}
+.block-plan-toolbar input,.block-plan-table input{width:66px;box-sizing:border-box;padding:6px 7px}
+.block-plan-toolbar .toolbar-separator{width:1px;height:31px;background:#cbd5e1;margin:0 3px}
+.block-plan-table{min-width:1120px}
+.block-plan-table th,.block-plan-table td{padding:6px 7px}
+.block-plan-table td:first-child,.block-plan-table th:first-child{width:24px;text-align:center}
+.block-plan-table td small{display:block;color:#64748b;font-size:10px;margin-top:2px;max-width:220px}
+.block-plan-table .normalization-note{color:#92400e}
+.block-plan-table .contract-change-note{color:#b91c1c;font-weight:700}
+.block-plan-table .contract-change-note button{padding:1px 4px;margin-left:3px;font-size:9px;border-color:#b91c1c;color:#991b1b;background:#fff}
+.block-plan-table tr.partial-row{background:#fffbeb}
+.partial-badge{display:inline-flex;margin-left:7px;padding:2px 6px!important;border-color:#d97706!important;background:#fef3c7!important;color:#92400e!important;font-size:10px!important;font-weight:700}
+.block-plan-save{display:flex;justify-content:flex-end}
+.partial-user-list{display:grid;gap:6px;max-width:900px}
+.partial-user-list>p{margin:0 0 4px;color:#64748b;font-size:12px}
+.partial-user-list>button{display:flex;align-items:center;justify-content:space-between;text-align:left;padding:8px 10px;background:#fff;border:1px solid #dbe2ea}
+.partial-user-list>button.has-partial{border-color:#d97706;background:#fffbeb}
+.partial-user-list small{display:block;color:#64748b;margin-top:2px}
+.partial-contract-modal{width:min(1380px,94vw);height:min(900px,92vh)}
+.partial-contract-modal .shift-modal-header{align-items:flex-start}
+.partial-contract-modal .shift-modal-header h2{margin:3px 0}
+.partial-contract-modal .shift-modal-header p{margin:0;color:#64748b;font-size:12px}
+.partial-contract-label{color:#6d28d9;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+.partial-tabs{padding:0 16px 7px}
+.partial-contract-body{overflow:auto;padding-top:10px}
+.partial-calendar-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
+.partial-calendar-grid section{border:1px solid #dbe2ea;border-radius:8px;padding:8px;background:#f8fafc}
+.partial-calendar-grid h3{text-align:center;margin:0 0 6px;font-size:13px}
+.partial-calendar-head,.partial-calendar-days{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.partial-calendar-head span{text-align:center;color:#64748b;font-size:10px;font-weight:700}
+.partial-calendar-days button{aspect-ratio:1.25;padding:2px;background:#fff;border:1px solid #dbe2ea}
+.partial-calendar-days button.unavailable{border-color:#b91c1c;background:#fee2e2;color:#991b1b;font-weight:800}
+.partial-summary{border:1px solid #dbe2ea;border-radius:8px;padding:12px;background:#f8fafc}
+.partial-summary h3,.partial-summary p{margin:0 0 7px}
+.partial-block-values{display:flex;align-items:end;gap:7px;flex-wrap:wrap;margin:10px 0}
+.partial-block-values>strong{width:100%;font-size:12px}
+.partial-block-values label{display:grid;gap:3px;color:#475569;font-size:10px}
+.partial-block-values input{width:72px;padding:6px 7px;box-sizing:border-box}
+.summary-pills{display:flex;gap:5px;flex-wrap:wrap}
+.summary-pills span{border:1px solid #a78bfa;background:#ede9fe;color:#5b21b6;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:700}
+.partial-rule-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:6px}
+.partial-rule-list label{display:grid;grid-template-columns:minmax(0,1fr) 105px;align-items:center;gap:8px;border:1px solid #dbe2ea;border-radius:7px;padding:7px;background:#fff;font-size:12px}
+.partial-rule-list label.atlas-adjusted{border-color:#7c3aed;background:#faf5ff}
+.partial-rule-list label.manual-override{box-shadow:inset 3px 0 #d97706}
+.partial-rule-list small{display:block;color:#64748b;font-size:10px;margin-top:2px}
+.partial-rule-list input:not([type=checkbox]){width:100%;box-sizing:border-box;padding:6px 7px}
+.partial-contract-modal .action-spacer{flex:1}
+@media(max-width:900px){.block-plan-toolbar .toolbar-separator{display:none}.partial-contract-modal{width:97vw}.partial-calendar-grid{grid-template-columns:1fr}.partial-rule-list{grid-template-columns:1fr}}

@@ -10,7 +10,7 @@ import random
 from time import monotonic
 from ortools.sat.python import cp_model
 from .search_budget import SearchBudget
-from .contract_overrides import apply_effective_contracts
+from .block_user_planning import apply_block_user_plans, block_workload_override
 
 from django.db import transaction
 from django.db.models import Q
@@ -447,10 +447,80 @@ def _with_workload_hour_override(target, override):
     }
 
 
+def _with_block_workload_overrides(target, plan):
+    rules = list(target.get('rules') or [])
+    applied = {}
+    for units in ('HOURS', 'SHIFTS'):
+        override = block_workload_override(plan or {}, units)
+        if override is None:
+            continue
+        matching = [rule for rule in rules if rule.get('units') == units]
+        template = next(
+            (rule for rule in matching if rule.get('period_type') == 'SCHEDULE_BLOCK'),
+            matching[0] if matching else {},
+        )
+        rules = [rule for rule in rules if rule.get('units') != units]
+        rules.append({
+            'period_type': 'SCHEDULE_BLOCK',
+            'units': units,
+            'min_value': override['minimum'],
+            'max_value': override['maximum'],
+            'min_penalty_weight': template.get('min_penalty_weight', Decimal('0')),
+            'max_penalty_weight': template.get('max_penalty_weight', Decimal('0')),
+            'spread_violations': bool(template.get('spread_violations')),
+        })
+        applied[units.lower()] = override
+    if not applied:
+        return target
+    primary = next((rule for rule in rules if rule.get('units') == 'HOURS'), rules[0] if rules else {})
+    values = [value for value in (primary.get('min_value'), primary.get('max_value')) if value is not None]
+    return {
+        **target,
+        'units': primary.get('units', target.get('units', 'HOURS')),
+        'target': sum(values) / Decimal(len(values)) if values else target.get('target', Decimal('0')),
+        'rules': rules,
+        'block_user_workload_adjustment': applied,
+    }
+
+
 def _version_contract_target(version, physician_id, contract, default_hours_target, default_shift_target):
     target = _contract_target(contract, default_hours_target, default_shift_target)
     overrides = version.workload_hour_overrides if isinstance(version.workload_hour_overrides, dict) else {}
-    return _with_workload_hour_override(target, overrides.get(str(physician_id)))
+    target = _with_workload_hour_override(target, overrides.get(str(physician_id)))
+    plan = (version.schedule_block.user_planning_settings or {}).get(str(physician_id), {})
+    return _with_block_workload_overrides(target, plan)
+
+
+class _EligibilityMap(dict):
+    def __init__(self, *args, unavailable_dates_by_physician=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.unavailable_dates_by_physician = unavailable_dates_by_physician or {}
+
+
+def _eligibility_map(contract_assignments):
+    return _EligibilityMap(
+        {
+            assignment.physician_id: {
+                facility.id for facility in assignment.contract.facilities.all()
+            }
+            for assignment in contract_assignments
+        },
+        unavailable_dates_by_physician={
+            assignment.physician_id: set(
+                getattr(assignment.contract, 'block_unavailable_dates', set())
+            )
+            for assignment in contract_assignments
+        },
+    )
+
+
+def _is_instance_eligible(instance, physician_id, eligible_facilities_by_physician):
+    if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+        return False
+    unavailable = getattr(
+        eligible_facilities_by_physician, 'unavailable_dates_by_physician', {},
+    ).get(physician_id, set())
+    return instance.date.isoformat() not in unavailable
 
 
 def _hour_rule_block_bounds(instances, rules):
@@ -1279,7 +1349,7 @@ def _can_assign_in_state(
 ):
     if physician_id in state[instance.id] and exclude_instance_id != instance.id:
         return False
-    if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+    if not _is_instance_eligible(instance, physician_id, eligible_facilities_by_physician):
         return False
 
     intervals = assigned_intervals
@@ -1412,7 +1482,7 @@ def _validate_schedule(
                 )
             if (
                 physician_id not in manual_assignment_only_physician_ids
-                and instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set())
+                and not _is_instance_eligible(instance, physician_id, eligible_facilities_by_physician)
             ):
                 facility_ineligible_violations += 1
                 add_violation(
@@ -5727,7 +5797,9 @@ def _fixed_shift_on_request_workload_floor(
             ):
                 candidates = [
                     instance for instance in candidates
-                    if instance.facility_id in eligible_facility_ids
+                    if _is_instance_eligible(
+                        instance, physician_id, eligible_facilities_by_physician,
+                    )
                 ]
             candidates = list({instance.id: instance for instance in candidates}.values())
             request_payload = {
@@ -7559,7 +7631,7 @@ def _solve_bounded_multi_physician_neighborhood(
         if deadline_reached('create_assignment_variables'):
             return _copy_state(state), scoring, debug
         for physician_id in cohort_ids:
-            if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+            if not _is_instance_eligible(instance, physician_id, eligible_facilities_by_physician):
                 continue
             if external_indexes[physician_id].conflicts(
                 instance, minimum_rest_by_physician[physician_id],
@@ -10332,8 +10404,8 @@ def build_violation_report(schedule_version, optimizer_run=None):
         .prefetch_related('contract__facilities')
         .order_by('physician__display_name', 'physician__user__last_name', 'physician__user__first_name', 'physician_id')
     )
-    active_contract_assignments = apply_effective_contracts(
-        active_contract_assignments,
+    active_contract_assignments = apply_block_user_plans(
+        active_contract_assignments, version.schedule_block,
     )
     physicians = [assignment.physician for assignment in active_contract_assignments]
     contract_by_physician = {
@@ -10363,12 +10435,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
         assignment.physician_id: _minimum_rest_hours(assignment.contract)
         for assignment in active_contract_assignments
     }
-    eligible_facilities_by_physician = {
-        assignment.physician_id: {
-            facility.id for facility in assignment.contract.facilities.all()
-        }
-        for assignment in active_contract_assignments
-    }
+    eligible_facilities_by_physician = _eligibility_map(active_contract_assignments)
     state, _manual_pairs = _state_from_assignments(assignments)
 
     total_required_hours = sum(
@@ -10400,6 +10467,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
             'maximum': Decimal('0'), 'rules': [],
         }
     requests_by_physician_date = defaultdict(list)
+    block_user_plans = version.schedule_block.user_planning_settings or {}
     for schedule_request in (
         ScheduleRequest.objects.filter(
             schedule_block=version.schedule_block,
@@ -10408,6 +10476,12 @@ def build_violation_report(schedule_version, optimizer_run=None):
         )
         .prefetch_related('shift_templates')
     ):
+        if schedule_request.date.isoformat() in set(
+            block_user_plans.get(str(schedule_request.physician_id), {}).get(
+                'unavailable_dates',
+            ) or ()
+        ):
+            continue
         requests_by_physician_date[
             (schedule_request.physician_id, schedule_request.date)
         ].append(schedule_request)
@@ -11025,7 +11099,7 @@ def evaluate_plateau_pairwise_swap(
         ('left', left_instance, right_physician_id, left_instance_id),
         ('right', right_instance, left_physician_id, right_instance_id),
     ):
-        if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+        if not _is_instance_eligible(instance, physician_id, eligible_facilities_by_physician):
             return {'legal': False, 'reason': 'not_facility_eligible', 'invalid_side': side}
         intervals = _intervals_for_physician(
             trial_state, instances_by_id, physician_id, exclude_instance_id=exclude_id,
@@ -11118,8 +11192,8 @@ def evaluate_plateau_reassignment(
     if new_physician_id in state.get(instance_id, ()):
         return {'legal': False, 'reason': 'duplicate_assignment'}
     instance = instances_by_id[instance_id]
-    if instance.facility_id not in eligible_facilities_by_physician.get(
-        new_physician_id, set(),
+    if not _is_instance_eligible(
+        instance, new_physician_id, eligible_facilities_by_physician,
     ):
         return {'legal': False, 'reason': 'not_facility_eligible'}
 
@@ -11262,8 +11336,8 @@ def evaluate_plateau_three_way_rotation(
         )
     for instance_id, new_physician_id in zip(instance_ids, new_physician_ids):
         instance = instances_by_id[instance_id]
-        if instance.facility_id not in eligible_facilities_by_physician.get(
-            new_physician_id, set(),
+        if not _is_instance_eligible(
+            instance, new_physician_id, eligible_facilities_by_physician,
         ):
             return {'legal': False, 'reason': 'not_facility_eligible'}
         intervals = _intervals_for_physician(
@@ -11540,8 +11614,8 @@ def optimize_schedule_version(
             .prefetch_related('contract__facilities')
             .order_by('physician__user__last_name', 'physician__user__first_name', 'physician_id')
         )
-        active_contract_assignments = apply_effective_contracts(
-            active_contract_assignments,
+        active_contract_assignments = apply_block_user_plans(
+            active_contract_assignments, version.schedule_block,
         )
         physicians = [assignment.physician for assignment in active_contract_assignments]
         physicians_by_id = {physician.id: physician for physician in physicians}
@@ -11568,12 +11642,7 @@ def optimize_schedule_version(
             assignment.physician_id: _minimum_rest_hours(assignment.contract)
             for assignment in active_contract_assignments
         }
-        eligible_facilities_by_physician = {
-            assignment.physician_id: {
-                facility.id for facility in assignment.contract.facilities.all()
-            }
-            for assignment in active_contract_assignments
-        }
+        eligible_facilities_by_physician = _eligibility_map(active_contract_assignments)
         for physician_id in manual_assignment_only_physician_ids:
             eligible_facilities_by_physician[physician_id] = set()
 
@@ -12438,16 +12507,10 @@ def optimize_schedule_version(
             include_internal_night_heuristics=True,
         )
         search_initial_score = initial_scoring['score']
-        reported_initial_score = (
-            (
-                float(source_run.final_score)
-                if source_run.final_score is not None
-                else source_state_reported_score_before_pre_score_changes
-            )
-            if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-            and source_run is not None
-            else search_initial_score
-        )
+        # A source Run contributes assignments, never its historical score.
+        # Current requests and effective Contracts may have changed, so the
+        # authoritative score of the copied state is this Run's true baseline.
+        reported_initial_score = search_initial_score
         same_shift_violations_initial = len(initial_scoring['same_shift_violations'])
         initial_night_report = _night_violation_report(
             instances,
@@ -12858,8 +12921,9 @@ def optimize_schedule_version(
                         for physician in physicians
                         if physician.id not in used_physician_ids
                         and physician.id != current_owner_id
-                        and outgoing.facility_id
-                        in eligible_facilities_by_physician.get(physician.id, set())
+                        and _is_instance_eligible(
+                            outgoing, physician.id, eligible_facilities_by_physician,
+                        )
                         and physician.id not in trial_state[outgoing_id]
                     ]
                     recipient_ids.sort(
@@ -14356,7 +14420,7 @@ def optimize_schedule_version(
                     debug_row['best_rejected_move_score_delta'] = float(delta)
 
         def assignment_rejection_category(trial_state, instance, physician_id, exclude_instance_id):
-            if instance.facility_id not in eligible_facilities_by_physician.get(physician_id, set()):
+            if not _is_instance_eligible(instance, physician_id, eligible_facilities_by_physician):
                 return 'facility_ineligible'
             intervals = _intervals_for_physician(
                 trial_state,
@@ -14784,8 +14848,8 @@ def optimize_schedule_version(
                     if instance.id in source_locked_open_ids:
                         record_minimum_rejection('locked_assignment', physician_name)
                         continue
-                    if instance.facility_id not in eligible_facilities_by_physician.get(
-                        to_physician_id, set(),
+                    if not _is_instance_eligible(
+                        instance, to_physician_id, eligible_facilities_by_physician,
                     ):
                         record_minimum_rejection('facility_ineligible', physician_name)
                         continue
@@ -15494,8 +15558,9 @@ def optimize_schedule_version(
                     (right_instance_id, left_physician_id),
                 ):
                     candidate_instance = instances_by_id[candidate_instance_id]
-                    if candidate_instance.facility_id not in eligible_facilities_by_physician.get(
-                        candidate_physician_id, set(),
+                    if not _is_instance_eligible(
+                        candidate_instance, candidate_physician_id,
+                        eligible_facilities_by_physician,
                     ):
                         return None
                     if not _can_assign_in_state(

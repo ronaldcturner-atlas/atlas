@@ -164,6 +164,18 @@ class ScheduleBlock(models.Model):
         blank=True,
     )
     shift_configuration_revision = models.PositiveBigIntegerField(default=0)
+    # Scheduler-only, block-scoped user targets and temporary partial-block
+    # contracts.  Keys are physician IDs so these settings never alter the
+    # physician's permanent Contract assignment or user override.
+    user_planning_settings = models.JSONField(default=dict, blank=True)
+    user_planning_updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name='updated_schedule_block_user_plans',
+        null=True,
+        blank=True,
+    )
+    user_planning_updated_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return self.generated_name

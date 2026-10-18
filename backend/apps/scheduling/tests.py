@@ -2724,6 +2724,94 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             required_staffing=1,
         )
 
+    def test_block_user_planning_values_and_partial_availability_are_enforced(self):
+        physician = self._create_assignment_physician(
+            'partial-block@example.com', 'Partial Block', [self.facility],
+        )
+        other_domain = Domain.objects.create(name='APP', active=True)
+        DomainMembership.objects.create(
+            domain=other_domain,
+            user=physician.user,
+            role=DomainMembership.Role.VIEW_ONLY,
+            clinically_active=False,
+            active=True,
+        )
+        contract = ContractUserAssignment.objects.get(
+            domain=self.domain, physician=physician,
+        ).contract
+        contract.workload_settings = {'period_rules': [
+            {
+                'period_type': 'MONTH', 'units': 'HOURS',
+                'min_value': '120', 'max_value': '140',
+                'min_penalty_weight': '9000', 'max_penalty_weight': '10000',
+            },
+            {
+                'period_type': 'SCHEDULE_BLOCK', 'units': 'HOURS',
+                'min_value': '240', 'max_value': '280',
+                'min_penalty_weight': '9000', 'max_penalty_weight': '10000',
+            },
+        ]}
+        contract.save(update_fields=['workload_settings', 'updated_at'])
+        users_url = f'/api/schedule-blocks/{self.block.id}/users/'
+
+        initial = self.client.get(users_url)
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.json()['users'][0]['physician_id'], physician.id)
+        self.assertEqual(initial.json()['users'][0]['minimum_hours'], '240')
+        self.assertEqual(initial.json()['users'][0]['maximum_hours'], '280')
+
+        saved = self.client.patch(
+            users_url,
+            data={'users': [{
+                'physician_id': physician.id,
+                'target_hours': '120',
+                'minimum_hours': '110',
+                'maximum_hours': '130',
+                'target_shifts': '12',
+                'minimum_shifts': '11',
+                'maximum_shifts': '13',
+            }]},
+            format='json',
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()['users'][0]['minimum_hours'], '110')
+
+        partial_url = (
+            f'/api/schedule-blocks/{self.block.id}/users/'
+            f'{physician.id}/partial/'
+        )
+        partial = self.client.patch(
+            partial_url,
+            data={'unavailable_dates': ['2026-07-06']},
+            format='json',
+        )
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.json()['unavailable_dates'], ['2026-07-06'])
+
+        self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/build/generate/',
+            data={'domain_id': self.domain.id},
+            format='json',
+        )
+        shift_instance = ScheduleShiftInstance.objects.get(
+            shift_template=self.day_template,
+        )
+        assignment_url = (
+            f'/api/schedule-blocks/{self.block.id}/build/'
+            f'shift-instances/{shift_instance.id}/assignments/'
+        )
+        context = self.client.get(assignment_url)
+        physician_context = {
+            row['id']: row for row in context.json()['eligible_physicians']
+        }[physician.id]
+        self.assertFalse(physician_context['block_date_eligible'])
+        self.assertFalse(physician_context['can_assign'])
+        rejected = self.client.post(
+            assignment_url, data={'physician_id': physician.id}, format='json',
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn('Temporary Partial Block Contract', rejected.json()['physician_id'])
+
     def test_generate_creates_open_dated_instances_and_moves_block_to_build(self):
         response = self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -4752,8 +4840,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(second_run.started_from_run_id, second_source.id)
         self.assertEqual(first_run.started_from_run_number, first_source.run_number)
         self.assertEqual(second_run.started_from_run_number, second_source.run_number)
-        self.assertEqual(first_run.initial_score, first_source.final_score)
-        self.assertEqual(second_run.initial_score, second_source.final_score)
+        self.assertIsNone(first_run.initial_score)
+        self.assertIsNone(second_run.initial_score)
         self.assertEqual(
             list(
                 OptimizerControl.objects.filter(optimizer_run__in=[first_run, second_run])
@@ -5059,7 +5147,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         queued_run = OptimizerRun.objects.get(id=response.json()['id'])
         self.assertEqual(queued_run.run_kind, 'OPTIMIZER_V2')
         self.assertEqual(queued_run.started_from_run_id, source_run.id)
-        self.assertEqual(queued_run.initial_score, source_run.final_score)
+        self.assertIsNone(queued_run.initial_score)
 
     def test_atlas_v2_fresh_fill_bootstraps_same_isolated_run(self):
         from apps.scheduling.optimizer_v2_runner import (

@@ -4,7 +4,7 @@ import hashlib
 import json
 import secrets
 from datetime import date as date_type, datetime, timedelta, timezone as datetime_timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from uuid import UUID
 from time import monotonic
@@ -68,6 +68,11 @@ from .contract_overrides import (
     effective_contract_for_assignment,
     normalized_rule_overrides,
     override_differences,
+)
+from .block_user_planning import (
+    apply_manual_temporary_overrides,
+    block_month_count,
+    generated_partial_settings,
 )
 from .optimizer import (
     build_violation_report,
@@ -3071,7 +3076,14 @@ def _build_request_counters(block, physician, policy, exclude_request_ids=None):
     )
 
     used = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'WEEKEND': 0}
+    unavailable_dates = set(
+        (block.user_planning_settings or {}).get(str(physician.id), {}).get(
+            'unavailable_dates',
+        ) or ()
+    )
     for schedule_request in requests:
+        if schedule_request.date.isoformat() in unavailable_dates:
+            continue
         if schedule_request.weight in used:
             used[schedule_request.weight] += 1
         if _request_counts_as_weekend(schedule_request, policy['eligible_facility_ids']):
@@ -5129,12 +5141,9 @@ def schedule_version_run_optimizer(request, version_id):
                     and source_run is not None
                     else None
                 ),
-                initial_score=(
-                    source_run.final_score
-                    if start_mode == OptimizerRun.StartMode.CURRENT_SCHEDULE
-                    and source_run is not None
-                    else None
-                ),
+                # The copied assignments are authoritatively rescored against
+                # the current constraints before this value is populated.
+                initial_score=None,
                 max_runtime_seconds=max_runtime_seconds or 120 * 60,
                 optimization_focus=optimization_focus,
                 run_kind=(
@@ -6123,7 +6132,16 @@ def _physician_assignment_eligibility(physician, shift_instance):
             id=shift_instance.facility_id,
         ).exists()
     )
-    can_assign = physician.active and domain_eligible and facility_eligible
+    unavailable_dates = set(
+        (shift_instance.schedule_block.user_planning_settings or {}).get(
+            str(physician.id), {},
+        ).get('unavailable_dates') or ()
+    )
+    block_date_eligible = shift_instance.date.isoformat() not in unavailable_dates
+    can_assign = (
+        physician.active and domain_eligible and facility_eligible
+        and block_date_eligible
+    )
 
     if not physician.active:
         reason = 'Physician is inactive.'
@@ -6134,6 +6152,8 @@ def _physician_assignment_eligibility(physician, shift_instance):
         )
     elif not facility_eligible:
         reason = f'Contract does not include {shift_instance.facility.name}.'
+    elif not block_date_eligible:
+        reason = 'User is unavailable on this date under their Temporary Partial Block Contract.'
     else:
         overlapping_assignment = _overlapping_assignment_for_physician(
             physician,
@@ -6148,6 +6168,7 @@ def _physician_assignment_eligibility(physician, shift_instance):
     return {
         'domain_eligible': domain_eligible,
         'facility_eligible': facility_eligible,
+        'block_date_eligible': block_date_eligible,
         'can_assign': can_assign,
         'ineligibility_reason': reason,
     }
@@ -6806,6 +6827,481 @@ def schedule_block_generate_shift_instances(request, block_id):
             'schedule_version': ScheduleVersionWorkspaceSerializer(version).data,
         }
     )
+
+
+def _planning_decimal_text(value):
+    if value in (None, ''):
+        return ''
+    number = Decimal(str(value))
+    text = format(number, 'f')
+    return text.rstrip('0').rstrip('.') if '.' in text else text
+
+
+def _planning_contract_defaults(contract, block):
+    settings, _adjusted = generated_partial_settings(contract, block, [])
+    rules = (settings.get('workload_settings') or {}).get('period_rules') or []
+    original_rules = (contract.workload_settings or {}).get('period_rules') or []
+    result = {}
+    for units, prefix in (('HOURS', 'hours'), ('SHIFTS', 'shifts')):
+        matching_indexes = [
+            index for index, row in enumerate(original_rules)
+            if row.get('units') == units
+        ]
+        if not matching_indexes:
+            continue
+        priority = {'SCHEDULE_BLOCK': 0, 'MONTH': 1, 'WEEK': 2}
+        selected_index = min(
+            matching_indexes,
+            key=lambda index: priority.get(
+                original_rules[index].get('period_type'), 3,
+            ),
+        )
+        rule = rules[selected_index]
+        minimum = rule.get('min_value', '')
+        maximum = rule.get('max_value', '')
+        values = [Decimal(str(value)) for value in (minimum, maximum) if value not in (None, '')]
+        target = (
+            (sum(values) / Decimal(len(values))).to_integral_value(
+                rounding=ROUND_HALF_UP,
+            )
+            if values else None
+        )
+        result.update({
+            f'target_{prefix}': _planning_decimal_text(target),
+            f'minimum_{prefix}': _planning_decimal_text(minimum),
+            f'maximum_{prefix}': _planning_decimal_text(maximum),
+            f'min_{prefix}_adjustment': (
+                _planning_decimal_text(target - Decimal(str(minimum)))
+                if target is not None and minimum not in (None, '') else ''
+            ),
+            f'max_{prefix}_adjustment': (
+                _planning_decimal_text(Decimal(str(maximum)) - target)
+                if target is not None and maximum not in (None, '') else ''
+            ),
+        })
+    return result
+
+
+def _previous_block_for_planning(block):
+    return (
+        ScheduleBlock.objects.filter(
+            domain=block.domain,
+            end_date__lt=block.start_date,
+            published_at__isnull=False,
+        )
+        .order_by('-end_date', '-published_at', '-id')
+        .first()
+    )
+
+
+def _previous_published_totals(block):
+    previous = _previous_block_for_planning(block)
+    if previous is None:
+        return None, {}
+    version = (
+        previous.schedule_versions.filter(
+            published_optimizer_run__isnull=False,
+        ).order_by('-version_number', '-id').first()
+    )
+    if version is None:
+        return previous, {}
+    rows = (version.original_published_snapshot or {}).get('assignments') or []
+    instance_ids = [row.get('shift_instance_id') for row in rows if row.get('shift_instance_id')]
+    instances = {
+        instance.id: instance
+        for instance in ScheduleShiftInstance.objects.filter(id__in=instance_ids)
+    }
+    totals = {}
+    for row in rows:
+        physician_id = row.get('physician_id')
+        instance = instances.get(row.get('shift_instance_id'))
+        if physician_id is None or instance is None:
+            continue
+        physician_totals = totals.setdefault(physician_id, {'hours': Decimal('0'), 'shifts': 0})
+        physician_totals['hours'] += Decimal(str(
+            (instance.end_datetime - instance.start_datetime).total_seconds() / 3600
+        ))
+        physician_totals['shifts'] += 1
+    return previous, totals
+
+
+def _normalized_carried_plan(block, previous, previous_plan):
+    carried_fields = (
+        'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
+        'target_shifts', 'min_shifts_adjustment', 'max_shifts_adjustment',
+    )
+    result = {field: previous_plan.get(field, '') for field in carried_fields}
+    if previous and block_month_count(previous) != block_month_count(block):
+        ratio = Decimal(block_month_count(block)) / Decimal(block_month_count(previous))
+        for field in ('target_hours', 'target_shifts'):
+            value = result.get(field)
+            if value not in (None, ''):
+                result[field] = _planning_decimal_text(
+                    (Decimal(str(value)) * ratio).to_integral_value(
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
+        result['normalization_note'] = (
+            f'Previous block: {block_month_count(previous)} months; current block: '
+            f'{block_month_count(block)} months; proportional target applied.'
+        )
+    for prefix in ('hours', 'shifts'):
+        target = result.get(f'target_{prefix}')
+        lower = result.get(f'min_{prefix}_adjustment')
+        upper = result.get(f'max_{prefix}_adjustment')
+        if target not in (None, ''):
+            target_decimal = Decimal(str(target))
+            if lower not in (None, ''):
+                result[f'minimum_{prefix}'] = _planning_decimal_text(
+                    max(Decimal('0'), target_decimal - Decimal(str(lower)))
+                )
+            if upper not in (None, ''):
+                result[f'maximum_{prefix}'] = _planning_decimal_text(
+                    target_decimal + Decimal(str(upper))
+                )
+    return result
+
+
+def _mark_block_planning_change(block, user):
+    block.user_planning_updated_by = user
+    block.user_planning_updated_at = timezone.now()
+    block.save(update_fields=[
+        'user_planning_settings', 'user_planning_updated_by',
+        'user_planning_updated_at', 'updated_at',
+    ])
+    block.schedule_versions.update(score_is_stale=True)
+    OptimizerRun.objects.filter(schedule_version__schedule_block=block).update(
+        score_is_stale=True,
+    )
+
+
+def _block_planning_eligible_user_ids(domain):
+    """Users clinically active in this domain, regardless of memberships elsewhere."""
+    return (
+        DomainMembership.objects.filter(
+            domain=domain,
+            active=True,
+            clinically_active=True,
+        )
+        .exclude(role=DomainMembership.Role.VIEW_ONLY)
+        .values_list('user_id', flat=True)
+    )
+
+
+@api_view(['GET', 'PATCH'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_users(request, block_id):
+    block = get_object_or_404(
+        ScheduleBlock.objects.select_related('domain__region'), id=block_id,
+    )
+    if not _can_manage_build_workspace(request.user, block.domain):
+        return _build_workspace_forbidden_response()
+    read_only = block.build_status in {
+        ScheduleBlock.BuildStatus.PREVIEW, ScheduleBlock.BuildStatus.ARCHIVE,
+    } or block.published_at is not None
+    eligible_user_ids = _block_planning_eligible_user_ids(block.domain)
+
+    assignments = list(
+        ContractUserAssignment.objects.filter(
+            domain=block.domain,
+            contract__active=True,
+            physician__active=True,
+            physician__user_id__in=eligible_user_ids,
+        )
+        .select_related('contract', 'physician__user', 'domain')
+        .prefetch_related('contract__facilities')
+        .distinct()
+        .order_by('physician__user__last_name', 'physician__user__first_name', 'physician_id')
+    )
+    assigned_physician_ids = {assignment.physician_id for assignment in assignments}
+    missing_contract_users = list(
+        Physician.objects.filter(
+            active=True,
+            user_id__in=eligible_user_ids,
+        )
+        .exclude(id__in=assigned_physician_ids)
+        .order_by('user__last_name', 'user__first_name', 'id')
+        .values_list('display_name', 'user__first_name', 'user__last_name')
+    )
+    if missing_contract_users:
+        names = [
+            display_name or f'{first_name} {last_name}'.strip()
+            for display_name, first_name, last_name in missing_contract_users
+        ]
+        return Response(
+            {
+                'detail': (
+                    'Every clinically active user must have an active Contract before '
+                    f'block planning can continue: {", ".join(names)}.'
+                ),
+                'missing_contract_users': names,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    if request.method == 'PATCH':
+        if read_only:
+            return Response(
+                {'detail': 'Published and Preview Schedule Block user plans are read only.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        allowed_ids = {assignment.physician_id for assignment in assignments}
+        assignment_by_physician = {
+            assignment.physician_id: assignment for assignment in assignments
+        }
+        rows = request.data.get('users')
+        if not isinstance(rows, list):
+            return Response({'users': 'Provide a list of user planning rows.'}, status=status.HTTP_400_BAD_REQUEST)
+        settings = copy.deepcopy(block.user_planning_settings or {})
+        numeric_fields = (
+            'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
+            'minimum_hours', 'maximum_hours', 'target_shifts',
+            'min_shifts_adjustment', 'max_shifts_adjustment',
+            'minimum_shifts', 'maximum_shifts',
+        )
+        errors = {}
+        for row in rows:
+            try:
+                physician_id = int(row.get('physician_id'))
+            except (TypeError, ValueError):
+                errors['physician_id'] = 'Every row requires a valid user.'
+                continue
+            if physician_id not in allowed_ids:
+                errors[str(physician_id)] = 'User is not clinically active with an applicable Contract in this Domain.'
+                continue
+            current = copy.deepcopy(settings.get(str(physician_id), {}))
+            for field in numeric_fields:
+                value = row.get(field, '')
+                if value in (None, ''):
+                    current.pop(field, None)
+                    continue
+                try:
+                    number = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError):
+                    errors[f'{physician_id}.{field}'] = 'Enter a valid nonnegative number.'
+                    continue
+                if not number.is_finite() or number < 0:
+                    errors[f'{physician_id}.{field}'] = 'Enter a valid nonnegative number.'
+                    continue
+                if 'shifts' in field and number != number.to_integral_value():
+                    errors[f'{physician_id}.{field}'] = 'Shift values must be whole numbers.'
+                    continue
+                current[field] = _planning_decimal_text(number)
+            for prefix in ('hours', 'shifts'):
+                minimum = current.get(f'minimum_{prefix}')
+                maximum = current.get(f'maximum_{prefix}')
+                if minimum not in (None, '') and maximum not in (None, '') and Decimal(minimum) > Decimal(maximum):
+                    errors[f'{physician_id}.{prefix}'] = 'Minimum cannot exceed maximum.'
+            current['updated_by'] = request.user.get_full_name() or request.user.username
+            current['updated_at'] = timezone.now().isoformat()
+            current['parent_contract_id'] = assignment_by_physician[physician_id].contract_id
+            current['parent_contract_updated_at'] = assignment_by_physician[physician_id].contract.updated_at.isoformat()
+            settings[str(physician_id)] = current
+        if errors:
+            return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+        block.user_planning_settings = settings
+        _mark_block_planning_change(block, request.user)
+
+    previous, actual_totals = _previous_published_totals(block)
+    previous_settings = previous.user_planning_settings if previous else {}
+    current_settings = block.user_planning_settings or {}
+    user_rows = []
+    for assignment in assignments:
+        effective_contract = effective_contract_for_assignment(assignment)
+        defaults = _planning_contract_defaults(effective_contract, block)
+        previous_plan = (previous_settings or {}).get(str(assignment.physician_id), {})
+        inherited = (
+            _normalized_carried_plan(block, previous, previous_plan)
+            if previous_plan else defaults
+        )
+        plan = {**inherited, **copy.deepcopy(current_settings.get(str(assignment.physician_id), {}))}
+        source_plan = current_settings.get(str(assignment.physician_id), {}) or previous_plan
+        parent_contract_changed = bool(
+            source_plan
+            and (
+                source_plan.get('parent_contract_id') not in (None, assignment.contract_id)
+                or (
+                    source_plan.get('parent_contract_updated_at')
+                    and source_plan.get('parent_contract_updated_at') != assignment.contract.updated_at.isoformat()
+                )
+            )
+        )
+        totals = actual_totals.get(assignment.physician_id, {})
+        user_rows.append({
+            'physician_id': assignment.physician_id,
+            'name': assignment.physician.display_name or assignment.physician.user.get_full_name() or assignment.physician.user.username,
+            'contract_id': assignment.contract_id,
+            'contract_name': assignment.contract.name,
+            'contract_updated_at': assignment.contract.updated_at,
+            'previous_hours': _planning_decimal_text(totals.get('hours')),
+            'previous_shifts': totals.get('shifts', ''),
+            'partial_block': bool(plan.get('temporary_contract_source') or plan.get('unavailable_dates')),
+            'excluded': len(plan.get('unavailable_dates') or []) == (block.end_date - block.start_date).days + 1,
+            'parent_contract_changed': parent_contract_changed,
+            'parent_defaults': defaults,
+            **plan,
+        })
+    return Response({
+        'schedule_block': ScheduleBlockSerializer(block).data,
+        'read_only': read_only,
+        'previous_block': (
+            {'id': previous.id, 'name': previous.generated_name, 'months': block_month_count(previous)}
+            if previous else None
+        ),
+        'current_block_months': block_month_count(block),
+        'users': user_rows,
+    })
+
+
+@api_view(['GET', 'PATCH', 'DELETE'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_partial_user(request, block_id, physician_id):
+    block = get_object_or_404(
+        ScheduleBlock.objects.select_related('domain__region'), id=block_id,
+    )
+    if not _can_manage_build_workspace(request.user, block.domain):
+        return _build_workspace_forbidden_response()
+    assignment = get_object_or_404(
+        ContractUserAssignment.objects.select_related(
+            'contract', 'domain__region', 'physician__user',
+        ).prefetch_related('contract__facilities'),
+        domain=block.domain,
+        physician_id=physician_id,
+        physician__active=True,
+        physician__user_id__in=_block_planning_eligible_user_ids(block.domain),
+        contract__active=True,
+    )
+    read_only = block.build_status in {
+        ScheduleBlock.BuildStatus.PREVIEW, ScheduleBlock.BuildStatus.ARCHIVE,
+    } or block.published_at is not None
+    settings = copy.deepcopy(block.user_planning_settings or {})
+    plan = copy.deepcopy(settings.get(str(physician_id), {}))
+
+    if request.method == 'DELETE':
+        if read_only:
+            return Response({'detail': 'Published and Preview Schedule Blocks are read only.'}, status=status.HTTP_409_CONFLICT)
+        plan.pop('unavailable_dates', None)
+        plan.pop('temporary_rule_overrides', None)
+        plan.pop('temporary_contract_source', None)
+        settings[str(physician_id)] = plan
+        block.user_planning_settings = settings
+        _mark_block_planning_change(block, request.user)
+
+    if request.method == 'PATCH':
+        if read_only:
+            return Response({'detail': 'Published and Preview Schedule Blocks are read only.'}, status=status.HTTP_409_CONFLICT)
+        if 'unavailable_dates' in request.data:
+            raw_dates = request.data.get('unavailable_dates')
+            if not isinstance(raw_dates, list):
+                return Response({'unavailable_dates': 'Provide a list of dates.'}, status=status.HTTP_400_BAD_REQUEST)
+            unavailable_dates = []
+            for value in raw_dates:
+                try:
+                    parsed = date_type.fromisoformat(str(value))
+                except ValueError:
+                    return Response({'unavailable_dates': f'{value} is not a valid date.'}, status=status.HTTP_400_BAD_REQUEST)
+                if parsed < block.start_date or parsed > block.end_date:
+                    return Response({'unavailable_dates': f'{value} is outside this Schedule Block.'}, status=status.HTTP_400_BAD_REQUEST)
+                unavailable_dates.append(parsed.isoformat())
+            plan['unavailable_dates'] = sorted(set(unavailable_dates))
+            plan.setdefault('temporary_rule_overrides', {})
+            plan['temporary_contract_source'] = {
+                'contract_id': assignment.contract_id,
+                'contract_updated_at': assignment.contract.updated_at.isoformat(),
+            }
+        if 'overrides' in request.data:
+            if not isinstance(request.data.get('overrides'), dict):
+                return Response({'overrides': 'Provide rule overrides as an object.'}, status=status.HTTP_400_BAD_REQUEST)
+            effective_parent = effective_contract_for_assignment(assignment)
+            generated, _paths = generated_partial_settings(
+                effective_parent, block, plan.get('unavailable_dates') or [],
+            )
+            try:
+                _settings, normalized = apply_manual_temporary_overrides(
+                    effective_parent, generated, request.data.get('overrides') or {},
+                )
+            except ValueError as exc:
+                return Response({'overrides': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            plan['temporary_rule_overrides'] = normalized
+        if 'block_values' in request.data:
+            block_values = request.data.get('block_values')
+            if not isinstance(block_values, dict):
+                return Response({'block_values': 'Provide block values as an object.'}, status=status.HTTP_400_BAD_REQUEST)
+            for field in (
+                'target_hours', 'minimum_hours', 'maximum_hours',
+                'target_shifts', 'minimum_shifts', 'maximum_shifts',
+            ):
+                value = block_values.get(field, '')
+                if value in (None, ''):
+                    plan.pop(field, None)
+                    continue
+                try:
+                    number = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError):
+                    return Response({f'block_values.{field}': 'Enter a valid nonnegative number.'}, status=status.HTTP_400_BAD_REQUEST)
+                if not number.is_finite() or number < 0 or ('shifts' in field and number != number.to_integral_value()):
+                    return Response({f'block_values.{field}': 'Enter a valid nonnegative whole number for shifts.'}, status=status.HTTP_400_BAD_REQUEST)
+                plan[field] = _planning_decimal_text(number)
+            for prefix in ('hours', 'shifts'):
+                minimum = plan.get(f'minimum_{prefix}')
+                maximum = plan.get(f'maximum_{prefix}')
+                if minimum not in (None, '') and maximum not in (None, '') and Decimal(minimum) > Decimal(maximum):
+                    return Response({f'block_values.{prefix}': 'Minimum cannot exceed maximum.'}, status=status.HTTP_400_BAD_REQUEST)
+        plan['updated_by'] = request.user.get_full_name() or request.user.username
+        plan['updated_at'] = timezone.now().isoformat()
+        settings[str(physician_id)] = plan
+        block.user_planning_settings = settings
+        _mark_block_planning_change(block, request.user)
+
+    effective_parent = effective_contract_for_assignment(assignment)
+    unavailable_dates = plan.get('unavailable_dates') or []
+    generated, adjusted_paths = generated_partial_settings(
+        effective_parent, block, unavailable_dates,
+    )
+    generated, manual = apply_manual_temporary_overrides(
+        effective_parent, generated, plan.get('temporary_rule_overrides') or {},
+    )
+    temporary = copy.copy(effective_parent)
+    for field, value in generated.items():
+        setattr(temporary, field, value)
+    parent_values = contract_rule_values(effective_parent)
+    effective_values = contract_rule_values(temporary)
+    rules = []
+    for path, parent_value in parent_values.items():
+        if path not in effective_values:
+            continue
+        rules.append({
+            'path': path,
+            'section': path.split('.', 1)[0],
+            'label': _contract_rule_path_label(effective_parent, path),
+            'parent_value': parent_value,
+            'effective_value': effective_values[path],
+            'atlas_adjusted': path in adjusted_paths,
+            'overridden': path in manual,
+        })
+    return Response({
+        'physician_id': assignment.physician_id,
+        'user_name': assignment.physician.display_name or assignment.physician.user.get_full_name() or assignment.physician.user.username,
+        'contract_id': assignment.contract_id,
+        'contract_name': assignment.contract.name,
+        'domain_name': block.domain.name,
+        'region_name': block.domain.region.name,
+        'schedule_block': ScheduleBlockSerializer(block).data,
+        'read_only': read_only,
+        'unavailable_dates': unavailable_dates,
+        'block_values': {
+            field: plan.get(field, '')
+            for field in (
+                'target_hours', 'minimum_hours', 'maximum_hours',
+                'target_shifts', 'minimum_shifts', 'maximum_shifts',
+            )
+        },
+        'rules': rules,
+        'adjusted_sections': sorted({path.split('.', 1)[0] for path in adjusted_paths}),
+        'manual_override_count': len(manual),
+    })
 
 
 @api_view(['GET', 'POST'])

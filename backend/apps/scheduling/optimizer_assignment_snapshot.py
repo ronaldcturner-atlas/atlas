@@ -389,7 +389,17 @@ def prepare_authoritative_requests(
         .prefetch_related('shift_templates')
     )
     requests_by_physician_date = defaultdict(list)
+    user_plans = version.schedule_block.user_planning_settings or {}
     for schedule_request in requests:
+        unavailable_dates = set(
+            user_plans.get(str(schedule_request.physician_id), {}).get(
+                'unavailable_dates',
+            ) or ()
+        )
+        if schedule_request.date.isoformat() in unavailable_dates:
+            # Preserve the request record for audit, but an unavailable date is
+            # outside this user's active partial-block contract.
+            continue
         requests_by_physician_date[
             (schedule_request.physician_id, schedule_request.date)
         ].append(schedule_request)

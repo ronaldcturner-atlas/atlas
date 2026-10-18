@@ -5,7 +5,7 @@ from functools import reduce
 from math import gcd
 
 from .models import ContractUserAssignment, ScheduleRequest, ScheduleShiftAssignment
-from .contract_overrides import apply_effective_contracts
+from .block_user_planning import apply_block_user_plans
 from .optimizer import (
     _version_contract_target,
     _workload_adjustment_context,
@@ -1304,7 +1304,7 @@ def build_workload_feasibility(
         .prefetch_related('contract__facilities')
         .order_by('physician__display_name', 'physician__user__last_name', 'physician_id')
     )
-    contract_assignments = apply_effective_contracts(contract_assignments)
+    contract_assignments = apply_block_user_plans(contract_assignments, block)
     manual_only_physician_ids = {
         assignment.physician_id
         for assignment in contract_assignments

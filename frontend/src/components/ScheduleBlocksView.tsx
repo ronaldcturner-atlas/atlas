@@ -94,6 +94,7 @@ type ScheduleBlocksViewProps = {
   onOpenRequests?: (blockId: number) => void
   onCloseRequests?: () => void
   onOpenBuild?: (blockId: number) => void
+  onOpenUsers?: (blockId: number) => void
 }
 
 const SCHEDULE_BLOCK_REGION_KEY = 'atlas.scheduleBlocks.region'
@@ -254,6 +255,7 @@ export default function ScheduleBlocksView({
   onOpenRequests,
   onCloseRequests,
   onOpenBuild,
+  onOpenUsers,
 }: ScheduleBlocksViewProps) {
   const [blocks, setBlocks] = useState<ScheduleBlock[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
@@ -903,14 +905,14 @@ export default function ScheduleBlocksView({
                         Open
                       </button>
                     )}
+                    {block.can_manage_build_workspace && (
+                      <button type="button" onClick={() => onOpenUsers?.(block.id)}>
+                        Users
+                      </button>
+                    )}
                     {(block.can_administer_requests || block.can_submit_own_requests) && (
                       <button type="button" onClick={() => openRequests(block)}>
                         Requests
-                      </button>
-                    )}
-                    {block.can_manage_build_workspace && (block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
-                      <button type="button" onClick={() => onOpenBuild?.(block.id)}>
-                        Build Schedule
                       </button>
                     )}
                     {block.can_manage_build_workspace && (block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD') && (
