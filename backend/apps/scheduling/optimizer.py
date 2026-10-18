@@ -10462,6 +10462,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
         physician.id: {
             'user_id': physician.id,
             'display_name': _physician_display_name(physician),
+            'contract_name': contract_by_physician[physician.id].name,
             'total_score': 0,
             'shifts': scoring['physician_shifts'][physician.id],
             'hours': float(scoring['physician_hours'][physician.id]),
@@ -10489,6 +10490,7 @@ def build_violation_report(schedule_version, optimizer_run=None):
                 if physician is not None
                 else f'Physician {physician_id}'
             ),
+            'contract_name': None,
             'total_score': 0,
             'shifts': len(physician_instances),
             'hours': float(sum(

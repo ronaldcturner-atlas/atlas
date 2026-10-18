@@ -561,6 +561,8 @@ select option:checked{
 .violation-user-section{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:14px}
 .violation-user-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}
 .violation-user-heading h3{margin:0;font-size:16px}
+.violation-user-identity{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.violation-user-identity>span{color:var(--muted);font-size:12px;font-weight:700}
 .violation-user-metrics{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:13px}
 .violation-empty{margin:0;color:var(--muted)}
 .violation-table-wrap{overflow:auto}

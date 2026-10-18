@@ -10548,6 +10548,8 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(len(payload['users']), 3)
         for user in payload['users']:
+            self.assertIn('contract_name', user)
+            self.assertEqual(user['contract_name'], f"{user['display_name']} Contract")
             self.assertIn('night_shifts', user)
             self.assertIn('violations', user)
             self.assertIn('workload_score', user)

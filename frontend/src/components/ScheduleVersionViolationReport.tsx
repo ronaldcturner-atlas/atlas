@@ -30,6 +30,7 @@ type AssignmentDetail = {
 }
 
 type ViolationRow = {
+  period_type?: string | null
   period_start?: string | null
   period_end?: string | null
   violation_type: string
@@ -109,6 +110,7 @@ type WorkloadScoreRow = {
 type ViolationUser = {
   user_id: number
   display_name: string
+  contract_name?: string | null
   total_score: number
   shifts: number
   hours: number
@@ -244,6 +246,19 @@ function violationLabel(violation: ViolationRow) {
     return `${typeLabel} (${violation.shift_rule_label})`
   }
   return typeLabel
+}
+
+function violationPeriodLabel(violation: ViolationRow) {
+  if (violation.period_type === 'WEEK') return 'Week'
+  if (violation.period_type === 'MONTH') return 'Month'
+  return 'Block'
+}
+
+function userContractLabel(user: ViolationUser) {
+  return user.contract_name
+    ?? user.workload_score?.contract_name
+    ?? user.violations.find((violation) => violation.contract_name)?.contract_name
+    ?? 'No contract'
 }
 
 function assignmentLabel(detail: AssignmentDetail) {
@@ -571,7 +586,10 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
         {filteredUsers.map((user) => (
           <section className="violation-user-section" key={user.user_id}>
             <div className="violation-user-heading">
-              <h3>{user.display_name}</h3>
+              <div className="violation-user-identity">
+                <h3>{user.display_name}</h3>
+                <span>Contract: {userContractLabel(user)}</span>
+              </div>
               <div className="violation-user-metrics">
                 <span>{activePenaltyFilter === 'total_score' ? 'Score' : 'Selected penalty'}: {user.filtered_score.toFixed(1)}</span>
                 <span>{user.shifts} shifts</span>
@@ -586,7 +604,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                   <thead>
                     <tr>
                       <th>Type</th>
-                      <th>Contract</th>
+                      <th>Period</th>
                       <th>Dates</th>
                       <th>Shift/Facility</th>
                       <th>Configured</th>
@@ -600,7 +618,7 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                     {user.violations.map((violation, index) => (
                       <tr key={`${violation.violation_type}-${index}`}>
                         <td>{violationLabel(violation)}</td>
-                        <td>{violation.contract_name ?? '-'}</td>
+                        <td>{violationPeriodLabel(violation)}</td>
                         <td>{violation.period_start && violation.period_end
                           ? `${formatDate(violation.period_start)} – ${formatDate(violation.period_end)}`
                           : violation.dates_involved.map(formatDate).join(', ') || '-'}</td>
@@ -637,7 +655,6 @@ export default function ScheduleVersionViolationReport({ versionId }: Props) {
                   </div>
                 ) : (
                 <div className="violation-user-metrics">
-                  <span>Contract: {user.workload_score.contract_name ?? 'No contract'}</span>
                   <span>Period: {user.workload_score.period_type ?? 'Not configured'}</span>
                   <span>Assigned: {user.workload_score.assigned_shifts} shifts, {user.workload_score.assigned_hours.toFixed(1)} hours</span>
                   <span>{workloadRangeLabel(user.workload_score, true)}</span>
