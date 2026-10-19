@@ -129,6 +129,53 @@ function weekOffset(date: Date, start: Date) {
   return Math.floor((dateUtc - startUtc) / 604800000)
 }
 
+type SwipeStart = { x: number; y: number } | null
+
+function useHorizontalSwipe(onSwipe: (direction: -1 | 1) => void) {
+  const startRef = React.useRef<SwipeStart>(null)
+  const suppressClickUntilRef = React.useRef(0)
+  const onSwipeRef = React.useRef(onSwipe)
+  onSwipeRef.current = onSwipe
+
+  const reset = () => {
+    startRef.current = null
+  }
+
+  return {
+    onTouchStart: (event: React.TouchEvent<HTMLElement>) => {
+      if (event.touches.length !== 1) {
+        reset()
+        return
+      }
+      const touch = event.touches[0]
+      startRef.current = { x: touch.clientX, y: touch.clientY }
+    },
+    onTouchEnd: (event: React.TouchEvent<HTMLElement>) => {
+      const start = startRef.current
+      const touch = event.changedTouches[0]
+      if (!start || !touch) {
+        reset()
+        return
+      }
+      const horizontalDistance = touch.clientX - start.x
+      const verticalDistance = touch.clientY - start.y
+      const isSwipe = Math.abs(horizontalDistance) >= 44
+        && Math.abs(horizontalDistance) > Math.abs(verticalDistance) * 1.25
+      if (isSwipe) {
+        suppressClickUntilRef.current = Date.now() + 400
+        onSwipeRef.current(horizontalDistance < 0 ? 1 : -1)
+      }
+      reset()
+    },
+    onTouchCancel: reset,
+    onClickCapture: (event: React.MouseEvent<HTMLElement>) => {
+      if (Date.now() >= suppressClickUntilRef.current) return
+      event.preventDefault()
+      event.stopPropagation()
+    },
+  }
+}
+
 function formatClockValue(value: string) {
   const [hoursValue, minutesValue = '0'] = value.split(':')
   const hours = Number(hoursValue)
@@ -664,6 +711,8 @@ export default function MobileNavigationPreview() {
     pendingWeekJumpRef.current = true
     setWeekIndex((current) => Math.max(0, Math.min(15, current + direction)))
   }
+  const monthSwipeHandlers = useHorizontalSwipe(moveMonth)
+  const weekSwipeHandlers = useHorizontalSwipe(moveListWeek)
 
   React.useEffect(() => {
     if (display !== 'list' || !pendingWeekJumpRef.current) return
@@ -1690,7 +1739,7 @@ export default function MobileNavigationPreview() {
                     <span><i className="own" />My shifts</span>{listScheduleScope === 'group' && <span><i className="other-status" />Available or open</span>}
                   </div>
                   <div className="mobile-weekdays">{['S','M','T','W','T','F','S'].map((day, index) => <span key={`${day}-${index}`}>{day}</span>)}</div>
-                  <div className="mobile-month-grid">
+                  <div className="mobile-month-grid mobile-swipe-surface" aria-label="Swipe left or right to change month" {...monthSwipeHandlers}>
                     {monthDays.map((day, index) => {
                       const calendarDate = day ? new Date(viewDate.getFullYear(), viewDate.getMonth(), day) : null
                       const { hasOwnShift, hasOtherStatus } = calendarDate ? markerStateForDate(calendarDate) : { hasOwnShift: false, hasOtherStatus: false }
@@ -1705,7 +1754,7 @@ export default function MobileNavigationPreview() {
                 </section>
               ) : (
                 <section className="mobile-list-preview" aria-label="List view preview">
-                  <div className="mobile-week-navigator" aria-label="Week navigation">
+                  <div className="mobile-week-navigator mobile-swipe-surface" aria-label="Week navigation; swipe left or right to change week" {...weekSwipeHandlers}>
                     <button type="button" className="week-step" aria-label="Previous week" onClick={() => moveListWeek(-1)}>‹</button>
                     {weekDays.map((date) => {
                       const key = dateKey(date)
