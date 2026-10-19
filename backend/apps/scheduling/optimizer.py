@@ -474,10 +474,12 @@ def _with_block_workload_overrides(target, plan):
         return target
     primary = next((rule for rule in rules if rule.get('units') == 'HOURS'), rules[0] if rules else {})
     values = [value for value in (primary.get('min_value'), primary.get('max_value')) if value is not None]
+    block_target_hours = _decimal_or_none((plan or {}).get('target_hours'))
     return {
         **target,
         'units': primary.get('units', target.get('units', 'HOURS')),
         'target': sum(values) / Decimal(len(values)) if values else target.get('target', Decimal('0')),
+        'block_target_hours': block_target_hours,
         'rules': rules,
         'block_user_workload_adjustment': applied,
     }
@@ -486,8 +488,12 @@ def _with_block_workload_overrides(target, plan):
 def _version_contract_target(version, physician_id, contract, default_hours_target, default_shift_target):
     target = _contract_target(contract, default_hours_target, default_shift_target)
     overrides = version.workload_hour_overrides if isinstance(version.workload_hour_overrides, dict) else {}
-    target = _with_workload_hour_override(target, overrides.get(str(physician_id)))
     plan = (version.schedule_block.user_planning_settings or {}).get(str(physician_id), {})
+    # Block Hours is authoritative whenever it contains an hour range. Older
+    # Schedule Version overrides remain readable for historical versions but
+    # must not compete with current block planning.
+    if block_workload_override(plan, 'HOURS') is None:
+        target = _with_workload_hour_override(target, overrides.get(str(physician_id)))
     return _with_block_workload_overrides(target, plan)
 
 

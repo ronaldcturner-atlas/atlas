@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { API_BASE } from '../api'
 
 type PlanRow = {
@@ -23,6 +24,28 @@ type PlanRow = {
   excluded: boolean
   parent_contract_changed?: boolean
   parent_defaults?: Partial<Record<NumericPlanKey, string>>
+  workload_adjusted?: boolean
+  workload_adjustment_base_values?: Partial<Record<NumericPlanKey, string>>
+  apply_workload_adjustment?: boolean
+  clear_workload_adjustment?: boolean
+}
+
+type WorkloadRecommendation = {
+  direction: 'increase_maximum' | 'decrease_minimum'
+  required_adjustment_hours: number
+  recommended_target_change_percent: number | null
+  adjustment_hours_per_fte: number | null
+  proposals: Array<{
+    physician_id: number
+    physician: string
+    current_target_hours: number
+    current_minimum_hours: number
+    current_maximum_hours: number | null
+    adjustment_hours: number
+    proposed_target_hours: number
+    proposed_minimum_hours: number
+    proposed_maximum_hours: number | null
+  }>
 }
 
 type BlockPlanResponse = {
@@ -112,6 +135,7 @@ function sectionLabel(section: string) {
 }
 
 export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
+  const location = useLocation()
   const [data, setData] = useState<BlockPlanResponse | null>(null)
   const [rows, setRows] = useState<PlanRow[]>([])
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -124,6 +148,8 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
   const [partialBlockValues, setPartialBlockValues] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [workloadRecommendation, setWorkloadRecommendation] = useState<WorkloadRecommendation | null>(null)
+  const [workloadRecommendationStaged, setWorkloadRecommendationStaged] = useState(false)
 
   const load = async () => {
     setError('')
@@ -135,6 +161,21 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
   }
 
   useEffect(() => { void load().catch((reason) => setError(displayError(reason))) }, [blockId])
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const versionId = params.get('workload_version_id')
+    if (!versionId) {
+      setWorkloadRecommendation(null)
+      return
+    }
+    const optimizerRunId = params.get('optimizer_run_id')
+    const query = optimizerRunId ? `?optimizer_run_id=${encodeURIComponent(optimizerRunId)}` : ''
+    void fetch(`${API_BASE}/schedule-versions/${versionId}/workload-feasibility/${query}`)
+      .then(jsonOrError)
+      .then((result) => setWorkloadRecommendation(result.fte_adjustment_preview || null))
+      .catch((reason) => setError(displayError(reason)))
+  }, [location.search])
 
   const updateRow = (physicianId: number, key: NumericPlanKey, value: string) => {
     setRows((current) => current.map((row) => row.physician_id === physicianId ? { ...row, [key]: value } : row))
@@ -155,7 +196,7 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
           const lower = Number(lowerText)
           const upper = Number(upperText)
           if (![target, lower, upper].every(Number.isFinite) || target < 0 || lower < 0 || upper < 0 || target - lower < 0) {
-            throw new Error(`Enter feasible nonnegative ${prefix} targets and adjustments.`)
+            throw new Error(`${copy.name}: enter a ${prefix} target at least as large as the selected lower range.`)
           }
           copy[`min_${prefix}_adjustment`] = String(lower)
           copy[`max_${prefix}_adjustment`] = String(upper)
@@ -170,17 +211,70 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
     } catch (reason) { setError(displayError(reason)) }
   }
 
+  const stageWorkloadRecommendation = () => {
+    if (!workloadRecommendation) return
+    const proposals = new Map(
+      workloadRecommendation.proposals.map((proposal) => [proposal.physician_id, proposal]),
+    )
+    setRows((current) => current.map((row) => {
+      const proposal = proposals.get(row.physician_id)
+      if (!proposal || !selected.has(row.physician_id)) return row
+      const base = row.workload_adjustment_base_values && Object.keys(row.workload_adjustment_base_values).length
+        ? row.workload_adjustment_base_values
+        : Object.fromEntries(([
+          'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
+          'minimum_hours', 'maximum_hours',
+        ] as NumericPlanKey[]).map((key) => [key, row[key] ?? '']))
+      const target = String(Math.round(proposal.proposed_target_hours))
+      const minimum = String(Math.round(proposal.proposed_minimum_hours))
+      const maximum = proposal.proposed_maximum_hours === null
+        ? ''
+        : String(Math.round(proposal.proposed_maximum_hours))
+      return {
+        ...row,
+        target_hours: target,
+        minimum_hours: minimum,
+        maximum_hours: maximum,
+        min_hours_adjustment: String(Number(target) - Number(minimum)),
+        max_hours_adjustment: maximum === '' ? '' : String(Number(maximum) - Number(target)),
+        workload_adjusted: true,
+        workload_adjustment_base_values: base,
+        apply_workload_adjustment: true,
+        clear_workload_adjustment: false,
+      }
+    }))
+    setWorkloadRecommendationStaged(true)
+  }
+
+  const resetWorkloadAdjustment = (physicianId: number) => {
+    setRows((current) => current.map((row) => {
+      if (row.physician_id !== physicianId || !row.workload_adjustment_base_values) return row
+      return {
+        ...row,
+        ...row.workload_adjustment_base_values,
+        workload_adjusted: false,
+        workload_adjustment_base_values: {},
+        apply_workload_adjustment: false,
+        clear_workload_adjustment: true,
+      }
+    }))
+  }
+
   const saveRows = async () => {
     setBusy(true); setError('')
     try {
       const payload = rows.map((row) => Object.fromEntries([
         ['physician_id', row.physician_id],
         ...numericKeys.map((key) => [key, row[key] ?? '']),
+        ['apply_workload_adjustment', Boolean(row.apply_workload_adjustment)],
+        ['clear_workload_adjustment', Boolean(row.clear_workload_adjustment)],
+        ['workload_adjustment_base_values', row.workload_adjustment_base_values || {}],
       ]))
       await jsonOrError(await fetch(`${API_BASE}/schedule-blocks/${blockId}/users/`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ users: payload }),
       }))
       await load()
+      setWorkloadRecommendationStaged(false)
     } catch (reason) { setError(displayError(reason)) } finally { setBusy(false) }
   }
 
@@ -202,7 +296,9 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
     try {
       const result = await jsonOrError(await fetch(`${API_BASE}/schedule-blocks/${blockId}/users/${partial.physician_id}/partial/`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ unavailable_dates: [...unavailable].sort(), overrides, block_values: partialBlockValues }),
+        body: JSON.stringify(review
+          ? { unavailable_dates: [...unavailable].sort(), overrides }
+          : { unavailable_dates: [...unavailable].sort(), overrides, block_values: partialBlockValues }),
       })) as PartialResponse
       setPartial(result); setUnavailable(new Set(result.unavailable_dates)); setPartialBlockValues(result.block_values || {})
       if (review) setPartialTab('summary')
@@ -252,6 +348,26 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
     </div>
 
     {tab === 'hours' ? <>
+      {workloadRecommendation && (
+        <div className="block-workload-recommendation">
+          <div>
+            <strong>Workload feasibility recommendation</strong>
+            <span>
+              {workloadRecommendation.direction === 'decrease_minimum' ? 'Lower' : 'Raise'} Block Target Hours proportionally by{' '}
+              {workloadRecommendation.required_adjustment_hours.toFixed(1)} aggregate hours. Existing hour-range widths are preserved.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="primary-action"
+            disabled={data.read_only || workloadRecommendationStaged}
+            onClick={stageWorkloadRecommendation}
+          >
+            {workloadRecommendationStaged ? 'Proposed Values Ready' : 'Preview Suggested Targets'}
+          </button>
+          {workloadRecommendationStaged && <small>Review the highlighted Target, Min, and Max values, then save Block Values.</small>}
+        </div>
+      )}
       <div className="block-plan-toolbar">
         <button type="button" onClick={() => setSelected(new Set(rows.map((row) => row.physician_id)))}>Select All</button>
         <button type="button" onClick={() => setSelected(new Set())}>Clear All</button>
@@ -269,8 +385,8 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
         <th></th><th>User / Contract</th><th>Target hrs</th><th>Min hrs</th><th>Max hrs</th><th>Previous hrs</th><th>Target shifts</th><th>Min shifts</th><th>Max shifts</th><th>Previous shifts</th>
       </tr></thead><tbody>{rows.map((row) => <tr key={row.physician_id} className={row.partial_block ? 'partial-row' : ''}>
         <td><input type="checkbox" checked={selected.has(row.physician_id)} onChange={(event) => setSelected((current) => { const next = new Set(current); event.target.checked ? next.add(row.physician_id) : next.delete(row.physician_id); return next })} /></td>
-        <td><strong>{row.name}</strong>{row.partial_block && <button className="partial-badge" onClick={() => void openPartial(row.physician_id)}>Partial{row.excluded ? ' · Excluded' : ''}</button>}<small>{row.contract_name}</small>{row.parent_contract_changed && <small className="contract-change-note">Parent Contract changed. <button type="button" onClick={() => resetRowToParent(row.physician_id)} disabled={data.read_only}>Reset to Contract</button></small>}{row.normalization_note && <small className="normalization-note">{row.normalization_note}</small>}</td>
-        {(['target_hours','minimum_hours','maximum_hours'] as NumericPlanKey[]).map((key) => <td key={key}><input disabled={data.read_only} value={row[key] ?? ''} onChange={(event) => updateRow(row.physician_id, key, event.target.value)} /></td>)}
+        <td><strong>{row.name}</strong>{row.partial_block && <button className="partial-badge" onClick={() => void openPartial(row.physician_id)}>Partial{row.excluded ? ' · Excluded' : ''}</button>}<small>{row.contract_name}</small>{row.workload_adjusted && <small className="workload-adjusted-note">Target adjusted from {row.workload_adjustment_base_values?.target_hours ?? '—'} <button type="button" onClick={() => resetWorkloadAdjustment(row.physician_id)} disabled={data.read_only}>Reset</button></small>}{row.parent_contract_changed && <small className="contract-change-note">Parent Contract changed. <button type="button" onClick={() => resetRowToParent(row.physician_id)} disabled={data.read_only}>Reset to Contract</button></small>}{row.normalization_note && <small className="normalization-note">{row.normalization_note}</small>}</td>
+        {(['target_hours','minimum_hours','maximum_hours'] as NumericPlanKey[]).map((key) => <td key={key}><input className={row.apply_workload_adjustment ? 'recommended-value' : ''} disabled={data.read_only} value={row[key] ?? ''} onChange={(event) => updateRow(row.physician_id, key, event.target.value)} /></td>)}
         <td>{formatNumber(row.previous_hours)}</td>
         {(['target_shifts','minimum_shifts','maximum_shifts'] as NumericPlanKey[]).map((key) => <td key={key}><input disabled={data.read_only} value={row[key] ?? ''} onChange={(event) => updateRow(row.physician_id, key, event.target.value)} /></td>)}
         <td>{formatNumber(row.previous_shifts)}</td>

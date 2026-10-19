@@ -299,14 +299,15 @@ def _aggregate_hour_rule_bounds(rule_rows):
     )
 
 
-def _fte_adjustment_preview(
+def _target_adjustment_preview(
     status, physician_rows, available_hours, aggregate_min, total_max,
     hour_granularity=None,
 ):
     if status == 'maximum_infeasible':
         candidates = [
             row for row in physician_rows
-            if row['effective_max_hours'] is not None and Decimal(str(row['fte'])) > 0
+            if row['effective_max_hours'] is not None
+            and Decimal(str(row.get('current_target_hours') or 0)) > 0
         ]
         required = available_hours - total_max
         direction = 'increase_maximum'
@@ -316,7 +317,7 @@ def _fte_adjustment_preview(
             row for row in physician_rows
             if row['effective_min_hours'] is not None
             and row['effective_min_hours'] > 0
-            and Decimal(str(row['fte'])) > 0
+            and Decimal(str(row.get('current_target_hours') or 0)) > 0
         ]
         required = aggregate_min - available_hours
         direction = 'decrease_minimum'
@@ -324,35 +325,42 @@ def _fte_adjustment_preview(
     else:
         return None
 
-    total_fte = sum((Decimal(str(row['fte'])) for row in candidates), Decimal('0'))
-    if not candidates or total_fte <= 0:
+    total_target = sum(
+        (Decimal(str(row['current_target_hours'])) for row in candidates),
+        Decimal('0'),
+    )
+    if not candidates or total_target <= 0:
         return {
             'direction': direction,
             'required_adjustment_hours': _number(required),
-            'total_applicable_fte': _number(total_fte),
+            'total_applicable_target_hours': _number(total_target),
+            'recommended_target_change_percent': None,
             'adjustment_hours_per_fte': None,
             'proposals': [],
             'can_preview': False,
-            'reason': 'No applicable physicians have a positive FTE and bounded hour range.',
+            'reason': 'No applicable users have positive Block Target Hours and a bounded hour range.',
         }
 
-    base_rate = required / total_fte
+    base_rate = required / total_target
     adjustments = {row['physician_id']: Decimal('0') for row in candidates}
     if direction == 'increase_maximum':
         for row in candidates:
-            adjustments[row['physician_id']] = base_rate * Decimal(str(row['fte']))
+            adjustments[row['physician_id']] = base_rate * Decimal(str(row['current_target_hours']))
     else:
         remaining = required
         active = list(candidates)
         while remaining > Decimal('0.000001') and active:
-            active_fte = sum((Decimal(str(row['fte'])) for row in active), Decimal('0'))
-            rate = remaining / active_fte
+            active_target = sum(
+                (Decimal(str(row['current_target_hours'])) for row in active),
+                Decimal('0'),
+            )
+            rate = remaining / active_target
             applied = Decimal('0')
             next_active = []
             for row in active:
                 physician_id = row['physician_id']
                 current = Decimal(str(row[current_key])) - adjustments[physician_id]
-                proposed = rate * Decimal(str(row['fte']))
+                proposed = rate * Decimal(str(row['current_target_hours']))
                 reduction = min(current, proposed)
                 adjustments[physician_id] += reduction
                 applied += reduction
@@ -363,72 +371,96 @@ def _fte_adjustment_preview(
             remaining -= applied
             active = next_active
 
+    # Block Hours are planned and edited as whole hours. Preserve the target-
+    # proportional distribution while apportioning the required aggregate
+    # change into whole-hour user adjustments. Rounding the aggregate upward
+    # prevents the recommendation itself from leaving the same feasibility
+    # shortfall behind.
+    rounded_required = required.to_integral_value(rounding=ROUND_CEILING)
+    whole_adjustments = {
+        physician_id: adjustment.to_integral_value(rounding=ROUND_FLOOR)
+        for physician_id, adjustment in adjustments.items()
+    }
+    remaining_whole_hours = int(rounded_required - sum(whole_adjustments.values(), Decimal('0')))
+    by_fraction = sorted(
+        candidates,
+        key=lambda row: (
+            adjustments[row['physician_id']]
+            - adjustments[row['physician_id']].to_integral_value(rounding=ROUND_FLOOR),
+            Decimal(str(row['current_target_hours'])),
+        ),
+        reverse=True,
+    )
+    while remaining_whole_hours > 0 and by_fraction:
+        advanced = False
+        for row in by_fraction:
+            if remaining_whole_hours <= 0:
+                break
+            physician_id = row['physician_id']
+            if direction == 'decrease_minimum':
+                maximum_reduction = Decimal(str(row[current_key])).to_integral_value(rounding=ROUND_FLOOR)
+                if whole_adjustments[physician_id] >= maximum_reduction:
+                    continue
+            whole_adjustments[physician_id] += Decimal('1')
+            remaining_whole_hours -= 1
+            advanced = True
+        if not advanced:
+            break
+
+    total_fte = sum((Decimal(str(row.get('fte') or 0)) for row in candidates), Decimal('0'))
+
     proposals = []
     for row in candidates:
         current = Decimal(str(row[current_key]))
-        adjustment = adjustments[row['physician_id']]
-        proposed = (
+        current_target = Decimal(str(row['current_target_hours']))
+        adjustment = whole_adjustments[row['physician_id']]
+        proposed_bound = (
             current + adjustment
             if direction == 'increase_maximum'
             else current - adjustment
+        )
+        proposed_target = (
+            current_target + adjustment
+            if direction == 'increase_maximum'
+            else current_target - adjustment
         )
         proposals.append({
             'physician_id': row['physician_id'],
             'physician': row['physician'],
             'fte': row['fte'],
-            'current_hours': _number(current),
+            'current_target_hours': _number(current_target),
+            'current_minimum_hours': row['effective_min_hours'],
+            'current_maximum_hours': row['effective_max_hours'],
             'adjustment_hours': _number(adjustment),
-            'proposed_hours': _number(max(proposed, Decimal('0'))),
+            'proposed_target_hours': _number(max(proposed_target, Decimal('0'))),
+            'proposed_minimum_hours': _number(
+                max(
+                    Decimal(str(row['effective_min_hours']))
+                    + (adjustment if direction == 'increase_maximum' else -adjustment),
+                    Decimal('0'),
+                )
+            ),
+            'proposed_maximum_hours': (
+                _number(
+                    Decimal(str(row['effective_max_hours']))
+                    + (adjustment if direction == 'increase_maximum' else -adjustment)
+                )
+                if row['effective_max_hours'] is not None else None
+            ),
+            'proposed_bound_hours': _number(max(proposed_bound, Decimal('0'))),
         })
-    applied_total = sum(adjustments.values(), Decimal('0'))
-    required_rate = max(
-        (
-            adjustments[row['physician_id']] / Decimal(str(row['fte']))
-            for row in candidates
-        ),
-        default=base_rate,
-    )
-    recommended_rate = max(
-        Decimal('1'),
-        required_rate.quantize(Decimal('1'), rounding=ROUND_CEILING),
-    )
-    if hour_granularity is not None:
-        # Raw hour totals can appear feasible even though no combination of
-        # whole shifts fits inside the adjusted bounds. Raise the recommended
-        # whole-hour rate until the bounds contain the required coverage at
-        # the schedule's actual shift-duration increment.
-        while recommended_rate <= Decimal('1000'):
-            adjusted_bounds = []
-            for row in candidates:
-                current = Decimal(str(row[current_key]))
-                adjusted = recommended_rate * Decimal(str(row['fte']))
-                proposed = (
-                    current + adjusted
-                    if direction == 'increase_maximum'
-                    else max(Decimal('0'), current - adjusted)
-                )
-                adjusted_bounds.append(
-                    _floor_to_granularity(proposed, hour_granularity)
-                    if direction == 'increase_maximum'
-                    else _ceil_to_granularity(proposed, hour_granularity)
-                )
-            adjusted_total = sum(adjusted_bounds, Decimal('0'))
-            if (
-                direction == 'increase_maximum'
-                and adjusted_total >= available_hours
-            ) or (
-                direction == 'decrease_minimum'
-                and adjusted_total <= available_hours
-            ):
-                break
-            recommended_rate += Decimal('1')
+    applied_total = sum(whole_adjustments.values(), Decimal('0'))
     return {
         'direction': direction,
         'required_adjustment_hours': _number(required),
-        'total_applicable_fte': _number(total_fte),
-        'adjustment_hours_per_fte': _number(recommended_rate),
+        'total_applicable_target_hours': _number(total_target),
+        'recommended_target_change_percent': _number(base_rate * Decimal('100')),
+        'adjustment_hours_per_fte': (
+            _number((required / total_fte).to_integral_value(rounding=ROUND_CEILING))
+            if total_fte > 0 else None
+        ),
         'proposals': proposals,
-        'can_preview': abs(applied_total - required) <= Decimal('0.0001'),
+        'can_preview': applied_total >= required,
         'reason': None,
     }
 
@@ -1451,6 +1483,14 @@ def build_workload_feasibility(
             'physician_id': physician.id,
             'physician': name,
             'fte': _number(physician.fte),
+            'current_target_hours': _number(
+                target.get('block_target_hours')
+                if target.get('block_target_hours') is not None
+                else (
+                    (physician_min + physician_max) / Decimal('2')
+                    if physician_max is not None else physician_min
+                )
+            ),
             'contract': contract.name,
             'workload_rule_periods': rule_rows,
             'effective_min_hours': _number(physician_min) if rule_rows else None,
@@ -1541,7 +1581,7 @@ def build_workload_feasibility(
         row for row in physician_rows
         if row.get('under_minimum_diagnostic') is not None
     ]
-    adjustment_preview = _fte_adjustment_preview(
+    adjustment_preview = _target_adjustment_preview(
         status,
         physician_rows,
         optimizer_required_hours,
@@ -1567,19 +1607,6 @@ def build_workload_feasibility(
     weekend_feasibility = _weekend_feasibility(
         instances, contract_assignments, visible_assignments, schedule_requests,
     )
-    if adjustment_preview:
-        groups = defaultdict(lambda: {'physician_count': 0})
-        rate = Decimal(str(adjustment_preview['adjustment_hours_per_fte'] or 0))
-        for proposal in adjustment_preview['proposals']:
-            groups[Decimal(str(proposal['fte']))]['physician_count'] += 1
-        adjustment_preview['fte_groups'] = [
-            {
-                'fte': _number(fte),
-                'physician_count': group['physician_count'],
-                'adjustment_hours_per_physician': _number(fte * rate),
-            }
-            for fte, group in sorted(groups.items(), reverse=True)
-        ]
     contract_adjustment_groups = {}
     for row in physician_rows:
         adjustment = row.get('workload_hour_adjustment')

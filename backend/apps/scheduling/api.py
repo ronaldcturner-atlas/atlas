@@ -70,9 +70,11 @@ from .contract_overrides import (
     override_differences,
 )
 from .block_user_planning import (
+    BLOCK_VALUE_FIELDS,
     apply_manual_temporary_overrides,
     block_month_count,
     generated_partial_settings,
+    prorated_block_values,
 )
 from .optimizer import (
     build_violation_report,
@@ -6930,7 +6932,12 @@ def _normalized_carried_plan(block, previous, previous_plan):
         'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
         'target_shifts', 'min_shifts_adjustment', 'max_shifts_adjustment',
     )
-    result = {field: previous_plan.get(field, '') for field in carried_fields}
+    carry_source = (
+        previous_plan.get('partial_block_base_values')
+        or previous_plan.get('workload_adjustment_base_values')
+        or previous_plan
+    )
+    result = {field: carry_source.get(field, '') for field in carried_fields}
     if previous and block_month_count(previous) != block_month_count(block):
         ratio = Decimal(block_month_count(block)) / Decimal(block_month_count(previous))
         for field in ('target_hours', 'target_shifts'):
@@ -7071,6 +7078,33 @@ def schedule_block_users(request, block_id):
                 errors[str(physician_id)] = 'User is not clinically active with an applicable Contract in this Domain.'
                 continue
             current = copy.deepcopy(settings.get(str(physician_id), {}))
+            if row.get('clear_workload_adjustment') is True:
+                current.pop('workload_adjusted', None)
+                current.pop('workload_adjustment_base_values', None)
+            if row.get('apply_workload_adjustment') is True:
+                raw_base = row.get('workload_adjustment_base_values')
+                if not isinstance(raw_base, dict):
+                    errors[f'{physician_id}.workload_adjustment'] = 'The original Block Hours values are required.'
+                elif not current.get('workload_adjustment_base_values'):
+                    base_values = {}
+                    for field in (
+                        'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
+                        'minimum_hours', 'maximum_hours',
+                    ):
+                        value = raw_base.get(field, '')
+                        if value in (None, ''):
+                            continue
+                        try:
+                            number = Decimal(str(value))
+                        except (InvalidOperation, TypeError, ValueError):
+                            errors[f'{physician_id}.workload_adjustment_base_values.{field}'] = 'Enter a valid nonnegative number.'
+                            continue
+                        if not number.is_finite() or number < 0:
+                            errors[f'{physician_id}.workload_adjustment_base_values.{field}'] = 'Enter a valid nonnegative number.'
+                            continue
+                        base_values[field] = _planning_decimal_text(number)
+                    current['workload_adjustment_base_values'] = base_values
+                current['workload_adjusted'] = True
             for field in numeric_fields:
                 value = row.get(field, '')
                 if value in (None, ''):
@@ -7115,7 +7149,16 @@ def schedule_block_users(request, block_id):
             _normalized_carried_plan(block, previous, previous_plan)
             if previous_plan else defaults
         )
-        plan = {**inherited, **copy.deepcopy(current_settings.get(str(assignment.physician_id), {}))}
+        stored_plan = copy.deepcopy(current_settings.get(str(assignment.physician_id), {}))
+        for field in (
+            'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
+            'minimum_hours', 'maximum_hours', 'target_shifts',
+            'min_shifts_adjustment', 'max_shifts_adjustment',
+            'minimum_shifts', 'maximum_shifts',
+        ):
+            if stored_plan.get(field) in (None, ''):
+                stored_plan.pop(field, None)
+        plan = {**inherited, **stored_plan}
         source_plan = current_settings.get(str(assignment.physician_id), {}) or previous_plan
         parent_contract_changed = bool(
             source_plan
@@ -7140,6 +7183,8 @@ def schedule_block_users(request, block_id):
             'excluded': len(plan.get('unavailable_dates') or []) == (block.end_date - block.start_date).days + 1,
             'parent_contract_changed': parent_contract_changed,
             'parent_defaults': defaults,
+            'workload_adjusted': bool(plan.get('workload_adjusted')),
+            'workload_adjustment_base_values': plan.get('workload_adjustment_base_values') or {},
             **plan,
         })
     return Response({
@@ -7185,6 +7230,14 @@ def schedule_block_partial_user(request, block_id, physician_id):
         plan.pop('unavailable_dates', None)
         plan.pop('temporary_rule_overrides', None)
         plan.pop('temporary_contract_source', None)
+        base_values = plan.pop('partial_block_base_values', {})
+        plan.pop('workload_adjusted', None)
+        plan.pop('workload_adjustment_base_values', None)
+        for field in BLOCK_VALUE_FIELDS:
+            if field in base_values:
+                plan[field] = base_values[field]
+            else:
+                plan.pop(field, None)
         settings[str(physician_id)] = plan
         block.user_planning_settings = settings
         _mark_block_planning_change(block, request.user)
@@ -7193,6 +7246,8 @@ def schedule_block_partial_user(request, block_id, physician_id):
         if read_only:
             return Response({'detail': 'Published and Preview Schedule Blocks are read only.'}, status=status.HTTP_409_CONFLICT)
         if 'unavailable_dates' in request.data:
+            plan.pop('workload_adjusted', None)
+            plan.pop('workload_adjustment_base_values', None)
             raw_dates = request.data.get('unavailable_dates')
             if not isinstance(raw_dates, list):
                 return Response({'unavailable_dates': 'Provide a list of dates.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -7206,6 +7261,22 @@ def schedule_block_partial_user(request, block_id, physician_id):
                     return Response({'unavailable_dates': f'{value} is outside this Schedule Block.'}, status=status.HTTP_400_BAD_REQUEST)
                 unavailable_dates.append(parsed.isoformat())
             plan['unavailable_dates'] = sorted(set(unavailable_dates))
+            if 'partial_block_base_values' not in plan:
+                plan['partial_block_base_values'] = {
+                    field: plan[field]
+                    for field in BLOCK_VALUE_FIELDS
+                    if plan.get(field) not in (None, '')
+                }
+            effective_block_values = prorated_block_values(
+                plan.get('partial_block_base_values') or {},
+                block,
+                plan['unavailable_dates'],
+            )
+            for field in BLOCK_VALUE_FIELDS:
+                if field in effective_block_values:
+                    plan[field] = effective_block_values[field]
+                else:
+                    plan.pop(field, None)
             plan.setdefault('temporary_rule_overrides', {})
             plan['temporary_contract_source'] = {
                 'contract_id': assignment.contract_id,

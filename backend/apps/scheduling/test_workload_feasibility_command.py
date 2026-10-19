@@ -64,7 +64,7 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(report['status'], 'maximum_infeasible')
         self.assertEqual(report['fte_adjustment_preview']['direction'], 'increase_maximum')
         self.assertEqual(report['fte_adjustment_preview']['required_adjustment_hours'], 10)
-        self.assertEqual(report['fte_adjustment_preview']['adjustment_hours_per_fte'], 7)
+        self.assertEqual(report['fte_adjustment_preview']['recommended_target_change_percent'], 250)
 
     def setUp(self):
         self.domain = Domain.objects.create(name='Physician', active=True)
@@ -166,26 +166,26 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         preview = aggregate['fte_adjustment_preview']
         self.assertEqual(preview['direction'], 'decrease_minimum')
         self.assertEqual(preview['required_adjustment_hours'], 10.0)
-        self.assertEqual(preview['total_applicable_fte'], 1.5)
-        self.assertEqual(preview['adjustment_hours_per_fte'], 8.0)
+        self.assertEqual(preview['total_applicable_target_hours'], 26.0)
+        self.assertAlmostEqual(preview['recommended_target_change_percent'], 1000 / 26)
+        self.assertEqual(preview['adjustment_hours_per_fte'], 7)
         proposals = {row['physician']: row for row in preview['proposals']}
-        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 4)
-        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 6)
+        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 5)
+        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 5)
         self.assertLessEqual(
-            sum(
-                max(
-                    0,
-                    row['current_hours']
-                    - preview['adjustment_hours_per_fte'] * row['fte'],
-                )
-                for row in preview['proposals']
-            ),
+            sum(row['proposed_minimum_hours'] for row in preview['proposals']),
             aggregate['total_available_scheduled_hours'],
         )
         self.assertAlmostEqual(
-            sum(row['proposed_hours'] for row in preview['proposals']),
+            sum(row['proposed_bound_hours'] for row in preview['proposals']),
             2.0,
         )
+        self.assertTrue(all(
+            row['proposed_target_hours'] == int(row['proposed_target_hours'])
+            and row['proposed_minimum_hours'] == int(row['proposed_minimum_hours'])
+            and row['proposed_maximum_hours'] == int(row['proposed_maximum_hours'])
+            for row in preview['proposals']
+        ))
 
     def test_aggregate_maximum_infeasible(self):
         self._set_ranges(0, 4)
@@ -198,20 +198,18 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         preview = aggregate['fte_adjustment_preview']
         self.assertEqual(preview['direction'], 'increase_maximum')
         self.assertEqual(preview['required_adjustment_hours'], 10.0)
-        self.assertEqual(preview['adjustment_hours_per_fte'], 7.0)
+        self.assertEqual(preview['total_applicable_target_hours'], 4.0)
+        self.assertEqual(preview['recommended_target_change_percent'], 250.0)
+        self.assertEqual(preview['adjustment_hours_per_fte'], 7)
         proposals = {row['physician']: row for row in preview['proposals']}
-        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 10 / 3)
-        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 20 / 3)
+        self.assertAlmostEqual(proposals['Workload Turner']['adjustment_hours'], 5)
+        self.assertAlmostEqual(proposals['Workload Full']['adjustment_hours'], 5)
         self.assertGreaterEqual(
-            sum(
-                row['current_hours']
-                + preview['adjustment_hours_per_fte'] * row['fte']
-                for row in preview['proposals']
-            ),
+            sum(row['proposed_maximum_hours'] for row in preview['proposals']),
             aggregate['total_available_scheduled_hours'],
         )
         self.assertAlmostEqual(
-            sum(row['proposed_hours'] for row in preview['proposals']),
+            sum(row['proposed_bound_hours'] for row in preview['proposals']),
             18.0,
         )
 
@@ -315,8 +313,8 @@ class ExplainWorkloadFeasibilityCommandTests(TestCase):
         self.assertEqual(aggregate['available_minus_total_minimum'], -10.0)
         self.assertEqual(aggregate['total_maximum_minus_available'], -10.0)
         self.assertEqual(
-            aggregate['fte_adjustment_preview']['adjustment_hours_per_fte'],
-            8.0,
+            aggregate['fte_adjustment_preview']['recommended_target_change_percent'],
+            100.0,
         )
         self.assertEqual(report['reduced_contract_focus'][0]['physician'], 'Workload Turner')
 

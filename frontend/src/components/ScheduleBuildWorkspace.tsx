@@ -411,7 +411,8 @@ type BuildContext = {
     fte_adjustment_preview: {
       direction: 'increase_maximum' | 'decrease_minimum'
       required_adjustment_hours: number
-      total_applicable_fte: number
+      total_applicable_target_hours: number
+      recommended_target_change_percent: number | null
       adjustment_hours_per_fte: number | null
       can_preview: boolean
       reason: string | null
@@ -419,14 +420,14 @@ type BuildContext = {
         physician_id: number
         physician: string
         fte: number
-        current_hours: number
+        current_target_hours: number
+        current_minimum_hours: number
+        current_maximum_hours: number | null
         adjustment_hours: number
-        proposed_hours: number
-      }>
-      fte_groups: Array<{
-        fte: number
-        physician_count: number
-        adjustment_hours_per_physician: number
+        proposed_target_hours: number
+        proposed_minimum_hours: number
+        proposed_maximum_hours: number | null
+        proposed_bound_hours: number
       }>
     } | null
   } | null
@@ -585,15 +586,6 @@ function hourRangeLabel(minimum: number | null, maximum: number | null) {
 function signedHourAdjustment(value: number | null) {
   if (value === null || Math.abs(value) < 0.0001) return 'No change'
   return `${value > 0 ? '+' : '−'}${Math.abs(value).toFixed(1)}h`
-}
-
-function signedWorkloadRate(
-  direction: 'increase_maximum' | 'decrease_minimum',
-  value: string | number | null,
-) {
-  if (value === null || value === '') return ''
-  const magnitude = Math.abs(Number(value))
-  return direction === 'decrease_minimum' ? `-${magnitude}` : String(magnitude)
 }
 
 function contractWorkloadRuleLabel(adjustment: WorkloadContractAdjustment) {
@@ -828,8 +820,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   const [showScoreDetails, setShowScoreDetails] = useState(false)
   const [showWorkloadDetails, setShowWorkloadDetails] = useState(false)
   const [showOptimizerDebug, setShowOptimizerDebug] = useState(false)
-  const [showFeasibilityPreview, setShowFeasibilityPreview] = useState(false)
-  const [workloadHoursPerFte, setWorkloadHoursPerFte] = useState('')
   const [isApplyingWorkloadAdjustment, setIsApplyingWorkloadAdjustment] = useState(false)
   const [debugCopyStatus, setDebugCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [summaryCopyStatus, setSummaryCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
@@ -977,7 +967,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     }
   }
 
-  const changeWorkloadAdjustment = async (reset = false) => {
+  const resetLegacyWorkloadAdjustment = async () => {
     const version = context?.selected_version
     if (!version) return
     try {
@@ -988,19 +978,11 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(reset ? { reset: true } : {
-          hours_per_fte: Number(
-            workloadHoursPerFte
-            || context?.workload_feasibility?.fte_adjustment_preview?.adjustment_hours_per_fte
-            || 0,
-          ),
-        }),
+        body: JSON.stringify({ reset: true }),
       })
       const data = await response.json().catch(() => null)
       if (!response.ok) throw new Error(apiError(data, 'Unable to adjust Schedule Block workload limits.'))
       setNotice(data.detail)
-      setShowFeasibilityPreview(false)
-      setWorkloadHoursPerFte('')
       await fetchContext(version.id, { optimizerRunId: selectedOptimizerRunIdRef.current })
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Unable to adjust Schedule Block workload limits.')
@@ -2417,11 +2399,14 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
     : weekendFeasibility?.conflicts.some((conflict) => !conflict.rule.toLowerCase().includes('minimum'))
       ? 'red'
       : 'yellow'
-  const allFeasibilityChecksPass = context?.workload_feasibility?.status === 'aggregate_feasible'
-    && !optimizerPreflight?.has_conflicts
-    && nightFeasibility?.status === 'feasible'
-    && requestOffFeasibility?.status === 'feasible'
-    && weekendFeasibility?.status === 'no_conflict_found'
+  const workloadFeasibilityPass = context?.workload_feasibility?.status === 'aggregate_feasible'
+  const nightFeasibilityPass = nightFeasibility?.status === 'feasible'
+  const requestOffFeasibilityPass = requestOffFeasibility?.status === 'feasible'
+  const weekendFeasibilityPass = weekendFeasibility?.status === 'no_conflict_found'
+  const hasPassingFeasibilityChecks = workloadFeasibilityPass
+    || nightFeasibilityPass
+    || requestOffFeasibilityPass
+    || weekendFeasibilityPass
   const nightCapacityShortfall = Math.max(0, ...(nightFeasibility?.periods.map((period) => (
     period.remaining_maximum_night_shifts === null
       ? 0
@@ -2711,8 +2696,9 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
 
       {context.workload_feasibility && (
         <>
-        {allFeasibilityChecksPass ? (
+        {hasPassingFeasibilityChecks && (
           <section className="feasibility-compact-summary" aria-label="Feasibility checks found no necessary conflict">
+            {workloadFeasibilityPass && (
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Workload feasibility</strong>
               <div className="feasibility-hover-panel workload-feasibility-hover-panel" role="tooltip">
@@ -2747,12 +2733,16 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <small>This compares total scheduled coverage with combined contract workload ranges. It does not evaluate how requests or assignments are distributed among users.</small>
               </div>
             </div>
+            )}
+            {workloadFeasibilityPass && (
             <WorkloadAdjustmentHover
               adjustments={context.workload_feasibility.workload_contract_adjustments}
               isResetting={isApplyingWorkloadAdjustment}
               resetDisabled={isMutatingBuild}
-              onReset={() => void changeWorkloadAdjustment(true)}
+              onReset={() => void resetLegacyWorkloadAdjustment()}
             />
+            )}
+            {nightFeasibilityPass && (
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Night-shift feasibility</strong>
               <div className="feasibility-hover-panel night-feasibility-hover-panel" role="tooltip">
@@ -2777,6 +2767,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
               </div>
             </div>
+            )}
+            {requestOffFeasibilityPass && (
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Request-off feasibility</strong>
               <div className="feasibility-hover-panel request-off-feasibility-hover-panel" role="tooltip">
@@ -2789,6 +2781,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <small>{requestOffFeasibility?.scope_note}</small>
               </div>
             </div>
+            )}
+            {weekendFeasibilityPass && (
             <div className="feasibility-compact-item">
               <strong tabIndex={0}>Weekend feasibility</strong>
               <div className="feasibility-hover-panel" role="tooltip">
@@ -2802,9 +2796,10 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
                 <small>{weekendFeasibility?.scope_note}</small>
               </div>
             </div>
+            )}
           </section>
-        ) : (
-        <>
+        )}
+        {!workloadFeasibilityPass && (
         <section
           className={`workload-feasibility-card workload-feasibility-${context.workload_feasibility.status}`}
           aria-label="Aggregate workload feasibility"
@@ -2816,7 +2811,7 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
               adjustments={context.workload_feasibility.workload_contract_adjustments}
               isResetting={isApplyingWorkloadAdjustment}
               resetDisabled={isMutatingBuild}
-              onReset={() => void changeWorkloadAdjustment(true)}
+              onReset={() => void resetLegacyWorkloadAdjustment()}
             />
           </div>
           <dl>
@@ -2876,85 +2871,30 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           <small>This compares total scheduled coverage with combined contract workload ranges. It does not evaluate how requests or assignments are distributed among users.</small>
           {context.workload_feasibility.fte_adjustment_preview && (
             <div className="workload-feasibility-preview">
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => setShowFeasibilityPreview((current) => !current)}
-                disabled={!context.workload_feasibility.fte_adjustment_preview.can_preview}
-              >
-                {showFeasibilityPreview ? 'Hide FTE Adjustment Preview' : 'Review FTE Adjustment'}
-              </button>
               {!context.workload_feasibility.fte_adjustment_preview.can_preview && (
                 <small>{context.workload_feasibility.fte_adjustment_preview.reason}</small>
               )}
-              {showFeasibilityPreview && context.workload_feasibility.fte_adjustment_preview.can_preview && (
+              {context.workload_feasibility.fte_adjustment_preview.can_preview && (
                 <div>
                   <p>
-                    {context.workload_feasibility.fte_adjustment_preview.direction === 'increase_maximum'
-                      ? 'Increase maximum hours'
-                      : 'Decrease minimum hours'} by{' '}
-                    {context.workload_feasibility.fte_adjustment_preview.required_adjustment_hours.toFixed(1)} hours across{' '}
-                    {context.workload_feasibility.fte_adjustment_preview.total_applicable_fte.toFixed(2)} FTE
-                    {context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte === null
-                      ? ''
-                      : ` (${signedWorkloadRate(
-                        context.workload_feasibility.fte_adjustment_preview.direction,
-                        context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte.toFixed(0),
-                      )} hours per FTE)`}.
+                    {context.workload_feasibility.fte_adjustment_preview.direction === 'decrease_minimum' ? 'Reduce' : 'Increase'}{' '}
+                    Block Target Hours by approximately{' '}
+                    <strong>{context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte?.toFixed(0)} hours per FTE</strong>.
                   </p>
-                  <div className="workload-feasibility-preview-table-wrap">
-                    <table>
-                      <thead>
-                        <tr><th>FTE group</th><th>Physicians</th><th>Change per physician</th></tr>
-                      </thead>
-                      <tbody>
-                        {context.workload_feasibility.fte_adjustment_preview.fte_groups.map((group) => (
-                          <tr key={group.fte}>
-                            <td>{group.fte.toFixed(2)} FTE</td>
-                            <td>{group.physician_count}</td>
-                            <td>
-                              {context.workload_feasibility?.fte_adjustment_preview?.direction === 'increase_maximum' ? '+' : '−'}
-                              {(group.fte * Number(
-                                workloadHoursPerFte
-                                || context.workload_feasibility?.fte_adjustment_preview?.adjustment_hours_per_fte
-                                || 0,
-                              )).toFixed(2)}h
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                  <label className="workload-adjustment-input">
-                    <span>Hours per FTE</span>
-                    <input
-                      type="number"
-                      min={context.workload_feasibility.fte_adjustment_preview.direction === 'decrease_minimum' ? '-1000' : '1'}
-                      max={context.workload_feasibility.fte_adjustment_preview.direction === 'decrease_minimum' ? '-1' : '1000'}
-                      step="1"
-                      value={signedWorkloadRate(
-                        context.workload_feasibility.fte_adjustment_preview.direction,
-                        workloadHoursPerFte || context.workload_feasibility.fte_adjustment_preview.adjustment_hours_per_fte,
-                      )}
-                      onChange={(event) => setWorkloadHoursPerFte(
-                        event.target.value === '' ? '' : String(Math.abs(Number(event.target.value))),
-                      )}
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className="primary-action"
-                    disabled={isMutatingBuild}
-                    onClick={() => void changeWorkloadAdjustment(false)}
+                  <Link
+                    className="primary-action workload-review-link"
+                    to={`/schedule-blocks/${blockId}/users?workload_version_id=${context.selected_version.id}${selectedOptimizerRunId ? `&optimizer_run_id=${selectedOptimizerRunId}` : ''}`}
                   >
-                    {isApplyingWorkloadAdjustment ? 'Applying...' : 'Apply to This Schedule Block'}
-                  </button>
-                  <small>This changes only this Schedule Version. Permanent Contract hours are unchanged.</small>
+                    Review in Block Hours
+                  </Link>
+                  <small>Nothing changes until the scheduler reviews and saves the proposed Block Target Hours.</small>
                 </div>
               )}
             </div>
           )}
         </section>
+        )}
+        {!nightFeasibilityPass && (
         <section
           className={`night-feasibility-card night-feasibility-${nightFeasibilityTone}`}
           aria-label="Residual night-shift feasibility"
@@ -3007,6 +2947,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           </div>
           <small>{context.workload_feasibility.night_feasibility.scope_note}</small>
         </section>
+        )}
+        {!requestOffFeasibilityPass && (
         <section
           className={`request-off-feasibility-card request-off-feasibility-${requestOffFeasibility?.status ?? 'feasible'}`}
           aria-label="Request-off staffing feasibility"
@@ -3037,6 +2979,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           ) : null}
           <small>{requestOffFeasibility?.scope_note}</small>
         </section>
+        )}
+        {!weekendFeasibilityPass && (
         <section
           className={`weekend-feasibility-card weekend-feasibility-${weekendFeasibilityTone}`}
           aria-label="Weekend feasibility"
@@ -3072,7 +3016,6 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
           ) : null}
           <small>{weekendFeasibility?.scope_note}</small>
         </section>
-        </>
         )}
         </>
       )}

@@ -1664,14 +1664,41 @@ select option {
 .schedule-light-theme .optimizer-elapsed-time{color:#1e3a8a}
 .schedule-light-theme .optimizer-live-best-score{color:#166534}
 .schedule-light-theme .night-feasibility-card,
+.schedule-light-theme .request-off-feasibility-card,
 .schedule-light-theme .weekend-feasibility-card,
 .schedule-light-theme .workload-feasibility-card,
 .schedule-light-theme .night-period-card{border-color:#dbe2ea;background:#fff;color:#172033}
-.schedule-light-theme .night-period-card dl div{background:#f8fafc}
+.schedule-light-theme .workload-feasibility-card dl div,
+.schedule-light-theme .night-period-card dl div,
+.schedule-light-theme .feasibility-hover-periods article,
+.schedule-light-theme .request-off-feasibility-dates article,
+.schedule-light-theme .weekend-feasibility-conflicts article{border-color:#dbe2ea;background:#f8fafc;color:#172033}
+.schedule-light-theme .workload-feasibility-card > div:first-child span,
+.schedule-light-theme .workload-feasibility-card small,
+.schedule-light-theme .workload-feasibility-card dt,
 .schedule-light-theme .night-feasibility-heading span,
 .schedule-light-theme .night-feasibility-card small,
+.schedule-light-theme .request-off-feasibility-card small,
+.schedule-light-theme .request-off-feasibility-dates dt,
 .schedule-light-theme .night-period-card p,
-.schedule-light-theme .night-feasibility-fixed-summary span{color:#64748b}
+.schedule-light-theme .night-period-card dt,
+.schedule-light-theme .night-feasibility-fixed-summary span,
+.schedule-light-theme .weekend-feasibility-conflicts article span{color:#64748b}
+.schedule-light-theme .workload-feasibility-card dd,
+.schedule-light-theme .night-period-card dd,
+.schedule-light-theme .request-off-feasibility-dates dd,
+.schedule-light-theme .weekend-feasibility-card dd{color:#172033}
+.schedule-light-theme .night-feasibility-alert{border-color:#f59e0b;background:#fffbeb;color:#92400e}
+.schedule-light-theme .request-off-feasibility-dates article{border-color:#fca5a5;background:#fef2f2}
+.schedule-light-theme .request-off-feasibility-dates article > span{color:#b91c1c}
+.schedule-light-theme .workload-feasibility-preview th,
+.schedule-light-theme .workload-feasibility-preview td{border-bottom-color:#dbe2ea}
+.schedule-light-theme .optimizer-preflight-conflicts{border-color:#dc2626;background:#fef2f2;color:#7f1d1d}
+.schedule-light-theme .optimizer-preflight-conflicts-header h3,
+.schedule-light-theme .optimizer-preflight-block-note{color:#7f1d1d}
+.schedule-light-theme .optimizer-preflight-conflict{border-color:#fecaca;background:#fff;color:#7f1d1d}
+.schedule-light-theme .optimizer-preflight-conflict > div span,
+.schedule-light-theme .optimizer-preflight-conflict li span{color:#991b1b}
 .schedule-light-theme .violation-report-tabs button.active{border-color:#dbe2ea;border-bottom-color:#fff;background:#fff;color:#172033}
 .schedule-light-theme .violation-report-tabs button:hover{color:#172033}
 .schedule-light-theme .proportionality-context-grid strong{color:#1d4ed8}
@@ -1703,6 +1730,15 @@ select option {
 .schedule-light-theme .contract-remove-button:hover:not(:disabled){background:#f1f5f9}
 .schedule-light-theme .contract-saved-banner{background:#dcfce7;color:#166534}
 .schedule-light-theme .contract-setup-banner{background:#fffbeb;color:#92400e}
+.schedule-light-theme .facilities-error,
+.schedule-light-theme .schedule-filter-error,
+.schedule-light-theme .assignment-popover-error,
+.schedule-light-theme .build-calendar-filter-error{
+  border:1px solid #dc2626;
+  background:#fef2f2;
+  color:#991b1b;
+  font-weight:700;
+}
 .schedule-light-theme .user-override-eyebrow{color:#4f46e5}
 .schedule-light-theme .user-override-default-field div{border-color:#dbe2ea;background:#eef2f7;color:#64748b}
 .schedule-light-theme .shared-rule-contract-chips span{border-color:#cbd5e1;background:#eef2ff;color:#3730a3}
@@ -1720,11 +1756,32 @@ select option {
 .schedule-light-theme .feasibility-compact-summary{border-color:#dbe2ea;background:#fff}
 .schedule-light-theme .feasibility-hover-panel{border-color:#cbd5e1;background:#fff;color:#172033;box-shadow:0 18px 45px rgba(15,23,42,.18)}
 .schedule-light-theme .feasibility-hover-panel dl div,
-.schedule-light-theme .workload-adjustment-hover-list article{border-color:#dbe2ea;background:#f8fafc}
+.schedule-light-theme .workload-adjustment-hover-list article,
+.schedule-light-theme .feasibility-hover-periods article{border-color:#dbe2ea;background:#f8fafc;color:#172033}
 .schedule-light-theme .feasibility-hover-panel p,
 .schedule-light-theme .feasibility-hover-panel small,
+.schedule-light-theme .feasibility-hover-panel dt,
 .schedule-light-theme .weekend-feasibility-card small,
 .schedule-light-theme .weekend-feasibility-card dt{color:#64748b}
+.schedule-light-theme .feasibility-hover-panel dd{color:#172033}
+
+/* Preserve feasibility status cues after the light-theme surface overrides.
+   These must follow the shared card rules above so border-color does not
+   replace the meaningful green / amber / red left edge. */
+.schedule-light-theme .feasibility-compact-summary,
+.schedule-light-theme .feasibility-hover-panel,
+.schedule-light-theme .workload-feasibility-aggregate_feasible,
+.schedule-light-theme .night-feasibility-green,
+.schedule-light-theme .request-off-feasibility-feasible,
+.schedule-light-theme .weekend-feasibility-green{border-left-color:#16a34a}
+.schedule-light-theme .workload-feasibility-minimum_infeasible,
+.schedule-light-theme .night-feasibility-yellow,
+.schedule-light-theme .weekend-feasibility-yellow,
+.schedule-light-theme .workload-adjustment-hover-panel-active{border-left-color:#d97706}
+.schedule-light-theme .workload-feasibility-maximum_infeasible,
+.schedule-light-theme .night-feasibility-red,
+.schedule-light-theme .request-off-feasibility-infeasible,
+.schedule-light-theme .weekend-feasibility-red{border-left-color:#dc2626}
 
 /* High-contrast action colors for the light theme. Keep destructive and
    warning actions unmistakable, including while an optimizer run disables
@@ -1799,6 +1856,10 @@ select option {
 .block-plan-tabs button.active{border-color:#4f46e5;background:#4f46e5;color:#fff;font-weight:700}
 .block-plan-tabs button.adjusted:not(.active){border-color:#7c3aed;background:#f5f3ff;color:#5b21b6}
 .block-plan-notice{border:1px solid #bfdbfe;background:#eff6ff;color:#1e3a8a;border-radius:7px;padding:8px 10px;font-size:12px}
+.block-workload-recommendation{display:flex;align-items:center;gap:12px;flex-wrap:wrap;border:1px solid #7c3aed;border-left:4px solid #7c3aed;background:#f5f3ff;color:#3b0764;border-radius:8px;padding:9px 11px}
+.block-workload-recommendation>div{display:grid;gap:2px;flex:1;min-width:260px}
+.block-workload-recommendation span,.block-workload-recommendation small{font-size:12px;color:#5b21b6}
+.workload-review-link{display:inline-flex;text-decoration:none}
 .block-plan-toolbar{display:flex;align-items:end;gap:7px;flex-wrap:wrap;border:1px solid #dbe2ea;background:#f8fafc;border-radius:8px;padding:8px}
 .block-plan-toolbar label{display:grid;gap:3px;font-size:11px;color:#475569}
 .block-plan-toolbar input,.block-plan-table input{width:66px;box-sizing:border-box;padding:6px 7px}
@@ -1809,6 +1870,9 @@ select option {
 .block-plan-table td small{display:block;color:#64748b;font-size:10px;margin-top:2px;max-width:220px}
 .block-plan-table .normalization-note{color:#92400e}
 .block-plan-table .contract-change-note{color:#b91c1c;font-weight:700}
+.block-plan-table .workload-adjusted-note{color:#5b21b6;font-weight:700}
+.block-plan-table .workload-adjusted-note button{padding:1px 4px;margin-left:3px;font-size:9px;border-color:#7c3aed;color:#5b21b6;background:#fff}
+.block-plan-table input.recommended-value{border-color:#7c3aed;background:#f5f3ff;box-shadow:0 0 0 1px rgba(124,58,237,.12)}
 .block-plan-table .contract-change-note button{padding:1px 4px;margin-left:3px;font-size:9px;border-color:#b91c1c;color:#991b1b;background:#fff}
 .block-plan-table tr.partial-row{background:#fffbeb}
 .partial-badge{display:inline-flex;margin-left:7px;padding:2px 6px!important;border-color:#d97706!important;background:#fef3c7!important;color:#92400e!important;font-size:10px!important;font-weight:700}

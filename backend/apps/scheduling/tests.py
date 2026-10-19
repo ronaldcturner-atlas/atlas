@@ -2787,6 +2787,12 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(partial.status_code, 200)
         self.assertEqual(partial.json()['unavailable_dates'], ['2026-07-06'])
+        self.assertEqual(partial.json()['block_values']['target_hours'], '60')
+        self.assertEqual(partial.json()['block_values']['minimum_hours'], '55')
+        self.assertEqual(partial.json()['block_values']['maximum_hours'], '65')
+        self.assertEqual(partial.json()['block_values']['target_shifts'], '6')
+        self.assertEqual(partial.json()['block_values']['minimum_shifts'], '5')
+        self.assertEqual(partial.json()['block_values']['maximum_shifts'], '7')
 
         self.client.post(
             f'/api/schedule-blocks/{self.block.id}/build/generate/',
@@ -2811,6 +2817,67 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(rejected.status_code, 400)
         self.assertIn('Temporary Partial Block Contract', rejected.json()['physician_id'])
+
+        removed = self.client.delete(partial_url)
+        self.assertEqual(removed.status_code, 200)
+        self.assertEqual(removed.json()['block_values']['target_hours'], '120')
+        self.assertEqual(removed.json()['block_values']['minimum_hours'], '110')
+        self.assertEqual(removed.json()['block_values']['maximum_hours'], '130')
+
+    def test_workload_target_adjustment_preserves_baseline_for_next_block(self):
+        physician = self._create_assignment_physician(
+            'target-adjustment@example.com', 'Target Adjustment', [self.facility],
+        )
+        users_url = f'/api/schedule-blocks/{self.block.id}/users/'
+        response = self.client.patch(
+            users_url,
+            data={'users': [{
+                'physician_id': physician.id,
+                'target_hours': '100',
+                'minimum_hours': '90',
+                'maximum_hours': '110',
+                'min_hours_adjustment': '10',
+                'max_hours_adjustment': '10',
+                'apply_workload_adjustment': True,
+                'workload_adjustment_base_values': {
+                    'target_hours': '120',
+                    'minimum_hours': '110',
+                    'maximum_hours': '130',
+                    'min_hours_adjustment': '10',
+                    'max_hours_adjustment': '10',
+                },
+            }]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        current = response.json()['users'][0]
+        self.assertTrue(current['workload_adjusted'])
+        self.assertEqual(current['target_hours'], '100')
+        self.assertEqual(
+            current['workload_adjustment_base_values']['target_hours'], '120',
+        )
+
+        self.block.published_at = timezone.now()
+        self.block.save(update_fields=['published_at', 'updated_at'])
+        next_block = ScheduleBlock.objects.create(
+            domain=self.domain,
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            request_open_datetime=timezone.make_aware(datetime(2026, 6, 1, 12, 0)),
+            request_close_datetime=timezone.make_aware(datetime(2026, 6, 15, 12, 0)),
+            build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        )
+        carried = self.client.get(
+            f'/api/schedule-blocks/{next_block.id}/users/',
+        )
+        self.assertEqual(carried.status_code, 200)
+        row = next(
+            item for item in carried.json()['users']
+            if item['physician_id'] == physician.id
+        )
+        self.assertEqual(row['target_hours'], '120')
+        self.assertEqual(row['minimum_hours'], '110')
+        self.assertEqual(row['maximum_hours'], '130')
 
     def test_generate_creates_open_dated_instances_and_moves_block_to_build(self):
         response = self.client.post(

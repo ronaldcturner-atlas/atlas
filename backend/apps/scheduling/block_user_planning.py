@@ -1,7 +1,7 @@
 import copy
 from calendar import monthrange
 from datetime import timedelta
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 from .contract_overrides import (
     CONTRACT_SETTING_FIELDS,
@@ -16,6 +16,11 @@ VOLUME_BOUNDS = (
     ('min_value', 'max_value'),
     ('min_shifts', 'max_shifts'),
     ('min_volume', 'max_volume'),
+)
+
+BLOCK_VALUE_FIELDS = (
+    'target_hours', 'minimum_hours', 'maximum_hours',
+    'target_shifts', 'minimum_shifts', 'maximum_shifts',
 )
 
 
@@ -132,6 +137,30 @@ def generated_partial_settings(contract, block, unavailable_dates):
             adjusted_paths,
         )
     return settings, sorted(set(adjusted_paths))
+
+
+def prorated_block_values(values, block, unavailable_dates):
+    """Prorate full-block planning values into temporary effective values."""
+    unavailable = set(unavailable_dates or ())
+    total_days = (block.end_date - block.start_date).days + 1
+    eligible_days = sum(
+        1
+        for offset in range(total_days)
+        if (block.start_date + timedelta(days=offset)).isoformat() not in unavailable
+    )
+    ratio = Decimal(eligible_days) / Decimal(total_days) if total_days else Decimal('0')
+    result = {}
+    for field in BLOCK_VALUE_FIELDS:
+        value = _decimal((values or {}).get(field))
+        if value is None:
+            continue
+        rounding = (
+            ROUND_FLOOR if field.startswith('minimum_')
+            else ROUND_CEILING if field.startswith('maximum_')
+            else ROUND_HALF_UP
+        )
+        result[field] = _clean_number((value * ratio).to_integral_value(rounding=rounding))
+    return result
 
 
 def apply_manual_temporary_overrides(contract, settings, overrides):
