@@ -7437,6 +7437,7 @@ def _solve_bounded_multi_physician_neighborhood(
     focus_start=None, focus_end=None, cohort_size=10,
     allow_non_improving=False, maximum_score_increase=None,
     diversification_bias=False, should_stop=None, clock=monotonic,
+    include_circadian_objective=False, maximum_reassignments=None,
 ):
     """Rebuild a coupled cohort atomically with CP-SAT.
 
@@ -7663,6 +7664,22 @@ def _solve_bounded_multi_physician_neighborhood(
             return _copy_state(state), scoring, debug
         model.add_exactly_one(slot_candidates[slot])
 
+    if maximum_reassignments is not None:
+        maximum_reassignments = max(int(maximum_reassignments), 0)
+        changed_assignments = []
+        for slot, (_instance, owner_id) in enumerate(movable):
+            owner_variable = variables.get((slot, owner_id))
+            if owner_variable is None:
+                changed_assignments.append(1)
+            else:
+                changed_assignments.append(1 - owner_variable)
+            for physician_id in cohort_ids:
+                variable = variables.get((slot, physician_id))
+                if variable is not None:
+                    model.add_hint(variable, int(physician_id == owner_id))
+        model.add(sum(changed_assignments) <= maximum_reassignments)
+        debug['maximum_reassignments'] = maximum_reassignments
+
     slots_by_instance = defaultdict(list)
     for slot, (instance, _owner_id) in enumerate(movable):
         slots_by_instance[instance.id].append(slot)
@@ -7781,6 +7798,93 @@ def _solve_bounded_multi_physician_neighborhood(
         return result
 
     objective_terms = list(request_assignment_terms)
+    if include_circadian_objective:
+        current_instance_ids = {instance.id for instance in instances}
+        boundary_context = _published_boundary_context(instances)
+        fixed_ids_by_physician = {
+            physician_id: {
+                instance.id
+                for instance in fixed_by_physician[physician_id]
+            }
+            for physician_id in cohort_ids
+        }
+        for physician_id in cohort_ids:
+            if deadline_reached('create_circadian_constraints'):
+                return _copy_state(state), scoring, debug
+            contract = contract_by_physician.get(physician_id)
+            settings = (
+                contract.workload_settings
+                if contract is not None
+                and isinstance(contract.workload_settings, dict)
+                else {}
+            )
+            weight = _configured_positive_penalty(
+                settings, 'circadian_penalty_weight', Decimal('0'),
+            )
+            if not settings.get('circadian_enabled') or weight <= 0:
+                continue
+
+            ordered = sorted(
+                [*boundary_context.get(physician_id, ()), *instances],
+                key=lambda instance: (
+                    instance.start_datetime,
+                    instance.end_datetime,
+                    instance.id,
+                ),
+            )
+            assigned = []
+            for instance in ordered:
+                if instance.id not in current_instance_ids:
+                    assigned.append(1)
+                elif instance.id in fixed_ids_by_physician[physician_id]:
+                    assigned.append(1)
+                else:
+                    assigned.append(model_or(
+                        movable_vars_by_physician_instance.get(
+                            (physician_id, instance.id),
+                            [],
+                        ),
+                        f'circadian_assignment_{physician_id}_{instance.id}',
+                    ))
+
+            for left_index, left in enumerate(ordered):
+                left_assigned = assigned[left_index]
+                if isinstance(left_assigned, int) and left_assigned == 0:
+                    continue
+                circadian_floor = left.start_datetime + timedelta(hours=23)
+                for right_index in range(left_index + 1, len(ordered)):
+                    right = ordered[right_index]
+                    if right.start_datetime >= circadian_floor:
+                        break
+                    if (
+                        right.id not in current_instance_ids
+                        or left.date == right.date
+                    ):
+                        continue
+                    right_assigned = assigned[right_index]
+                    if isinstance(right_assigned, int) and right_assigned == 0:
+                        continue
+                    edge = model_and(
+                        left_assigned,
+                        right_assigned,
+                        f'circadian_edge_{physician_id}_{left.id}_{right.id}',
+                    )
+                    for middle_index in range(left_index + 1, right_index):
+                        middle_assigned = assigned[middle_index]
+                        if isinstance(middle_assigned, int):
+                            if middle_assigned == 1:
+                                edge = 0
+                                break
+                            continue
+                        edge = model_and(
+                            edge,
+                            1 - middle_assigned,
+                            f'circadian_edge_clear_{physician_id}_{left.id}_{right.id}_{middle_index}',
+                        )
+                    if isinstance(edge, int) and edge == 0:
+                        continue
+                    objective_terms.append(int(weight * 60) * edge)
+
     # DAY_ON and SHIFT_ON are scored for absence, not per assignment. Model
     # their satisfaction explicitly so the neighborhood cannot trade away a
     # high-priority requested shift merely to repair workload.
@@ -7964,6 +8068,190 @@ def _solve_bounded_multi_physician_neighborhood(
                         )
                         model.add(
                             over >= total - int(round(float(effective['max_value']) * scale))
+                        )
+                        objective_terms.append(
+                            max(1, int(effective['max_penalty_weight'])) * over
+                        )
+
+            max_same_shifts = _decimal_or_none(
+                group.get('max_same_shifts_in_row')
+            )
+            same_shift_penalty = _decimal_or_none(
+                group.get('max_same_shifts_in_row_penalty_weight')
+            )
+            if (
+                max_same_shifts is not None
+                and max_same_shifts > 0
+                and same_shift_penalty is not None
+                and same_shift_penalty > 0
+            ):
+                maximum = int(max_same_shifts)
+                group_by_date = {}
+                fixed_dates = {
+                    instance.date
+                    for instance in fixed_by_physician[physician_id]
+                    if instance.shift_template_id in template_ids
+                }
+                for day in all_dates:
+                    if day in fixed_dates:
+                        group_by_date[day] = 1
+                        continue
+                    group_by_date[day] = model_or(
+                        [
+                            variables[slot, physician_id]
+                            for slot, (instance, _owner_id) in enumerate(movable)
+                            if (slot, physician_id) in variables
+                            and instance.date == day
+                            and instance.shift_template_id in template_ids
+                        ],
+                        f'shift_group_day_{physician_id}_{group_index}_{day.isoformat()}',
+                    )
+                for start_index in range(max(len(all_dates) - maximum, 0)):
+                    window = all_dates[start_index:start_index + maximum + 1]
+                    if not all(
+                        next_day == day + timedelta(days=1)
+                        for day, next_day in zip(window, window[1:])
+                    ):
+                        continue
+                    current = group_by_date[window[0]]
+                    previous = group_by_date.get(
+                        window[0] - timedelta(days=1), 0,
+                    )
+                    streak_start = model_and(
+                        current,
+                        1 - previous,
+                        f'shift_group_streak_start_{physician_id}_{group_index}_{start_index}',
+                    )
+                    values = [
+                        streak_start,
+                        *[group_by_date[day] for day in window[1:]],
+                    ]
+                    if any(
+                        isinstance(value, int) and value == 0
+                        for value in values
+                    ):
+                        continue
+                    if all(
+                        isinstance(value, int) and value == 1
+                        for value in values
+                    ):
+                        objective_terms.append(int(same_shift_penalty * 60))
+                        continue
+                    excess = model.new_bool_var(
+                        f'shift_group_streak_excess_{physician_id}_{group_index}_{start_index}'
+                    )
+                    for value in values:
+                        model.add(excess <= value)
+                    model.add(excess >= sum(values) - len(values) + 1)
+                    objective_terms.append(int(same_shift_penalty * 60) * excess)
+
+    # Facility-scoped ranges share the authoritative shift-rule component but
+    # use Facility membership rather than Shift Template groups.
+    for physician_id in cohort_ids:
+        if deadline_reached('create_facility_rule_constraints'):
+            return _copy_state(state), scoring, debug
+        contract = contract_by_physician.get(physician_id)
+        raw_settings = (
+            getattr(contract, 'facility_settings', {})
+            if contract is not None else {}
+        )
+        settings = raw_settings if isinstance(raw_settings, dict) else {}
+        for group_index, group in enumerate(settings.get('rules') or []):
+            if not isinstance(group, dict):
+                continue
+            try:
+                facility_id = int(group.get('facility_id') or 0)
+            except (TypeError, ValueError):
+                continue
+            if not facility_id:
+                continue
+            for rule in group.get('period_rules') or []:
+                if not isinstance(rule, dict):
+                    continue
+                period_type = rule.get('period_type') or 'SCHEDULE_BLOCK'
+                units = 'SHIFTS' if rule.get('units') == 'SHIFTS' else 'HOURS'
+                normalized = {
+                    'period_type': period_type,
+                    'units': units,
+                    'min_value': _decimal_or_none(rule.get('min_value')),
+                    'max_value': _decimal_or_none(rule.get('max_value')),
+                    'min_penalty_weight': _positive_decimal_or_default(
+                        rule.get('min_penalty_weight'), Decimal('0'),
+                    ),
+                    'max_penalty_weight': _positive_decimal_or_default(
+                        rule.get('max_penalty_weight'), Decimal('0'),
+                    ),
+                }
+                if (
+                    normalized['min_value'] is None
+                    and normalized['max_value'] is None
+                ):
+                    continue
+                for window_start, window_end in _period_windows(
+                    instances, period_type,
+                ):
+                    effective = _effective_workload_rule(
+                        normalized, window_start, window_end,
+                    )
+                    is_shifts = units == 'SHIFTS'
+                    scale = 1 if is_shifts else 60
+                    fixed_value = sum(
+                        1 if is_shifts else int(round(float(
+                            _shift_hours(instance) * 60
+                        )))
+                        for instance in fixed_by_physician[physician_id]
+                        if instance.facility_id == facility_id
+                        and window_start <= instance.date <= window_end
+                    )
+                    terms = []
+                    maximum_possible = fixed_value
+                    for slot, (instance, _owner_id) in enumerate(movable):
+                        variable = variables.get((slot, physician_id))
+                        if (
+                            variable is None
+                            or instance.facility_id != facility_id
+                            or not window_start <= instance.date <= window_end
+                        ):
+                            continue
+                        value = (
+                            1 if is_shifts
+                            else int(round(float(_shift_hours(instance) * 60)))
+                        )
+                        terms.append(value * variable)
+                        maximum_possible += value
+                    total = fixed_value + sum(terms)
+                    if effective['min_value'] is not None:
+                        under = model.new_int_var(
+                            0,
+                            max(
+                                maximum_possible,
+                                int(effective['min_value'] * scale),
+                                1,
+                            ),
+                            f'facility_rule_under_{physician_id}_{group_index}_{window_start.isoformat()}',
+                        )
+                        model.add(
+                            under >= int(round(float(
+                                effective['min_value'] * scale
+                            ))) - total
+                        )
+                        objective_terms.append(
+                            max(1, int(effective['min_penalty_weight'])) * under
+                        )
+                    if effective['max_value'] is not None:
+                        over = model.new_int_var(
+                            0,
+                            max(
+                                maximum_possible,
+                                int(effective['max_value'] * scale),
+                                1,
+                            ),
+                            f'facility_rule_over_{physician_id}_{group_index}_{window_start.isoformat()}',
+                        )
+                        model.add(
+                            over >= total - int(round(float(
+                                effective['max_value'] * scale
+                            )))
                         )
                         objective_terms.append(
                             max(1, int(effective['max_penalty_weight'])) * over
@@ -8566,6 +8854,7 @@ def _solve_bounded_multi_physician_neighborhood(
     )
     solver.parameters.num_search_workers = 8
     solver.parameters.random_seed = rng.randrange(1, 2_000_000_000)
+    debug['solver_workers'] = solver.parameters.num_search_workers
     status = solver.solve(model)
     debug['attempts'] = 1
     debug['solver_status'] = solver.status_name(status)
@@ -8665,6 +8954,7 @@ def _constraint_boundary_padding_days(contract_by_physician, maximum=7):
 def _adaptive_violation_focuses(
     *, instances, physicians, state, scoring, contract_by_physician,
     requests_by_physician_date,
+    include_circadian=False,
 ):
     """Return weighted physician/date seeds for destroy-and-repair windows.
 
@@ -8700,6 +8990,11 @@ def _adaptive_violation_focuses(
             'dates': sorted(set(dates)),
             'penalty': amount,
             'violation_type': row.get('violation_type', 'WORKLOAD'),
+            'instance_ids': {
+                int(instance_id)
+                for instance_id in row.get('shift_instance_ids', ())
+                if str(instance_id).isdigit()
+            },
         })
 
     for row in scoring.get('workload_score_rows', ()):
@@ -8728,6 +9023,12 @@ def _adaptive_violation_focuses(
         requests_by_physician_date,
     ):
         add_focus(row)
+    if include_circadian:
+        for row in _circadian_violation_report(
+            instances, physicians, state, contract_by_physician,
+            details=True,
+        ).get('violations', ()):
+            add_focus(row)
 
     return sorted(
         focuses,

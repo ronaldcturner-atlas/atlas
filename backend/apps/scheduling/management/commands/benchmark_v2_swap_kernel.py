@@ -71,6 +71,7 @@ from apps.scheduling.optimizer_revisions import (
     AVAILABILITY_V2_REVISION,
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
+    TEMPORAL_V2_REVISION,
     require_supported_v2_revision,
 )
 
@@ -187,6 +188,8 @@ def _structural_focus_family(violation_type):
         return 'same_shift'
     if value.startswith(('SHIFT_GROUP_', 'FACILITY_RULE_')):
         return 'shift_rule'
+    if value.startswith('CIRCADIAN_'):
+        return 'circadian'
     if 'CONSECUTIVE_DAY' in value or value == 'MAX_DAYS_IN_ROW':
         return 'consecutive'
     if 'NIGHT' in value:
@@ -201,6 +204,7 @@ STRUCTURAL_FAMILY_SCORE_COMPONENT = {
     'shift_rule': 'shift_rule_score',
     'night': 'night_score',
     'weekend': 'weekend_score',
+    'circadian': 'circadian_score',
     'consecutive': 'consecutive_days_score',
 }
 
@@ -2503,10 +2507,17 @@ class Command(BaseCommand):
             optimizer_revision in {
                 CIRCADIAN_V2_REVISION,
                 AVAILABILITY_V2_REVISION,
+                TEMPORAL_V2_REVISION,
             }
         )
         block_availability_candidate_scoring = (
-            optimizer_revision == AVAILABILITY_V2_REVISION
+            optimizer_revision in {
+                AVAILABILITY_V2_REVISION,
+                TEMPORAL_V2_REVISION,
+            }
+        )
+        temporal_reconstruction_scoring = (
+            optimizer_revision == TEMPORAL_V2_REVISION
         )
         if options['reset_engine_context']:
             _ENGINE_CONTEXT_CACHE.clear()
@@ -4624,6 +4635,7 @@ class Command(BaseCommand):
                     scoring=current_scoring,
                     contract_by_physician=contracts,
                     requests_by_physician_date=requests_by_physician_date,
+                    include_circadian=temporal_reconstruction_scoring,
                 )
                 focuses_by_family = defaultdict(list)
                 for focus_row in focuses:
@@ -4740,6 +4752,11 @@ class Command(BaseCommand):
                         minimum_rest_by_physician=minimum_rest_by_physician,
                         rng=reconstruction_rng,
                         focus_physician_ids=(focus or {}).get('physician_ids'),
+                        focus_instance_ids=(
+                            (focus or {}).get('instance_ids')
+                            if temporal_reconstruction_scoring
+                            else None
+                        ),
                         focus_start=focus_start,
                         focus_end=focus_end,
                         cohort_size=reconstruction_rng.choice((14, 16, 18)),
@@ -4747,6 +4764,12 @@ class Command(BaseCommand):
                         maximum_score_increase=maximum_score_increase,
                         diversification_bias=True,
                         time_limit_seconds=8.0,
+                        include_circadian_objective=(
+                            temporal_reconstruction_scoring
+                        ),
+                        maximum_reassignments=(
+                            24 if temporal_reconstruction_scoring else None
+                        ),
                     )
                 )
                 reconstruction.update({
@@ -4764,6 +4787,18 @@ class Command(BaseCommand):
                         )
                         if reconstruction.get('accepted') else None
                     ),
+                    'diagnostics': {
+                        key: reconstruction[key]
+                        for key in (
+                            'attempts', 'candidates', 'solver_status',
+                            'skipped_reason', 'stopped', 'stopped_stage',
+                            'assignment_distance', 'score_before',
+                            'score_after', 'breakdown_before',
+                            'breakdown_after', 'maximum_reassignments',
+                            'solver_workers',
+                        )
+                        if key in reconstruction
+                    },
                 })
                 if reconstruction.get('accepted'):
                     reassignments = []
@@ -5038,6 +5073,12 @@ class Command(BaseCommand):
                         minimum_rest_by_physician=minimum_rest_by_physician,
                         rng=random.Random(int(current_fingerprint[:16], 16)),
                         time_limit_seconds=4.0,
+                        include_circadian_objective=(
+                            temporal_reconstruction_scoring
+                        ),
+                        maximum_reassignments=(
+                            16 if temporal_reconstruction_scoring else None
+                        ),
                     )
                 )
                 if reconstruction.get('accepted'):
@@ -5472,6 +5513,9 @@ class Command(BaseCommand):
             'read_only': True,
             'optimizer_revision': optimizer_revision,
             'circadian_candidate_scoring': circadian_candidate_scoring,
+            'temporal_reconstruction_scoring': (
+                temporal_reconstruction_scoring
+            ),
             'applied_in_memory_swaps': applied_in_memory_swaps,
             'run_number': run.run_number,
             'schedule_version_id': version.id,

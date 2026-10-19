@@ -304,3 +304,288 @@ class ConstraintAwareNeighborhoodTests(SimpleTestCase):
         self.assertEqual(state[1], [1])
         self.assertEqual(state[3], [1])
         self.assertTrue({2, 3}.issubset(set(debug['connected_owner_ids'])))
+
+    def test_circadian_objective_guides_atomic_temporal_exchange(self):
+        early_template = SimpleNamespace(
+            id=100, night_shift=False, weekend_days=[],
+        )
+        late_template = SimpleNamespace(
+            id=200, night_shift=False, weekend_days=[],
+        )
+        instances = []
+        for offset in range(2):
+            day = date(2027, 3, 1) + timedelta(days=offset)
+            instances.extend([
+                SimpleNamespace(
+                    id=offset * 2 + 1, date=day, facility_id=10,
+                    shift_template_id=early_template.id,
+                    shift_template=early_template,
+                    start_datetime=datetime.combine(
+                        day, time(8), tzinfo=timezone.utc,
+                    ),
+                    end_datetime=datetime.combine(
+                        day, time(16), tzinfo=timezone.utc,
+                    ),
+                ),
+                SimpleNamespace(
+                    id=offset * 2 + 2, date=day, facility_id=10,
+                    shift_template_id=late_template.id,
+                    shift_template=late_template,
+                    start_datetime=datetime.combine(
+                        day, time(10), tzinfo=timezone.utc,
+                    ),
+                    end_datetime=datetime.combine(
+                        day, time(18), tzinfo=timezone.utc,
+                    ),
+                ),
+            ])
+        physicians = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        contracts = {
+            physician.id: SimpleNamespace(
+                id=physician.id,
+                name='Circadian contract',
+                request_settings={},
+                night_settings={},
+                workload_settings={
+                    'circadian_enabled': True,
+                    'circadian_penalty_weight': 100,
+                },
+                weekend_settings={},
+                shift_settings={},
+                manual_assignment_only=False,
+            )
+            for physician in physicians
+        }
+        initial = {1: [2], 2: [1], 3: [1], 4: [2]}
+
+        def authoritative_score(_instances, _physicians, state, *_args, **_kwargs):
+            report = optimizer._circadian_violation_report(
+                instances, physicians, state, contracts,
+            )
+            return {
+                'score': report['score'],
+                'fixed_request_on_unmet': 0,
+                'breakdown': {'circadian_score': report['score']},
+                'workload_score_rows': [],
+                'same_shift_violations': [],
+            }
+
+        initial_scoring = authoritative_score(None, None, initial)
+        self.assertEqual(initial_scoring['score'], Decimal('100'))
+        with patch.object(
+            optimizer, '_published_boundary_context', return_value={},
+        ), patch.object(
+            optimizer, '_night_violation_report',
+            return_value={'night_violations': []},
+        ), patch.object(
+            optimizer, '_request_scoring_rows', return_value=[],
+        ), patch.object(
+            optimizer, '_score_schedule', side_effect=authoritative_score,
+        ):
+            state, result, debug = optimizer._solve_bounded_multi_physician_neighborhood(
+                instances=instances,
+                physicians=physicians,
+                state=initial,
+                scoring=initial_scoring,
+                manual_pairs=set(),
+                targets={1: {'rules': []}, 2: {'rules': []}},
+                contract_by_physician=contracts,
+                requests_by_physician_date={},
+                eligible_facilities_by_physician={1: {10}, 2: {10}},
+                minimum_rest_by_physician={1: 0, 2: 0},
+                rng=Random(31),
+                focus_physician_ids={1, 2},
+                focus_start=date(2027, 3, 1),
+                focus_end=date(2027, 3, 2),
+                cohort_size=2,
+                include_circadian_objective=True,
+                maximum_reassignments=2,
+            )
+
+        self.assertTrue(debug['accepted'], debug)
+        self.assertEqual(result['score'], Decimal('0'))
+        self.assertNotEqual(state, initial)
+        self.assertLessEqual(debug['assignment_distance'], 2)
+
+    def test_facility_rule_objective_guides_atomic_exchange(self):
+        template = SimpleNamespace(
+            id=100, night_shift=False, weekend_days=[],
+        )
+        day = date(2027, 3, 8)
+        instances = [
+            SimpleNamespace(
+                id=1, date=day, facility_id=10,
+                shift_template_id=template.id, shift_template=template,
+                start_datetime=datetime.combine(
+                    day, time(8), tzinfo=timezone.utc,
+                ),
+                end_datetime=datetime.combine(
+                    day, time(16), tzinfo=timezone.utc,
+                ),
+            ),
+            SimpleNamespace(
+                id=2, date=day, facility_id=20,
+                shift_template_id=template.id, shift_template=template,
+                start_datetime=datetime.combine(
+                    day, time(8), tzinfo=timezone.utc,
+                ),
+                end_datetime=datetime.combine(
+                    day, time(16), tzinfo=timezone.utc,
+                ),
+            ),
+        ]
+        physicians = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        contracts = {
+            1: SimpleNamespace(
+                id=1, name='Facility limited', request_settings={},
+                night_settings={}, workload_settings={}, weekend_settings={},
+                shift_settings={}, manual_assignment_only=False,
+                facility_settings={'rules': [{
+                    'facility_id': 10,
+                    'period_rules': [{
+                        'period_type': 'SCHEDULE_BLOCK', 'units': 'SHIFTS',
+                        'max_value': 0, 'max_penalty_weight': 100,
+                    }],
+                }]},
+            ),
+            2: SimpleNamespace(
+                id=2, name='Unrestricted', request_settings={},
+                night_settings={}, workload_settings={}, weekend_settings={},
+                shift_settings={}, facility_settings={},
+                manual_assignment_only=False,
+            ),
+        }
+        initial = {1: [1], 2: [2]}
+
+        def authoritative_score(_instances, _physicians, state, *_args, **_kwargs):
+            report = optimizer._shift_period_report(
+                instances, physicians, state, contracts,
+            )
+            return {
+                'score': report['score'],
+                'fixed_request_on_unmet': 0,
+                'breakdown': {'shift_rule_score': report['score']},
+                'workload_score_rows': [],
+                'same_shift_violations': [],
+            }
+
+        initial_scoring = authoritative_score(None, None, initial)
+        self.assertEqual(initial_scoring['score'], Decimal('100'))
+        with patch.object(
+            optimizer, '_night_violation_report',
+            return_value={'night_violations': []},
+        ), patch.object(
+            optimizer, '_request_scoring_rows', return_value=[],
+        ), patch.object(
+            optimizer, '_score_schedule', side_effect=authoritative_score,
+        ):
+            state, result, debug = optimizer._solve_bounded_multi_physician_neighborhood(
+                instances=instances,
+                physicians=physicians,
+                state=initial,
+                scoring=initial_scoring,
+                manual_pairs=set(),
+                targets={1: {'rules': []}, 2: {'rules': []}},
+                contract_by_physician=contracts,
+                requests_by_physician_date={},
+                eligible_facilities_by_physician={1: {10, 20}, 2: {10, 20}},
+                minimum_rest_by_physician={1: 0, 2: 0},
+                rng=Random(37),
+                focus_physician_ids={1},
+                focus_start=day,
+                focus_end=day,
+                cohort_size=2,
+                maximum_reassignments=2,
+            )
+
+        self.assertTrue(debug['accepted'], debug)
+        self.assertEqual(result['score'], Decimal('0'))
+        self.assertEqual(state, {1: [2], 2: [1]})
+
+    def test_shift_group_streak_objective_guides_atomic_exchange(self):
+        group_template = SimpleNamespace(
+            id=100, night_shift=False, weekend_days=[],
+        )
+        alternate_template = SimpleNamespace(
+            id=200, night_shift=False, weekend_days=[],
+        )
+        instances = []
+        for offset in range(2):
+            day = date(2027, 3, 15) + timedelta(days=offset)
+            for template in (group_template, alternate_template):
+                instances.append(SimpleNamespace(
+                    id=len(instances) + 1, date=day, facility_id=10,
+                    shift_template_id=template.id, shift_template=template,
+                    start_datetime=datetime.combine(
+                        day, time(8), tzinfo=timezone.utc,
+                    ),
+                    end_datetime=datetime.combine(
+                        day, time(16), tzinfo=timezone.utc,
+                    ),
+                ))
+        physicians = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        contracts = {
+            1: SimpleNamespace(
+                id=1, name='Streak limited', request_settings={},
+                night_settings={}, workload_settings={}, weekend_settings={},
+                facility_settings={}, manual_assignment_only=False,
+                shift_settings={'rules': [{
+                    'shift_template_ids': [group_template.id],
+                    'max_same_shifts_in_row': 1,
+                    'max_same_shifts_in_row_penalty_weight': 100,
+                }]},
+            ),
+            2: SimpleNamespace(
+                id=2, name='Unrestricted', request_settings={},
+                night_settings={}, workload_settings={}, weekend_settings={},
+                shift_settings={}, facility_settings={},
+                manual_assignment_only=False,
+            ),
+        }
+        initial = {1: [1], 2: [2], 3: [1], 4: [2]}
+
+        def authoritative_score(_instances, _physicians, state, *_args, **_kwargs):
+            report = optimizer._shift_period_report(
+                instances, physicians, state, contracts,
+            )
+            return {
+                'score': report['score'],
+                'fixed_request_on_unmet': 0,
+                'breakdown': {'shift_rule_score': report['score']},
+                'workload_score_rows': [],
+                'same_shift_violations': [],
+            }
+
+        initial_scoring = authoritative_score(None, None, initial)
+        self.assertEqual(initial_scoring['score'], Decimal('100'))
+        with patch.object(
+            optimizer, '_night_violation_report',
+            return_value={'night_violations': []},
+        ), patch.object(
+            optimizer, '_request_scoring_rows', return_value=[],
+        ), patch.object(
+            optimizer, '_score_schedule', side_effect=authoritative_score,
+        ):
+            state, result, debug = optimizer._solve_bounded_multi_physician_neighborhood(
+                instances=instances,
+                physicians=physicians,
+                state=initial,
+                scoring=initial_scoring,
+                manual_pairs=set(),
+                targets={1: {'rules': []}, 2: {'rules': []}},
+                contract_by_physician=contracts,
+                requests_by_physician_date={},
+                eligible_facilities_by_physician={1: {10}, 2: {10}},
+                minimum_rest_by_physician={1: 0, 2: 0},
+                rng=Random(41),
+                focus_physician_ids={1},
+                focus_start=date(2027, 3, 15),
+                focus_end=date(2027, 3, 16),
+                cohort_size=2,
+                maximum_reassignments=2,
+            )
+
+        self.assertTrue(debug['accepted'], debug)
+        self.assertEqual(result['score'], Decimal('0'))
+        self.assertNotEqual(state, initial)
+        self.assertLessEqual(debug['assignment_distance'], 2)

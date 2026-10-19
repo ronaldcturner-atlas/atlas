@@ -16,6 +16,7 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     _same_shift_score,
     _state_with_all_instances,
     _streak_penalty_from_days,
+    _structural_focus_family,
 )
 from apps.scheduling.optimizer_v2 import (
     V2AssignmentRowCache,
@@ -47,6 +48,7 @@ from apps.scheduling.optimizer_revisions import (
     AVAILABILITY_V2_REVISION,
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
+    TEMPORAL_V2_REVISION,
     configuration_digest,
     require_supported_v2_revision,
 )
@@ -94,6 +96,18 @@ class OptimizerRevisionTests(SimpleTestCase):
         self.assertEqual(
             require_supported_v2_revision(AVAILABILITY_V2_REVISION),
             AVAILABILITY_V2_REVISION,
+        )
+
+    def test_temporal_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(TEMPORAL_V2_REVISION),
+            TEMPORAL_V2_REVISION,
+        )
+
+    def test_circadian_violation_uses_temporal_structural_family(self):
+        self.assertEqual(
+            _structural_focus_family('CIRCADIAN_BACKWARD_ROTATION'),
+            'circadian',
         )
 
 
