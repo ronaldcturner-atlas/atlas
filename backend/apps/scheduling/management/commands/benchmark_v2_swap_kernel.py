@@ -14,6 +14,7 @@ from apps.scheduling.models import (
     OptimizerRun,
     ScheduleRequest,
 )
+from apps.scheduling.block_user_planning import apply_block_user_plans
 from apps.scheduling.contract_overrides import apply_effective_contracts
 from apps.scheduling.optimizer import (
     DEFAULT_FACILITY_PROPORTIONALITY_WEIGHT,
@@ -28,6 +29,7 @@ from apps.scheduling.optimizer import (
     _night_minimum_reassignment_candidates,
     _night_recovery_conflict_pairs,
     _effective_workload_rule,
+    _eligibility_map,
     _feasible_proportionality_target_matrix,
     _is_weekend_designated,
     _period_windows,
@@ -66,6 +68,7 @@ from apps.scheduling.optimizer_v2 import (
     swap_assignments,
 )
 from apps.scheduling.optimizer_revisions import (
+    AVAILABILITY_V2_REVISION,
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     require_supported_v2_revision,
@@ -79,6 +82,40 @@ TIME_BANDS = ('BEFORE_9_AM', '9_AM_TO_9_59_AM', '10_AM_TO_1_59_PM', '2_PM_OR_LAT
 # The lineage in the key prevents a context from a different search chain from
 # contributing cycle history or cached scoring rows to the current chain.
 _ENGINE_CONTEXT_CACHE = {}
+
+
+def _requests_active_under_block_plans(schedule_requests, contracts):
+    """Exclude auditable requests on dates made unavailable for the block."""
+    active = []
+    for schedule_request in schedule_requests:
+        contract = contracts.get(schedule_request.physician_id)
+        unavailable_dates = set(
+            getattr(contract, 'block_unavailable_dates', set())
+        )
+        if schedule_request.date.isoformat() not in unavailable_dates:
+            active.append(schedule_request)
+    return active
+
+
+def _shift_eligibility_matrix(
+    instances, physician_ids, contracts, eligible_facility, shift_facility,
+):
+    """Precompute facility and Block Hours date eligibility per shift."""
+    eligible_shift = np.asarray(
+        eligible_facility, dtype=np.bool_,
+    )[:, np.asarray(shift_facility, dtype=np.int32)].copy()
+    shift_indexes_by_date = defaultdict(list)
+    for shift_index, instance in enumerate(instances):
+        shift_indexes_by_date[instance.date.isoformat()].append(shift_index)
+    for physician_index, physician_id in enumerate(physician_ids):
+        unavailable_dates = getattr(
+            contracts[physician_id], 'block_unavailable_dates', set(),
+        )
+        for unavailable_date in unavailable_dates:
+            shift_indexes = shift_indexes_by_date.get(str(unavailable_date))
+            if shift_indexes:
+                eligible_shift[physician_index, shift_indexes] = False
+    return eligible_shift
 
 
 def _state_with_all_instances(state, instances):
@@ -2463,7 +2500,13 @@ class Command(BaseCommand):
             options.get('optimizer_revision') or STABLE_V2_REVISION
         )
         circadian_candidate_scoring = (
-            optimizer_revision == CIRCADIAN_V2_REVISION
+            optimizer_revision in {
+                CIRCADIAN_V2_REVISION,
+                AVAILABILITY_V2_REVISION,
+            }
+        )
+        block_availability_candidate_scoring = (
+            optimizer_revision == AVAILABILITY_V2_REVISION
         )
         if options['reset_engine_context']:
             _ENGINE_CONTEXT_CACHE.clear()
@@ -2519,6 +2562,10 @@ class Command(BaseCommand):
             contract_assignments = apply_effective_contracts(
                 contract_assignments,
             )
+            if block_availability_candidate_scoring:
+                contract_assignments = apply_block_user_plans(
+                    contract_assignments, version.schedule_block,
+                )
             if runtime_cache is not None:
                 runtime_cache['database_inputs'] = {
                     'run': run,
@@ -2868,6 +2915,10 @@ class Command(BaseCommand):
                 )
                 .prefetch_related('shift_templates')
             )
+            if block_availability_candidate_scoring:
+                schedule_requests = _requests_active_under_block_plans(
+                    schedule_requests, contracts,
+                )
             requests_by_physician_date = defaultdict(list)
             for schedule_request in schedule_requests:
                 requests_by_physician_date[
@@ -3043,6 +3094,18 @@ class Command(BaseCommand):
             rest_seconds[physician_idx] = float(
                 _minimum_rest_hours(assignment.contract),
             ) * 3600.0
+
+        eligible_shift = (
+            _shift_eligibility_matrix(
+                instances,
+                physician_ids,
+                contracts,
+                eligible_facility,
+                shift_facility,
+            )
+            if block_availability_candidate_scoring
+            else eligible_facility[:, shift_facility]
+        )
 
         governed = np.zeros((physician_count, shift_count), dtype=np.bool_)
         for physician_idx, template_ids in enumerate(governed_template_ids):
@@ -3478,8 +3541,8 @@ class Command(BaseCommand):
 
             legal = (
                 distinct
-                & eligible_facility[left_physician, shift_facility[right_shift]]
-                & eligible_facility[right_physician, shift_facility[left_shift]]
+                & eligible_shift[left_physician, right_shift]
+                & eligible_shift[right_physician, left_shift]
             )
             right_conflicts_left_owner = (
                 (shift_end[left_shift] + rest_seconds[left_physician] > shift_start[right_shift])
@@ -3830,8 +3893,7 @@ class Command(BaseCommand):
                     shift_for_assignment,
                     physician_for_assignment,
                     occupancy,
-                    eligible_facility,
-                    shift_facility,
+                    eligible_shift,
                     conflict_counts,
                     boundary_conflict,
                 )
@@ -4503,12 +4565,17 @@ class Command(BaseCommand):
             or validation_sample
             or options['checkpoint_score']
         ):
-            eligible_facilities_by_physician = {
-                assignment.physician_id: {
-                    facility.id for facility in assignment.contract.facilities.all()
+            eligible_facilities_by_physician = (
+                _eligibility_map(contract_assignments)
+                if block_availability_candidate_scoring
+                else {
+                    assignment.physician_id: {
+                        facility.id
+                        for facility in assignment.contract.facilities.all()
+                    }
+                    for assignment in contract_assignments
                 }
-                for assignment in contract_assignments
-            }
+            )
             minimum_rest_by_physician = {
                 assignment.physician_id: _minimum_rest_hours(assignment.contract)
                 for assignment in contract_assignments

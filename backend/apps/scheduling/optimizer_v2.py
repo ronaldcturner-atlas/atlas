@@ -494,8 +494,7 @@ def legal_reassignment_candidates(
     shift_for_assignment,
     physician_for_assignment,
     occupancy,
-    eligible_facility,
-    shift_facility,
+    eligible_shift,
     conflict_counts,
     boundary_conflict,
 ):
@@ -503,20 +502,16 @@ def legal_reassignment_candidates(
     shifts = np.asarray(shift_for_assignment, dtype=np.int32)
     owners = np.asarray(physician_for_assignment, dtype=np.int32)
     occupancy = np.asarray(occupancy, dtype=np.bool_)
-    eligible = np.asarray(eligible_facility, dtype=np.bool_)
-    facilities = np.asarray(shift_facility, dtype=np.int32)
+    eligible = np.asarray(eligible_shift, dtype=np.bool_)
     conflicts = np.asarray(conflict_counts)
     boundary = np.asarray(boundary_conflict, dtype=np.bool_)
     physician_count, shift_count = occupancy.shape
     if shifts.shape != owners.shape:
         raise ValueError('Assignment shift and physician arrays must match.')
-    if eligible.shape[0] != physician_count:
-        raise ValueError('Eligibility must contain one row per physician.')
+    if eligible.shape != occupancy.shape:
+        raise ValueError('Shift eligibility must match occupancy.')
     if conflicts.shape != occupancy.shape or boundary.shape != occupancy.shape:
         raise ValueError('Conflict matrices must match occupancy.')
-    if facilities.shape != (shift_count,):
-        raise ValueError('Shift facilities must contain one value per shift.')
-
     assignment_batches = []
     replacement_batches = []
     all_physicians = np.arange(physician_count, dtype=np.int32)
@@ -526,7 +521,7 @@ def legal_reassignment_candidates(
         legal = (
             (all_physicians != owner_index)
             & ~occupancy[:, shift_index]
-            & eligible[:, facilities[shift_index]]
+            & eligible[:, shift_index]
             & (conflicts[:, shift_index] == 0)
             & ~boundary[:, shift_index]
         )

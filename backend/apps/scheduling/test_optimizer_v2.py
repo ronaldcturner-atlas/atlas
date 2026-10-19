@@ -11,6 +11,8 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     _prepare_circadian_kernel,
     _prepare_shift_rule_kernel,
     _request_reassignment_deltas,
+    _requests_active_under_block_plans,
+    _shift_eligibility_matrix,
     _same_shift_score,
     _state_with_all_instances,
     _streak_penalty_from_days,
@@ -42,6 +44,7 @@ from apps.scheduling.optimizer_v2_runner import (
 )
 from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 from apps.scheduling.optimizer_revisions import (
+    AVAILABILITY_V2_REVISION,
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     configuration_digest,
@@ -87,6 +90,12 @@ class OptimizerRevisionTests(SimpleTestCase):
             CIRCADIAN_V2_REVISION,
         )
 
+    def test_availability_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(AVAILABILITY_V2_REVISION),
+            AVAILABILITY_V2_REVISION,
+        )
+
 
 class V2SwapKernelCommandTests(SimpleTestCase):
     @staticmethod
@@ -100,6 +109,53 @@ class V2SwapKernelCommandTests(SimpleTestCase):
             start_datetime=start,
             end_datetime=start + timedelta(hours=8),
         )
+
+    def test_partial_block_unavailable_dates_remove_requests_from_scoring(self):
+        active_request = SimpleNamespace(
+            physician_id=1, date=date(2027, 2, 2),
+        )
+        unavailable_request = SimpleNamespace(
+            physician_id=1, date=date(2027, 2, 1),
+        )
+        unaffected_request = SimpleNamespace(
+            physician_id=2, date=date(2027, 2, 1),
+        )
+        contracts = {
+            1: SimpleNamespace(block_unavailable_dates={'2027-02-01'}),
+            2: SimpleNamespace(block_unavailable_dates=set()),
+        }
+
+        result = _requests_active_under_block_plans(
+            [unavailable_request, active_request, unaffected_request],
+            contracts,
+        )
+
+        self.assertEqual(result, [active_request, unaffected_request])
+
+    def test_shift_eligibility_combines_facilities_and_unavailable_dates(self):
+        instances = [
+            SimpleNamespace(date=date(2027, 2, 1)),
+            SimpleNamespace(date=date(2027, 2, 2)),
+            SimpleNamespace(date=date(2027, 2, 1)),
+        ]
+        eligible = _shift_eligibility_matrix(
+            instances=instances,
+            physician_ids=[10, 20],
+            contracts={
+                10: SimpleNamespace(block_unavailable_dates={'2027-02-01'}),
+                20: SimpleNamespace(block_unavailable_dates=set()),
+            },
+            eligible_facility=np.asarray([
+                [True, True],
+                [True, False],
+            ]),
+            shift_facility=np.asarray([0, 0, 1]),
+        )
+
+        np.testing.assert_array_equal(eligible, np.asarray([
+            [False, True, False],
+            [True, True, False],
+        ]))
 
     def test_circadian_kernel_scores_backward_replacement(self):
         instances = [
@@ -799,13 +855,12 @@ class V2StateTransitionTests(SimpleTestCase):
                 [False, False],
                 [False, False],
             ]),
-            eligible_facility=np.asarray([
+            eligible_shift=np.asarray([
                 [True, True],
                 [True, True],
                 [False, False],
-                [True, True],
+                [True, False],
             ]),
-            shift_facility=np.asarray([0, 1]),
             conflict_counts=np.asarray([
                 [1, 0],
                 [1, 1],
