@@ -86,6 +86,12 @@ describe('desktop calendar controls', () => {
     expect(calendarStyles).toMatch(/\.calendar-shift-name,[^{]*\.calendar-shift-user\{[^}]*white-space:nowrap;[^}]*text-overflow:clip/)
   })
 
+  it('uses the configured facility color only for each desktop shift left edge', () => {
+    expect(calendarSource).toContain("fetch(`${API_BASE}/facilities/?active=true`")
+    expect(calendarSource).toContain("facilityColor: facilityColorById.get(apiShift.facility) || '#94a3b8'")
+    expect(calendarSource).toContain('style={{ borderLeftColor: shift.facilityColor }}')
+  })
+
   it('uses effective schedule-management permissions instead of legacy groups', () => {
     expect(calendarSource).toContain('Boolean(user?.can_manage_schedules)')
     expect(calendarSource).not.toContain("groups.some((group) => ['admin', 'scheduler']")

@@ -42,6 +42,11 @@ type DomainOption = {
   active: boolean
 }
 
+type FacilityOption = {
+  id: number
+  color: string
+}
+
 type RequestBlockReminder = {
   id: number
   name: string
@@ -57,6 +62,7 @@ type Shift = {
   instanceId: number
   physicianId: number | null
   facility: string
+  facilityColor: string
   facilityOrder: number
   shift: string
   role: string
@@ -207,6 +213,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
   const [selectedShift, setSelectedShift] = useState<Shift | null>(null)
   const [allShifts, setAllShifts] = useState<APIShift[]>([])
   const [domains, setDomains] = useState<DomainOption[]>([])
+  const [facilities, setFacilities] = useState<FacilityOption[]>([])
   const [requestBlocks, setRequestBlocks] = useState<RequestBlockReminder[]>([])
   const [requestWindowNow, setRequestWindowNow] = useState(() => Date.now())
   const [selectedRegionId, setSelectedRegionId] = useState<number | null>(() => {
@@ -263,7 +270,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     const fetchShifts = async () => {
       try {
         setLoadError(null)
-        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse, requestBlocksResponse] = await Promise.all([
+        const [shiftsResponse, physiciansResponse, tradesResponse, policyResponse, commentsResponse, domainsResponse, requestBlocksResponse, facilitiesResponse] = await Promise.all([
           fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
           fetch(`${API_BASE}/physicians/`, { credentials: 'include' }),
           fetch(`${API_BASE}/shift-trades/`, { credentials: 'include', cache: 'no-store' }),
@@ -271,11 +278,12 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
           fetch(`${API_BASE}/published-schedule-comments/`, { credentials: 'include' }),
           fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include' }),
           fetch(`${API_BASE}/schedule-blocks/`, { credentials: 'include' }),
+          fetch(`${API_BASE}/facilities/?active=true`, { credentials: 'include' }),
         ])
         if (!shiftsResponse.ok || !physiciansResponse.ok || !domainsResponse.ok) {
           throw new Error('Unable to load the schedule filters')
         }
-        const [shiftsData, physiciansData, tradesData, policyData, commentsData, domainsData, requestBlocksData] = await Promise.all([
+        const [shiftsData, physiciansData, tradesData, policyData, commentsData, domainsData, requestBlocksData, facilitiesData] = await Promise.all([
           shiftsResponse.json(),
           physiciansResponse.json(),
           tradesResponse.ok ? tradesResponse.json() : [],
@@ -283,6 +291,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
           commentsResponse.ok ? commentsResponse.json() : [],
           domainsResponse.json(),
           requestBlocksResponse.ok ? requestBlocksResponse.json() : [],
+          facilitiesResponse.ok ? facilitiesResponse.json() : [],
         ])
         setAllShifts(shiftsData)
         setPhysicians(physiciansData)
@@ -290,6 +299,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         setTradePolicy(policyData)
         setDateComments(commentsData)
         setDomains(domainsData)
+        setFacilities(Array.isArray(facilitiesData) ? facilitiesData : [])
         setRequestBlocks(requestBlocksData)
       } catch (error) {
         console.error('Error fetching shifts:', error)
@@ -398,6 +408,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
     domain.id,
     domainRibbonColor(domain, index),
   ]))
+  const facilityColorById = new Map(facilities.map((facility) => [facility.id, facility.color]))
 
   const sortedPhysicians = physicians.filter((physician) => visiblePhysicianIds.has(physician.id)).sort((left, right) => {
     const leftName = left.display_name || `${left.first_name} ${left.last_name}`
@@ -609,6 +620,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
         instanceId: apiShift.shift_instance_id,
         physicianId: apiShift.physician,
         facility: apiShift.facility_short_name || apiShift.facility_name,
+        facilityColor: facilityColorById.get(apiShift.facility) || '#94a3b8',
         facilityOrder: apiShift.facility_sort_order,
         shift,
         role: apiShift.role_display,
@@ -1102,7 +1114,7 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                       <div
                         key={`${shift.instanceId}-${shift.assignmentId ?? 'open'}`}
                         className={`shift-item shift-item-compact clickable ${statusClassForShift(shift)}`}
-                        style={{ borderLeftColor: ribbonColor }}
+                        style={{ borderLeftColor: shift.facilityColor }}
                         onClick={() => {
                           setSelectedShift(shift)
                           setTradeOnlyPosting(shift.postingMode === 'TRADE_ONLY')

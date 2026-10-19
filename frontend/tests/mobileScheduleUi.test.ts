@@ -238,4 +238,19 @@ describe('mobile published schedule actions', () => {
     expect(mobileStyles).toContain('.mobile-month-preview .mobile-day-schedule>button.calendar-own-highlight')
     expect(mobileStyles).toContain('.mobile-month-preview .mobile-day-schedule>button.calendar-available-highlight')
   })
+
+  it('keeps past week dates visibly distinct while preserving today and selection states', () => {
+    expect(mobileSource).toContain("isPast ? 'past ' : ''")
+    expect(mobileSource).toContain("key === dateKey(today) ? 'today ' : ''")
+    expect(mobileStyles).toContain('.mobile-week-navigator button.past:not(.active):not(.today){background:#f1f5f9;color:#64748b}')
+    expect(mobileStyles).toContain('.mobile-week-navigator button.active{background:#cbd5e1;color:#172033}')
+  })
+
+  it('uses configured facility colors only on the shift edge and groups Physician shifts before APP shifts', () => {
+    expect(mobileSource).toContain("fetch(`${API_BASE}/facilities/?active=true`")
+    expect(mobileSource).toContain('facilityColor: facilityColorById.get(shift.facility)')
+    expect(mobileSource).toContain('<i style={{ backgroundColor: shift.facilityColor }} />')
+    expect(mobileSource).toContain("shift.domain.trim().toLowerCase() === 'physician' ? 0")
+    expect(mobileSource).toContain("shift.domain.trim().toLowerCase() === 'app' ? 1 : 2")
+  })
 })

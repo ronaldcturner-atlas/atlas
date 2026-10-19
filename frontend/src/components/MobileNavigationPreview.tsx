@@ -19,6 +19,7 @@ const primaryItems: Array<{ id: PreviewPage; label: string; icon: string }> = [
 
 type PreviewShift = {
   facility: string
+  facilityColor?: string
   time: string
   physician: string
   domain: string
@@ -42,6 +43,7 @@ type SelectedPreviewShift = PreviewShift & { date: Date }
 type APIShift = {
   id: number | null
   shift_instance_id: number
+  facility: number
   facility_name: string
   facility_short_name: string
   physician: number | null
@@ -64,6 +66,7 @@ type APIShift = {
 }
 
 type DomainOption = { id: number; name: string; region: number; region_name: string; active: boolean }
+type FacilityOption = { id: number; color: string }
 type TradeOfferOption = { id: number; date: string; facility: string; time: string }
 type TradeOption = TradeOfferOption & { physicianId: number; physicianName: string }
 type MobileTradeAssignment = { id: number; physician_name: string; date: string; facility: string; start_time: string; end_time: string }
@@ -201,12 +204,14 @@ function displayHours(value: number) {
 }
 
 function PreviewShiftList({ date, shifts, label = 'Selected date', onSelect, currentUserName, prioritizeCalendarShifts = false }: { date: Date; shifts: PreviewShift[]; label?: string; onSelect?: (shift: SelectedPreviewShift) => void; currentUserName?: string; prioritizeCalendarShifts?: boolean }) {
-  const displayedShifts = prioritizeCalendarShifts
-    ? [...shifts].sort((left, right) => {
-      const priority = (shift: PreviewShift) => shift.isMine ? 0 : shift.tone && shift.tone !== 'standard' ? 1 : 2
-      return priority(left) - priority(right)
-    })
-    : shifts
+  const displayedShifts = [...shifts].sort((left, right) => {
+    const domainPriority = (shift: PreviewShift) => shift.domain.trim().toLowerCase() === 'physician' ? 0 : shift.domain.trim().toLowerCase() === 'app' ? 1 : 2
+    const domainComparison = domainPriority(left) - domainPriority(right)
+    if (domainComparison) return domainComparison
+    if (!prioritizeCalendarShifts) return 0
+    const statusPriority = (shift: PreviewShift) => shift.isMine ? 0 : shift.tone && shift.tone !== 'standard' ? 1 : 2
+    return statusPriority(left) - statusPriority(right)
+  })
   const availableIndexes = displayedShifts.flatMap((shift, index) => (
     prioritizeCalendarShifts && !shift.isMine && shift.tone && shift.tone !== 'standard' ? [index] : []
   ))
@@ -230,7 +235,7 @@ function PreviewShiftList({ date, shifts, label = 'Selected date', onSelect, cur
               ? ` calendar-available-highlight${index === firstAvailableIndex ? ' available-first' : ''}${index === lastAvailableIndex ? ' available-last' : ''}`
               : ''
           : ''
-        return <button type="button" className={`shift-tone-${mobileTone}${calendarHighlight}`} key={`${shift.instanceId ?? facility}-${time}`} onClick={() => onSelect?.({ ...shift, physician: displayedPhysician, date })}><i /><span><strong>{facility}</strong><small>{time}</small></span><b>{displayedPhysician}<small>{domainLabel}{statusLabel ? ` · ${statusLabel}` : ''}</small></b><em>›</em></button>
+        return <button type="button" className={`shift-tone-${mobileTone}${calendarHighlight}`} key={`${shift.instanceId ?? facility}-${time}`} onClick={() => onSelect?.({ ...shift, physician: displayedPhysician, date })}><i style={{ backgroundColor: shift.facilityColor }} /><span><strong>{facility}</strong><small>{time}</small></span><b>{displayedPhysician}<small>{domainLabel}{statusLabel ? ` · ${statusLabel}` : ''}</small></b><em>›</em></button>
       })}
     </section>
   )
@@ -315,6 +320,7 @@ export default function MobileNavigationPreview() {
   const [scheduleDataMessage, setScheduleDataMessage] = React.useState('')
   const [apiShifts, setApiShifts] = React.useState<APIShift[]>([])
   const [availableDomains, setAvailableDomains] = React.useState<DomainOption[]>([])
+  const [facilities, setFacilities] = React.useState<FacilityOption[]>([])
   const [tradeRequests, setTradeRequests] = React.useState<MobileTradeRequest[]>([])
   const [isLoadingTradeRequests, setIsLoadingTradeRequests] = React.useState(false)
   const [tradeCenterFeedback, setTradeCenterFeedback] = React.useState('')
@@ -456,18 +462,25 @@ export default function MobileNavigationPreview() {
     setScheduleDataState('loading')
     setScheduleDataMessage('')
     try {
-      const [scheduleResponse, domainsResponse] = await Promise.all([
+      const [scheduleResponse, domainsResponse, facilitiesResponse] = await Promise.all([
         fetch(`${API_BASE}/published-schedule/`, { credentials: 'include', cache: 'no-store' }),
         fetch(`${API_BASE}/domains/?active=true&accessible=true`, { credentials: 'include', cache: 'no-store' }),
+        fetch(`${API_BASE}/facilities/?active=true`, { credentials: 'include', cache: 'no-store' }),
       ])
       if (!scheduleResponse.ok || !domainsResponse.ok) throw new Error('Published schedule could not be loaded.')
-      const [schedule, domains] = await Promise.all([scheduleResponse.json(), domainsResponse.json()])
+      const [schedule, domains, facilityData] = await Promise.all([
+        scheduleResponse.json(),
+        domainsResponse.json(),
+        facilitiesResponse.ok ? facilitiesResponse.json() : [],
+      ])
       setApiShifts(Array.isArray(schedule) ? schedule : [])
       setAvailableDomains(Array.isArray(domains) ? domains : [])
+      setFacilities(Array.isArray(facilityData) ? facilityData : [])
       setScheduleDataState('live')
     } catch (error) {
       setApiShifts([])
       setAvailableDomains([])
+      setFacilities([])
       setScheduleDataState('error')
       setScheduleDataMessage(error instanceof Error ? error.message : 'Published schedule could not be loaded.')
     }
@@ -657,6 +670,7 @@ export default function MobileNavigationPreview() {
       setActiveListDate(dateKey(new Date(viewDate.getFullYear(), viewDate.getMonth(), daysInMonth)))
     }
   }, [daysInMonth, selectedDay])
+  const facilityColorById = new Map(facilities.map((facility) => [facility.id, facility.color]))
   const liveShiftsByDate = apiShifts.reduce<Record<string, PreviewShift[]>>((result, shift) => {
     if (selectedDomainIds.length && !selectedDomainIds.includes(shift.domain)) return result
     const isMine = shift.physician != null && shift.physician === user?.physician_id
@@ -664,6 +678,7 @@ export default function MobileNavigationPreview() {
     const postingMode = shift.posting_mode === 'PICKUP' ? 'pickup' : shift.posting_mode === 'TRADE_ONLY' ? 'trade' : undefined
     const previewShift: PreviewShift = {
       facility: shift.facility_short_name || shift.facility_name,
+      facilityColor: facilityColorById.get(shift.facility),
       time: `${formatClockValue(shift.start_time)}–${formatClockValue(shift.end_time)}`,
       physician: shift.physician_name || 'Open shift',
       domain: shift.domain_name,
@@ -1745,7 +1760,8 @@ export default function MobileNavigationPreview() {
                       const { hasOwnShift, hasOtherStatus } = calendarDate ? markerStateForDate(calendarDate) : { hasOwnShift: false, hasOtherStatus: false }
                       const today = new Date()
                       const isToday = calendarDate != null && dateKey(calendarDate) === dateKey(today)
-                      return <button type="button" key={index} className={`${isToday ? 'today ' : ''}${day === selectedDay ? 'selected' : ''}`} disabled={day == null} onClick={() => day && setSelectedDay(day)}>
+                      const isPast = calendarDate != null && calendarDate.getTime() < new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()
+                      return <button type="button" key={index} className={`${isToday ? 'today ' : ''}${isPast ? 'past ' : ''}${day === selectedDay ? 'selected' : ''}`} disabled={day == null} onClick={() => day && setSelectedDay(day)}>
                         {day && <><span>{day}</span>{(hasOwnShift || hasOtherStatus) && <i className="mobile-date-shift-dots">{hasOwnShift && <b className="own" aria-label="My shift" />}{hasOtherStatus && <b className="other-status" aria-label="Available or open shift" />}</i>}</>}
                       </button>
                     })}
@@ -1760,7 +1776,9 @@ export default function MobileNavigationPreview() {
                       const key = dateKey(date)
                       const { hasOwnShift, hasOtherStatus } = markerStateForDate(date)
                       const adjacentMonth = date.getMonth() !== weekDays[3].getMonth()
-                      return <button type="button" key={key} data-week-date={key} className={`${key === activeListDate ? 'active ' : ''}${key === dateKey(new Date()) ? 'today ' : ''}${adjacentMonth ? 'adjacent' : ''}`} onClick={() => jumpToListDate(date)} aria-label={`Jump to ${date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}`}>
+                      const today = new Date()
+                      const isPast = date.getTime() < new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()
+                      return <button type="button" key={key} data-week-date={key} className={`${key === activeListDate ? 'active ' : ''}${key === dateKey(today) ? 'today ' : ''}${isPast ? 'past ' : ''}${adjacentMonth ? 'adjacent' : ''}`} onClick={() => jumpToListDate(date)} aria-label={`Jump to ${date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}`}>
                         <span>{date.toLocaleDateString('en-US', { weekday: 'narrow' })}</span><strong>{date.getDate()}</strong>{adjacentMonth && <small>{date.toLocaleDateString('en-US', { month: 'short' })}</small>}<i>{hasOwnShift && <b className="own" />}{hasOtherStatus && <b className="other-status" />}</i>
                       </button>
                     })}
