@@ -135,7 +135,7 @@ The Trade Requests control counts pending activity. A newly received, unseen req
 
 The desktop application uses the approved light visual language with light surfaces, readable contrast, and consistent action hierarchy. The desktop Schedule retains its full controls and six-color legend: My assigned shift blue (`#1f65a6`), Available for pickup green (`#34d399`), My posted shift amber (`#fbbf24`), Trade sent purple (`#c084fc`), Trade received pink (`#f472b6`), and Open shift red (`#f87171`). Current ownership has visual precedence: a shift assigned to the signed-in user remains blue even when it is posted or involved in a pending trade. The compact mobile two-dot calendar must not replace this desktop legend.
 
-Facility identity is shown on detailed desktop and mobile Schedule rows only by a narrow left-edge stripe using the Facility's configured color. The stripe does not tint the full shift row and does not replace ownership, availability, trade, or open-shift status styling.
+Facility identity is shown on detailed desktop and mobile Schedule rows by a narrow left-edge stripe using the Facility's configured color, plus a subtler one-pixel outline in the same hue on the top, right, and bottom. Ordinary rows use a neutral surface rather than a facility or lavender background tint. These facility accents do not replace ownership, availability, trade, or open-shift status styling.
 
 When a request window is open, a compact Requests Open control appears in the Schedule view for a clinically active user in the applicable Domain and links directly to that block's request entry workflow.
 

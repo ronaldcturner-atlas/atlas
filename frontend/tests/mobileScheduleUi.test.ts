@@ -246,10 +246,15 @@ describe('mobile published schedule actions', () => {
     expect(mobileStyles).toContain('.mobile-week-navigator button.active{background:#cbd5e1;color:#172033}')
   })
 
-  it('uses configured facility colors only on the shift edge and groups Physician shifts before APP shifts', () => {
+  it('uses configured facility colors on the strong left edge and subtle other three sides, and groups Physician shifts before APP shifts', () => {
     expect(mobileSource).toContain("fetch(`${API_BASE}/facilities/?active=true`")
     expect(mobileSource).toContain('facilityColor: facilityColorById.get(shift.facility)')
+    expect(mobileSource).toContain("style={{ '--facility-color': shift.facilityColor } as React.CSSProperties}")
     expect(mobileSource).toContain('<i style={{ backgroundColor: shift.facilityColor }} />')
+    expect(mobileStyles).toContain('.mobile-day-schedule>button::after')
+    expect(mobileStyles).toContain('border-top:1px solid color-mix')
+    expect(mobileStyles).toContain('border-right:1px solid color-mix')
+    expect(mobileStyles).toContain('border-bottom:1px solid color-mix')
     expect(mobileSource).toContain("shift.domain.trim().toLowerCase() === 'physician' ? 0")
     expect(mobileSource).toContain("shift.domain.trim().toLowerCase() === 'app' ? 1 : 2")
   })

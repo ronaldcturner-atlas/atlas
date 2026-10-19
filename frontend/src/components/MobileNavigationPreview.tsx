@@ -235,7 +235,7 @@ function PreviewShiftList({ date, shifts, label = 'Selected date', onSelect, cur
               ? ` calendar-available-highlight${index === firstAvailableIndex ? ' available-first' : ''}${index === lastAvailableIndex ? ' available-last' : ''}`
               : ''
           : ''
-        return <button type="button" className={`shift-tone-${mobileTone}${calendarHighlight}`} key={`${shift.instanceId ?? facility}-${time}`} onClick={() => onSelect?.({ ...shift, physician: displayedPhysician, date })}><i style={{ backgroundColor: shift.facilityColor }} /><span><strong>{facility}</strong><small>{time}</small></span><b>{displayedPhysician}<small>{domainLabel}{statusLabel ? ` · ${statusLabel}` : ''}</small></b><em>›</em></button>
+        return <button type="button" className={`shift-tone-${mobileTone}${calendarHighlight}`} key={`${shift.instanceId ?? facility}-${time}`} style={{ '--facility-color': shift.facilityColor } as React.CSSProperties} onClick={() => onSelect?.({ ...shift, physician: displayedPhysician, date })}><i style={{ backgroundColor: shift.facilityColor }} /><span><strong>{facility}</strong><small>{time}</small></span><b>{displayedPhysician}<small>{domainLabel}{statusLabel ? ` · ${statusLabel}` : ''}</small></b><em>›</em></button>
       })}
     </section>
   )

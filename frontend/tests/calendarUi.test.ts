@@ -86,10 +86,14 @@ describe('desktop calendar controls', () => {
     expect(calendarStyles).toMatch(/\.calendar-shift-name,[^{]*\.calendar-shift-user\{[^}]*white-space:nowrap;[^}]*text-overflow:clip/)
   })
 
-  it('uses the configured facility color only for each desktop shift left edge', () => {
+  it('uses a neutral shift surface with the configured facility color on the strong left edge and subtle other three sides', () => {
     expect(calendarSource).toContain("fetch(`${API_BASE}/facilities/?active=true`")
     expect(calendarSource).toContain("facilityColor: facilityColorById.get(apiShift.facility) || '#94a3b8'")
-    expect(calendarSource).toContain('style={{ borderLeftColor: shift.facilityColor }}')
+    expect(calendarSource).toContain("style={{ '--facility-color': shift.facilityColor } as React.CSSProperties}")
+    expect(calendarStyles).toContain('.shift-item{background:var(--shift-bg, #fff)')
+    expect(calendarStyles).toContain('.shift-item.facility-bordered-shift{--shift-bg:#fff;border-top:1px solid color-mix')
+    expect(calendarStyles).toContain('.shift-item.facility-bordered-shift:is(.shift-tone-day')
+    expect(calendarStyles).toContain('border-left:3px solid var(--facility-color, var(--accent))')
   })
 
   it('uses effective schedule-management permissions instead of legacy groups', () => {

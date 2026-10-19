@@ -1113,8 +1113,8 @@ export default function Calendar({ shiftsRefreshToken, forceUserView = false }: 
                       {domainShifts.map((shift) => (
                       <div
                         key={`${shift.instanceId}-${shift.assignmentId ?? 'open'}`}
-                        className={`shift-item shift-item-compact clickable ${statusClassForShift(shift)}`}
-                        style={{ borderLeftColor: shift.facilityColor }}
+                        className={`shift-item shift-item-compact facility-bordered-shift clickable ${statusClassForShift(shift)}`}
+                        style={{ '--facility-color': shift.facilityColor } as React.CSSProperties}
                         onClick={() => {
                           setSelectedShift(shift)
                           setTradeOnlyPosting(shift.postingMode === 'TRADE_ONLY')
