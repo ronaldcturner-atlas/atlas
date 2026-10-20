@@ -77,6 +77,7 @@ from apps.scheduling.optimizer_revisions import (
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
     TEMPORAL_ESCALATION_V2_REVISION,
+    TEMPORAL_TARGETING_V2_REVISION,
     WEEKEND_EXCHANGE_V2_REVISION,
     require_supported_v2_revision,
 )
@@ -231,6 +232,56 @@ def _should_attempt_temporal_plateau_escalation(
     if current_scoring is None or reconstructed_scoring is None:
         return False
     return reconstructed_scoring['score'] >= current_scoring['score']
+
+
+def _rank_temporal_escalation_windows(
+    *, family_focuses, schedule_start, schedule_end, window_days=42,
+):
+    """Rank fixed windows by the authoritative temporal penalty they cover."""
+    latest_start = max(
+        schedule_start,
+        schedule_end - timedelta(days=window_days - 1),
+    )
+    candidates = []
+    core_start = schedule_start
+    while core_start <= latest_start:
+        core_end = min(
+            schedule_end,
+            core_start + timedelta(days=window_days - 1),
+        )
+        covered = [
+            focus for focus in family_focuses
+            if any(core_start <= day <= core_end for day in focus['dates'])
+        ]
+        if covered:
+            candidates.append({
+                'core_start': core_start,
+                'core_end': core_end,
+                'opportunity_penalty': sum(
+                    (focus['penalty'] for focus in covered), Decimal('0')
+                ),
+                'focus_count': len(covered),
+                'physician_ids': set().union(*(
+                    focus['physician_ids'] for focus in covered
+                )),
+                'instance_ids': set().union(*(
+                    focus['instance_ids'] for focus in covered
+                )),
+                'violation_types': sorted({
+                    focus['violation_type'] for focus in covered
+                }),
+            })
+        core_start += timedelta(days=1)
+    return sorted(
+        candidates,
+        key=lambda row: (
+            row['opportunity_penalty'],
+            row['focus_count'],
+            len(row['physician_ids']),
+            -row['core_start'].toordinal(),
+        ),
+        reverse=True,
+    )
 
 
 def _time_band(instance):
@@ -2534,6 +2585,7 @@ class Command(BaseCommand):
                 TEMPORAL_V2_REVISION,
                 WEEKEND_EXCHANGE_V2_REVISION,
                 TEMPORAL_ESCALATION_V2_REVISION,
+                TEMPORAL_TARGETING_V2_REVISION,
             }
         )
         block_availability_candidate_scoring = (
@@ -2542,19 +2594,26 @@ class Command(BaseCommand):
                 TEMPORAL_V2_REVISION,
                 WEEKEND_EXCHANGE_V2_REVISION,
                 TEMPORAL_ESCALATION_V2_REVISION,
+                TEMPORAL_TARGETING_V2_REVISION,
             }
         )
         temporal_reconstruction_scoring = optimizer_revision in {
             TEMPORAL_V2_REVISION,
             WEEKEND_EXCHANGE_V2_REVISION,
             TEMPORAL_ESCALATION_V2_REVISION,
+            TEMPORAL_TARGETING_V2_REVISION,
         }
         balanced_weekend_exchange_scoring = optimizer_revision in {
             WEEKEND_EXCHANGE_V2_REVISION,
             TEMPORAL_ESCALATION_V2_REVISION,
+            TEMPORAL_TARGETING_V2_REVISION,
         }
-        temporal_plateau_escalation_scoring = (
-            optimizer_revision == TEMPORAL_ESCALATION_V2_REVISION
+        temporal_plateau_escalation_scoring = optimizer_revision in {
+            TEMPORAL_ESCALATION_V2_REVISION,
+            TEMPORAL_TARGETING_V2_REVISION,
+        }
+        ranked_temporal_targeting = (
+            optimizer_revision == TEMPORAL_TARGETING_V2_REVISION
         )
         if options['reset_engine_context']:
             _ENGINE_CONTEXT_CACHE.clear()
@@ -4864,36 +4923,70 @@ class Command(BaseCommand):
                     escalation_rng = random.Random(
                         int(options['diversification_seed'])
                     )
-                    escalation_focus = (
-                        escalation_rng.choice(
-                            family_focuses[:min(12, len(family_focuses))]
-                        )
-                        if family_focuses else None
-                    )
-                    escalation_focus_dates = (
-                        (escalation_focus or {}).get('dates') or []
-                    )
-                    escalation_anchor = (
-                        escalation_rng.choice(escalation_focus_dates)
-                        if escalation_focus_dates
-                        else escalation_rng.choice(instances).date
-                    )
                     escalation_window_days = 42
-                    escalation_core_start = max(
-                        schedule_start,
-                        escalation_anchor - timedelta(
-                            days=escalation_rng.randrange(
-                                0,
-                                max(escalation_window_days // 3, 1) + 1,
+                    ranked_window_index = (
+                        0
+                        if (
+                            ranked_temporal_targeting
+                            and selected_family == 'circadian'
+                        )
+                        else None
+                    )
+                    ranked_window = None
+                    if ranked_window_index is not None:
+                        ranked_windows = _rank_temporal_escalation_windows(
+                            family_focuses=family_focuses,
+                            schedule_start=schedule_start,
+                            schedule_end=schedule_end,
+                            window_days=escalation_window_days,
+                        )
+                        ranked_window_index = max(
+                            int(ranked_window_index), 0,
+                        )
+                        if ranked_window_index < len(ranked_windows):
+                            ranked_window = ranked_windows[
+                                ranked_window_index
+                            ]
+                    if ranked_window is not None:
+                        escalation_focus = {
+                            'physician_ids': ranked_window['physician_ids'],
+                            'instance_ids': ranked_window['instance_ids'],
+                            'violation_type': 'RANKED_TEMPORAL_WINDOW',
+                        }
+                        escalation_core_start = ranked_window['core_start']
+                        escalation_core_end = ranked_window['core_end']
+                    else:
+                        escalation_focus = (
+                            escalation_rng.choice(
+                                family_focuses[:min(12, len(family_focuses))]
                             )
-                        ),
-                    )
-                    escalation_core_end = min(
-                        schedule_end,
-                        escalation_core_start + timedelta(
-                            days=escalation_window_days - 1
-                        ),
-                    )
+                            if family_focuses else None
+                        )
+                        escalation_focus_dates = (
+                            (escalation_focus or {}).get('dates') or []
+                        )
+                        escalation_anchor = (
+                            escalation_rng.choice(escalation_focus_dates)
+                            if escalation_focus_dates
+                            else escalation_rng.choice(instances).date
+                        )
+                        escalation_core_start = max(
+                            schedule_start,
+                            escalation_anchor - timedelta(
+                                days=escalation_rng.randrange(
+                                    0,
+                                    max(
+                                        escalation_window_days // 3, 1
+                                    ) + 1,
+                                )
+                            ),
+                        )
+                        escalation_core_end = min(
+                            schedule_end,
+                            escalation_core_start + timedelta(
+                                days=escalation_window_days - 1
+                            ),
+                        )
                     escalation_focus_start = max(
                         schedule_start,
                         escalation_core_start - timedelta(
@@ -4970,6 +5063,22 @@ class Command(BaseCommand):
                         'cohort_size': 16,
                         'time_limit_seconds': 20.0,
                         'maximum_reassignments': 40,
+                        'targeting': (
+                            'ranked_window'
+                            if ranked_window is not None else 'random_focus'
+                        ),
+                        'ranked_window_index': (
+                            ranked_window_index
+                            if ranked_window is not None else None
+                        ),
+                        'opportunity_penalty': (
+                            float(ranked_window['opportunity_penalty'])
+                            if ranked_window is not None else None
+                        ),
+                        'focus_count': (
+                            ranked_window['focus_count']
+                            if ranked_window is not None else None
+                        ),
                         'diagnostics': {
                             key: escalation_reconstruction[key]
                             for key in (

@@ -20,7 +20,7 @@ class ProductionOptimizerTelemetry:
     checkpoints, so telemetry cost does not scale with candidate count.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self):
         self.neighborhood_count = 0
@@ -30,6 +30,7 @@ class ProductionOptimizerTelemetry:
         self.selection_modes = defaultdict(_metric_row)
         self.operations = defaultdict(_metric_row)
         self.structural_families = defaultdict(_metric_row)
+        self.temporal_plateau_escalations = defaultdict(_metric_row)
         self.first_verified_checkpoint_seconds = None
         self.best_verified_score = None
         self.best_verified_seconds = None
@@ -109,6 +110,31 @@ class ProductionOptimizerTelemetry:
                 accepted=bool(structural_attempt.get('accepted')),
                 official_delta=structural_attempt.get('score_delta'),
             )
+        plateau_escalation = (
+            (structural_attempt or {}).get('plateau_escalation') or {}
+        )
+        if plateau_escalation.get('attempted'):
+            diagnostics = plateau_escalation.get('diagnostics') or {}
+            score_before = diagnostics.get('score_before')
+            score_after = diagnostics.get('score_after')
+            official_delta = (
+                float(score_after) - float(score_before)
+                if score_before is not None and score_after is not None
+                else None
+            )
+            targeting = str(
+                plateau_escalation.get('targeting') or 'random_focus'
+            )
+            family = str(
+                plateau_escalation.get('selected_family') or 'unknown'
+            )
+            self._record_metric(
+                self.temporal_plateau_escalations[
+                    f'{family}:{targeting}'
+                ],
+                accepted=bool(plateau_escalation.get('accepted')),
+                official_delta=official_delta,
+            )
 
     def record_verified_checkpoint(
         self, *, elapsed_seconds, accepted_transitions, score,
@@ -168,6 +194,9 @@ class ProductionOptimizerTelemetry:
             'operations': self._metric_mapping(self.operations),
             'structural_families': self._metric_mapping(
                 self.structural_families
+            ),
+            'temporal_plateau_escalations': self._metric_mapping(
+                self.temporal_plateau_escalations
             ),
             'first_verified_checkpoint_seconds': (
                 self.first_verified_checkpoint_seconds

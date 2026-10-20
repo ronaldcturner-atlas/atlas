@@ -10,6 +10,7 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     _pair_validation_penalty_deltas,
     _prepare_circadian_kernel,
     _prepare_shift_rule_kernel,
+    _rank_temporal_escalation_windows,
     _request_reassignment_deltas,
     _requests_active_under_block_plans,
     _shift_eligibility_matrix,
@@ -51,6 +52,7 @@ from apps.scheduling.optimizer_revisions import (
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
     TEMPORAL_ESCALATION_V2_REVISION,
+    TEMPORAL_TARGETING_V2_REVISION,
     WEEKEND_EXCHANGE_V2_REVISION,
     configuration_digest,
     require_supported_v2_revision,
@@ -118,6 +120,47 @@ class OptimizerRevisionTests(SimpleTestCase):
             require_supported_v2_revision(TEMPORAL_ESCALATION_V2_REVISION),
             TEMPORAL_ESCALATION_V2_REVISION,
         )
+
+    def test_temporal_targeting_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(TEMPORAL_TARGETING_V2_REVISION),
+            TEMPORAL_TARGETING_V2_REVISION,
+        )
+
+    def test_temporal_windows_rank_authoritative_penalty_concentration(self):
+        focuses = [
+            {
+                'dates': [date(2027, 1, 5)],
+                'penalty': Decimal('2000'),
+                'physician_ids': {1},
+                'instance_ids': {10},
+                'violation_type': 'CIRCADIAN_BACKWARD_ROTATION',
+            },
+            {
+                'dates': [date(2027, 3, 5)],
+                'penalty': Decimal('5000'),
+                'physician_ids': {2},
+                'instance_ids': {20},
+                'violation_type': 'CIRCADIAN_BACKWARD_ROTATION',
+            },
+            {
+                'dates': [date(2027, 3, 20)],
+                'penalty': Decimal('4000'),
+                'physician_ids': {3},
+                'instance_ids': {30},
+                'violation_type': 'CIRCADIAN_BACKWARD_ROTATION',
+            },
+        ]
+
+        ranked = _rank_temporal_escalation_windows(
+            family_focuses=focuses,
+            schedule_start=date(2027, 1, 1),
+            schedule_end=date(2027, 4, 30),
+        )
+
+        self.assertEqual(ranked[0]['opportunity_penalty'], Decimal('9000'))
+        self.assertEqual(ranked[0]['physician_ids'], {2, 3})
+        self.assertEqual(ranked[0]['instance_ids'], {20, 30})
 
     def test_temporal_escalation_requires_eligible_family_and_plateau(self):
         current = {'score': Decimal('432200')}
@@ -460,6 +503,16 @@ class ProductionOptimizerTelemetryTests(SimpleTestCase):
                 'selected_family': 'weekend',
                 'accepted': True,
                 'score_delta': -2500,
+                'plateau_escalation': {
+                    'attempted': True,
+                    'accepted': True,
+                    'selected_family': 'circadian',
+                    'targeting': 'ranked_window',
+                    'diagnostics': {
+                        'score_before': 7500,
+                        'score_after': 5000,
+                    },
+                },
             },
             command_seconds=8.0,
         )
@@ -497,6 +550,12 @@ class ProductionOptimizerTelemetryTests(SimpleTestCase):
             2500.0,
         )
         self.assertEqual(summary['structural_families']['weekend']['accepted'], 1)
+        self.assertEqual(
+            summary['temporal_plateau_escalations'][
+                'circadian:ranked_window'
+            ]['official_penalty_reduction'],
+            2500.0,
+        )
         self.assertEqual(summary['first_verified_checkpoint_seconds'], 8.0)
         self.assertEqual(summary['best_verified_score'], 7000.0)
         self.assertEqual(summary['best_verified_seconds'], 14.0)
