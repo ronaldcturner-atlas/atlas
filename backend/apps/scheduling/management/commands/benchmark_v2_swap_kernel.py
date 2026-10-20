@@ -45,6 +45,7 @@ from apps.scheduling.optimizer import (
     _state_from_assignments,
     _version_contract_target,
     _version_shift_instances_queryset,
+    _weekend_volume_report,
     _weekend_repair_candidates,
     _weekend_support_cycle_candidates,
     _consecutive_day_break_candidates,
@@ -53,6 +54,9 @@ from apps.scheduling.optimizer import (
     evaluate_plateau_three_way_rotation,
 )
 from apps.scheduling.run_state import assignments_for_viewed_run
+from apps.scheduling.weekend_exchange import (
+    solve_balanced_weekend_streak_exchange,
+)
 from apps.scheduling.optimizer_v2 import (
     V2EngineContext,
     internal_conflict_count_matrices,
@@ -72,6 +76,7 @@ from apps.scheduling.optimizer_revisions import (
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
+    WEEKEND_EXCHANGE_V2_REVISION,
     require_supported_v2_revision,
 )
 
@@ -83,6 +88,7 @@ TIME_BANDS = ('BEFORE_9_AM', '9_AM_TO_9_59_AM', '10_AM_TO_1_59_PM', '2_PM_OR_LAT
 # The lineage in the key prevents a context from a different search chain from
 # contributing cycle history or cached scoring rows to the current chain.
 _ENGINE_CONTEXT_CACHE = {}
+_BALANCED_WEEKEND_MONTH_ATTEMPTS = defaultdict(set)
 
 
 def _requests_active_under_block_plans(schedule_requests, contracts):
@@ -2508,19 +2514,26 @@ class Command(BaseCommand):
                 CIRCADIAN_V2_REVISION,
                 AVAILABILITY_V2_REVISION,
                 TEMPORAL_V2_REVISION,
+                WEEKEND_EXCHANGE_V2_REVISION,
             }
         )
         block_availability_candidate_scoring = (
             optimizer_revision in {
                 AVAILABILITY_V2_REVISION,
                 TEMPORAL_V2_REVISION,
+                WEEKEND_EXCHANGE_V2_REVISION,
             }
         )
-        temporal_reconstruction_scoring = (
-            optimizer_revision == TEMPORAL_V2_REVISION
+        temporal_reconstruction_scoring = optimizer_revision in {
+            TEMPORAL_V2_REVISION,
+            WEEKEND_EXCHANGE_V2_REVISION,
+        }
+        balanced_weekend_exchange_scoring = (
+            optimizer_revision == WEEKEND_EXCHANGE_V2_REVISION
         )
         if options['reset_engine_context']:
             _ENGINE_CONTEXT_CACHE.clear()
+            _BALANCED_WEEKEND_MONTH_ATTEMPTS.clear()
         run_number = options['run_number']
         run_id = options['run_id']
         if run_id is None and run_number is None:
@@ -4566,6 +4579,7 @@ class Command(BaseCommand):
         exact_results = []
         transition_validation = None
         structural_reconstruction_attempt = None
+        balanced_weekend_reconstruction_attempt = None
         in_process_transition = None
         authoritative_current_score = None
         authoritative_current_breakdown = None
@@ -5053,34 +5067,212 @@ class Command(BaseCommand):
                         'score_source': 'authoritative_v1_tactic',
                     }
             if (
-                transition_validation is None
-                and best_selection is None
-                and options['selection_mode'] == 'improve'
-            ):
-                reconstructed_state, reconstructed_scoring, reconstruction = (
-                    _solve_bounded_multi_physician_neighborhood(
-                        instances=instances,
-                        physicians=physicians,
-                        state=state,
-                        scoring=current_scoring,
-                        manual_pairs=manual_pairs,
-                        targets=targets,
-                        contract_by_physician=contracts,
-                        requests_by_physician_date=requests_by_physician_date,
-                        eligible_facilities_by_physician=(
-                            eligible_facilities_by_physician
-                        ),
-                        minimum_rest_by_physician=minimum_rest_by_physician,
-                        rng=random.Random(int(current_fingerprint[:16], 16)),
-                        time_limit_seconds=4.0,
-                        include_circadian_objective=(
-                            temporal_reconstruction_scoring
-                        ),
-                        maximum_reassignments=(
-                            16 if temporal_reconstruction_scoring else None
-                        ),
+                options['selection_mode'] == 'improve'
+                and (
+                    (
+                        transition_validation is None
+                        and best_selection is None
+                    )
+                    or (
+                        balanced_weekend_exchange_scoring
+                        and transition_validation is not None
+                        and Decimal(str(
+                            transition_validation.get(
+                                'authoritative_official_delta', 0,
+                            )
+                        )) == 0
                     )
                 )
+            ):
+                standard_reconstruction_allowed = (
+                    transition_validation is None and best_selection is None
+                )
+                if current_scoring is None:
+                    current_scoring = _score_schedule(
+                        instances,
+                        physicians,
+                        state,
+                        targets,
+                        contracts,
+                        requests_by_physician_date,
+                        eligible_facilities_by_physician,
+                        minimum_rest_by_physician,
+                    )
+                    authoritative_current_score = float(
+                        current_scoring['score']
+                    )
+                    authoritative_current_breakdown = {
+                        key: float(value)
+                        for key, value in (
+                            current_scoring.get('breakdown') or {}
+                        ).items()
+                    }
+                balanced_weekend_month = None
+                weekend_score = Decimal(str(
+                    current_scoring['breakdown'].get('weekend_score', 0)
+                ))
+                competing_soft_score = max(
+                    Decimal(str(current_scoring['breakdown'].get(key, 0)))
+                    for key in (
+                        'workload_score', 'request_score', 'same_shift_score',
+                        'shift_rule_score', 'night_score', 'circadian_score',
+                    )
+                )
+                if (
+                    balanced_weekend_exchange_scoring
+                    and weekend_score > 0
+                    and weekend_score >= competing_soft_score
+                ):
+                    month_penalties = defaultdict(lambda: Decimal('0'))
+                    weekend_report = _weekend_volume_report(
+                        instances,
+                        physicians,
+                        state,
+                        contracts,
+                        details=True,
+                    )
+                    for violation in weekend_report.get('violations', ()):
+                        if (
+                            violation.get('violation_type')
+                            != 'MAX_CONSECUTIVE_WEEKENDS'
+                        ):
+                            continue
+                        violation_months = {
+                            (
+                                instances_by_id[int(instance_id)].date.year,
+                                instances_by_id[int(instance_id)].date.month,
+                            )
+                            for instance_id in (
+                                violation.get('shift_instance_ids') or ()
+                            )
+                            if int(instance_id) in instances_by_id
+                        }
+                        penalty = Decimal(str(
+                            violation.get(
+                                'penalty_amount',
+                                violation.get('penalty', 0),
+                            )
+                        ))
+                        for month_key in violation_months:
+                            month_penalties[month_key] += penalty
+                    candidate_months = sorted(
+                        {
+                            (instance.date.year, instance.date.month)
+                            for instance in instances
+                            if _is_weekend_designated(instance)
+                            and not instance.shift_template.night_shift
+                        },
+                        key=lambda month_key: (
+                            -month_penalties[month_key], month_key,
+                        ),
+                    )
+                    attempt_key = (run.id, current_fingerprint)
+                    for stale_key in list(
+                        _BALANCED_WEEKEND_MONTH_ATTEMPTS
+                    ):
+                        if stale_key[0] == run.id and stale_key != attempt_key:
+                            del _BALANCED_WEEKEND_MONTH_ATTEMPTS[stale_key]
+                    attempted_months = _BALANCED_WEEKEND_MONTH_ATTEMPTS[
+                        attempt_key
+                    ]
+                    balanced_weekend_month = next(
+                        (
+                            month_key for month_key in candidate_months
+                            if month_key not in attempted_months
+                        ),
+                        None,
+                    )
+                    if balanced_weekend_month is not None:
+                        attempted_months.add(balanced_weekend_month)
+
+                if balanced_weekend_month is not None:
+                    reconstructed_state, reconstructed_scoring, reconstruction = (
+                        solve_balanced_weekend_streak_exchange(
+                            instances=instances,
+                            physicians=physicians,
+                            state=state,
+                            scoring=current_scoring,
+                            manual_pairs=manual_pairs,
+                            targets=targets,
+                            contract_by_physician=contracts,
+                            requests_by_physician_date=requests_by_physician_date,
+                            eligible_facilities_by_physician=(
+                                eligible_facilities_by_physician
+                            ),
+                            minimum_rest_by_physician=(
+                                minimum_rest_by_physician
+                            ),
+                            rng=random.Random(
+                                int(current_fingerprint[:16], 16)
+                            ),
+                            time_limit_seconds=4.0,
+                            maximum_reassignments=24,
+                            year=balanced_weekend_month[0],
+                            month=balanced_weekend_month[1],
+                        )
+                    )
+                    reconstruction['balanced_weekend_month'] = (
+                        f'{balanced_weekend_month[0]:04d}-'
+                        f'{balanced_weekend_month[1]:02d}'
+                    )
+                    reconstruction['neighborhood_kind'] = (
+                        'balanced_weekend_exchange'
+                    )
+                    balanced_weekend_reconstruction_attempt = {
+                        'month': reconstruction['balanced_weekend_month'],
+                        'accepted': bool(reconstruction.get('accepted')),
+                        'diagnostics': {
+                            key: reconstruction[key]
+                            for key in (
+                                'attempts', 'candidates', 'solver_status',
+                                'skipped_reason', 'stopped', 'stopped_stage',
+                                'assignment_distance', 'score_before',
+                                'score_after', 'breakdown_before',
+                                'breakdown_after', 'maximum_reassignments',
+                                'solver_workers',
+                                'preserve_capacity_signatures',
+                            )
+                            if key in reconstruction
+                        },
+                    }
+                elif standard_reconstruction_allowed:
+                    reconstructed_state, reconstructed_scoring, reconstruction = (
+                        _solve_bounded_multi_physician_neighborhood(
+                            instances=instances,
+                            physicians=physicians,
+                            state=state,
+                            scoring=current_scoring,
+                            manual_pairs=manual_pairs,
+                            targets=targets,
+                            contract_by_physician=contracts,
+                            requests_by_physician_date=(
+                                requests_by_physician_date
+                            ),
+                            eligible_facilities_by_physician=(
+                                eligible_facilities_by_physician
+                            ),
+                            minimum_rest_by_physician=(
+                                minimum_rest_by_physician
+                            ),
+                            rng=random.Random(
+                                int(current_fingerprint[:16], 16)
+                            ),
+                            time_limit_seconds=4.0,
+                            include_circadian_objective=(
+                                temporal_reconstruction_scoring
+                            ),
+                            maximum_reassignments=(
+                                16 if temporal_reconstruction_scoring else None
+                            ),
+                        )
+                    )
+                else:
+                    reconstructed_state = state
+                    reconstructed_scoring = current_scoring
+                    reconstruction = {
+                        'accepted': False,
+                        'skipped_reason': 'neutral_candidate_retained',
+                    }
                 if reconstruction.get('accepted'):
                     reassignments = []
                     patch_is_balanced = True
@@ -5516,6 +5708,9 @@ class Command(BaseCommand):
             'temporal_reconstruction_scoring': (
                 temporal_reconstruction_scoring
             ),
+            'balanced_weekend_exchange_scoring': (
+                balanced_weekend_exchange_scoring
+            ),
             'applied_in_memory_swaps': applied_in_memory_swaps,
             'run_number': run.run_number,
             'schedule_version_id': version.id,
@@ -5603,6 +5798,9 @@ class Command(BaseCommand):
             'best_candidate_transition_validation': transition_validation,
             'structural_reconstruction_attempt': (
                 structural_reconstruction_attempt
+            ),
+            'balanced_weekend_reconstruction_attempt': (
+                balanced_weekend_reconstruction_attempt
             ),
             'in_process_transition': in_process_transition,
             'scope': (

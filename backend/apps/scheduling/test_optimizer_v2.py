@@ -49,6 +49,7 @@ from apps.scheduling.optimizer_revisions import (
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
+    WEEKEND_EXCHANGE_V2_REVISION,
     configuration_digest,
     require_supported_v2_revision,
 )
@@ -102,6 +103,12 @@ class OptimizerRevisionTests(SimpleTestCase):
         self.assertEqual(
             require_supported_v2_revision(TEMPORAL_V2_REVISION),
             TEMPORAL_V2_REVISION,
+        )
+
+    def test_weekend_exchange_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(WEEKEND_EXCHANGE_V2_REVISION),
+            WEEKEND_EXCHANGE_V2_REVISION,
         )
 
     def test_circadian_violation_uses_temporal_structural_family(self):

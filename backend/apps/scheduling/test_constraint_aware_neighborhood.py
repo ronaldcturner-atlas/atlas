@@ -9,6 +9,7 @@ from django.test import SimpleTestCase
 
 from . import optimizer
 from .models import ScheduleRequest
+from .weekend_exchange import solve_balanced_weekend_streak_exchange
 
 
 class FakeRelatedManager:
@@ -194,6 +195,103 @@ class ConstraintAwareNeighborhoodTests(SimpleTestCase):
         self.assertEqual(state, {1: [2], 2: [2]})
         self.assertEqual(result['score'], Decimal('0'))
         self.assertIn(2, debug['connected_owner_ids'])
+
+    def test_balanced_weekend_exchange_preserves_capacity_signature(self):
+        template = SimpleNamespace(
+            id=100,
+            night_shift=False,
+            weekend_days=['Saturday'],
+        )
+        days = (
+            date(2027, 3, 6),
+            date(2027, 3, 13),
+            date(2027, 3, 20),
+            date(2027, 3, 27),
+        )
+        instances = [
+            SimpleNamespace(
+                id=index,
+                date=day,
+                facility_id=10,
+                shift_template_id=template.id,
+                shift_template=template,
+                start_datetime=datetime.combine(
+                    day, time(8), tzinfo=timezone.utc,
+                ),
+                end_datetime=datetime.combine(
+                    day, time(16), tzinfo=timezone.utc,
+                ),
+            )
+            for index, day in enumerate(days, start=1)
+        ]
+        physicians = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+        contracts = {
+            physician.id: SimpleNamespace(
+                id=physician.id,
+                name='Weekend contract',
+                request_settings={},
+                night_settings={},
+                workload_settings={},
+                weekend_settings={
+                    'max_consecutive_weekends': 1,
+                    'max_consecutive_weekends_penalty_weight': 100,
+                },
+                shift_settings={},
+                manual_assignment_only=False,
+            )
+            for physician in physicians
+        }
+        initial = {1: [1], 2: [1], 3: [2], 4: [2]}
+
+        def authoritative_score(_instances, _physicians, state, *_args, **_kwargs):
+            owner_dates = defaultdict(list)
+            for instance in instances:
+                owner_dates[state[instance.id][0]].append(instance.date)
+            separated = all(
+                len(values) == 2
+                and values[1] != values[0] + timedelta(days=7)
+                for values in map(sorted, owner_dates.values())
+            )
+            return scoring(0 if separated else 200, weekend=(
+                0 if separated else 200
+            ))
+
+        with patch.object(
+            optimizer, '_night_violation_report',
+            return_value={'night_violations': []},
+        ), patch.object(
+            optimizer, '_request_scoring_rows', return_value=[],
+        ), patch.object(
+            optimizer, '_score_schedule', side_effect=authoritative_score,
+        ):
+            state, result, debug = solve_balanced_weekend_streak_exchange(
+                instances=instances,
+                physicians=physicians,
+                state=initial,
+                scoring=authoritative_score(None, None, initial),
+                manual_pairs=set(),
+                targets={1: {'rules': []}, 2: {'rules': []}},
+                contract_by_physician=contracts,
+                requests_by_physician_date={},
+                eligible_facilities_by_physician={1: {10}, 2: {10}},
+                minimum_rest_by_physician={1: 0, 2: 0},
+                rng=Random(41),
+                maximum_reassignments=2,
+                year=2027,
+                month=3,
+            )
+
+        self.assertTrue(debug['accepted'], debug)
+        self.assertEqual(result['score'], Decimal('0'))
+        self.assertEqual(
+            {physician_id: sum(
+                physician_id in state[instance.id]
+                for instance in instances
+            ) for physician_id in (1, 2)},
+            {1: 2, 2: 2},
+        )
+        self.assertTrue(debug['preserve_capacity_signatures'])
+        self.assertLessEqual(debug['assignment_distance'], 2)
 
     def test_focus_instances_include_owners_for_atomic_request_block_exchange(self):
         day_template = SimpleNamespace(
