@@ -17,6 +17,7 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     _state_with_all_instances,
     _streak_penalty_from_days,
     _structural_focus_family,
+    _should_attempt_temporal_plateau_escalation,
 )
 from apps.scheduling.optimizer_v2 import (
     V2AssignmentRowCache,
@@ -49,6 +50,7 @@ from apps.scheduling.optimizer_revisions import (
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
+    TEMPORAL_ESCALATION_V2_REVISION,
     WEEKEND_EXCHANGE_V2_REVISION,
     configuration_digest,
     require_supported_v2_revision,
@@ -110,6 +112,40 @@ class OptimizerRevisionTests(SimpleTestCase):
             require_supported_v2_revision(WEEKEND_EXCHANGE_V2_REVISION),
             WEEKEND_EXCHANGE_V2_REVISION,
         )
+
+    def test_temporal_escalation_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(TEMPORAL_ESCALATION_V2_REVISION),
+            TEMPORAL_ESCALATION_V2_REVISION,
+        )
+
+    def test_temporal_escalation_requires_eligible_family_and_plateau(self):
+        current = {'score': Decimal('432200')}
+
+        self.assertTrue(_should_attempt_temporal_plateau_escalation(
+            enabled=True,
+            selected_family='circadian',
+            current_scoring=current,
+            reconstructed_scoring={'score': Decimal('432200')},
+        ))
+        self.assertTrue(_should_attempt_temporal_plateau_escalation(
+            enabled=True,
+            selected_family='shift_rule',
+            current_scoring=current,
+            reconstructed_scoring={'score': Decimal('434200')},
+        ))
+        self.assertFalse(_should_attempt_temporal_plateau_escalation(
+            enabled=True,
+            selected_family='weekend',
+            current_scoring=current,
+            reconstructed_scoring={'score': Decimal('432200')},
+        ))
+        self.assertFalse(_should_attempt_temporal_plateau_escalation(
+            enabled=True,
+            selected_family='circadian',
+            current_scoring=current,
+            reconstructed_scoring={'score': Decimal('430200')},
+        ))
 
     def test_circadian_violation_uses_temporal_structural_family(self):
         self.assertEqual(

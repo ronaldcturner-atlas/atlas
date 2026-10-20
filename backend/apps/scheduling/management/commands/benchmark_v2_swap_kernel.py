@@ -76,6 +76,7 @@ from apps.scheduling.optimizer_revisions import (
     CIRCADIAN_V2_REVISION,
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
+    TEMPORAL_ESCALATION_V2_REVISION,
     WEEKEND_EXCHANGE_V2_REVISION,
     require_supported_v2_revision,
 )
@@ -89,6 +90,7 @@ TIME_BANDS = ('BEFORE_9_AM', '9_AM_TO_9_59_AM', '10_AM_TO_1_59_PM', '2_PM_OR_LAT
 # contributing cycle history or cached scoring rows to the current chain.
 _ENGINE_CONTEXT_CACHE = {}
 _BALANCED_WEEKEND_MONTH_ATTEMPTS = defaultdict(set)
+_TEMPORAL_PLATEAU_ESCALATION_ATTEMPTS = set()
 
 
 def _requests_active_under_block_plans(schedule_requests, contracts):
@@ -213,6 +215,22 @@ STRUCTURAL_FAMILY_SCORE_COMPONENT = {
     'circadian': 'circadian_score',
     'consecutive': 'consecutive_days_score',
 }
+
+TEMPORAL_PLATEAU_ESCALATION_FAMILIES = frozenset({
+    'circadian',
+    'shift_rule',
+})
+
+
+def _should_attempt_temporal_plateau_escalation(
+    *, enabled, selected_family, current_scoring, reconstructed_scoring,
+):
+    """Reserve the larger temporal solve for a confirmed deep plateau."""
+    if not enabled or selected_family not in TEMPORAL_PLATEAU_ESCALATION_FAMILIES:
+        return False
+    if current_scoring is None or reconstructed_scoring is None:
+        return False
+    return reconstructed_scoring['score'] >= current_scoring['score']
 
 
 def _time_band(instance):
@@ -2515,6 +2533,7 @@ class Command(BaseCommand):
                 AVAILABILITY_V2_REVISION,
                 TEMPORAL_V2_REVISION,
                 WEEKEND_EXCHANGE_V2_REVISION,
+                TEMPORAL_ESCALATION_V2_REVISION,
             }
         )
         block_availability_candidate_scoring = (
@@ -2522,14 +2541,20 @@ class Command(BaseCommand):
                 AVAILABILITY_V2_REVISION,
                 TEMPORAL_V2_REVISION,
                 WEEKEND_EXCHANGE_V2_REVISION,
+                TEMPORAL_ESCALATION_V2_REVISION,
             }
         )
         temporal_reconstruction_scoring = optimizer_revision in {
             TEMPORAL_V2_REVISION,
             WEEKEND_EXCHANGE_V2_REVISION,
+            TEMPORAL_ESCALATION_V2_REVISION,
         }
-        balanced_weekend_exchange_scoring = (
-            optimizer_revision == WEEKEND_EXCHANGE_V2_REVISION
+        balanced_weekend_exchange_scoring = optimizer_revision in {
+            WEEKEND_EXCHANGE_V2_REVISION,
+            TEMPORAL_ESCALATION_V2_REVISION,
+        }
+        temporal_plateau_escalation_scoring = (
+            optimizer_revision == TEMPORAL_ESCALATION_V2_REVISION
         )
         if options['reset_engine_context']:
             _ENGINE_CONTEXT_CACHE.clear()
@@ -4793,6 +4818,184 @@ class Command(BaseCommand):
                     'maximum_score_increase': float(maximum_score_increase),
                     'deep_restart_number': deep_restart_number,
                 })
+                escalation_key = (run.id, selected_family)
+                escalation_eligible = (
+                    _should_attempt_temporal_plateau_escalation(
+                        enabled=temporal_plateau_escalation_scoring,
+                        selected_family=selected_family,
+                        current_scoring=current_scoring,
+                        reconstructed_scoring=reconstructed_scoring,
+                    )
+                )
+                escalation_already_attempted = (
+                    escalation_key in _TEMPORAL_PLATEAU_ESCALATION_ATTEMPTS
+                )
+                plateau_escalation = {
+                    'attempted': False,
+                    'accepted': False,
+                    'selected_family': selected_family,
+                }
+                if escalation_eligible and escalation_already_attempted:
+                    plateau_escalation['skipped_reason'] = (
+                        'family_already_attempted_for_run'
+                    )
+                elif not escalation_eligible:
+                    plateau_escalation['skipped_reason'] = (
+                        'normal_reconstruction_improved'
+                        if (
+                            temporal_plateau_escalation_scoring
+                            and selected_family
+                            in TEMPORAL_PLATEAU_ESCALATION_FAMILIES
+                            and reconstructed_scoring is not None
+                            and reconstructed_scoring['score']
+                            < current_scoring['score']
+                        )
+                        else 'family_not_eligible'
+                    )
+                else:
+                    for stale_key in list(
+                        _TEMPORAL_PLATEAU_ESCALATION_ATTEMPTS
+                    ):
+                        if stale_key[0] != run.id:
+                            _TEMPORAL_PLATEAU_ESCALATION_ATTEMPTS.remove(
+                                stale_key
+                            )
+                    _TEMPORAL_PLATEAU_ESCALATION_ATTEMPTS.add(escalation_key)
+                    escalation_rng = random.Random(
+                        int(options['diversification_seed'])
+                    )
+                    escalation_focus = (
+                        escalation_rng.choice(
+                            family_focuses[:min(12, len(family_focuses))]
+                        )
+                        if family_focuses else None
+                    )
+                    escalation_focus_dates = (
+                        (escalation_focus or {}).get('dates') or []
+                    )
+                    escalation_anchor = (
+                        escalation_rng.choice(escalation_focus_dates)
+                        if escalation_focus_dates
+                        else escalation_rng.choice(instances).date
+                    )
+                    escalation_window_days = 42
+                    escalation_core_start = max(
+                        schedule_start,
+                        escalation_anchor - timedelta(
+                            days=escalation_rng.randrange(
+                                0,
+                                max(escalation_window_days // 3, 1) + 1,
+                            )
+                        ),
+                    )
+                    escalation_core_end = min(
+                        schedule_end,
+                        escalation_core_start + timedelta(
+                            days=escalation_window_days - 1
+                        ),
+                    )
+                    escalation_focus_start = max(
+                        schedule_start,
+                        escalation_core_start - timedelta(
+                            days=boundary_padding
+                        ),
+                    )
+                    escalation_focus_end = min(
+                        schedule_end,
+                        escalation_core_end + timedelta(
+                            days=boundary_padding
+                        ),
+                    )
+                    (
+                        escalation_state,
+                        escalation_scoring,
+                        escalation_reconstruction,
+                    ) = _solve_bounded_multi_physician_neighborhood(
+                        instances=instances,
+                        physicians=physicians,
+                        state=state,
+                        scoring=current_scoring,
+                        manual_pairs=manual_pairs,
+                        targets=targets,
+                        contract_by_physician=contracts,
+                        requests_by_physician_date=(
+                            requests_by_physician_date
+                        ),
+                        eligible_facilities_by_physician=(
+                            eligible_facilities_by_physician
+                        ),
+                        minimum_rest_by_physician=(
+                            minimum_rest_by_physician
+                        ),
+                        rng=escalation_rng,
+                        focus_physician_ids=(
+                            escalation_focus or {}
+                        ).get('physician_ids'),
+                        focus_instance_ids=(
+                            escalation_focus or {}
+                        ).get('instance_ids'),
+                        focus_start=escalation_focus_start,
+                        focus_end=escalation_focus_end,
+                        cohort_size=16,
+                        allow_non_improving=False,
+                        maximum_score_increase=Decimal('0'),
+                        diversification_bias=True,
+                        time_limit_seconds=20.0,
+                        include_circadian_objective=True,
+                        maximum_reassignments=40,
+                    )
+                    escalation_reconstruction.update({
+                        'violation_focus': (
+                            escalation_focus or {}
+                        ).get('violation_type'),
+                        'focus_start': escalation_focus_start.isoformat(),
+                        'focus_end': escalation_focus_end.isoformat(),
+                        'maximum_score_increase': 0.0,
+                        'deep_restart_number': deep_restart_number,
+                        'plateau_escalation': True,
+                    })
+                    escalation_accepted = bool(
+                        escalation_reconstruction.get('accepted')
+                        and escalation_scoring['score']
+                        < current_scoring['score']
+                    )
+                    plateau_escalation.update({
+                        'attempted': True,
+                        'accepted': escalation_accepted,
+                        'violation_focus': (
+                            escalation_focus or {}
+                        ).get('violation_type'),
+                        'focus_start': escalation_focus_start.isoformat(),
+                        'focus_end': escalation_focus_end.isoformat(),
+                        'cohort_size': 16,
+                        'time_limit_seconds': 20.0,
+                        'maximum_reassignments': 40,
+                        'diagnostics': {
+                            key: escalation_reconstruction[key]
+                            for key in (
+                                'attempts', 'candidates', 'solver_status',
+                                'skipped_reason', 'stopped', 'stopped_stage',
+                                'assignment_distance', 'score_before',
+                                'score_after', 'breakdown_before',
+                                'breakdown_after', 'maximum_reassignments',
+                                'solver_workers',
+                            )
+                            if key in escalation_reconstruction
+                        },
+                    })
+                    if escalation_accepted:
+                        reconstructed_state = escalation_state
+                        reconstructed_scoring = escalation_scoring
+                        reconstruction = escalation_reconstruction
+                        structural_reconstruction_attempt.update({
+                            'violation_focus': (
+                                escalation_focus or {}
+                            ).get('violation_type'),
+                        })
+                if temporal_plateau_escalation_scoring:
+                    structural_reconstruction_attempt[
+                        'plateau_escalation'
+                    ] = plateau_escalation
                 structural_reconstruction_attempt.update({
                     'score_delta': (
                         float(
