@@ -15,14 +15,8 @@ try {
 
     Write-Host ''
     Write-Host 'Atlas frontend: http://localhost:5173' -ForegroundColor Green
-    Write-Host 'Keep this terminal open while the frontend dev server is running.' -ForegroundColor Yellow
-    Write-Host 'Press Ctrl+C to stop the frontend dev server.'
+    Write-Host 'The frontend is supervised by Docker and restarts automatically.' -ForegroundColor Yellow
     Write-Host ''
-
-    & npm run dev --prefix frontend
-    if ($LASTEXITCODE -ne 0) {
-        throw "The frontend dev server exited with code $LASTEXITCODE."
-    }
 }
 finally {
     Pop-Location

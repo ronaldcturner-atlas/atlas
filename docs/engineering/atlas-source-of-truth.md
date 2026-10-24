@@ -536,7 +536,7 @@ From the project root in PowerShell, run:
 .\start-atlas.ps1
 ```
 
-This starts the Docker services in the background and runs the Vite frontend development server. Open Atlas at [http://localhost:5173](http://localhost:5173). The frontend runs in the foreground, so keep that PowerShell terminal open while using Atlas. Press `Ctrl+C` to stop the frontend server; the Docker services remain running in the background.
+This starts the Docker services, including the supervised Vite frontend development server, in the background. Open Atlas at [http://localhost:5173](http://localhost:5173). The frontend uses the same `restart: unless-stopped` lifecycle as the other local application services, so closing the PowerShell terminal does not stop it. Frontend source and configuration files are mounted into the development container for Vite hot reloads.
 
 The equivalent npm convenience command is:
 
