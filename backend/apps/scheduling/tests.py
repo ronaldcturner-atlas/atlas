@@ -2857,8 +2857,6 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             current['workload_adjustment_base_values']['target_hours'], '120',
         )
 
-        self.block.published_at = timezone.now()
-        self.block.save(update_fields=['published_at', 'updated_at'])
         next_block = ScheduleBlock.objects.create(
             domain=self.domain,
             start_date=date(2026, 8, 1),
@@ -2878,6 +2876,93 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(row['target_hours'], '120')
         self.assertEqual(row['minimum_hours'], '110')
         self.assertEqual(row['maximum_hours'], '130')
+
+    def test_partial_user_carries_full_block_baseline_and_requires_confirmation(self):
+        physician = self._create_assignment_physician(
+            'partial-carry@example.com', 'Partial Carry', [self.facility],
+        )
+        users_url = f'/api/schedule-blocks/{self.block.id}/users/'
+        saved = self.client.patch(
+            users_url,
+            data={'users': [{
+                'physician_id': physician.id,
+                'target_hours': '120',
+                'minimum_hours': '110',
+                'maximum_hours': '130',
+            }]},
+            format='json',
+        )
+        self.assertEqual(saved.status_code, 200)
+        partial_url = (
+            f'/api/schedule-blocks/{self.block.id}/users/'
+            f'{physician.id}/partial/'
+        )
+        partial = self.client.patch(
+            partial_url,
+            data={'unavailable_dates': ['2026-07-06']},
+            format='json',
+        )
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.json()['block_values']['target_hours'], '60')
+
+        next_block = ScheduleBlock.objects.create(
+            domain=self.domain,
+            start_date=date(2026, 8, 1),
+            end_date=date(2026, 8, 31),
+            request_open_datetime=timezone.make_aware(datetime(2026, 6, 1, 12, 0)),
+            request_close_datetime=timezone.make_aware(datetime(2026, 6, 15, 12, 0)),
+            build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        )
+        next_url = f'/api/schedule-blocks/{next_block.id}/users/'
+        carried = self.client.get(next_url)
+        self.assertEqual(carried.status_code, 200)
+        row = next(
+            item for item in carried.json()['users']
+            if item['physician_id'] == physician.id
+        )
+        self.assertEqual(row['target_hours'], '120')
+        self.assertEqual(row['minimum_hours'], '110')
+        self.assertEqual(row['maximum_hours'], '130')
+        self.assertTrue(row['carried_from_partial_block'])
+        self.assertTrue(row['carry_confirmation_required'])
+        self.assertFalse(row['partial_block'])
+
+        rejected = self.client.patch(
+            next_url,
+            data={'users': [{
+                'physician_id': physician.id,
+                'target_hours': '120',
+                'minimum_hours': '110',
+                'maximum_hours': '130',
+            }]},
+            format='json',
+        )
+        self.assertEqual(rejected.status_code, 400)
+
+        confirmed = self.client.patch(
+            next_url,
+            data={'users': [{
+                'physician_id': physician.id,
+                'target_hours': '120',
+                'minimum_hours': '110',
+                'maximum_hours': '130',
+                'carry_forward_confirmed': True,
+            }]},
+            format='json',
+        )
+        self.assertEqual(confirmed.status_code, 200)
+        confirmed_row = next(
+            item for item in confirmed.json()['users']
+            if item['physician_id'] == physician.id
+        )
+        self.assertFalse(confirmed_row['carry_confirmation_required'])
+        self.assertFalse(confirmed_row['partial_block'])
+        self.block.refresh_from_db()
+        self.assertTrue(
+            self.block.user_planning_settings[str(physician.id)][
+                'temporary_contract_source'
+            ]
+        )
 
     def test_generate_creates_open_dated_instances_and_moves_block_to_build(self):
         response = self.client.post(

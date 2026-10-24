@@ -28,6 +28,9 @@ type PlanRow = {
   workload_adjustment_base_values?: Partial<Record<NumericPlanKey, string>>
   apply_workload_adjustment?: boolean
   clear_workload_adjustment?: boolean
+  carried_from_partial_block?: boolean
+  carry_confirmation_required?: boolean
+  carry_forward_confirmed?: boolean
 }
 
 type WorkloadRecommendation = {
@@ -59,6 +62,7 @@ type BlockPlanResponse = {
   }
   read_only: boolean
   previous_block: null | { id: number; name: string; months: number }
+  planning_source_block: null | { id: number; name: string; months: number }
   current_block_months: number
   users: PlanRow[]
 }
@@ -178,11 +182,25 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
   }, [location.search])
 
   const updateRow = (physicianId: number, key: NumericPlanKey, value: string) => {
-    setRows((current) => current.map((row) => row.physician_id === physicianId ? { ...row, [key]: value } : row))
+    setRows((current) => current.map((row) => row.physician_id === physicianId ? {
+      ...row,
+      [key]: value,
+      ...(row.carry_confirmation_required && key.includes('hours')
+        ? { carry_forward_confirmed: true, carry_confirmation_required: false }
+        : {}),
+    } : row))
+  }
+
+  const confirmCarriedHours = (physicianId: number) => {
+    setRows((current) => current.map((row) => row.physician_id === physicianId ? {
+      ...row,
+      carry_forward_confirmed: true,
+      carry_confirmation_required: false,
+    } : row))
   }
 
   const resetRowToParent = (physicianId: number) => {
-    setRows((current) => current.map((row) => row.physician_id === physicianId ? { ...row, ...(row.parent_defaults || {}), parent_contract_changed: false } : row))
+    setRows((current) => current.map((row) => row.physician_id === physicianId ? { ...row, ...(row.parent_defaults || {}), parent_contract_changed: false, carry_forward_confirmed: true, carry_confirmation_required: false } : row))
   }
 
   const autofill = (kind: 'hours' | 'shifts' | 'both') => {
@@ -205,6 +223,10 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
         }
         if (kind === 'hours' || kind === 'both') fill('hours', adjustments.minHours, adjustments.maxHours)
         if (kind === 'shifts' || kind === 'both') fill('shifts', adjustments.minShifts, adjustments.maxShifts)
+        if ((kind === 'hours' || kind === 'both') && copy.carry_confirmation_required) {
+          copy.carry_forward_confirmed = true
+          copy.carry_confirmation_required = false
+        }
         return copy
       })
       setRows(next)
@@ -241,6 +263,8 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
         workload_adjustment_base_values: base,
         apply_workload_adjustment: true,
         clear_workload_adjustment: false,
+        carry_forward_confirmed: true,
+        carry_confirmation_required: false,
       }
     }))
     setWorkloadRecommendationStaged(true)
@@ -269,6 +293,7 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
         ['apply_workload_adjustment', Boolean(row.apply_workload_adjustment)],
         ['clear_workload_adjustment', Boolean(row.clear_workload_adjustment)],
         ['workload_adjustment_base_values', row.workload_adjustment_base_values || {}],
+        ['carry_forward_confirmed', Boolean(row.carry_forward_confirmed)],
       ]))
       await jsonOrError(await fetch(`${API_BASE}/schedule-blocks/${blockId}/users/`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ users: payload }),
@@ -380,12 +405,13 @@ export default function ScheduleBlockUsersView({ blockId, onBack }: Props) {
         <button type="button" onClick={() => autofill('shifts')} disabled={data.read_only}>Autofill Shifts</button>
         <button type="button" className="primary-action" onClick={() => autofill('both')} disabled={data.read_only}>Autofill Both</button>
       </div>
+      {rows.some((row) => row.carry_confirmation_required) && <div className="block-plan-notice">One or more users were partial in the preceding block. Confirm or adjust each highlighted user's full-block hours before saving.</div>}
       {!data.previous_block && <div className="block-plan-notice">No earlier published block is available. Targets and ranges begin with the effective parent Contract.</div>}
       <div className="scheduler-table-wrap"><table className="scheduler-table block-plan-table"><thead><tr>
         <th></th><th>User / Contract</th><th>Target hrs</th><th>Min hrs</th><th>Max hrs</th><th>Previous hrs</th><th>Target shifts</th><th>Min shifts</th><th>Max shifts</th><th>Previous shifts</th>
       </tr></thead><tbody>{rows.map((row) => <tr key={row.physician_id} className={row.partial_block ? 'partial-row' : ''}>
         <td><input type="checkbox" checked={selected.has(row.physician_id)} onChange={(event) => setSelected((current) => { const next = new Set(current); event.target.checked ? next.add(row.physician_id) : next.delete(row.physician_id); return next })} /></td>
-        <td><strong>{row.name}</strong>{row.partial_block && <button className="partial-badge" onClick={() => void openPartial(row.physician_id)}>Partial{row.excluded ? ' · Excluded' : ''}</button>}<small>{row.contract_name}</small>{row.workload_adjusted && <small className="workload-adjusted-note">Target adjusted from {row.workload_adjustment_base_values?.target_hours ?? '—'} <button type="button" onClick={() => resetWorkloadAdjustment(row.physician_id)} disabled={data.read_only}>Reset</button></small>}{row.parent_contract_changed && <small className="contract-change-note">Parent Contract changed. <button type="button" onClick={() => resetRowToParent(row.physician_id)} disabled={data.read_only}>Reset to Contract</button></small>}{row.normalization_note && <small className="normalization-note">{row.normalization_note}</small>}</td>
+        <td><strong>{row.name}</strong>{row.partial_block && <button className="partial-badge" onClick={() => void openPartial(row.physician_id)}>Partial{row.excluded ? ' · Excluded' : ''}</button>}<small>{row.contract_name}</small>{row.carry_confirmation_required && <small className="contract-change-note">Partial in {data.planning_source_block?.name || 'the preceding block'} — confirm or adjust full-block hours. <button type="button" onClick={() => confirmCarriedHours(row.physician_id)} disabled={data.read_only}>Confirm hours</button></small>}{row.workload_adjusted && <small className="workload-adjusted-note">Target adjusted from {row.workload_adjustment_base_values?.target_hours ?? '—'} <button type="button" onClick={() => resetWorkloadAdjustment(row.physician_id)} disabled={data.read_only}>Reset</button></small>}{row.parent_contract_changed && <small className="contract-change-note">Parent Contract changed. <button type="button" onClick={() => resetRowToParent(row.physician_id)} disabled={data.read_only}>Reset to Contract</button></small>}{row.normalization_note && <small className="normalization-note">{row.normalization_note}</small>}</td>
         {(['target_hours','minimum_hours','maximum_hours'] as NumericPlanKey[]).map((key) => <td key={key}><input className={row.apply_workload_adjustment ? 'recommended-value' : ''} disabled={data.read_only} value={row[key] ?? ''} onChange={(event) => updateRow(row.physician_id, key, event.target.value)} /></td>)}
         <td>{formatNumber(row.previous_hours)}</td>
         {(['target_shifts','minimum_shifts','maximum_shifts'] as NumericPlanKey[]).map((key) => <td key={key}><input disabled={data.read_only} value={row[key] ?? ''} onChange={(event) => updateRow(row.physician_id, key, event.target.value)} /></td>)}

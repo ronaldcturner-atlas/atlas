@@ -6884,7 +6884,7 @@ def _planning_contract_defaults(contract, block):
     return result
 
 
-def _previous_block_for_planning(block):
+def _previous_published_block_for_planning(block):
     return (
         ScheduleBlock.objects.filter(
             domain=block.domain,
@@ -6896,8 +6896,20 @@ def _previous_block_for_planning(block):
     )
 
 
+def _previous_planned_block_for_planning(block):
+    return (
+        ScheduleBlock.objects.filter(
+            domain=block.domain,
+            end_date__lt=block.start_date,
+        )
+        .exclude(user_planning_settings={})
+        .order_by('-end_date', '-updated_at', '-id')
+        .first()
+    )
+
+
 def _previous_published_totals(block):
-    previous = _previous_block_for_planning(block)
+    previous = _previous_published_block_for_planning(block)
     if previous is None:
         return None, {}
     version = (
@@ -6930,7 +6942,9 @@ def _previous_published_totals(block):
 def _normalized_carried_plan(block, previous, previous_plan):
     carried_fields = (
         'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
+        'minimum_hours', 'maximum_hours',
         'target_shifts', 'min_shifts_adjustment', 'max_shifts_adjustment',
+        'minimum_shifts', 'maximum_shifts',
     )
     carry_source = (
         previous_plan.get('partial_block_base_values')
@@ -7047,6 +7061,11 @@ def schedule_block_users(request, block_id):
             status=status.HTTP_409_CONFLICT,
         )
 
+    planning_previous = _previous_planned_block_for_planning(block)
+    planning_previous_settings = (
+        planning_previous.user_planning_settings if planning_previous else {}
+    )
+
     if request.method == 'PATCH':
         if read_only:
             return Response(
@@ -7078,6 +7097,23 @@ def schedule_block_users(request, block_id):
                 errors[str(physician_id)] = 'User is not clinically active with an applicable Contract in this Domain.'
                 continue
             current = copy.deepcopy(settings.get(str(physician_id), {}))
+            previous_plan = (planning_previous_settings or {}).get(
+                str(physician_id), {},
+            )
+            carried_from_partial_block = bool(
+                previous_plan.get('temporary_contract_source')
+                or previous_plan.get('unavailable_dates')
+            )
+            if carried_from_partial_block and not current.get(
+                'carry_forward_confirmed', False,
+            ):
+                if row.get('carry_forward_confirmed') is not True:
+                    errors[f'{physician_id}.carry_forward_confirmed'] = (
+                        'This user was partial in the preceding block. Confirm or '
+                        'adjust the carried full-block hours before saving.'
+                    )
+                    continue
+                current['carry_forward_confirmed'] = True
             if row.get('clear_workload_adjustment') is True:
                 current.pop('workload_adjusted', None)
                 current.pop('workload_adjustment_base_values', None)
@@ -7138,7 +7174,7 @@ def schedule_block_users(request, block_id):
         _mark_block_planning_change(block, request.user)
 
     previous, actual_totals = _previous_published_totals(block)
-    previous_settings = previous.user_planning_settings if previous else {}
+    previous_settings = planning_previous_settings
     current_settings = block.user_planning_settings or {}
     user_rows = []
     for assignment in assignments:
@@ -7150,6 +7186,10 @@ def schedule_block_users(request, block_id):
             if previous_plan else defaults
         )
         stored_plan = copy.deepcopy(current_settings.get(str(assignment.physician_id), {}))
+        carried_from_partial_block = bool(
+            previous_plan.get('temporary_contract_source')
+            or previous_plan.get('unavailable_dates')
+        )
         for field in (
             'target_hours', 'min_hours_adjustment', 'max_hours_adjustment',
             'minimum_hours', 'maximum_hours', 'target_shifts',
@@ -7180,6 +7220,14 @@ def schedule_block_users(request, block_id):
             'previous_hours': _planning_decimal_text(totals.get('hours')),
             'previous_shifts': totals.get('shifts', ''),
             'partial_block': bool(plan.get('temporary_contract_source') or plan.get('unavailable_dates')),
+            'carried_from_partial_block': carried_from_partial_block,
+            'carry_confirmation_required': bool(
+                carried_from_partial_block
+                and not stored_plan.get('carry_forward_confirmed', False)
+            ),
+            'carry_forward_confirmed': bool(
+                stored_plan.get('carry_forward_confirmed', False)
+            ),
             'excluded': len(plan.get('unavailable_dates') or []) == (block.end_date - block.start_date).days + 1,
             'parent_contract_changed': parent_contract_changed,
             'parent_defaults': defaults,
@@ -7193,6 +7241,14 @@ def schedule_block_users(request, block_id):
         'previous_block': (
             {'id': previous.id, 'name': previous.generated_name, 'months': block_month_count(previous)}
             if previous else None
+        ),
+        'planning_source_block': (
+            {
+                'id': planning_previous.id,
+                'name': planning_previous.generated_name,
+                'months': block_month_count(planning_previous),
+            }
+            if planning_previous else None
         ),
         'current_block_months': block_month_count(block),
         'users': user_rows,
