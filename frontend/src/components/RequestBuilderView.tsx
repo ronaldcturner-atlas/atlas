@@ -8,6 +8,7 @@ type RequestType = 'NONE' | StoredRequestType
 type Weight = 'LOW' | 'MEDIUM' | 'HIGH' | 'FIXED'
 type BulkPatternMode = 'SELECTED' | 'EVERY' | 'NTH' | 'REMAINING'
 type CalendarRequestView = 'INDIVIDUAL' | 'BULK' | 'ALL'
+type BulkRecipientTab = 'USERS' | 'GROUPS'
 
 type ScheduleBlockSummary = {
   id: number
@@ -19,6 +20,56 @@ type ScheduleBlockSummary = {
 type PhysicianChoice = {
   id: number
   name: string
+}
+
+type RequestGroupMember = {
+  domain_membership_id: number
+  physician_id: number | null
+  name: string
+  eligible: boolean
+  excluded_reason: string
+}
+
+type RequestGroup = {
+  id: number
+  name: string
+  revision: number
+  needs_attention: boolean
+  member_count: number
+  eligible_member_count: number
+  member_physician_ids: number[]
+  members: RequestGroupMember[]
+}
+
+type BulkPreview = {
+  can_save: boolean
+  selected_groups: Array<{ id: number; name: string; revision: number }>
+  group_revisions: Record<string, number>
+  individual_recipient_count: number
+  recipient_count: number
+  recipients: PhysicianChoice[]
+  excluded_users: Array<{ group_id: number; group_name: string; name: string; reason: string }>
+  dates: string[]
+  date_count: number
+  request_count: number
+  request_scope: RequestScope
+  request_type: StoredRequestType
+  weight: Weight
+  duplicate_requests: Array<{
+    request_id: number
+    physician_id: number
+    physician_name: string
+    date: string
+    request_scope: RequestScope
+    request_type: StoredRequestType
+    weight: Weight
+  }>
+  validation_conflicts: Array<{
+    physician_id: number
+    physician_name: string
+    date: string
+    message: string
+  }>
 }
 
 type RequestItem = {
@@ -63,6 +114,7 @@ type RequestContextResponse = {
   request_policy: RequestPolicy | null
   request_counters: Record<RequestCounterKey, RequestCounter>
   request_totals?: Record<RequestScope, Record<RequestTotalKey, number>>
+  request_groups: RequestGroup[]
 }
 
 type RequestCounterKey = 'HIGH' | 'MEDIUM' | 'LOW' | 'WEEKEND'
@@ -359,6 +411,14 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
   const [bulkPendingDates, setBulkPendingDates] = useState<string[]>([])
   const [patternMode, setPatternMode] = useState<BulkPatternMode>('SELECTED')
   const [calendarRequestView, setCalendarRequestView] = useState<CalendarRequestView>('INDIVIDUAL')
+  const [bulkRecipientTab, setBulkRecipientTab] = useState<BulkRecipientTab>('USERS')
+  const [selectedGroupIds, setSelectedGroupIds] = useState<number[]>([])
+  const [groupSearch, setGroupSearch] = useState('')
+  const [editingGroupId, setEditingGroupId] = useState<number | null>(null)
+  const [groupName, setGroupName] = useState('')
+  const [groupMemberIds, setGroupMemberIds] = useState<number[]>([])
+  const [isGroupSaving, setIsGroupSaving] = useState(false)
+  const [bulkPreview, setBulkPreview] = useState<BulkPreview | null>(null)
 
   const canEdit = block.build_status === 'PRE_BUILD' || block.build_status === 'BUILD'
   const isSchedulerMode = Boolean(contextData?.is_scheduler_or_admin && !forceUserView)
@@ -414,6 +474,8 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
           ? current.filter((physicianId) => availablePhysicianIds.has(physicianId))
           : []
       ))
+      const availableGroupIds = new Set((data.request_groups ?? []).map((group) => group.id))
+      setSelectedGroupIds((current) => current.filter((groupId) => availableGroupIds.has(groupId)))
     } catch (requestError) {
       if (requestId !== contextRequestId.current) {
         return
@@ -434,6 +496,9 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     setBulkSelectedDates([])
     setBulkPendingDates([])
     setCalendarRequestView('INDIVIDUAL')
+    setBulkRecipientTab('USERS')
+    setSelectedGroupIds([])
+    setBulkPreview(null)
     setSelectedScope('USER')
     setNightsOnly(false)
     fetchContext(forceUserView ? physicianId ?? undefined : undefined)
@@ -453,17 +518,32 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     return map
   }, [block.end_date, block.start_date, contextData])
 
+  const combinedBulkPhysicianIds = useMemo(() => {
+    const ids = new Set(bulkPhysicianIds)
+    for (const group of contextData?.request_groups ?? []) {
+      if (!selectedGroupIds.includes(group.id)) {
+        continue
+      }
+      for (const member of group.members) {
+        if (member.eligible && member.physician_id !== null) {
+          ids.add(member.physician_id)
+        }
+      }
+    }
+    return Array.from(ids).sort((left, right) => left - right)
+  }, [bulkPhysicianIds, contextData?.request_groups, selectedGroupIds])
+
   const calendarPhysicianIds = useMemo(() => (
     calendarRequestView === 'ALL'
       ? null
       : new Set(
-        calendarRequestView === 'BULK' && bulkPhysicianIds.length > 0
-          ? bulkPhysicianIds
+        calendarRequestView === 'BULK' && combinedBulkPhysicianIds.length > 0
+          ? combinedBulkPhysicianIds
           : selectedPhysicianId !== null
             ? [selectedPhysicianId]
             : [],
       )
-  ), [bulkPhysicianIds, calendarRequestView, selectedPhysicianId])
+  ), [combinedBulkPhysicianIds, calendarRequestView, selectedPhysicianId])
 
   const visibleRequestsByDate = useMemo(() => {
     const map = new Map<string, RequestItem[]>()
@@ -505,6 +585,25 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     }
     return (contextData?.physicians ?? []).filter((physician) => physician.name.toLowerCase().includes(query))
   }, [contextData?.physicians, physicianSearch])
+
+  const filteredRequestGroups = useMemo(() => {
+    const query = groupSearch.trim().toLowerCase()
+    return (contextData?.request_groups ?? []).filter((group) => (
+      !query || group.name.toLowerCase().includes(query)
+    ))
+  }, [contextData?.request_groups, groupSearch])
+
+  useEffect(() => {
+    setBulkPreview(null)
+  }, [
+    bulkPhysicianIds,
+    selectedGroupIds,
+    bulkSelectedDates,
+    bulkScope,
+    bulkRequestType,
+    bulkWeight,
+    bulkShiftTemplateIds,
+  ])
 
   useEffect(() => {
     if (individualSelectedDates.length > 1) {
@@ -935,31 +1034,108 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     })
   }
 
-  const saveBulkRequests = async () => {
-    if (!bulkPhysicianIds.length) {
-      setError('Select one or more physicians for bulk requests.')
+  const beginCreateGroup = () => {
+    setEditingGroupId(null)
+    setGroupName('')
+    setGroupMemberIds([])
+  }
+
+  const beginEditGroup = (group: RequestGroup) => {
+    setEditingGroupId(group.id)
+    setGroupName(group.name)
+    setGroupMemberIds(group.member_physician_ids)
+  }
+
+  const saveRequestGroup = async () => {
+    if (!groupName.trim()) {
+      setError('Enter a group name.')
       return
+    }
+    if (!groupMemberIds.length) {
+      setError('A request group must have at least one member.')
+      return
+    }
+    try {
+      setIsGroupSaving(true)
+      setError(null)
+      const response = await fetch(
+        editingGroupId === null
+          ? `${API_BASE}/schedule-blocks/${block.id}/request-groups/`
+          : `${API_BASE}/schedule-blocks/${block.id}/request-groups/${editingGroupId}/`,
+        {
+          method: editingGroupId === null ? 'POST' : 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            name: groupName,
+            physician_ids: groupMemberIds,
+            revision: editingGroupId === null
+              ? undefined
+              : contextData.request_groups.find((group) => group.id === editingGroupId)?.revision,
+          }),
+        },
+      )
+      if (!response.ok) {
+        const data = await response.json().catch(() => null)
+        throw new Error(getErrorMessage('Unable to save request group.', data))
+      }
+      await fetchContext(selectedPhysicianId ?? undefined)
+      setEditingGroupId(null)
+      setGroupName('')
+      setGroupMemberIds([])
+    } catch (groupError) {
+      setError(groupError instanceof Error ? groupError.message : 'Unable to save request group.')
+    } finally {
+      setIsGroupSaving(false)
+    }
+  }
+
+  const deleteRequestGroup = async (group: RequestGroup) => {
+    if (!window.confirm(`Delete request group “${group.name}”? Existing requests will not be changed.`)) {
+      return
+    }
+    try {
+      setError(null)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/request-groups/${group.id}/`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ revision: group.revision }),
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => null)
+        throw new Error(getErrorMessage('Unable to delete request group.', data))
+      }
+      setSelectedGroupIds((current) => current.filter((groupId) => groupId !== group.id))
+      if (editingGroupId === group.id) {
+        beginCreateGroup()
+      }
+      await fetchContext(selectedPhysicianId ?? undefined)
+    } catch (groupError) {
+      setError(groupError instanceof Error ? groupError.message : 'Unable to delete request group.')
+    }
+  }
+
+  const validateBulkSelection = () => {
+    if (!bulkPhysicianIds.length && !selectedGroupIds.length) {
+      return 'Select one or more physicians or request groups.'
     }
 
     if (!bulkSelectedDates.length) {
-      setError('Select one or more dates for bulk requests.')
-      return
+      return 'Select one or more dates for bulk requests.'
     }
 
     if (bulkSelectedDates.some((dateValue) => !isDateWithinBlock(dateValue, block.start_date, block.end_date))) {
-      setError('Every selected date must be within this Schedule Block.')
-      return
+      return 'Every selected date must be within this Schedule Block.'
     }
 
     if (bulkRequestType === 'SHIFT_ON' && bulkShiftTemplateIds.length !== 1) {
-      setError('Select exactly one shift that is available on every selected date.')
-      return
+      return 'Select exactly one shift that is available on every selected date.'
     }
 
     if (bulkRequestType === 'SHIFT_OFF') {
       if (!bulkShiftTemplateIds.length) {
-        setError('Select one or more shifts for a Shift Off request.')
-        return
+        return 'Select one or more shifts for a Shift Off request.'
       }
       const selectedTemplates = (contextData?.shift_templates ?? []).filter((template) => (
         bulkShiftTemplateIds.includes(template.id)
@@ -969,9 +1145,30 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
         return !selectedTemplates.some((template) => template.active_days_of_week.includes(dayName))
       })
       if (dateWithoutApplicableShift) {
-        setError(`At least one selected Shift Off shift must occur on ${dateWithoutApplicableShift}.`)
-        return
+        return `At least one selected Shift Off shift must occur on ${dateWithoutApplicableShift}.`
       }
+    }
+    return null
+  }
+
+  const bulkRequestPayload = (previewOnly: boolean, acknowledgeDuplicates = false) => ({
+    physician_ids: bulkPhysicianIds,
+    group_ids: selectedGroupIds,
+    group_revisions: previewOnly ? {} : (bulkPreview?.group_revisions ?? {}),
+    request_scope: bulkScope,
+    request_type: bulkRequestType,
+    weight: bulkWeight,
+    shift_template_ids: bulkShiftTemplateIds,
+    dates: bulkSelectedDates,
+    preview_only: previewOnly,
+    acknowledge_duplicates: acknowledgeDuplicates,
+  })
+
+  const reviewBulkRequests = async () => {
+    const selectionError = validateBulkSelection()
+    if (selectionError) {
+      setError(selectionError)
+      return
     }
 
     try {
@@ -984,26 +1181,45 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
           'Content-Type': 'application/json',
         },
         credentials: 'include',
-        body: JSON.stringify({
-          physician_ids: bulkPhysicianIds,
-          request_scope: bulkScope,
-          request_type: bulkRequestType,
-          weight: bulkWeight,
-          shift_template_ids: bulkShiftTemplateIds,
-          dates: bulkSelectedDates,
-        }),
+        body: JSON.stringify(bulkRequestPayload(true)),
       })
 
       if (!response.ok) {
         const data = await response.json().catch(() => null)
         throw new Error(getErrorMessage('Unable to save bulk requests.', data))
       }
+      setBulkPreview(await response.json())
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Unable to review bulk requests.')
+    } finally {
+      setIsBulkSaving(false)
+    }
+  }
 
+  const confirmBulkRequests = async () => {
+    if (!bulkPreview?.can_save) {
+      setError('Resolve all conflicts before saving.')
+      return
+    }
+    try {
+      setIsBulkSaving(true)
+      setError(null)
+      const response = await fetch(`${API_BASE}/schedule-blocks/${block.id}/requests/bulk/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(bulkRequestPayload(false, true)),
+      })
+      if (!response.ok) {
+        const data = await response.json().catch(() => null)
+        throw new Error(getErrorMessage('Unable to save bulk requests.', data))
+      }
       if (selectedPhysicianId) {
         await fetchContext(selectedPhysicianId)
       }
       setBulkSelectedDates([])
       setBulkPendingDates([])
+      setBulkPreview(null)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Unable to save bulk requests.')
     } finally {
@@ -1061,7 +1277,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
     : filteredPhysicians
   const shiftSelectionMode = requestType === 'SHIFT_ON' ? 'single' : requestType === 'SHIFT_OFF' ? 'multiple' : 'none'
   const bulkShiftSelectionMode = bulkRequestType === 'SHIFT_ON' ? 'single' : bulkRequestType === 'SHIFT_OFF' ? 'multiple' : 'none'
-  const bulkRequestCount = bulkPhysicianIds.length * bulkSelectedDates.length
+  const bulkRequestCount = combinedBulkPhysicianIds.length * bulkSelectedDates.length
 
   return (
     <div className="request-builder-root">
@@ -1437,46 +1653,117 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
             </div>
           </div>
           <div className="request-bulk-grid">
-            <fieldset className="days-fieldset">
-              <legend>
-                <span>Select Users</span>
-                <button
-                  type="button"
-                  className="request-clear-user-selection"
-                  onClick={() => {
-                    setBulkPhysicianIds([])
-                    setBulkPendingDates([])
-                    setCalendarRequestView('INDIVIDUAL')
-                  }}
-                  disabled={!canEdit || bulkPhysicianIds.length === 0}
-                >
-                  Clear Selected Users
+            <div className="request-bulk-recipient-area">
+              <div className="request-recipient-tabs">
+                <button type="button" className={bulkRecipientTab === 'USERS' ? 'active' : ''} onClick={() => setBulkRecipientTab('USERS')}>Select Users</button>
+                <button type="button" className={bulkRecipientTab === 'GROUPS' ? 'active' : ''} onClick={() => setBulkRecipientTab('GROUPS')}>
+                  Group Requests
+                  {(contextData.request_groups ?? []).some((group) => group.needs_attention) && <span className="request-attention-dot" title="A group needs attention" />}
                 </button>
-              </legend>
-              <div className="request-template-list">
-                {contextData.physicians.map((physician) => (
-                  <label key={physician.id} className="day-option">
-                    <input
-                      type="checkbox"
-                      checked={bulkPhysicianIds.includes(physician.id)}
-                      onChange={() => {
-                        setBulkPhysicianIds((current) => {
-                          const next = current.includes(physician.id)
-                            ? current.filter((value) => value !== physician.id)
-                            : [...current, physician.id]
-                          setCalendarRequestView(next.length ? 'BULK' : 'INDIVIDUAL')
-                          if (!next.length) {
-                            setBulkPendingDates([])
-                          }
-                          return next
-                        })
-                      }}
-                    />
-                    <span>{physician.name}</span>
-                  </label>
-                ))}
               </div>
-            </fieldset>
+
+              {bulkRecipientTab === 'USERS' ? (
+                <fieldset className="days-fieldset request-recipient-list">
+                  <legend>
+                    <span>{bulkPhysicianIds.length} individually selected</span>
+                    <button
+                      type="button"
+                      className="request-clear-user-selection"
+                      onClick={() => setBulkPhysicianIds([])}
+                      disabled={!canEdit || bulkPhysicianIds.length === 0}
+                    >
+                      Clear
+                    </button>
+                  </legend>
+                  <div className="request-template-list">
+                    {contextData.physicians.map((physician) => (
+                      <label key={physician.id} className="day-option">
+                        <input
+                          type="checkbox"
+                          checked={bulkPhysicianIds.includes(physician.id)}
+                          onChange={() => {
+                            setBulkPhysicianIds((current) => (
+                              current.includes(physician.id)
+                                ? current.filter((value) => value !== physician.id)
+                                : [...current, physician.id]
+                            ))
+                            setCalendarRequestView('BULK')
+                          }}
+                        />
+                        <span>{physician.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              ) : (
+                <div className="request-group-pane">
+                  {(contextData.request_groups ?? []).some((group) => group.needs_attention) && (
+                    <div className="request-group-attention">A group has no members. Add a member or delete it before using groups.</div>
+                  )}
+                  <div className="request-group-toolbar">
+                    <input value={groupSearch} onChange={(event) => setGroupSearch(event.target.value)} placeholder="Search groups" />
+                    <button type="button" onClick={beginCreateGroup}>New Group</button>
+                  </div>
+                  <div className="request-group-list">
+                    {filteredRequestGroups.map((group) => (
+                      <div key={group.id} className={`request-group-row ${group.needs_attention ? 'needs-attention' : ''}`}>
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={selectedGroupIds.includes(group.id)}
+                            disabled={group.needs_attention || group.member_count === 0}
+                            onChange={() => {
+                              setSelectedGroupIds((current) => (
+                                current.includes(group.id)
+                                  ? current.filter((groupId) => groupId !== group.id)
+                                  : [...current, group.id]
+                              ))
+                              setCalendarRequestView('BULK')
+                            }}
+                          />
+                          <span><strong>{group.name}</strong><small>{group.member_count} member{group.member_count === 1 ? '' : 's'}{group.needs_attention ? ' · Needs attention' : ''}</small></span>
+                        </label>
+                        <div>
+                          <button type="button" onClick={() => beginEditGroup(group)}>Edit</button>
+                          <button type="button" className="danger" onClick={() => deleteRequestGroup(group)}>Delete</button>
+                        </div>
+                      </div>
+                    ))}
+                    {!filteredRequestGroups.length && <div className="empty-state">No saved request groups.</div>}
+                  </div>
+                  <div className="request-group-editor">
+                    <strong>{editingGroupId === null ? 'Create Group' : 'Edit Group'}</strong>
+                    <input value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="Group name" />
+                    <div className="request-group-member-list">
+                      {contextData.physicians.map((physician) => (
+                        <label key={physician.id}>
+                          <input
+                            type="checkbox"
+                            checked={groupMemberIds.includes(physician.id)}
+                            onChange={() => setGroupMemberIds((current) => (
+                              current.includes(physician.id)
+                                ? current.filter((physicianId) => physicianId !== physician.id)
+                                : [...current, physician.id]
+                            ))}
+                          />
+                          {physician.name}
+                        </label>
+                      ))}
+                    </div>
+                    {editingGroupId !== null && (contextData.request_groups.find((group) => group.id === editingGroupId)?.members ?? []).filter((member) => !member.eligible).map((member) => (
+                      <div key={member.domain_membership_id} className="request-group-retained-member">{member.name} retained · {member.excluded_reason}</div>
+                    ))}
+                    <div className="request-group-editor-actions">
+                      <button type="button" onClick={saveRequestGroup} disabled={isGroupSaving}>{isGroupSaving ? 'Saving…' : 'Save Group'}</button>
+                      {(editingGroupId !== null || groupName || groupMemberIds.length > 0) && <button type="button" onClick={beginCreateGroup}>Cancel</button>}
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div className="request-recipient-summary">{combinedBulkPhysicianIds.length} unique recipient{combinedBulkPhysicianIds.length === 1 ? '' : 's'} selected</div>
+            </div>
+
+            <div className="request-bulk-settings-stack">
 
             <label className="facility-field">
               <span>Request Mode</span>
@@ -1563,6 +1850,7 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
             {bulkWeight === 'FIXED' && (
               <div className="request-existing-note">Fixed is a high-penalty preference, not a hard constraint.</div>
             )}
+            </div>
           </div>
 
           <div className="request-pattern-panel">
@@ -1620,13 +1908,52 @@ export default function RequestBuilderView({ block, forceUserView = false, physi
           </div>
 
           <div className="request-bulk-preview">
-            This will create {bulkRequestCount} requests for {bulkPhysicianIds.length} users on {bulkSelectedDates.length} dates.
+            {bulkPreview ? (
+              <>
+                <strong>{bulkPreview.request_count} requests · {bulkPreview.recipient_count} users · {bulkPreview.date_count} dates</strong>
+                <span>{bulkPreview.request_scope === 'ADMIN' ? 'Admin' : 'User'} · {requestTypeLabel(bulkPreview.request_type)} · {requestWeightLabel(bulkPreview.weight)}</span>
+                {!!bulkPreview.selected_groups.length && <span>Groups: {bulkPreview.selected_groups.map((group) => group.name).join(', ')}</span>}
+                {!!bulkPreview.excluded_users.length && (
+                  <div className="request-preview-warning">
+                    <strong>Excluded from this operation</strong>
+                    {bulkPreview.excluded_users.map((item) => <span key={`${item.group_id}-${item.name}`}>{item.name} ({item.group_name}) — {item.reason}</span>)}
+                  </div>
+                )}
+                {!!bulkPreview.duplicate_requests.length && (
+                  <div className="request-preview-warning">
+                    <strong>Same-mode requests will be replaced only after confirmation</strong>
+                    {bulkPreview.duplicate_requests.map((item) => (
+                      <span key={item.request_id}>{item.physician_name} · {item.date} · {requestTypeLabel(item.request_type)} · {requestWeightLabel(item.weight)}</span>
+                    ))}
+                  </div>
+                )}
+                {!!bulkPreview.validation_conflicts.length && (
+                  <div className="request-preview-error">
+                    <strong>Resolve before saving</strong>
+                    {bulkPreview.validation_conflicts.map((item, index) => (
+                      <span key={`${item.physician_id}-${item.date}-${index}`}>{item.physician_name} · {item.date} — {item.message}</span>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>Ready to review {bulkRequestCount} requests for {combinedBulkPhysicianIds.length} users on {bulkSelectedDates.length} dates.</>
+            )}
           </div>
 
           <div className="request-editor-actions">
-            <button type="button" onClick={saveBulkRequests} disabled={!canEdit || isBulkSaving}>
-              {isBulkSaving ? 'Saving Bulk Requests...' : 'Save Bulk Requests'}
-            </button>
+            {bulkPreview ? (
+              <>
+                <button type="button" onClick={() => setBulkPreview(null)} disabled={isBulkSaving}>Back</button>
+                <button type="button" onClick={confirmBulkRequests} disabled={!canEdit || isBulkSaving || !bulkPreview.can_save}>
+                  {isBulkSaving ? 'Saving Bulk Requests...' : bulkPreview.duplicate_requests.length ? 'Confirm and Replace Duplicates' : 'Confirm and Save'}
+                </button>
+              </>
+            ) : (
+              <button type="button" onClick={reviewBulkRequests} disabled={!canEdit || isBulkSaving}>
+                {isBulkSaving ? 'Reviewing...' : 'Review Bulk Requests'}
+              </button>
+            )}
           </div>
         </section>
       )}

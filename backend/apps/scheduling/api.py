@@ -49,6 +49,10 @@ from .models import (
     ScheduleCommentSeriesException,
     ScheduleDateComment,
     ScheduleRequest,
+    ScheduleRequestBulkOperation,
+    ScheduleRequestBulkOperationItem,
+    ScheduleRequestGroup,
+    ScheduleRequestGroupMember,
     ScheduleShiftAssignment,
     ScheduleShiftInstance,
     ScheduleVersion,
@@ -2942,6 +2946,101 @@ def _working_request_physicians(block):
     return physicians.distinct().order_by('user__last_name', 'user__first_name')
 
 
+def _normalize_request_group_name(value):
+    display_name = ' '.join(str(value or '').split())
+    return display_name, display_name.casefold()
+
+
+def _request_group_payload(group, block):
+    eligible_ids = set(_working_request_physicians(block).values_list('id', flat=True))
+    members = []
+    for link in group.memberships.select_related(
+        'domain_membership__user__physician',
+        'domain_membership__role_template',
+    ).all():
+        membership = link.domain_membership
+        physician = getattr(membership.user, 'physician', None)
+        physician_id = physician.id if physician else None
+        eligible = physician_id in eligible_ids
+        if physician is None:
+            reason = 'No clinician profile'
+        elif not membership.active:
+            reason = 'Domain access inactive'
+        elif not membership.clinically_active:
+            reason = 'Not clinically active'
+        elif (
+            membership.role == DomainMembership.Role.VIEW_ONLY
+            or getattr(membership.role_template, 'system_key', '') == 'view_only'
+        ):
+            reason = 'View only'
+        elif not physician.active:
+            reason = 'User inactive'
+        else:
+            reason = ''
+        name = (
+            physician.display_name
+            if physician and physician.display_name
+            else membership.user.get_full_name()
+            or membership.user.username
+        )
+        members.append({
+            'domain_membership_id': membership.id,
+            'physician_id': physician_id,
+            'name': name,
+            'eligible': eligible,
+            'excluded_reason': reason,
+        })
+    members.sort(key=lambda item: item['name'].casefold())
+    return {
+        'id': group.id,
+        'name': group.name,
+        'revision': group.revision,
+        'needs_attention': group.needs_attention or not members,
+        'member_count': len(members),
+        'eligible_member_count': sum(1 for member in members if member['eligible']),
+        'member_physician_ids': [
+            member['physician_id'] for member in members if member['physician_id'] is not None
+        ],
+        'members': members,
+    }
+
+
+def _request_groups_for_block(block):
+    return list(
+        ScheduleRequestGroup.objects.filter(domain=block.domain)
+        .prefetch_related(
+            'memberships__domain_membership__user__physician',
+            'memberships__domain_membership__role_template',
+        )
+        .order_by('-needs_attention', 'normalized_name', 'id')
+    )
+
+
+def _request_group_memberships(block, physician_ids):
+    eligible_ids = set(_working_request_physicians(block).values_list('id', flat=True))
+    requested_ids = {int(value) for value in physician_ids}
+    if not requested_ids or not requested_ids.issubset(eligible_ids):
+        return None
+    memberships = list(
+        DomainMembership.objects.filter(
+            domain=block.domain,
+            user__physician__id__in=requested_ids,
+            active=True,
+            clinically_active=True,
+        )
+        .exclude(role=DomainMembership.Role.VIEW_ONLY)
+        .exclude(role_template__system_key='view_only')
+        .select_related('user__physician')
+    )
+    return memberships if len(memberships) == len(requested_ids) else None
+
+
+def _mark_request_block_scores_stale(block):
+    versions = ScheduleVersion.objects.filter(schedule_block=block)
+    versions.update(score_is_stale=True)
+    OptimizerRun.objects.filter(schedule_version__in=versions).update(score_is_stale=True)
+
+
 def _get_request_contract(physician, domain=None):
     """Return the single active contract when Request Builder can resolve one unambiguously."""
     assignments_query = ContractUserAssignment.objects.filter(
@@ -3273,6 +3372,176 @@ def _validate_request_payload(
     return None
 
 
+@api_view(['GET', 'POST'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_request_groups(request, block_id):
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    if not _can_manage_requests(request.user, block.domain):
+        return Response(
+            {'detail': 'Administrative request permission is required.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if request.method == 'GET':
+        return Response([
+            _request_group_payload(group, block)
+            for group in _request_groups_for_block(block)
+        ])
+
+    if not _editable_request_status(block):
+        return Response(
+            {'detail': 'Request groups can only be changed from a writable Schedule Block.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    name, normalized_name = _normalize_request_group_name(request.data.get('name'))
+    if not name:
+        return Response({'name': 'Group name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if len(name) > 120 or len(normalized_name) > 120:
+        return Response({'name': 'Group name must be 120 characters or fewer.'}, status=status.HTTP_400_BAD_REQUEST)
+    raw_physician_ids = request.data.get('physician_ids') or []
+    if not isinstance(raw_physician_ids, list) or not raw_physician_ids:
+        return Response(
+            {'physician_ids': 'A request group must have at least one member.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        physician_ids = sorted({int(value) for value in raw_physician_ids})
+    except (TypeError, ValueError):
+        return Response({'physician_ids': 'Member ids must be integers.'}, status=status.HTTP_400_BAD_REQUEST)
+    memberships = _request_group_memberships(block, physician_ids)
+    if memberships is None:
+        return Response(
+            {'physician_ids': 'Every member must currently be eligible for requests in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if ScheduleRequestGroup.objects.filter(
+        domain=block.domain,
+        normalized_name=normalized_name,
+    ).exists():
+        return Response(
+            {'name': 'A request group with this name already exists in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        group = ScheduleRequestGroup.objects.create(
+            domain=block.domain,
+            name=name,
+            normalized_name=normalized_name,
+            created_by=request.user,
+            updated_by=request.user,
+        )
+        ScheduleRequestGroupMember.objects.bulk_create([
+            ScheduleRequestGroupMember(group=group, domain_membership=membership)
+            for membership in memberships
+        ])
+    return Response(_request_group_payload(group, block), status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH', 'DELETE'])
+@authentication_classes([CsrfProtectedSessionAuthentication])
+@permission_classes([IsAuthenticated])
+def schedule_block_request_group_detail(request, block_id, group_id):
+    block = get_object_or_404(ScheduleBlock, id=block_id)
+    if not _can_manage_requests(request.user, block.domain):
+        return Response(
+            {'detail': 'Administrative request permission is required.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not _editable_request_status(block):
+        return Response(
+            {'detail': 'Request groups can only be changed from a writable Schedule Block.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    try:
+        expected_revision = int(request.data.get('revision'))
+    except (TypeError, ValueError):
+        return Response(
+            {'revision': 'The current group revision is required.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    group = get_object_or_404(ScheduleRequestGroup, id=group_id, domain=block.domain)
+    if request.method == 'DELETE':
+        with transaction.atomic():
+            group = ScheduleRequestGroup.objects.select_for_update().get(id=group.id)
+            if group.revision != expected_revision:
+                return Response(
+                    {'detail': 'This group changed after it was opened. Refresh before deleting it.'},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            group.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    name, normalized_name = _normalize_request_group_name(request.data.get('name', group.name))
+    if not name:
+        return Response({'name': 'Group name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if len(name) > 120 or len(normalized_name) > 120:
+        return Response({'name': 'Group name must be 120 characters or fewer.'}, status=status.HTTP_400_BAD_REQUEST)
+    raw_physician_ids = request.data.get('physician_ids')
+    if raw_physician_ids is None:
+        physician_ids = list(
+            group.memberships.values_list('domain_membership__user__physician__id', flat=True)
+        )
+    else:
+        if not isinstance(raw_physician_ids, list) or not raw_physician_ids:
+            return Response(
+                {'physician_ids': 'A request group must have at least one member.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            physician_ids = sorted({int(value) for value in raw_physician_ids})
+        except (TypeError, ValueError):
+            return Response({'physician_ids': 'Member ids must be integers.'}, status=status.HTTP_400_BAD_REQUEST)
+    current_links = list(
+        group.memberships.select_related('domain_membership__user__physician')
+    )
+    current_memberships_by_physician = {
+        link.domain_membership.user.physician.id: link.domain_membership
+        for link in current_links
+        if hasattr(link.domain_membership.user, 'physician')
+    }
+    retained_ids = set(physician_ids).intersection(current_memberships_by_physician)
+    new_ids = set(physician_ids).difference(retained_ids)
+    new_memberships = _request_group_memberships(block, new_ids) if new_ids else []
+    if new_memberships is None:
+        return Response(
+            {'physician_ids': 'New members must currently be eligible for requests in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    memberships = [current_memberships_by_physician[physician_id] for physician_id in retained_ids]
+    memberships.extend(new_memberships)
+    if ScheduleRequestGroup.objects.filter(
+        domain=block.domain,
+        normalized_name=normalized_name,
+    ).exclude(id=group.id).exists():
+        return Response(
+            {'name': 'A request group with this name already exists in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    with transaction.atomic():
+        group = ScheduleRequestGroup.objects.select_for_update().get(id=group.id)
+        if group.revision != expected_revision:
+            return Response(
+                {'detail': 'This group changed after it was opened. Refresh and try again.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        next_revision = group.revision + 1
+        group.memberships.all().delete()
+        ScheduleRequestGroupMember.objects.bulk_create([
+            ScheduleRequestGroupMember(group=group, domain_membership=membership)
+            for membership in memberships
+        ])
+        group.name = name
+        group.normalized_name = normalized_name
+        group.revision = next_revision
+        group.needs_attention = False
+        group.updated_by = request.user
+        group.save(update_fields=[
+            'name', 'normalized_name', 'revision', 'needs_attention',
+            'updated_by', 'updated_at',
+        ])
+    return Response(_request_group_payload(group, block))
+
+
 @api_view(['GET'])
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
@@ -3408,6 +3677,13 @@ def schedule_block_requests_context(request, block_id):
             'request_policy': policy,
             'request_counters': counters,
             'request_totals': _build_schedule_block_request_totals(block, visible_requests),
+            'request_groups': (
+                [
+                    _request_group_payload(group, block)
+                    for group in _request_groups_for_block(block)
+                ]
+                if can_manage else []
+            ),
         }
     )
 
@@ -3497,6 +3773,8 @@ def schedule_block_request_upsert(request, block_id):
     request_type = str(request.data.get('request_type') or '').upper()
     if request_type == 'NONE':
         deleted, _ = ScheduleRequest.objects.filter(id=getattr(existing_request, 'id', None)).delete()
+        if deleted:
+            _mark_request_block_scores_stale(block)
         return Response({'deleted': bool(deleted)})
 
     if not can_manage and request_type not in policy['allowed_request_types']:
@@ -3592,6 +3870,7 @@ def schedule_block_request_upsert(request, block_id):
     else:
         schedule_request.shift_templates.clear()
 
+    _mark_request_block_scores_stale(block)
     return Response(ScheduleRequestSerializer(schedule_request).data)
 
 
@@ -3654,6 +3933,7 @@ def schedule_block_request_detail(request, block_id, request_id):
         )
 
     schedule_request.delete()
+    _mark_request_block_scores_stale(block)
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -3697,12 +3977,15 @@ def schedule_block_clear_requests(request, block_id):
             status=status.HTTP_403_FORBIDDEN,
         )
     deleted_count, _ = requests_to_delete.delete()
+    if deleted_count:
+        _mark_request_block_scores_stale(block)
     return Response({'deleted_count': deleted_count, 'request_scope': request_scope})
 
 
 @api_view(['POST'])
 @authentication_classes([CsrfProtectedSessionAuthentication])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def schedule_block_bulk_requests(request, block_id):
     block = get_object_or_404(ScheduleBlock, id=block_id)
     if not _editable_request_status(block):
@@ -3749,30 +4032,128 @@ def schedule_block_bulk_requests(request, block_id):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+    preview_only = bool(request.data.get('preview_only', False))
+    acknowledge_duplicates = bool(request.data.get('acknowledge_duplicates', False))
+
     physician_ids = request.data.get('physician_ids') or []
-    if not isinstance(physician_ids, list) or not physician_ids:
-        return Response({'physician_ids': 'Select one or more physicians.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not isinstance(physician_ids, list):
+        return Response({'physician_ids': 'physician_ids must be an array.'}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        physician_ids = sorted({int(physician_id) for physician_id in physician_ids})
+        individual_physician_ids = sorted({int(physician_id) for physician_id in physician_ids})
     except (TypeError, ValueError):
         return Response({'physician_ids': 'physician_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    raw_group_ids = request.data.get('group_ids') or []
+    if not isinstance(raw_group_ids, list):
+        return Response({'group_ids': 'group_ids must be an array.'}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        group_ids = sorted({int(group_id) for group_id in raw_group_ids})
+    except (TypeError, ValueError):
+        return Response({'group_ids': 'group_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
+    if group_ids and not can_manage:
+        return Response(
+            {'detail': 'Only admin/scheduler users can use saved request groups.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if not individual_physician_ids and not group_ids:
+        return Response(
+            {'physician_ids': 'Select one or more physicians or request groups.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    group_query = ScheduleRequestGroup.objects.filter(
+        domain=block.domain,
+        id__in=group_ids,
+    ).prefetch_related(
+        'memberships__domain_membership__user__physician',
+        'memberships__domain_membership__role_template',
+    )
+    if not preview_only:
+        group_query = group_query.select_for_update()
+    selected_groups = list(group_query.order_by('normalized_name', 'id'))
+    if len(selected_groups) != len(group_ids):
+        return Response(
+            {'group_ids': 'One or more selected request groups are unavailable in this Domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    attention_groups = [group.name for group in selected_groups if group.needs_attention or not group.memberships.exists()]
+    if attention_groups:
+        return Response(
+            {'group_ids': f'Fix or delete these empty groups before continuing: {", ".join(attention_groups)}.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    expected_revisions = request.data.get('group_revisions') or {}
+    if not isinstance(expected_revisions, dict):
+        return Response({'group_revisions': 'group_revisions must be an object.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not preview_only:
+        changed_groups = [
+            group.name for group in selected_groups
+            if str(expected_revisions.get(str(group.id), expected_revisions.get(group.id, ''))) != str(group.revision)
+        ]
+        if changed_groups:
+            return Response(
+                {
+                    'detail': 'One or more selected groups changed after review. Refresh and review again.',
+                    'stale_groups': changed_groups,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+    eligible_physicians = list(_working_request_physicians(block))
+    eligible_by_id = {physician.id: physician for physician in eligible_physicians}
+    invalid_individual_ids = [
+        physician_id for physician_id in individual_physician_ids
+        if physician_id not in eligible_by_id
+    ]
     if not can_manage:
         if self_physician is None:
             return Response({'detail': 'Authenticated user is not linked to a physician profile.'}, status=status.HTTP_403_FORBIDDEN)
+        if individual_physician_ids != [self_physician.id] or group_ids:
+            return Response(
+                {'detail': 'You do not have permission to modify requests for another user.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+    if invalid_individual_ids:
+        return Response(
+            {'physician_ids': 'One or more individually selected users do not have working access to this Schedule Block domain.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    expanded_physician_ids = set(individual_physician_ids)
+    excluded_users = []
+    excluded_keys = set()
+    for group in selected_groups:
+        payload = _request_group_payload(group, block)
+        for member in payload['members']:
+            physician_id = member['physician_id']
+            if member['eligible'] and physician_id is not None:
+                expanded_physician_ids.add(physician_id)
+                continue
+            key = (group.id, member['domain_membership_id'])
+            if key not in excluded_keys:
+                excluded_keys.add(key)
+                excluded_users.append({
+                    'group_id': group.id,
+                    'group_name': group.name,
+                    'name': member['name'],
+                    'reason': member['excluded_reason'] or 'Not currently eligible',
+                })
+    physician_ids = sorted(expanded_physician_ids)
+    if not physician_ids:
+        return Response(
+            {'physician_ids': 'No eligible recipients remain in the current selection.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not can_manage:
         if physician_ids != [self_physician.id]:
             return Response(
                 {'detail': 'You do not have permission to modify requests for another user.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-    physicians = list(_working_request_physicians(block).filter(id__in=physician_ids))
-    if len(physicians) != len(physician_ids):
-        return Response(
-            {'physician_ids': 'One or more selected users do not have working access to this Schedule Block domain.'},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
+    physicians = [eligible_by_id[physician_id] for physician_id in physician_ids]
 
     raw_dates = request.data.get('dates') or []
     if not isinstance(raw_dates, list) or not raw_dates:
@@ -3813,7 +4194,30 @@ def schedule_block_bulk_requests(request, block_id):
     except (TypeError, ValueError):
         return Response({'shift_template_ids': 'shift_template_ids must contain only integer ids.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    existing_query = ScheduleRequest.objects.filter(
+        schedule_block=block,
+        physician_id__in=physician_ids,
+        date__in=parsed_dates,
+        request_scope=request_scope,
+    ).select_related('physician__user')
+    if not preview_only:
+        existing_query = existing_query.select_for_update()
+    existing_requests = list(existing_query)
+    duplicate_requests = [
+        {
+            'request_id': item.id,
+            'physician_id': item.physician_id,
+            'physician_name': _serialize_physician_choice(item.physician)['name'],
+            'date': item.date.isoformat(),
+            'request_scope': item.request_scope,
+            'request_type': item.request_type,
+            'weight': item.weight,
+        }
+        for item in existing_requests
+    ]
+
     plans = {}
+    validation_conflicts = []
     for physician in physicians:
         policy = _get_request_policy(physician, can_manage=can_manage, domain=block.domain)
         if not can_manage and request_type not in policy['allowed_request_types']:
@@ -3860,9 +4264,13 @@ def schedule_block_bulk_requests(request, block_id):
                 eligible_template_ids,
             )
             if payload_error:
-                payload_error['date'] = parsed_date.isoformat()
-                payload_error['physician_id'] = physician.id
-                return Response(payload_error, status=status.HTTP_400_BAD_REQUEST)
+                validation_conflicts.append({
+                    'physician_id': physician.id,
+                    'physician_name': _serialize_physician_choice(physician)['name'],
+                    'date': parsed_date.isoformat(),
+                    'message': next(iter(payload_error.values())),
+                })
+                continue
 
             applicable_selected_templates = [
                 template for template in available_templates if template.id in shift_template_ids
@@ -3885,46 +4293,120 @@ def schedule_block_bulk_requests(request, block_id):
                 counter = projected_counters[key]
                 if not counter['unlimited'] and counter['limit'] is not None:
                     if counter['used'] + increment > counter['limit']:
-                        return Response(
-                            {
-                                'request_limit': (
-                                    f'{key.title()} request limit of {counter["limit"]} '
-                                    f'has been reached for {_serialize_physician_choice(physician)["name"]}.'
-                                ),
-                                'physician_id': physician.id,
-                                'date': parsed_date.isoformat(),
-                            },
-                            status=status.HTTP_400_BAD_REQUEST,
-                        )
+                        validation_conflicts.append({
+                            'physician_id': physician.id,
+                            'physician_name': _serialize_physician_choice(physician)['name'],
+                            'date': parsed_date.isoformat(),
+                            'message': f'{key.title()} request limit of {counter["limit"]} would be exceeded.',
+                        })
                 counter['used'] += increment
 
-    saved_count = 0
-    with transaction.atomic():
-        for physician in physicians:
-            for parsed_date in parsed_dates:
-                schedule_request, _ = ScheduleRequest.objects.get_or_create(
-                    schedule_block=block,
-                    physician=physician,
-                    date=parsed_date,
-                    request_scope=request_scope,
-                    defaults={
-                        'request_type': request_type,
-                        'weight': weight,
-                        'created_by': request.user,
-                    },
-                )
-                schedule_request.request_type = request_type
-                schedule_request.weight = weight
-                schedule_request.created_by = request.user
-                schedule_request.save()
-                selected_templates = plans[(physician.id, parsed_date)]
-                if selected_templates:
-                    schedule_request.shift_templates.set(selected_templates)
-                else:
-                    schedule_request.shift_templates.clear()
-                saved_count += 1
+    preview_payload = {
+        'can_save': not validation_conflicts,
+        'selected_groups': [
+            {'id': group.id, 'name': group.name, 'revision': group.revision}
+            for group in selected_groups
+        ],
+        'group_revisions': {str(group.id): group.revision for group in selected_groups},
+        'individual_recipient_count': len(individual_physician_ids),
+        'recipient_count': len(physicians),
+        'recipients': [_serialize_physician_choice(physician) for physician in physicians],
+        'excluded_users': excluded_users,
+        'dates': [parsed_date.isoformat() for parsed_date in parsed_dates],
+        'date_count': len(parsed_dates),
+        'request_count': len(physicians) * len(parsed_dates),
+        'request_scope': request_scope,
+        'request_type': request_type,
+        'weight': weight,
+        'duplicate_requests': duplicate_requests,
+        'validation_conflicts': validation_conflicts,
+    }
+    if preview_only:
+        return Response(preview_payload)
+    if validation_conflicts:
+        conflict_response = {
+            'detail': 'Resolve all request conflicts before saving.',
+            **preview_payload,
+        }
+        request_limit_conflict = next(
+            (
+                conflict['message']
+                for conflict in validation_conflicts
+                if 'request limit' in conflict['message'].lower()
+            ),
+            None,
+        )
+        if request_limit_conflict:
+            conflict_response['request_limit'] = request_limit_conflict
+        return Response(
+            conflict_response,
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if duplicate_requests and can_manage and not acknowledge_duplicates:
+        return Response(
+            {
+                'detail': 'Same-mode requests already exist. Review and explicitly confirm before replacing them.',
+                'requires_duplicate_confirmation': True,
+                **preview_payload,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
-    return Response({'saved_count': saved_count, 'request_scope': request_scope})
+    saved_count = 0
+    operation = None
+    if selected_groups:
+        operation = ScheduleRequestBulkOperation.objects.create(
+            schedule_block=block,
+            request_scope=request_scope,
+            request_type=request_type,
+            weight=weight,
+            group_snapshot=preview_payload['selected_groups'],
+            recipient_snapshot=preview_payload['recipients'],
+            dates=preview_payload['dates'],
+            created_by=request.user,
+            expires_after=max(parsed_dates),
+        )
+    operation_items = []
+    for physician in physicians:
+        for parsed_date in parsed_dates:
+            schedule_request, _ = ScheduleRequest.objects.get_or_create(
+                schedule_block=block,
+                physician=physician,
+                date=parsed_date,
+                request_scope=request_scope,
+                defaults={
+                    'request_type': request_type,
+                    'weight': weight,
+                    'created_by': request.user,
+                },
+            )
+            schedule_request.request_type = request_type
+            schedule_request.weight = weight
+            schedule_request.created_by = request.user
+            schedule_request.save()
+            selected_templates = plans[(physician.id, parsed_date)]
+            if selected_templates:
+                schedule_request.shift_templates.set(selected_templates)
+            else:
+                schedule_request.shift_templates.clear()
+            if operation is not None:
+                operation_items.append(ScheduleRequestBulkOperationItem(
+                    operation=operation,
+                    schedule_request=schedule_request,
+                    physician=physician,
+                    physician_name=_serialize_physician_choice(physician)['name'],
+                    date=parsed_date,
+                ))
+            saved_count += 1
+    if operation_items:
+        ScheduleRequestBulkOperationItem.objects.bulk_create(operation_items)
+    _mark_request_block_scores_stale(block)
+
+    return Response({
+        'saved_count': saved_count,
+        'request_scope': request_scope,
+        'audit_operation_id': operation.id if operation else None,
+    })
 
 
 def _build_workspace_forbidden_response():

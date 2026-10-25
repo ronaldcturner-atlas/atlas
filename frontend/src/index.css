@@ -416,7 +416,34 @@ select option:checked{
 .request-selected-date-summary{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
 .request-selected-date-summary span{padding:3px 6px;border:1px solid rgba(165,180,252,.5);border-radius:999px;background:rgba(79,70,229,.18);color:#e0e7ff;font-size:10px;font-weight:650}
 
-.request-bulk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}
+.request-bulk-grid{display:grid;grid-template-columns:minmax(420px,1fr) minmax(210px,280px);gap:12px;align-items:start}
+.request-bulk-recipient-area{min-width:0}
+.request-recipient-tabs{display:flex;gap:6px;margin-bottom:7px}
+.request-recipient-tabs button{position:relative;padding:6px 10px;border:1px solid rgba(255,255,255,.16);border-radius:7px;background:transparent;color:inherit;cursor:pointer}
+.request-recipient-tabs button.active{border-color:#818cf8;background:#4f46e5;color:#fff}
+.request-attention-dot{display:inline-block;width:7px;height:7px;margin-left:6px;border-radius:50%;background:#dc2626}
+.request-recipient-list .request-template-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));max-height:190px;overflow:auto}
+.request-recipient-summary{margin-top:6px;color:var(--muted);font-size:12px}
+.request-bulk-settings-stack{display:grid;gap:8px;align-content:start}
+.request-bulk-settings-stack .days-fieldset{margin:0}
+.request-group-pane{display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,1fr);gap:8px;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:8px}
+.request-group-attention{grid-column:1/-1;padding:7px 9px;border:1px solid #dc2626;border-radius:6px;background:#7f1d1d;color:#fee2e2;font-size:12px}
+.request-group-toolbar{display:flex;gap:6px;grid-column:1/-1}
+.request-group-toolbar input{min-width:0;flex:1}
+.request-group-toolbar button,.request-group-row button,.request-group-editor-actions button{padding:5px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.16);background:transparent;color:inherit;cursor:pointer}
+.request-group-list{display:grid;gap:5px;align-content:start;max-height:230px;overflow:auto}
+.request-group-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 7px;border:1px solid rgba(255,255,255,.1);border-radius:6px}
+.request-group-row.needs-attention{border-color:#dc2626}
+.request-group-row>label{display:flex;align-items:center;gap:7px;min-width:0}
+.request-group-row>label span{display:grid;min-width:0}
+.request-group-row small{color:var(--muted);font-size:11px}
+.request-group-row>div{display:flex;gap:4px}
+.request-group-row button.danger{border-color:#ef4444;color:#fecaca}
+.request-group-editor{display:grid;gap:6px;align-content:start;padding:7px;border:1px solid rgba(255,255,255,.1);border-radius:6px}
+.request-group-member-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px;max-height:145px;overflow:auto;font-size:12px}
+.request-group-member-list label{display:flex;align-items:center;gap:5px}
+.request-group-retained-member{font-size:11px;color:#b45309}
+.request-group-editor-actions{display:flex;gap:6px}
 .request-bulk-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .request-bulk-header h3{margin:0}
 .request-clear-actions{display:flex;gap:8px;flex-wrap:wrap}
@@ -432,7 +459,11 @@ select option:checked{
 .request-clear-user-selection:disabled{opacity:0.45;cursor:not-allowed}
 .request-bulk-selected-dates .request-selected-date-chip{background:#1d4ed8;border-color:#60a5fa;color:#fff;font-weight:700;box-shadow:0 0 0 1px rgba(147,197,253,0.18)}
 .request-bulk-selected-dates .request-selected-date-chip:hover{background:#2563eb;border-color:#bfdbfe;color:#fff}
-.request-bulk-preview{margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(79,70,229,0.14);color:#c7d2fe;font-size:13px}
+.request-bulk-preview{display:grid;gap:4px;margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(79,70,229,0.14);color:#c7d2fe;font-size:13px}
+.request-preview-warning,.request-preview-error{display:grid;gap:2px;margin-top:5px;padding:7px;border-radius:6px}
+.request-preview-warning{border:1px solid #d97706;background:#fffbeb;color:#92400e}
+.request-preview-error{border:1px solid #dc2626;background:#fef2f2;color:#991b1b}
+@media(max-width:900px){.request-bulk-grid{grid-template-columns:1fr}.request-group-pane{grid-template-columns:1fr}.request-group-toolbar,.request-group-attention{grid-column:auto}}
 
 @media (max-width: 1100px){
   .request-builder-layout{grid-template-columns:1fr}
@@ -1613,6 +1644,17 @@ select option {
 .schedule-light-theme .schedule-block-modal-tabs button,
 .schedule-light-theme .user-self-actions>button{border-color:#cbd5e1;background:#fff;color:#334155}
 .schedule-light-theme .contract-modal .schedule-block-modal-tabs button.active{border-color:#4f46e5;background:#4f46e5;color:#fff;box-shadow:0 1px 3px rgba(30,41,59,.2)}
+.schedule-light-theme .request-recipient-tabs button,
+.schedule-light-theme .request-group-pane,
+.schedule-light-theme .request-group-row,
+.schedule-light-theme .request-group-editor,
+.schedule-light-theme .request-group-toolbar button,
+.schedule-light-theme .request-group-row button,
+.schedule-light-theme .request-group-editor-actions button{border-color:#cbd5e1;background:#fff;color:#334155}
+.schedule-light-theme .request-recipient-tabs button.active{border-color:#4f46e5;background:#4f46e5;color:#fff}
+.schedule-light-theme .request-group-row.needs-attention{border-color:#dc2626}
+.schedule-light-theme .request-group-row button.danger{border-color:#dc2626;color:#991b1b}
+.schedule-light-theme .request-group-attention{border-color:#dc2626;background:#fef2f2;color:#991b1b}
 .schedule-light-theme .role-permission-group-header button:hover,
 .schedule-light-theme .facility-actions button:hover,
 .schedule-light-theme .build-calendar-toolbar button:hover,

@@ -28,6 +28,8 @@ from .models import (
     OptimizerRun,
     ScheduleBlock,
     ScheduleRequest,
+    ScheduleRequestBulkOperation,
+    ScheduleRequestGroup,
     ScheduleShiftAssignment,
     ScheduleShiftInstance,
     ScheduleVersion,
@@ -2478,10 +2480,22 @@ class ScheduleRequestApiTests(TestCase):
             },
             format='json',
         )
+        confirmed_admin_response = self.client.post(
+            bulk_url,
+            data={
+                **common_payload,
+                'request_scope': 'ADMIN',
+                'weight': 'FIXED',
+                'acknowledge_duplicates': True,
+            },
+            format='json',
+        )
 
         self.assertEqual(user_response.status_code, 200)
         self.assertEqual(admin_response.status_code, 200)
-        self.assertEqual(repeated_admin_response.status_code, 200)
+        self.assertEqual(repeated_admin_response.status_code, 409)
+        self.assertTrue(repeated_admin_response.json()['requires_duplicate_confirmation'])
+        self.assertEqual(confirmed_admin_response.status_code, 200)
         self.assertEqual(
             ScheduleRequest.objects.filter(
                 schedule_block=self.block,
@@ -2562,6 +2576,199 @@ class ScheduleRequestApiTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+    def test_scheduler_can_create_and_reuse_domain_request_group(self):
+        self.client.force_authenticate(user=self.scheduler_user)
+        create_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/request-groups/',
+            data={'name': ' Medical Directors ', 'physician_ids': [self.physician.id]},
+            format='json',
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+        group_payload = create_response.json()
+        self.assertEqual(group_payload['name'], 'Medical Directors')
+        self.assertEqual(group_payload['member_count'], 1)
+        self.assertFalse(group_payload['needs_attention'])
+
+        context_response = self.client.get(
+            f'/api/schedule-blocks/{self.block.id}/requests/context/'
+        )
+        self.assertEqual(context_response.status_code, 200)
+        self.assertEqual(context_response.json()['request_groups'][0]['id'], group_payload['id'])
+
+    def test_request_group_edit_clears_transient_attention_and_rejects_stale_revision(self):
+        self.client.force_authenticate(user=self.scheduler_user)
+        create_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/request-groups/',
+            data={'name': 'Medical Directors', 'physician_ids': [self.physician.id]},
+            format='json',
+        )
+        group_payload = create_response.json()
+        detail_url = (
+            f'/api/schedule-blocks/{self.block.id}/request-groups/{group_payload["id"]}/'
+        )
+
+        update_response = self.client.patch(
+            detail_url,
+            data={
+                'name': 'Group Admin',
+                'physician_ids': [self.physician.id],
+                'revision': group_payload['revision'],
+            },
+            format='json',
+        )
+        self.assertEqual(update_response.status_code, 200)
+        updated_payload = update_response.json()
+        self.assertEqual(updated_payload['name'], 'Group Admin')
+        self.assertFalse(updated_payload['needs_attention'])
+        self.assertEqual(updated_payload['revision'], group_payload['revision'] + 1)
+
+        stale_response = self.client.patch(
+            detail_url,
+            data={
+                'name': 'Stale Change',
+                'physician_ids': [self.physician.id],
+                'revision': group_payload['revision'],
+            },
+            format='json',
+        )
+        self.assertEqual(stale_response.status_code, 409)
+
+    def test_group_bulk_preview_deduplicates_individual_recipient_and_saves_audit(self):
+        self.client.force_authenticate(user=self.scheduler_user)
+        group_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/request-groups/',
+            data={'name': 'Group Admin', 'physician_ids': [self.physician.id]},
+            format='json',
+        )
+        group = group_response.json()
+        payload = {
+            'physician_ids': [self.physician.id],
+            'group_ids': [group['id']],
+            'dates': ['2026-07-01', '2026-07-02'],
+            'request_scope': 'ADMIN',
+            'request_type': 'DAY_OFF',
+            'weight': 'MEDIUM',
+            'shift_template_ids': [],
+        }
+
+        preview_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={**payload, 'preview_only': True},
+            format='json',
+        )
+        self.assertEqual(preview_response.status_code, 200)
+        preview = preview_response.json()
+        self.assertEqual(preview['recipient_count'], 1)
+        self.assertEqual(preview['request_count'], 2)
+
+        save_response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/bulk/',
+            data={
+                **payload,
+                'group_revisions': preview['group_revisions'],
+                'acknowledge_duplicates': True,
+            },
+            format='json',
+        )
+        self.assertEqual(save_response.status_code, 200)
+        self.assertEqual(ScheduleRequest.objects.filter(schedule_block=self.block).count(), 2)
+        operation = ScheduleRequestBulkOperation.objects.get(id=save_response.json()['audit_operation_id'])
+        self.assertEqual(operation.items.count(), 2)
+        self.assertEqual(operation.group_snapshot[0]['name'], 'Group Admin')
+
+    def test_same_scope_duplicate_requires_confirmation_but_other_scope_is_additive(self):
+        self._assign_contract({'allow_day_off': True, 'medium_request_limit': '5'})
+        ScheduleRequest.objects.create(
+            schedule_block=self.block,
+            physician=self.physician,
+            date=date(2026, 7, 1),
+            request_scope=ScheduleRequest.RequestScope.USER,
+            request_type=ScheduleRequest.RequestType.DAY_OFF,
+            weight=ScheduleRequest.Weight.MEDIUM,
+            created_by=self.scheduler_user,
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        url = f'/api/schedule-blocks/{self.block.id}/requests/bulk/'
+        base = {
+            'physician_ids': [self.physician.id],
+            'dates': ['2026-07-01'],
+            'request_type': 'DAY_ON',
+            'weight': 'MEDIUM',
+            'shift_template_ids': [],
+        }
+
+        user_response = self.client.post(
+            url, data={**base, 'request_scope': 'USER'}, format='json',
+        )
+        self.assertEqual(user_response.status_code, 409)
+        self.assertTrue(user_response.json()['requires_duplicate_confirmation'])
+
+        admin_response = self.client.post(
+            url, data={**base, 'request_scope': 'ADMIN'}, format='json',
+        )
+        self.assertEqual(admin_response.status_code, 200)
+        self.assertEqual(
+            ScheduleRequest.objects.filter(
+                schedule_block=self.block,
+                physician=self.physician,
+                date=date(2026, 7, 1),
+            ).count(),
+            2,
+        )
+
+    def test_domain_removal_marks_newly_empty_group_for_attention(self):
+        self.client.force_authenticate(user=self.scheduler_user)
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/request-groups/',
+            data={'name': 'Medical Directors', 'physician_ids': [self.physician.id]},
+            format='json',
+        )
+        group = ScheduleRequestGroup.objects.get(id=response.json()['id'])
+        DomainMembership.objects.get(
+            domain=self.block.domain,
+            user=self.physician_user,
+        ).delete()
+
+        group.refresh_from_db()
+        self.assertTrue(group.needs_attention)
+        self.assertEqual(group.memberships.count(), 0)
+        self.assertEqual(group.revision, response.json()['revision'] + 1)
+
+    def test_request_mutation_marks_existing_build_scores_stale(self):
+        version = ScheduleVersion.objects.create(
+            schedule_block=self.block,
+            domain=self.block.domain,
+            version_number=1,
+            name='Build 1',
+            score_is_stale=False,
+        )
+        run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            status=OptimizerRun.Status.COMPLETED,
+            score_is_stale=False,
+        )
+        self.client.force_authenticate(user=self.scheduler_user)
+        response = self.client.post(
+            f'/api/schedule-blocks/{self.block.id}/requests/upsert/',
+            data={
+                'physician_id': self.physician.id,
+                'date': '2026-07-01',
+                'request_scope': 'ADMIN',
+                'request_type': 'DAY_OFF',
+                'weight': 'MEDIUM',
+                'shift_template_ids': [],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        version.refresh_from_db()
+        run.refresh_from_db()
+        self.assertTrue(version.score_is_stale)
+        self.assertTrue(run.score_is_stale)
 
 
 class ScheduleBuildWorkspaceApiTests(TestCase):

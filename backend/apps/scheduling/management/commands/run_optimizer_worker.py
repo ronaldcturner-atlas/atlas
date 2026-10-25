@@ -15,6 +15,7 @@ from django.utils import timezone
 from apps.scheduling.models import (
     OptimizerControl,
     OptimizerRun,
+    ScheduleRequestBulkOperation,
 )
 from apps.scheduling.optimizer import optimize_schedule_version
 from apps.scheduling.optimizer_v2_runner import (
@@ -274,11 +275,17 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         next_trade_cleanup = 0.0
+        next_request_audit_cleanup = 0.0
         while True:
             now = monotonic()
             if now >= next_trade_cleanup:
                 expire_started_trade_activity()
                 next_trade_cleanup = now + 30.0
+            if now >= next_request_audit_cleanup:
+                ScheduleRequestBulkOperation.objects.filter(
+                    expires_after__lt=timezone.localdate(),
+                ).delete()
+                next_request_audit_cleanup = now + 3600.0
             control_id = self._claim_next()
             if control_id is not None:
                 self.stdout.write(f'Running or resuming optimizer job {control_id}')

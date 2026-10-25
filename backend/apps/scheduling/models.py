@@ -868,6 +868,130 @@ class ScheduleRequest(models.Model):
         ]
 
 
+class ScheduleRequestGroup(models.Model):
+    """A persistent Domain-scoped recipient shortcut for scheduler requests."""
+
+    domain = models.ForeignKey(
+        Domain,
+        on_delete=models.CASCADE,
+        related_name='schedule_request_groups',
+    )
+    name = models.CharField(max_length=120)
+    normalized_name = models.CharField(max_length=120)
+    revision = models.PositiveBigIntegerField(default=1)
+    needs_attention = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='created_schedule_request_groups',
+    )
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='updated_schedule_request_groups',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['normalized_name', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['domain', 'normalized_name'],
+                name='unique_schedule_request_group_name_per_domain',
+            ),
+        ]
+
+
+class ScheduleRequestGroupMember(models.Model):
+    """Persistent group membership anchored to one Domain membership."""
+
+    group = models.ForeignKey(
+        ScheduleRequestGroup,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+    )
+    domain_membership = models.ForeignKey(
+        'domains.DomainMembership',
+        on_delete=models.CASCADE,
+        related_name='schedule_request_group_memberships',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = [
+            'domain_membership__user__last_name',
+            'domain_membership__user__first_name',
+            'id',
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['group', 'domain_membership'],
+                name='unique_schedule_request_group_member',
+            ),
+        ]
+
+
+class ScheduleRequestBulkOperation(models.Model):
+    """Temporary audit record for one confirmed bulk-request operation."""
+
+    schedule_block = models.ForeignKey(
+        ScheduleBlock,
+        on_delete=models.CASCADE,
+        related_name='request_bulk_operations',
+    )
+    request_scope = models.CharField(max_length=10, choices=ScheduleRequest.RequestScope.choices)
+    request_type = models.CharField(max_length=12, choices=ScheduleRequest.RequestType.choices)
+    weight = models.CharField(max_length=10, choices=ScheduleRequest.Weight.choices)
+    group_snapshot = models.JSONField(default=list, blank=True)
+    recipient_snapshot = models.JSONField(default=list, blank=True)
+    dates = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_request_bulk_operations',
+    )
+    expires_after = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+
+class ScheduleRequestBulkOperationItem(models.Model):
+    operation = models.ForeignKey(
+        ScheduleRequestBulkOperation,
+        on_delete=models.CASCADE,
+        related_name='items',
+    )
+    schedule_request = models.ForeignKey(
+        ScheduleRequest,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='bulk_operation_items',
+    )
+    physician = models.ForeignKey(
+        Physician,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='schedule_request_bulk_operation_items',
+    )
+    physician_name = models.CharField(max_length=200)
+    date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['date', 'physician_name', 'id']
+
+
 class OptimizerControl(models.Model):
     """Cooperative cancellation, committed separately from the search transaction."""
     token = models.UUIDField(primary_key=True)
