@@ -37,10 +37,14 @@ class CoveragePriorityTests(TestCase):
         self.assertGreater(len(accepted), 1)
         self.assertTrue(all(row['score_after'] < row['score_before'] for row in accepted))
         self.assertEqual(summary['unfilled_shift_count'], 0)
-        # The displayed starting penalty is the source run's immutable stored
-        # final penalty.  Current-rule rescoring remains available in debug
-        # diagnostics for tests and audits when rules changed after that run.
-        self.assertEqual(summary['initial_score'], float(source.final_score))
+        # A source Run contributes assignments, not a historical score. The
+        # copied state is rescored under the current effective rules after the
+        # pre-search workload repair establishes the optimizer baseline.
+        self.assertEqual(
+            summary['initial_score'],
+            summary['debug']['search_initial_score'],
+        )
+        self.assertGreater(summary['initial_score'], float(source.final_score))
         self.assertGreater(
             summary['debug']['source_state_reported_score_before_pre_score_changes'],
             summary['final_score'],
@@ -97,7 +101,10 @@ class CoveragePriorityTests(TestCase):
         self.assertEqual(summary['unfilled_shift_count'], 0)
         self.assertEqual(assignments_for_viewed_run(version, result).count(), 31)
         self.assertEqual(summary['assignments_made'], 30)
-        self.assertGreater(summary['final_score'], summary['initial_score'])
+        self.assertGreater(
+            summary['final_score'],
+            summary['debug']['source_state_reported_score_before_pre_score_changes'],
+        )
         self.assertTrue(summary['debug']['coverage_improved_to_complete'])
         self.assertFalse(summary['debug']['source_state_restored_as_best'])
         self.assertTrue(assignments_for_viewed_run(version, result).filter(
@@ -151,4 +158,7 @@ class CoveragePriorityTests(TestCase):
         self.assertEqual(adaptive_start['unfilled'], 0)
         self.assertEqual(summary['unfilled_shift_count'], 0)
         self.assertEqual(assignments_for_viewed_run(version, result).count(), 31)
-        self.assertGreater(summary['final_score'], summary['initial_score'])
+        self.assertGreater(
+            summary['final_score'],
+            summary['debug']['source_state_reported_score_before_pre_score_changes'],
+        )

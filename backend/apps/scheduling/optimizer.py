@@ -526,6 +526,8 @@ def _is_instance_eligible(instance, physician_id, eligible_facilities_by_physici
     unavailable = getattr(
         eligible_facilities_by_physician, 'unavailable_dates_by_physician', {},
     ).get(physician_id, set())
+    if not unavailable:
+        return True
     return instance.date.isoformat() not in unavailable
 
 
