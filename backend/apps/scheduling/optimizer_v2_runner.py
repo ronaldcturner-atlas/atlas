@@ -37,7 +37,7 @@ from .optimizer_v2 import (
 )
 from .optimizer_revisions import (
     LEGACY_V2_TEST_RUN_KIND,
-    MULTISTART_FRESH_FILL_V2_REVISION,
+    MULTISTART_FRESH_FILL_V2_REVISIONS,
     STABLE_V2_REVISION,
     V2_RUN_KIND,
     V2_RUN_KINDS,
@@ -649,7 +649,7 @@ def optimize_schedule_version_v2(
     if fresh_fill:
         if (
             optimizer_run.optimizer_revision
-            == MULTISTART_FRESH_FILL_V2_REVISION
+            in MULTISTART_FRESH_FILL_V2_REVISIONS
         ):
             bootstrap_summary = _construct_multistart_initial_schedule(
                 schedule_version,

@@ -72,14 +72,13 @@ from apps.scheduling.optimizer_v2 import (
     swap_assignments,
 )
 from apps.scheduling.optimizer_revisions import (
-    AVAILABILITY_V2_REVISION,
-    CIRCADIAN_V2_REVISION,
-    MULTISTART_FRESH_FILL_V2_REVISION,
+    BALANCED_WEEKEND_EXCHANGE_V2_REVISIONS,
+    BLOCK_AVAILABILITY_CANDIDATE_SCORING_V2_REVISIONS,
+    CIRCADIAN_CANDIDATE_SCORING_V2_REVISIONS,
     STABLE_V2_REVISION,
-    TEMPORAL_V2_REVISION,
-    TEMPORAL_ESCALATION_V2_REVISION,
+    TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS,
+    TEMPORAL_RECONSTRUCTION_SCORING_V2_REVISIONS,
     TEMPORAL_TARGETING_V2_REVISION,
-    WEEKEND_EXCHANGE_V2_REVISION,
     require_supported_v2_revision,
 )
 
@@ -2580,41 +2579,21 @@ class Command(BaseCommand):
             options.get('optimizer_revision') or STABLE_V2_REVISION
         )
         circadian_candidate_scoring = (
-            optimizer_revision in {
-                CIRCADIAN_V2_REVISION,
-                AVAILABILITY_V2_REVISION,
-                MULTISTART_FRESH_FILL_V2_REVISION,
-                TEMPORAL_V2_REVISION,
-                WEEKEND_EXCHANGE_V2_REVISION,
-                TEMPORAL_ESCALATION_V2_REVISION,
-                TEMPORAL_TARGETING_V2_REVISION,
-            }
+            optimizer_revision in CIRCADIAN_CANDIDATE_SCORING_V2_REVISIONS
         )
         block_availability_candidate_scoring = (
-            optimizer_revision in {
-                AVAILABILITY_V2_REVISION,
-                MULTISTART_FRESH_FILL_V2_REVISION,
-                TEMPORAL_V2_REVISION,
-                WEEKEND_EXCHANGE_V2_REVISION,
-                TEMPORAL_ESCALATION_V2_REVISION,
-                TEMPORAL_TARGETING_V2_REVISION,
-            }
+            optimizer_revision
+            in BLOCK_AVAILABILITY_CANDIDATE_SCORING_V2_REVISIONS
         )
-        temporal_reconstruction_scoring = optimizer_revision in {
-            TEMPORAL_V2_REVISION,
-            WEEKEND_EXCHANGE_V2_REVISION,
-            TEMPORAL_ESCALATION_V2_REVISION,
-            TEMPORAL_TARGETING_V2_REVISION,
-        }
-        balanced_weekend_exchange_scoring = optimizer_revision in {
-            WEEKEND_EXCHANGE_V2_REVISION,
-            TEMPORAL_ESCALATION_V2_REVISION,
-            TEMPORAL_TARGETING_V2_REVISION,
-        }
-        temporal_plateau_escalation_scoring = optimizer_revision in {
-            TEMPORAL_ESCALATION_V2_REVISION,
-            TEMPORAL_TARGETING_V2_REVISION,
-        }
+        temporal_reconstruction_scoring = (
+            optimizer_revision in TEMPORAL_RECONSTRUCTION_SCORING_V2_REVISIONS
+        )
+        balanced_weekend_exchange_scoring = (
+            optimizer_revision in BALANCED_WEEKEND_EXCHANGE_V2_REVISIONS
+        )
+        temporal_plateau_escalation_scoring = (
+            optimizer_revision in TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS
+        )
         ranked_temporal_targeting = (
             optimizer_revision == TEMPORAL_TARGETING_V2_REVISION
         )

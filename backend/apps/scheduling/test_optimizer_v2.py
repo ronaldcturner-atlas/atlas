@@ -48,9 +48,16 @@ from apps.scheduling.optimizer_v2_runner import (
 from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 from apps.scheduling.optimizer_revisions import (
     AVAILABILITY_V2_REVISION,
+    BALANCED_WEEKEND_EXCHANGE_V2_REVISIONS,
+    BLOCK_AVAILABILITY_CANDIDATE_SCORING_V2_REVISIONS,
+    CIRCADIAN_CANDIDATE_SCORING_V2_REVISIONS,
     CIRCADIAN_V2_REVISION,
+    MULTISTART_CIRCADIAN_V2_REVISION,
     MULTISTART_FRESH_FILL_V2_REVISION,
+    MULTISTART_FRESH_FILL_V2_REVISIONS,
     STABLE_V2_REVISION,
+    TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS,
+    TEMPORAL_RECONSTRUCTION_SCORING_V2_REVISIONS,
     TEMPORAL_V2_REVISION,
     TEMPORAL_ESCALATION_V2_REVISION,
     TEMPORAL_TARGETING_V2_REVISION,
@@ -109,6 +116,28 @@ class OptimizerRevisionTests(SimpleTestCase):
             require_supported_v2_revision(MULTISTART_FRESH_FILL_V2_REVISION),
             MULTISTART_FRESH_FILL_V2_REVISION,
         )
+
+    def test_multistart_circadian_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(MULTISTART_CIRCADIAN_V2_REVISION),
+            MULTISTART_CIRCADIAN_V2_REVISION,
+        )
+
+    def test_multistart_circadian_has_only_intended_revision_features(self):
+        revision = MULTISTART_CIRCADIAN_V2_REVISION
+
+        self.assertIn(revision, MULTISTART_FRESH_FILL_V2_REVISIONS)
+        self.assertIn(revision, CIRCADIAN_CANDIDATE_SCORING_V2_REVISIONS)
+        self.assertIn(
+            revision,
+            BLOCK_AVAILABILITY_CANDIDATE_SCORING_V2_REVISIONS,
+        )
+        self.assertIn(
+            revision,
+            TEMPORAL_RECONSTRUCTION_SCORING_V2_REVISIONS,
+        )
+        self.assertNotIn(revision, BALANCED_WEEKEND_EXCHANGE_V2_REVISIONS)
+        self.assertNotIn(revision, TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS)
 
     def test_temporal_candidate_revision_is_supported(self):
         self.assertEqual(
