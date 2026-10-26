@@ -2,6 +2,7 @@
 
 import io
 import json
+import hashlib
 from decimal import Decimal
 from time import monotonic
 
@@ -36,6 +37,7 @@ from .optimizer_v2 import (
 )
 from .optimizer_revisions import (
     LEGACY_V2_TEST_RUN_KIND,
+    MULTISTART_FRESH_FILL_V2_REVISION,
     STABLE_V2_REVISION,
     V2_RUN_KIND,
     V2_RUN_KINDS,
@@ -50,6 +52,158 @@ from .run_state import assignments_for_viewed_run
 
 # Compatibility import for older code and completed-run tests.
 V2_TEST_RUN_KIND = LEGACY_V2_TEST_RUN_KIND
+MULTISTART_FRESH_FILL_CANDIDATE_COUNT = 6
+
+
+def _fresh_fill_candidate_seeds(base_seed, candidate_count):
+    """Return a deterministic, unique seed sequence led by the run seed."""
+    base_seed = int(base_seed)
+    seeds = [base_seed]
+    maximum_seed = (1 << 63) - 1
+    for candidate_index in range(1, int(candidate_count)):
+        digest = hashlib.sha256(
+            f'atlas-fresh-fill:{base_seed}:{candidate_index}'.encode('utf-8')
+        ).digest()
+        candidate_seed = int.from_bytes(digest[:8], 'big') & maximum_seed
+        if candidate_seed == 0:
+            candidate_seed = candidate_index
+        while candidate_seed in seeds:
+            candidate_seed = (candidate_seed + 1) & maximum_seed
+            if candidate_seed == 0:
+                candidate_seed = 1
+        seeds.append(candidate_seed)
+    return tuple(seeds)
+
+
+def _fresh_fill_candidate_rank(report, candidate_index):
+    """Rank by official penalty, then proportionality, then stable order."""
+    proportionality = report.get('proportionality') or {}
+    return (
+        Decimal(str(report['total_score'])),
+        Decimal(str(proportionality.get('total', 0))),
+        int(candidate_index),
+    )
+
+
+def _construct_multistart_initial_schedule(
+    schedule_version,
+    *,
+    optimizer_run,
+    created_by=None,
+    stop_requested=None,
+):
+    """Persist the best of deterministic, independently constructed starts."""
+    base_seed = int(optimizer_run.seed or optimizer_run.id)
+    seeds = _fresh_fill_candidate_seeds(
+        base_seed, MULTISTART_FRESH_FILL_CANDIDATE_COUNT,
+    )
+    candidates = []
+    selected_rank = None
+    selected_rows = None
+    selected_summary = None
+    selected_index = None
+
+    try:
+        for candidate_index, candidate_seed in enumerate(seeds):
+            if (
+                candidate_index > 0
+                and stop_requested is not None
+                and stop_requested()
+            ):
+                break
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=optimizer_run,
+            ).delete()
+            candidate_started = monotonic()
+            summary = construct_complete_initial_schedule(
+                schedule_version,
+                created_by=created_by,
+                optimizer_run=optimizer_run,
+                seed=candidate_seed,
+                stop_requested=stop_requested,
+                # Candidate scores are published only after the best complete
+                # hard-valid bootstrap has been selected.
+                progress_callback=None,
+            )
+            report = build_violation_report(
+                schedule_version,
+                optimizer_run=optimizer_run,
+            )
+            _require_hard_valid_final_report(report)
+            rows = list(
+                ScheduleShiftAssignment.objects
+                .filter(optimizer_run=optimizer_run)
+                .order_by('shift_instance_id', 'physician_id', 'id')
+                .values(
+                    'shift_instance_id',
+                    'physician_id',
+                    'created_by_id',
+                    'assignment_source',
+                    'is_locked',
+                )
+            )
+            rank = _fresh_fill_candidate_rank(report, candidate_index)
+            candidate = {
+                'candidate_index': candidate_index,
+                'seed': candidate_seed,
+                'score': float(report['total_score']),
+                'proportionality': float(
+                    (report.get('proportionality') or {}).get('total', 0)
+                ),
+                'score_breakdown': report['score_breakdown'],
+                'assignment_count': len(rows),
+                'wall_seconds': monotonic() - candidate_started,
+            }
+            candidates.append(candidate)
+            if selected_rank is None or rank < selected_rank:
+                selected_rank = rank
+                selected_rows = rows
+                selected_summary = dict(summary)
+                selected_index = candidate_index
+    except Exception:
+        if selected_rows is not None:
+            ScheduleShiftAssignment.objects.filter(
+                optimizer_run=optimizer_run,
+            ).delete()
+            ScheduleShiftAssignment.objects.bulk_create([
+                ScheduleShiftAssignment(
+                    optimizer_run=optimizer_run,
+                    **row,
+                )
+                for row in selected_rows
+            ], batch_size=1000)
+        raise
+
+    if selected_rows is None:
+        raise ValueError('Multi-start Fresh Fill did not produce a candidate.')
+
+    ScheduleShiftAssignment.objects.filter(
+        optimizer_run=optimizer_run,
+    ).delete()
+    ScheduleShiftAssignment.objects.bulk_create([
+        ScheduleShiftAssignment(
+            optimizer_run=optimizer_run,
+            **row,
+        )
+        for row in selected_rows
+    ], batch_size=1000)
+    optimizer_run.refresh_from_db()
+    selected = candidates[selected_index]
+    return {
+        **selected_summary,
+        'final_score': selected['score'],
+        'multi_start': {
+            'strategy': 'deterministic_best_of_n',
+            'base_search_seed': base_seed,
+            'requested_candidate_count': len(seeds),
+            'completed_candidate_count': len(candidates),
+            'selected_candidate_index': selected_index,
+            'selected_seed': selected['seed'],
+            'selected_score': selected['score'],
+            'selected_proportionality': selected['proportionality'],
+            'candidates': candidates,
+        },
+    }
 
 
 def _compact_search_summary(search_result):
@@ -109,7 +263,10 @@ def _compact_bootstrap_summary(summary):
         'iterations_run', 'improvement_count', 'assignments_made',
         'unfilled_shift_count', 'final_overlap_violations',
     )
-    return {key: summary[key] for key in keys if key in summary}
+    compact = {key: summary[key] for key in keys if key in summary}
+    if isinstance(summary.get('multi_start'), dict):
+        compact['multi_start'] = summary['multi_start']
+    return compact
 
 
 def _failure_configuration_snapshot(schedule_version):
@@ -490,15 +647,26 @@ def optimize_schedule_version_v2(
 
     bootstrap_summary = None
     if fresh_fill:
-        bootstrap_summary = construct_complete_initial_schedule(
-            schedule_version,
-            created_by=created_by,
-            optimizer_run=optimizer_run,
-            stop_requested=stop_requested,
-            # Partial construction scores are not comparable to the score of
-            # a complete schedule and therefore are not a verified best.
-            progress_callback=None,
-        )
+        if (
+            optimizer_run.optimizer_revision
+            == MULTISTART_FRESH_FILL_V2_REVISION
+        ):
+            bootstrap_summary = _construct_multistart_initial_schedule(
+                schedule_version,
+                created_by=created_by,
+                optimizer_run=optimizer_run,
+                stop_requested=stop_requested,
+            )
+        else:
+            bootstrap_summary = construct_complete_initial_schedule(
+                schedule_version,
+                created_by=created_by,
+                optimizer_run=optimizer_run,
+                stop_requested=stop_requested,
+                # Partial construction scores are not comparable to the score
+                # of a complete schedule and therefore are not a verified best.
+                progress_callback=None,
+            )
         source_run = optimizer_run
     elif original_published:
         _materialize_original_published_snapshot(

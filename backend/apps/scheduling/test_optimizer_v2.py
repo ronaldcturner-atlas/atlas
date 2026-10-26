@@ -49,6 +49,7 @@ from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 from apps.scheduling.optimizer_revisions import (
     AVAILABILITY_V2_REVISION,
     CIRCADIAN_V2_REVISION,
+    MULTISTART_FRESH_FILL_V2_REVISION,
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
     TEMPORAL_ESCALATION_V2_REVISION,
@@ -101,6 +102,12 @@ class OptimizerRevisionTests(SimpleTestCase):
         self.assertEqual(
             require_supported_v2_revision(AVAILABILITY_V2_REVISION),
             AVAILABILITY_V2_REVISION,
+        )
+
+    def test_multistart_fresh_fill_candidate_revision_is_supported(self):
+        self.assertEqual(
+            require_supported_v2_revision(MULTISTART_FRESH_FILL_V2_REVISION),
+            MULTISTART_FRESH_FILL_V2_REVISION,
         )
 
     def test_temporal_candidate_revision_is_supported(self):

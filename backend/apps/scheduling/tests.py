@@ -5590,6 +5590,163 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
             [(instance.id, physician.id)],
         )
 
+    def test_multistart_fresh_fill_selects_and_restores_best_candidate(self):
+        from apps.scheduling.optimizer_revisions import (
+            MULTISTART_FRESH_FILL_V2_REVISION,
+        )
+        from apps.scheduling.optimizer_v2_runner import (
+            MULTISTART_FRESH_FILL_CANDIDATE_COUNT,
+            _construct_multistart_initial_schedule,
+            _fresh_fill_candidate_seeds,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        ordinary_physician = self._create_assignment_physician(
+            'v2.multi.ordinary@example.com',
+            'V2 Multi Ordinary',
+            facilities=[self.facility],
+        )
+        best_physician = self._create_assignment_physician(
+            'v2.multi.best@example.com',
+            'V2 Multi Best',
+            facilities=[self.facility],
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            optimizer_revision=MULTISTART_FRESH_FILL_V2_REVISION,
+            max_runtime_seconds=60,
+            seed=9186,
+        )
+        seeds = _fresh_fill_candidate_seeds(
+            v2_run.seed, MULTISTART_FRESH_FILL_CANDIDATE_COUNT,
+        )
+        selected_seed = seeds[5]
+
+        def bootstrap(_version, **kwargs):
+            physician = (
+                best_physician
+                if kwargs['seed'] == selected_seed
+                else ordinary_physician
+            )
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=(
+                    ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                ),
+                optimizer_run=kwargs['optimizer_run'],
+            )
+            return {
+                'unfilled_shift_count': 0,
+                'final_overlap_violations': 0,
+                'final_score': 100 if physician == best_physician else 200,
+            }
+
+        def report(_version, **kwargs):
+            assignment = ScheduleShiftAssignment.objects.get(
+                optimizer_run=kwargs['optimizer_run'],
+            )
+            best = assignment.physician_id == best_physician.id
+            return {
+                'total_score': 100 if best else 200,
+                'score_breakdown': {
+                    'overlap_score': 0,
+                    'invalid_assignment_score': 0,
+                    'coverage_score': 0,
+                },
+                'proportionality': {'total': 10 if best else 20},
+            }
+
+        with patch(
+            'apps.scheduling.optimizer_v2_runner.'
+            'construct_complete_initial_schedule',
+            side_effect=bootstrap,
+        ) as constructor, patch(
+            'apps.scheduling.optimizer_v2_runner.build_violation_report',
+            side_effect=report,
+        ):
+            summary = _construct_multistart_initial_schedule(
+                version,
+                optimizer_run=v2_run,
+                created_by=self.scheduler_user,
+            )
+
+        self.assertEqual(constructor.call_count, 6)
+        self.assertEqual(
+            [call.kwargs['seed'] for call in constructor.call_args_list],
+            list(seeds),
+        )
+        self.assertEqual(v2_run.seed, 9186)
+        self.assertEqual(
+            summary['multi_start']['selected_candidate_index'], 5,
+        )
+        self.assertEqual(
+            summary['multi_start']['selected_seed'], selected_seed,
+        )
+        self.assertEqual(summary['multi_start']['selected_score'], 100)
+        self.assertEqual(
+            list(
+                ScheduleShiftAssignment.objects.filter(optimizer_run=v2_run)
+                .values_list('shift_instance_id', 'physician_id')
+            ),
+            [(instance.id, best_physician.id)],
+        )
+
+    def test_candidate_constructor_restores_persisted_search_seed(self):
+        from apps.scheduling.optimizer_v1_constructor import (
+            construct_complete_fresh_fill_schedule,
+        )
+        from apps.scheduling.optimizer_revisions import (
+            MULTISTART_FRESH_FILL_V2_REVISION,
+        )
+
+        version = self._create_build_version()
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            optimizer_revision=MULTISTART_FRESH_FILL_V2_REVISION,
+            max_runtime_seconds=60,
+            seed=9186,
+        )
+
+        def legacy_constructor(_version, **kwargs):
+            OptimizerRun.objects.filter(pk=kwargs['optimizer_run'].pk).update(
+                seed=kwargs['seed'],
+            )
+            return {
+                'unfilled_shift_count': 0,
+                'final_overlap_violations': 0,
+                'final_score': 100,
+            }
+
+        with patch(
+            'apps.scheduling.optimizer.optimize_schedule_version',
+            side_effect=legacy_constructor,
+        ) as constructor:
+            construct_complete_fresh_fill_schedule(
+                version,
+                optimizer_run=v2_run,
+                seed=4411,
+                created_by=self.scheduler_user,
+            )
+
+        self.assertEqual(constructor.call_args.kwargs['seed'], 4411)
+        v2_run.refresh_from_db()
+        self.assertEqual(v2_run.seed, 9186)
+
     def test_atlas_v2_fresh_fill_real_constructor_handoff(self):
         from apps.scheduling.optimizer_v2_runner import (
             optimize_schedule_version_v2_test,

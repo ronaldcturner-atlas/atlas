@@ -10,6 +10,7 @@ def construct_complete_fresh_fill_schedule(
     schedule_version,
     *,
     optimizer_run,
+    seed=None,
     created_by=None,
     stop_requested=None,
     progress_callback=None,
@@ -22,22 +23,31 @@ def construct_complete_fresh_fill_schedule(
     """
     from .optimizer import optimize_schedule_version
 
-    return optimize_schedule_version(
-        schedule_version,
-        created_by=created_by,
-        optimizer_run=optimizer_run,
-        seed=optimizer_run.seed,
-        start_mode=OptimizerRun.StartMode.FRESH_FILL,
-        source_run=None,
-        max_runtime_seconds=optimizer_run.max_runtime_seconds,
-        optimization_focus=optimizer_run.optimization_focus,
-        adaptive_runtime=True,
-        stop_requested=stop_requested,
-        progress_callback=progress_callback,
-        isolated_run=True,
-        finalize_run=False,
-        construction_only=True,
-    )
+    authoritative_seed = optimizer_run.seed
+    candidate_seed = authoritative_seed if seed is None else seed
+    try:
+        return optimize_schedule_version(
+            schedule_version,
+            created_by=created_by,
+            optimizer_run=optimizer_run,
+            seed=candidate_seed,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            source_run=None,
+            max_runtime_seconds=optimizer_run.max_runtime_seconds,
+            optimization_focus=optimizer_run.optimization_focus,
+            adaptive_runtime=True,
+            stop_requested=stop_requested,
+            progress_callback=progress_callback,
+            isolated_run=True,
+            finalize_run=False,
+            construction_only=True,
+        )
+    finally:
+        if seed is not None and candidate_seed != authoritative_seed:
+            OptimizerRun.objects.filter(pk=optimizer_run.pk).update(
+                seed=authoritative_seed,
+            )
+            optimizer_run.seed = authoritative_seed
 
 
 def complete_schedule_from_source(

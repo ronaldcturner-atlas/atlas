@@ -26,6 +26,7 @@ class InitialScheduleConstructorTests(SimpleTestCase):
     @staticmethod
     def _run():
         return SimpleNamespace(
+            pk=77,
             seed=9183,
             max_runtime_seconds=7200,
             optimization_focus=OptimizerRun.OptimizationFocus.STANDARD,
@@ -109,6 +110,48 @@ class InitialScheduleConstructorTests(SimpleTestCase):
             finalize_run=False,
             construction_only=True,
         )
+
+    def test_constructor_accepts_an_explicit_candidate_seed(self):
+        run = self._run()
+
+        with patch(
+            'apps.scheduling.optimizer.optimize_schedule_version',
+            return_value={'final_score': 2923000},
+        ) as optimizer, patch(
+            'apps.scheduling.optimizer_v1_constructor.'
+            'OptimizerRun.objects.filter',
+        ) as run_filter:
+            construct_complete_fresh_fill_schedule(
+                'schedule-version',
+                optimizer_run=run,
+                seed=4411,
+            )
+
+        self.assertEqual(optimizer.call_args.kwargs['seed'], 4411)
+        run_filter.assert_called_once_with(pk=77)
+        run_filter.return_value.update.assert_called_once_with(seed=9183)
+        self.assertEqual(run.seed, 9183)
+
+    def test_explicit_candidate_seed_is_restored_after_constructor_failure(self):
+        run = self._run()
+
+        with patch(
+            'apps.scheduling.optimizer.optimize_schedule_version',
+            side_effect=RuntimeError('constructor failed'),
+        ), patch(
+            'apps.scheduling.optimizer_v1_constructor.'
+            'OptimizerRun.objects.filter',
+        ) as run_filter:
+            with self.assertRaisesMessage(RuntimeError, 'constructor failed'):
+                construct_complete_fresh_fill_schedule(
+                    'schedule-version',
+                    optimizer_run=run,
+                    seed=4411,
+                )
+
+        run_filter.assert_called_once_with(pk=77)
+        run_filter.return_value.update.assert_called_once_with(seed=9183)
+        self.assertEqual(run.seed, 9183)
 
     def test_source_completion_adapter_preserves_selected_schedule(self):
         run = self._run()

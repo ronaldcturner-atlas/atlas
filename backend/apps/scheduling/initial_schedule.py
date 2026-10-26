@@ -15,6 +15,7 @@ def construct_complete_initial_schedule(
     schedule_version,
     *,
     optimizer_run,
+    seed=None,
     created_by=None,
     stop_requested=None,
     progress_callback=None,
@@ -29,12 +30,17 @@ def construct_complete_initial_schedule(
         if progress_callback is not None:
             progress_callback(score, force=force)
 
+    constructor_options = {
+        'created_by': created_by,
+        'optimizer_run': optimizer_run,
+        'stop_requested': stop_requested,
+        'progress_callback': construction_progress,
+    }
+    if seed is not None:
+        constructor_options['seed'] = seed
     summary = construct_complete_fresh_fill_schedule(
         schedule_version,
-        created_by=created_by,
-        optimizer_run=optimizer_run,
-        stop_requested=stop_requested,
-        progress_callback=construction_progress,
+        **constructor_options,
     )
     if int(summary.get('unfilled_shift_count') or 0) > 0:
         raise ValueError(

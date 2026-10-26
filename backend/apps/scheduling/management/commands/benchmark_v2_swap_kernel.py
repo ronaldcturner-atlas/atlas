@@ -74,6 +74,7 @@ from apps.scheduling.optimizer_v2 import (
 from apps.scheduling.optimizer_revisions import (
     AVAILABILITY_V2_REVISION,
     CIRCADIAN_V2_REVISION,
+    MULTISTART_FRESH_FILL_V2_REVISION,
     STABLE_V2_REVISION,
     TEMPORAL_V2_REVISION,
     TEMPORAL_ESCALATION_V2_REVISION,
@@ -2582,6 +2583,7 @@ class Command(BaseCommand):
             optimizer_revision in {
                 CIRCADIAN_V2_REVISION,
                 AVAILABILITY_V2_REVISION,
+                MULTISTART_FRESH_FILL_V2_REVISION,
                 TEMPORAL_V2_REVISION,
                 WEEKEND_EXCHANGE_V2_REVISION,
                 TEMPORAL_ESCALATION_V2_REVISION,
@@ -2591,6 +2593,7 @@ class Command(BaseCommand):
         block_availability_candidate_scoring = (
             optimizer_revision in {
                 AVAILABILITY_V2_REVISION,
+                MULTISTART_FRESH_FILL_V2_REVISION,
                 TEMPORAL_V2_REVISION,
                 WEEKEND_EXCHANGE_V2_REVISION,
                 TEMPORAL_ESCALATION_V2_REVISION,
