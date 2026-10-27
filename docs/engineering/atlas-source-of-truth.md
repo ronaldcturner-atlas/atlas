@@ -253,6 +253,8 @@ Before every Run, Atlas snapshots the current authoritative inputs and reconcile
 
 Every completed V2 Run retains bounded production telemetry for optimizer health, comparison, and future capacity planning. Telemetry is accumulated in memory only at vectorized-neighborhood and existing authoritative-checkpoint boundaries; candidate evaluation performs no database, network, or per-candidate telemetry writes. The retained summary includes time to the first and best verified checkpoints, aggregate phase timings, cache use, stop reason, and attempts, acceptances, and authoritative penalty movement by selection mode, accepted operation, and structural rule family. Full neighborhood payloads and transition replay details remain temporary failure diagnostics rather than permanent completed-Run history. Production telemetry must remain below 1% overhead in representative benchmarks.
 
+Atlas also retains internal lineage metadata for each completed optimizer result: the originating Fresh Fill Run number, cumulative actual runtime across that exact continuation chain, actual runtime since the last verified authoritative penalty reduction, and the number of Runs in the lineage that stopped for productivity exhaustion. Facility/Shift distribution runs add to cumulative runtime but do not age the penalty-stagnation clock unless they reduce the official penalty. This metadata is for optimizer decisions and diagnostics; it is not part of the user-facing Run workspace.
+
 The two focus modes are:
 
 - `STANDARD`, the default, which treats Facility and broad time-of-day proportionality as a score-neutral tie-breaker.

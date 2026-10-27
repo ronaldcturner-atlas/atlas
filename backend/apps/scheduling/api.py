@@ -87,6 +87,7 @@ from .optimizer import (
     recalculate_schedule_version_score,
 )
 from .optimizer_v2_runner import V2_RUN_KIND
+from .optimizer_lineage import inherited_optimizer_lineage
 from .optimizer_revisions import (
     code_release_identifier,
     configured_scoring_revision,
@@ -5765,6 +5766,7 @@ def optimizer_run_save_copy(request, run_id):
             completion_score=source.completion_score,
             completion_score_breakdown=source.completion_score_breakdown,
             completion_scoring_revision=source.completion_scoring_revision,
+            **inherited_optimizer_lineage(source),
             locked_open_shift_instance_ids=locked_open_ids,
             suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
             backdated_shift_template_revisions=dict(source.backdated_shift_template_revisions or {}),
@@ -5931,6 +5933,7 @@ def optimizer_run_save_manual_changes_as_new(request, run_id):
                 source.completion_score_breakdown or {}
             ),
             completion_scoring_revision=source.completion_scoring_revision,
+            **inherited_optimizer_lineage(source),
             locked_open_shift_instance_ids=edited_locked_open_ids,
             suppressed_shift_instance_ids=list(source.suppressed_shift_instance_ids or []),
             backdated_shift_template_revisions=dict(source.backdated_shift_template_revisions or {}),

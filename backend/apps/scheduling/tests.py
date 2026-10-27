@@ -5956,6 +5956,13 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(v2_run.final_score, 0)
         self.assertEqual(summary['stopped_reason'], 'complete_fixed_schedule')
         self.assertEqual(summary['unfilled_shift_count'], 0)
+        self.assertEqual(v2_run.lineage_fresh_fill_run_number, 1)
+        self.assertGreater(v2_run.lineage_cumulative_runtime_seconds, 0)
+        self.assertEqual(
+            v2_run.lineage_runtime_since_penalty_reduction_seconds,
+            v2_run.lineage_cumulative_runtime_seconds,
+        )
+        self.assertEqual(v2_run.lineage_search_exhaustion_count, 0)
 
     @override_settings(ATLAS_V2_ENABLED=False)
     def test_background_atlas_v2_test_is_gated_until_workers_restart(self):
@@ -6765,6 +6772,16 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         optimized = self.client.post(f'/api/schedule-versions/{version.id}/run-optimizer/', format='json')
         self.assertEqual(optimized.status_code, 200)
         source = OptimizerRun.objects.get(id=optimized.json()['optimizer_run_id'])
+        source.lineage_fresh_fill_run_number = source.run_number
+        source.lineage_cumulative_runtime_seconds = 7200.0
+        source.lineage_runtime_since_penalty_reduction_seconds = 1800.0
+        source.lineage_search_exhaustion_count = 1
+        source.save(update_fields=[
+            'lineage_fresh_fill_run_number',
+            'lineage_cumulative_runtime_seconds',
+            'lineage_runtime_since_penalty_reduction_seconds',
+            'lineage_search_exhaustion_count',
+        ])
         day = ScheduleShiftInstance.objects.get(shift_template=self.day_template)
         source_day = list(ScheduleShiftAssignment.objects.filter(optimizer_run=source, shift_instance=day).order_by('id'))
         self.assertEqual(len(source_day), 2)
@@ -6791,6 +6808,16 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(copied.copied_from_run, source)
         self.assertEqual(copied.run_kind, 'COPY')
         self.assertTrue(copied.is_active)
+        self.assertEqual(
+            copied.lineage_fresh_fill_run_number,
+            source.run_number,
+        )
+        self.assertEqual(copied.lineage_cumulative_runtime_seconds, 7200.0)
+        self.assertEqual(
+            copied.lineage_runtime_since_penalty_reduction_seconds,
+            1800.0,
+        )
+        self.assertEqual(copied.lineage_search_exhaustion_count, 1)
         source.refresh_from_db()
         self.assertFalse(source.is_active)
         self.assertIn(overnight.id, copied.locked_open_shift_instance_ids)

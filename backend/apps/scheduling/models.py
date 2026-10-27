@@ -419,6 +419,17 @@ class OptimizerRun(models.Model):
     # Preserve the lineage label even if an administrator later deletes the
     # source run.  The score itself is snapshotted in initial_score.
     started_from_run_number = models.PositiveIntegerField(null=True, blank=True)
+    # Internal optimizer-lineage measurements. These are intentionally not
+    # user-facing; they allow Atlas to reason about cumulative search effort
+    # across a Fresh Fill and its continuation runs.
+    lineage_fresh_fill_run_number = models.PositiveIntegerField(
+        null=True, blank=True,
+    )
+    lineage_cumulative_runtime_seconds = models.FloatField(default=0.0)
+    lineage_runtime_since_penalty_reduction_seconds = models.FloatField(
+        default=0.0,
+    )
+    lineage_search_exhaustion_count = models.PositiveIntegerField(default=0)
     run_kind = models.CharField(max_length=20, default='OPTIMIZER')
     locked_open_shift_instance_ids = models.JSONField(default=list, blank=True)
     # Published backdates may remove an occurrence from the live schedule while

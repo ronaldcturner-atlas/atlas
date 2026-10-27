@@ -47,6 +47,7 @@ from .optimizer_revisions import (
     optimizer_provenance,
     require_supported_v2_revision,
 )
+from .optimizer_lineage import completed_optimizer_lineage
 from .run_state import assignments_for_viewed_run
 
 
@@ -765,6 +766,7 @@ def optimize_schedule_version_v2(
         'source_rescore': source_rescore,
         **optimizer_provenance(optimizer_run),
     }
+    search_started_elapsed_seconds = None
     remaining_runtime_seconds = max(
         float(optimizer_run.max_runtime_seconds) - (monotonic() - overall_started),
         0.0,
@@ -799,6 +801,7 @@ def optimize_schedule_version_v2(
         }
     else:
         try:
+            search_started_elapsed_seconds = monotonic() - overall_started
             call_command(
                 'benchmark_v2_continuous',
                 run_id=source_run.id,
@@ -914,6 +917,16 @@ def optimize_schedule_version_v2(
             max(int(required) - len(state.get(instance_id, ())), 0)
             for instance_id, required in instance_required.items()
         )
+        runtime_seconds = monotonic() - overall_started
+        lineage = completed_optimizer_lineage(
+            optimizer_run,
+            runtime_seconds=runtime_seconds,
+            initial_score=source_initial_score,
+            final_score=final_score,
+            stopped_reason=search_result['stopped_reason'],
+            search_result=search_result,
+            search_started_elapsed_seconds=search_started_elapsed_seconds,
+        )
         summary = {
             'message': 'Atlas V2 run completed.',
             'optimizer_engine': 'V2',
@@ -932,7 +945,7 @@ def optimize_schedule_version_v2(
             'source_rescored_score': (
                 source_rescore['current_authoritative_score']
             ),
-            'runtime_seconds': monotonic() - overall_started,
+            'runtime_seconds': runtime_seconds,
             'timed_out': search_result['stopped_reason'] == 'runtime_limit',
             'stopped_reason': search_result['stopped_reason'],
             'iterations_run': int(search_result['total_evaluations']),
@@ -964,6 +977,18 @@ def optimize_schedule_version_v2(
         optimizer_run.completion_score_breakdown = report['score_breakdown']
         optimizer_run.completion_scoring_revision = optimizer_run.scoring_revision
         optimizer_run.optimizer_summary = summary
+        optimizer_run.lineage_fresh_fill_run_number = lineage[
+            'lineage_fresh_fill_run_number'
+        ]
+        optimizer_run.lineage_cumulative_runtime_seconds = lineage[
+            'lineage_cumulative_runtime_seconds'
+        ]
+        optimizer_run.lineage_runtime_since_penalty_reduction_seconds = (
+            lineage['lineage_runtime_since_penalty_reduction_seconds']
+        )
+        optimizer_run.lineage_search_exhaustion_count = lineage[
+            'lineage_search_exhaustion_count'
+        ]
         # Detailed checkpoints and transition replay data are useful only
         # while a run is active or after an unexpected failure.
         optimizer_run.optimizer_debug = {}
@@ -979,6 +1004,10 @@ def optimize_schedule_version_v2(
             'completion_score', 'completion_score_breakdown',
             'completion_scoring_revision',
             'optimizer_summary', 'optimizer_debug', 'score_is_stale',
+            'lineage_fresh_fill_run_number',
+            'lineage_cumulative_runtime_seconds',
+            'lineage_runtime_since_penalty_reduction_seconds',
+            'lineage_search_exhaustion_count',
             'is_active', 'notes',
         ])
     publish_verified_best(final_score, force=True)
