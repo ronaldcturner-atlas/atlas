@@ -2816,9 +2816,11 @@ def _can_submit_own_requests(user, domain=None):
 
 
 def _request_blocks_for_regular_user(user):
-    """Return the relevant published and upcoming block for each accessible Domain."""
+    """Return relevant published and unexpired request blocks for each accessible Domain."""
     request_domain_ids = permitted_domain_ids(user, 'submit_own_requests')
-    block_ids = []
+    block_ids = set()
+    now = timezone.now()
+    today = timezone.localdate()
     for domain_id in request_domain_ids:
         domain_blocks = ScheduleBlock.objects.filter(domain_id=domain_id)
         latest_published = (
@@ -2826,18 +2828,18 @@ def _request_blocks_for_regular_user(user):
             .order_by('-published_at')
             .first()
         )
-        upcoming = (
+        upcoming_ids = (
             domain_blocks.filter(
                 published_at__isnull=True,
-                end_date__gte=timezone.localdate(),
+                end_date__gte=today,
+                request_close_datetime__gte=now,
             )
             .order_by('start_date', 'created_at')
-            .first()
+            .values_list('id', flat=True)
         )
         if latest_published is not None:
-            block_ids.append(latest_published.id)
-        if upcoming is not None:
-            block_ids.append(upcoming.id)
+            block_ids.add(latest_published.id)
+        block_ids.update(upcoming_ids)
     return ScheduleBlock.objects.filter(
         Q(id__in=block_ids)
         | Q(

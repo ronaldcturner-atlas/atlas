@@ -1763,7 +1763,7 @@ class ScheduleRequestApiTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
 
-    def test_regular_user_only_sees_latest_published_and_upcoming_request_blocks(self):
+    def test_regular_user_sees_latest_published_and_all_unexpired_upcoming_request_blocks(self):
         older_published = ScheduleBlock.objects.create(
             start_date=date(2026, 4, 1),
             end_date=date(2026, 4, 30),
@@ -1787,6 +1787,20 @@ class ScheduleRequestApiTests(TestCase):
             request_close_datetime=timezone.now() + timedelta(days=10),
             build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
         )
+        second_upcoming = ScheduleBlock.objects.create(
+            start_date=timezone.localdate() + timedelta(days=90),
+            end_date=timezone.localdate() + timedelta(days=120),
+            request_open_datetime=timezone.now() - timedelta(days=1),
+            request_close_datetime=timezone.now() + timedelta(days=20),
+            build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        )
+        expired_upcoming = ScheduleBlock.objects.create(
+            start_date=timezone.localdate() + timedelta(days=150),
+            end_date=timezone.localdate() + timedelta(days=180),
+            request_open_datetime=timezone.now() - timedelta(days=20),
+            request_close_datetime=timezone.now() - timedelta(days=1),
+            build_status=ScheduleBlock.BuildStatus.PRE_BUILD,
+        )
         ScheduleRequest.objects.create(
             schedule_block=latest_published,
             physician=self.physician,
@@ -1803,8 +1817,12 @@ class ScheduleRequestApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         returned_ids = {item['id'] for item in payload}
-        self.assertEqual(returned_ids, {latest_published.id, upcoming.id})
+        self.assertEqual(
+            returned_ids,
+            {latest_published.id, upcoming.id, second_upcoming.id},
+        )
         self.assertNotIn(older_published.id, returned_ids)
+        self.assertNotIn(expired_upcoming.id, returned_ids)
         published_payload = next(item for item in payload if item['id'] == latest_published.id)
         self.assertEqual(len(published_payload['my_requests']), 1)
         self.assertEqual(published_payload['my_requests'][0]['request_type'], 'DAY_OFF')
