@@ -10,6 +10,7 @@ from apps.scheduling.management.commands.benchmark_v2_swap_kernel import (
     _pair_validation_penalty_deltas,
     _prepare_circadian_kernel,
     _prepare_shift_rule_kernel,
+    _weekend_score_compact,
     _rank_temporal_escalation_windows,
     _request_reassignment_deltas,
     _requests_active_under_block_plans,
@@ -62,6 +63,8 @@ from apps.scheduling.optimizer_revisions import (
     TEMPORAL_ESCALATION_V2_REVISION,
     TEMPORAL_TARGETING_V2_REVISION,
     WEEKEND_EXCHANGE_V2_REVISION,
+    WEEKEND_SPREAD_PRIORITY_V2_REVISION,
+    WEEKEND_SPREAD_PRIORITY_V2_REVISIONS,
     configuration_digest,
     require_supported_v2_revision,
 )
@@ -138,6 +141,17 @@ class OptimizerRevisionTests(SimpleTestCase):
         )
         self.assertNotIn(revision, BALANCED_WEEKEND_EXCHANGE_V2_REVISIONS)
         self.assertNotIn(revision, TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS)
+
+    def test_weekend_spread_revision_has_only_intended_features(self):
+        revision = WEEKEND_SPREAD_PRIORITY_V2_REVISION
+        self.assertEqual(require_supported_v2_revision(revision), revision)
+        self.assertIn(revision, MULTISTART_FRESH_FILL_V2_REVISIONS)
+        self.assertIn(revision, CIRCADIAN_CANDIDATE_SCORING_V2_REVISIONS)
+        self.assertIn(
+            revision,
+            TEMPORAL_RECONSTRUCTION_SCORING_V2_REVISIONS,
+        )
+        self.assertIn(revision, WEEKEND_SPREAD_PRIORITY_V2_REVISIONS)
 
     def test_temporal_candidate_revision_is_supported(self):
         self.assertEqual(
@@ -931,6 +945,29 @@ class V2CandidateSelectionTests(SimpleTestCase):
         self.assertEqual(selected.candidate_index, 1)
         self.assertEqual(selected.proportionality_delta, -3.0)
 
+    def test_spread_priority_precedes_proportionality_for_score_neutral_move(self):
+        selected = select_best_candidate(
+            official_deltas=np.asarray([0.0, 0.0]),
+            spread_priority_deltas=np.asarray([-1.0, 0.0]),
+            proportionality_deltas=np.asarray([50.0, -100.0]),
+            left_assignment_indexes=np.asarray([1, 2]),
+            right_assignment_indexes=np.asarray([11, 12]),
+        )
+
+        self.assertEqual(selected.candidate_index, 0)
+        self.assertEqual(selected.spread_priority_delta, -1.0)
+
+    def test_spread_priority_cannot_justify_worse_official_score(self):
+        selected = select_best_candidate(
+            official_deltas=np.asarray([1.0]),
+            spread_priority_deltas=np.asarray([-100.0]),
+            proportionality_deltas=np.asarray([-100.0]),
+            left_assignment_indexes=np.asarray([1]),
+            right_assignment_indexes=np.asarray([11]),
+        )
+
+        self.assertIsNone(selected)
+
     def test_worse_official_score_is_never_accepted(self):
         selected = select_best_candidate(
             official_deltas=np.asarray([1.0, 5.0]),
@@ -959,6 +996,58 @@ class V2CandidateSelectionTests(SimpleTestCase):
                 left_assignment_indexes=np.asarray([1]),
                 right_assignment_indexes=np.asarray([11]),
             )
+
+
+class V2WeekendSpreadKernelTests(SimpleTestCase):
+    def test_compact_weekend_scoring_tracks_repeat_violation_depth(self):
+        settings = {
+            'period_rules': [{
+                'period_type': 'MONTH',
+                'max_volume': '4',
+                'max_penalty_weight': '10000',
+                'spread_violations': True,
+            }],
+        }
+        current = [
+            (day, True, False) for day in (2, 3, 9, 10, 16, 17)
+        ]
+
+        score, spread_priority = _weekend_score_compact(
+            current,
+            prior=[],
+            settings=settings,
+            windows={'MONTH': [(1, 31)]},
+            block_bounds=(1, 31),
+            prior_bounds=None,
+        )
+
+        self.assertEqual(score, 20000.0)
+        self.assertEqual(spread_priority, 1.0)
+
+    def test_compact_weekend_scoring_ignores_spread_when_toggle_is_off(self):
+        settings = {
+            'period_rules': [{
+                'period_type': 'MONTH',
+                'max_volume': '4',
+                'max_penalty_weight': '10000',
+                'spread_violations': False,
+            }],
+        }
+        current = [
+            (day, True, False) for day in (2, 3, 9, 10, 16, 17)
+        ]
+
+        score, spread_priority = _weekend_score_compact(
+            current,
+            prior=[],
+            settings=settings,
+            windows={'MONTH': [(1, 31)]},
+            block_bounds=(1, 31),
+            prior_bounds=None,
+        )
+
+        self.assertEqual(score, 20000.0)
+        self.assertEqual(spread_priority, 0.0)
 
 
 class V2StateTransitionTests(SimpleTestCase):
@@ -1175,6 +1264,7 @@ class V2EngineContextTests(SimpleTestCase):
             left_assignment_index=0,
             right_assignment_index=1,
             official_delta=-10.0,
+            spread_priority_delta=0.0,
             proportionality_delta=0.0,
         )
 

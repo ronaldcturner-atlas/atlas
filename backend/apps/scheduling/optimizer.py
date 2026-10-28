@@ -11376,8 +11376,8 @@ def evaluate_plateau_pairwise_swap(
     requests_by_physician_date, eligible_facilities_by_physician,
     minimum_rest_by_physician, current_score, left_instance_id,
     left_physician_id, right_instance_id, right_physician_id,
-    allow_proportional_tiebreak=False, current_scoring=None,
-    legality_only=False,
+    allow_proportional_tiebreak=False, allow_spread_tiebreak=False,
+    current_scoring=None, legality_only=False,
 ):
     """Evaluate one plateau swap with the official persisted score objective."""
     if left_instance_id == right_instance_id or left_physician_id == right_physician_id:
@@ -11454,8 +11454,9 @@ def evaluate_plateau_pairwise_swap(
         minimum_rest_by_physician,
     )
     delta = trial_scoring['score'] - current_score
+    spread_priority_delta = None
     proportionality_delta = None
-    proportionality_improved = False
+    secondary_improved = False
     if allow_proportional_tiebreak and delta == 0:
         if current_scoring is None:
             current_scoring = _score_schedule(
@@ -11463,16 +11464,27 @@ def evaluate_plateau_pairwise_swap(
                 requests_by_physician_date, eligible_facilities_by_physician,
                 minimum_rest_by_physician,
             )
-        current_secondary = _secondary_priority_value(current_scoring)
-        trial_secondary = _secondary_priority_value(trial_scoring)
-        proportionality_delta = (
-            trial_secondary[1] - current_secondary[1]
+        current_proportionality = _proportionality_priority_value(
+            current_scoring,
         )
-        proportionality_improved = trial_secondary < current_secondary
+        trial_proportionality = _proportionality_priority_value(trial_scoring)
+        proportionality_delta = trial_proportionality - current_proportionality
+        if allow_spread_tiebreak:
+            current_spread = _spread_priority_value(current_scoring)
+            trial_spread = _spread_priority_value(trial_scoring)
+            spread_priority_delta = trial_spread - current_spread
+            secondary_improved = (
+                trial_spread, trial_proportionality,
+            ) < (
+                current_spread, current_proportionality,
+            )
+        else:
+            secondary_improved = trial_proportionality < current_proportionality
     return {
         'legal': True,
-        'improving': delta < 0 or proportionality_improved,
+        'improving': delta < 0 or secondary_improved,
         'score_delta': delta,
+        'spread_priority_delta': spread_priority_delta,
         'proportionality_delta': proportionality_delta,
         'incremental_score_delta': incremental_delta,
         'incremental_rejection': False,
@@ -11487,7 +11499,8 @@ def evaluate_plateau_reassignment(
     requests_by_physician_date, eligible_facilities_by_physician,
     minimum_rest_by_physician, current_score, instance_id,
     old_physician_id, new_physician_id, current_scoring=None,
-    allow_proportional_tiebreak=False, legality_only=False,
+    allow_proportional_tiebreak=False, allow_spread_tiebreak=False,
+    legality_only=False,
 ):
     """Evaluate one V1-style reassignment with authoritative safeguards."""
     if old_physician_id == new_physician_id:
@@ -11565,8 +11578,9 @@ def evaluate_plateau_reassignment(
         minimum_rest_by_physician,
     )
     delta = trial_scoring['score'] - current_score
+    spread_priority_delta = None
     proportionality_delta = None
-    proportionality_improved = False
+    secondary_improved = False
     if allow_proportional_tiebreak and delta == 0:
         if current_scoring is None:
             current_scoring = _score_schedule(
@@ -11579,16 +11593,27 @@ def evaluate_plateau_reassignment(
                 eligible_facilities_by_physician,
                 minimum_rest_by_physician,
             )
-        current_secondary = _secondary_priority_value(current_scoring)
-        trial_secondary = _secondary_priority_value(trial_scoring)
-        proportionality_delta = (
-            trial_secondary[1] - current_secondary[1]
+        current_proportionality = _proportionality_priority_value(
+            current_scoring,
         )
-        proportionality_improved = trial_secondary < current_secondary
+        trial_proportionality = _proportionality_priority_value(trial_scoring)
+        proportionality_delta = trial_proportionality - current_proportionality
+        if allow_spread_tiebreak:
+            current_spread = _spread_priority_value(current_scoring)
+            trial_spread = _spread_priority_value(trial_scoring)
+            spread_priority_delta = trial_spread - current_spread
+            secondary_improved = (
+                trial_spread, trial_proportionality,
+            ) < (
+                current_spread, current_proportionality,
+            )
+        else:
+            secondary_improved = trial_proportionality < current_proportionality
     return {
         'legal': True,
-        'improving': delta < 0 or proportionality_improved,
+        'improving': delta < 0 or secondary_improved,
         'score_delta': delta,
+        'spread_priority_delta': spread_priority_delta,
         'proportionality_delta': proportionality_delta,
         'incremental_score_delta': incremental_delta,
         'incremental_rejection': False,

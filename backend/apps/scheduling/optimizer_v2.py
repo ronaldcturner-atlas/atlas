@@ -179,6 +179,7 @@ class V2CandidateSelection:
     left_assignment_index: int
     right_assignment_index: int
     official_delta: float
+    spread_priority_delta: float
     proportionality_delta: float
 
 
@@ -608,33 +609,47 @@ def select_best_candidate(
     left_assignment_indexes,
     right_assignment_indexes,
     *,
+    spread_priority_deltas=None,
     tolerance=1e-9,
 ):
     """Select the best admissible v2 transition.
 
-    A lower official penalty always wins. Proportionality may select a move only
-    when the official penalty is unchanged within tolerance; it can never
-    justify a worse official schedule.
+    A lower official penalty always wins. For score-neutral moves, reducing
+    repeat-violation depth wins before proportionality. Neither secondary
+    objective can justify a worse official schedule.
     """
     official = np.asarray(official_deltas, dtype=np.float64)
     proportionality = np.asarray(proportionality_deltas, dtype=np.float64)
+    spread_priority = (
+        np.zeros(official.shape, dtype=np.float64)
+        if spread_priority_deltas is None
+        else np.asarray(spread_priority_deltas, dtype=np.float64)
+    )
     left = np.asarray(left_assignment_indexes, dtype=np.int32)
     right = np.asarray(right_assignment_indexes, dtype=np.int32)
     if not (
-        official.shape == proportionality.shape == left.shape == right.shape
+        official.shape == spread_priority.shape == proportionality.shape
+        == left.shape == right.shape
     ):
         raise ValueError('Candidate arrays must have identical shapes.')
     acceptable = np.flatnonzero(
         (official < -tolerance)
         | (
             (np.abs(official) <= tolerance)
-            & (proportionality < -tolerance)
+            & (
+                (spread_priority < -tolerance)
+                | (
+                    (np.abs(spread_priority) <= tolerance)
+                    & (proportionality < -tolerance)
+                )
+            )
         )
     )
     if not acceptable.size:
         return None
     ordering = np.lexsort((
         proportionality[acceptable],
+        spread_priority[acceptable],
         official[acceptable],
     ))
     candidate_index = int(acceptable[int(ordering[0])])
@@ -643,6 +658,7 @@ def select_best_candidate(
         left_assignment_index=int(left[candidate_index]),
         right_assignment_index=int(right[candidate_index]),
         official_delta=float(official[candidate_index]),
+        spread_priority_delta=float(spread_priority[candidate_index]),
         proportionality_delta=float(proportionality[candidate_index]),
     )
 
@@ -654,6 +670,7 @@ def select_diversification_candidate(
     right_assignment_indexes,
     *,
     seed,
+    spread_priority_deltas=None,
     minimum_penalty_increase=0.0,
     maximum_penalty_increase=10000.0,
     candidate_pool_size=256,
@@ -667,10 +684,16 @@ def select_diversification_candidate(
     """
     official = np.asarray(official_deltas, dtype=np.float64)
     proportionality = np.asarray(proportionality_deltas, dtype=np.float64)
+    spread_priority = (
+        np.zeros(official.shape, dtype=np.float64)
+        if spread_priority_deltas is None
+        else np.asarray(spread_priority_deltas, dtype=np.float64)
+    )
     left = np.asarray(left_assignment_indexes, dtype=np.int32)
     right = np.asarray(right_assignment_indexes, dtype=np.int32)
     if not (
-        official.shape == proportionality.shape == left.shape == right.shape
+        official.shape == spread_priority.shape == proportionality.shape
+        == left.shape == right.shape
     ):
         raise ValueError('Candidate arrays must have identical shapes.')
     maximum = max(float(maximum_penalty_increase), 0.0)
@@ -680,6 +703,7 @@ def select_diversification_candidate(
     )
     admissible = np.flatnonzero(
         np.isfinite(official)
+        & np.isfinite(spread_priority)
         & np.isfinite(proportionality)
         & (official >= minimum - tolerance)
         & (official <= maximum + tolerance)
@@ -698,6 +722,7 @@ def select_diversification_candidate(
         admissible = impactful
     ordering = np.lexsort((
         proportionality[admissible],
+        spread_priority[admissible],
         official[admissible],
     ))
     pool = admissible[ordering[:max(int(candidate_pool_size), 1)]]
@@ -708,5 +733,6 @@ def select_diversification_candidate(
         left_assignment_index=int(left[candidate_index]),
         right_assignment_index=int(right[candidate_index]),
         official_delta=float(official[candidate_index]),
+        spread_priority_delta=float(spread_priority[candidate_index]),
         proportionality_delta=float(proportionality[candidate_index]),
     )

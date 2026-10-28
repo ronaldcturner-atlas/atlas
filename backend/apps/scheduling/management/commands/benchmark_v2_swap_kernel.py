@@ -79,6 +79,7 @@ from apps.scheduling.optimizer_revisions import (
     TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS,
     TEMPORAL_RECONSTRUCTION_SCORING_V2_REVISIONS,
     TEMPORAL_TARGETING_V2_REVISION,
+    WEEKEND_SPREAD_PRIORITY_V2_REVISIONS,
     require_supported_v2_revision,
 )
 
@@ -957,11 +958,20 @@ def _weekend_cycle_start_ordinal(day):
     return week_start - 7 if weekday == 0 else week_start
 
 
-def _weekend_score_compact(current, prior, settings, windows, block_bounds, prior_bounds):
-    """Mirror authoritative weekend scoring using compact immutable features."""
+def _weekend_score_compact(
+    current, prior, settings, windows, block_bounds, prior_bounds,
+    *, include_spread=True,
+):
+    """Mirror authoritative weekend score and spread priority compactly."""
     current_weekend = [row for row in current if row[1]]
     prior_weekend = [row for row in prior if row[1]]
     score = 0.0
+    spread_depths = defaultdict(float)
+
+    def add_spread_depth(kind, period, depth, enabled):
+        if include_spread and enabled and depth > 0:
+            spread_depths[(kind, period)] += float(depth)
+
     rules = [
         rule for rule in (settings.get('period_rules') or ())
         if isinstance(rule, dict)
@@ -973,13 +983,22 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
             count = sum(start <= row[0] <= end for row in current_weekend)
             minimum = rule.get('min_volume')
             maximum = rule.get('max_volume')
+            spread_enabled = bool(rule.get('spread_violations'))
             if minimum not in (None, ''):
-                score += max(_number(minimum) - count, 0.0) * max(
-                    _number(rule.get('min_penalty_weight')), 0.0,
+                deviation = max(_number(minimum) - count, 0.0)
+                weight = max(_number(rule.get('min_penalty_weight')), 0.0)
+                score += deviation * weight
+                add_spread_depth(
+                    'WEEKEND_UNDER_MINIMUM', period, deviation,
+                    spread_enabled and weight > 0,
                 )
             if maximum not in (None, ''):
-                score += max(count - _number(maximum), 0.0) * max(
-                    _number(rule.get('max_penalty_weight')), 0.0,
+                deviation = max(count - _number(maximum), 0.0)
+                weight = max(_number(rule.get('max_penalty_weight')), 0.0)
+                score += deviation * weight
+                add_spread_depth(
+                    'WEEKEND_OVER_MAXIMUM', period, deviation,
+                    spread_enabled and weight > 0,
                 )
 
     combined_weekend = [(row[0], False) for row in prior_weekend]
@@ -1016,6 +1035,16 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
                     actual - limit - max(prior_count - limit, 0), 0,
                 )
             score += weight if deviation else 0.0
+            add_spread_depth(
+                (
+                    'MIN_CONSECUTIVE_WEEKEND_SHIFTS'
+                    if side == 'min'
+                    else 'MAX_CONSECUTIVE_WEEKEND_SHIFTS'
+                ),
+                'WEEKEND_BLOCK',
+                1.0 if deviation else 0.0,
+                bool(settings.get('consecutive_weekend_shifts_spread_violations')),
+            )
 
     weekends = {}
     for day, is_current in combined_weekend:
@@ -1055,6 +1084,16 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
                 weight if side == 'min' and deviation
                 else deviation * weight
             )
+            add_spread_depth(
+                (
+                    'MIN_CONSECUTIVE_WEEKENDS'
+                    if side == 'min'
+                    else 'MAX_CONSECUTIVE_WEEKENDS'
+                ),
+                'WEEKEND_STREAK',
+                1.0 if side == 'min' and deviation else deviation,
+                bool(settings.get('consecutive_weekends_spread_violations')),
+            )
 
     friday_weight = max(_number(
         settings.get('block_friday_night_before_weekend_off_penalty_weight'),
@@ -1083,12 +1122,25 @@ def _weekend_score_compact(current, prior, settings, windows, block_bounds, prio
                 continue
             if saturday not in weekend_days and sunday not in weekend_days:
                 score += friday_weight
-    return score
+                add_spread_depth(
+                    'FRIDAY_NIGHT_BEFORE_WEEKEND_OFF',
+                    'WEEKEND',
+                    1.0,
+                    bool(settings.get(
+                        'friday_night_before_weekend_off_spread_violations'
+                    )),
+                )
+    spread_priority = sum(
+        depth * (depth - 1.0) / 2.0
+        for depth in spread_depths.values()
+    )
+    return score, spread_priority
 
 
 def _prepare_weekend_kernel(
     instances, occupancy, physician_ids, contracts, movable_pairs,
     instance_index, shift_signatures, signature_features,
+    *, include_spread=False,
 ):
     """Precompute exact fixed-state weekend deltas by replacement signature."""
     period_types = {'SCHEDULE_BLOCK', 'MONTH', 'WEEK'}
@@ -1121,6 +1173,7 @@ def _prepare_weekend_kernel(
     current_by_physician = []
     settings_by_physician = []
     base_scores = []
+    base_spread_priorities = []
     for physician_idx, physician_id in enumerate(physician_ids):
         current = [
             signature_features[int(shift_signatures[shift_idx])]
@@ -1131,17 +1184,23 @@ def _prepare_weekend_kernel(
             settings = {}
         current_by_physician.append(current)
         settings_by_physician.append(settings)
-        base_scores.append(_weekend_score_compact(
+        base_score, base_spread_priority = _weekend_score_compact(
             current,
             prior_by_physician[physician_id],
             settings,
             windows,
             block_bounds,
             prior_bounds,
-        ))
+            include_spread=include_spread,
+        )
+        base_scores.append(base_score)
+        base_spread_priorities.append(base_spread_priority)
 
     signature_count = len(signature_features)
     deltas = np.zeros((len(movable_pairs), signature_count), dtype=np.float64)
+    spread_deltas = np.zeros(
+        (len(movable_pairs), signature_count), dtype=np.float64,
+    )
     cache = {}
     physician_lookup = {
         physician_id: physician_idx
@@ -1156,20 +1215,28 @@ def _prepare_weekend_kernel(
         if cached is None:
             current = list(current_by_physician[physician_idx])
             current.remove(signature_features[old_signature])
-            cached = np.zeros(signature_count, dtype=np.float64)
+            cached = np.zeros((2, signature_count), dtype=np.float64)
             for new_signature, feature in enumerate(signature_features):
-                after = _weekend_score_compact(
+                after_score, after_spread_priority = _weekend_score_compact(
                     [*current, feature],
                     prior_by_physician[physician_id],
                     settings_by_physician[physician_idx],
                     windows,
                     block_bounds,
                     prior_bounds,
+                    include_spread=include_spread,
                 )
-                cached[new_signature] = after - base_scores[physician_idx]
+                cached[0, new_signature] = (
+                    after_score - base_scores[physician_idx]
+                )
+                cached[1, new_signature] = (
+                    after_spread_priority
+                    - base_spread_priorities[physician_idx]
+                )
             cache[cache_key] = cached
-        deltas[assignment_idx] = cached
-    return deltas
+        deltas[assignment_idx] = cached[0]
+        spread_deltas[assignment_idx] = cached[1]
+    return deltas, spread_deltas
 
 
 def _unique_period_rules(settings):
@@ -2591,6 +2658,9 @@ class Command(BaseCommand):
         balanced_weekend_exchange_scoring = (
             optimizer_revision in BALANCED_WEEKEND_EXCHANGE_V2_REVISIONS
         )
+        weekend_spread_priority_scoring = (
+            optimizer_revision in WEEKEND_SPREAD_PRIORITY_V2_REVISIONS
+        )
         temporal_plateau_escalation_scoring = (
             optimizer_revision in TEMPORAL_PLATEAU_ESCALATION_V2_REVISIONS
         )
@@ -3052,6 +3122,7 @@ class Command(BaseCommand):
             workload_kernel = cached_tables['workload']
             shift_rule_kernel = cached_tables['shift_rule']
             weekend_kernel = cached_tables['weekend']
+            weekend_spread_kernel = cached_tables['weekend_spread']
             circadian_kernel = {
                 'replacement_by_assignment': (
                     cached_tables['circadian']
@@ -3064,6 +3135,7 @@ class Command(BaseCommand):
             }
             for name in (
                 'consecutive', 'same_shift', 'workload', 'shift_rule', 'weekend',
+                'weekend_spread',
             ):
                 preparation_breakdown[f'{name}_kernel_seconds'] = 0.0
             preparation_breakdown['circadian_kernel_seconds'] = 0.0
@@ -3139,7 +3211,7 @@ class Command(BaseCommand):
                 perf_counter() - component_started
             )
             component_started = perf_counter()
-            weekend_kernel = _prepare_weekend_kernel(
+            weekend_kernel, weekend_spread_kernel = _prepare_weekend_kernel(
                 instances,
                 occupancy,
                 physician_ids,
@@ -3148,6 +3220,7 @@ class Command(BaseCommand):
                 instance_index,
                 shift_signatures,
                 signature_features,
+                include_spread=weekend_spread_priority_scoring,
             )
             preparation_breakdown['weekend_kernel_seconds'] = (
                 perf_counter() - component_started
@@ -3375,6 +3448,7 @@ class Command(BaseCommand):
                 'shift_rule': shift_rule_kernel,
                 'consecutive': consecutive_kernel,
                 'weekend': weekend_kernel,
+                'weekend_spread': weekend_spread_kernel,
                 'same_shift': same_shift_kernel['replacement_by_assignment'],
                 'facility_proportionality_score': (
                     facility_proportionality_kernel['score_delta']
@@ -3402,6 +3476,9 @@ class Command(BaseCommand):
         shift_rule_kernel = engine_context.assignment_rows.tables['shift_rule']
         consecutive_kernel = engine_context.assignment_rows.tables['consecutive']
         weekend_kernel = engine_context.assignment_rows.tables['weekend']
+        weekend_spread_kernel = engine_context.assignment_rows.tables[
+            'weekend_spread'
+        ]
         same_shift_kernel['replacement_by_assignment'] = (
             engine_context.assignment_rows.tables['same_shift']
         )
@@ -3511,10 +3588,11 @@ class Command(BaseCommand):
                 perf_counter() - refresh_component_started
             )
             refresh_component_started = perf_counter()
-            refreshed_weekend = _prepare_weekend_kernel(
+            refreshed_weekend, refreshed_weekend_spread = _prepare_weekend_kernel(
                 instances, affected_occupancy, affected_ids, contracts,
                 refreshed_pairs, instance_index, shift_signatures,
                 signature_features,
+                include_spread=weekend_spread_priority_scoring,
             )
             refresh_breakdown['weekend_seconds'] = (
                 perf_counter() - refresh_component_started
@@ -3568,6 +3646,7 @@ class Command(BaseCommand):
                 'shift_rule': refreshed_shift_rule,
                 'consecutive': refreshed_consecutive,
                 'weekend': refreshed_weekend,
+                'weekend_spread': refreshed_weekend_spread,
                 'same_shift': refreshed_same_shift['replacement_by_assignment'],
                 'facility_proportionality_score': refreshed_facility['score_delta'],
                 'facility_proportionality_baseline': (
@@ -3605,6 +3684,7 @@ class Command(BaseCommand):
         reassignment_candidate_schedules = 0
         night_left_assignment_batches = []
         night_right_assignment_batches = []
+        night_spread_priority_batches = []
         night_priority_batches = []
         night_partial_penalty_batches = []
         overlap_delta_batches = []
@@ -3688,6 +3768,14 @@ class Command(BaseCommand):
                     right_index[selected], shift_signatures[left_shift]
                 ]
             )
+            weekend_spread_delta = (
+                weekend_spread_kernel[
+                    left_index, shift_signatures[selected_right_shift]
+                ]
+                + weekend_spread_kernel[
+                    right_index[selected], shift_signatures[left_shift]
+                ]
+            )
             weekend_neutral = np.abs(weekend_delta) <= 1e-9
             weekend_neutral_states += int(np.count_nonzero(weekend_neutral))
             facility_delta = (
@@ -3748,6 +3836,7 @@ class Command(BaseCommand):
                 np.full(selected.size, left_index, dtype=np.int32)
             )
             night_right_assignment_batches.append(right_index[selected])
+            night_spread_priority_batches.append(weekend_spread_delta)
             night_priority_batches.append(priority_delta)
             night_partial_penalty_batches.append(
                 workload_delta + weekend_delta + overlap_deltas + rest_deltas
@@ -3835,6 +3924,9 @@ class Command(BaseCommand):
                 else np.zeros_like(shift_rule_deltas)
             )
             night_priorities = np.concatenate(night_priority_batches)
+            spread_priority_deltas = np.concatenate(
+                night_spread_priority_batches
+            )
             night_partial_penalties = np.concatenate(night_partial_penalty_batches)
             overlap_deltas = np.concatenate(overlap_delta_batches)
             rest_deltas = np.concatenate(rest_delta_batches)
@@ -3889,8 +3981,10 @@ class Command(BaseCommand):
                     )
                 ), dtype=np.bool_, count=len(official_deltas))
                 official_deltas = official_deltas.copy()
+                spread_priority_deltas = spread_priority_deltas.copy()
                 night_priorities = night_priorities.copy()
                 official_deltas[excluded] = np.inf
+                spread_priority_deltas[excluded] = np.inf
                 night_priorities[excluded] = np.inf
             selection_mode = options['selection_mode']
             if selection_mode == 'diversify':
@@ -3900,6 +3994,7 @@ class Command(BaseCommand):
                     night_left_assignments,
                     night_right_assignments,
                     seed=options['diversification_seed'],
+                    spread_priority_deltas=spread_priority_deltas,
                     minimum_penalty_increase=options[
                         'minimum_diversification_penalty'
                     ],
@@ -3913,6 +4008,7 @@ class Command(BaseCommand):
                     night_priorities,
                     night_left_assignments,
                     night_right_assignments,
+                    spread_priority_deltas=spread_priority_deltas,
                 )
             if best_selection is not None:
                 best_index = best_selection.candidate_index
@@ -3926,6 +4022,9 @@ class Command(BaseCommand):
                     'right_instance_id': movable_pairs[best_right][0],
                     'right_physician_id': movable_pairs[best_right][1],
                     'predicted_official_delta': best_selection.official_delta,
+                    'predicted_spread_priority_delta': (
+                        best_selection.spread_priority_delta
+                    ),
                     'predicted_proportionality_delta': (
                         best_selection.proportionality_delta
                     ),
@@ -4311,10 +4410,14 @@ class Command(BaseCommand):
                 perf_counter() - component_started
             )
             component_started = perf_counter()
-            affected_weekend_kernel = _prepare_weekend_kernel(
+            (
+                affected_weekend_kernel,
+                affected_weekend_spread_kernel,
+            ) = _prepare_weekend_kernel(
                 instances, affected_occupancy, affected_ids, contracts,
                 affected_pairs, instance_index, shift_signatures,
                 signature_features,
+                include_spread=weekend_spread_priority_scoring,
             )
             affected_refresh_breakdown['weekend_kernel_seconds'] = (
                 perf_counter() - component_started
@@ -4388,6 +4491,10 @@ class Command(BaseCommand):
                     affected_weekend_kernel,
                     weekend_kernel[affected_assignment_indexes],
                 ),
+                'weekend_spread': max_abs_error(
+                    affected_weekend_spread_kernel,
+                    weekend_spread_kernel[affected_assignment_indexes],
+                ),
                 'same_shift': max_abs_error(
                     affected_same_shift_kernel['replacement_by_assignment'],
                     same_shift_kernel['replacement_by_assignment'][
@@ -4435,6 +4542,11 @@ class Command(BaseCommand):
                 ('merged_shift_rule', shift_rule_kernel, affected_shift_rule_kernel),
                 ('merged_consecutive', consecutive_kernel, affected_consecutive_kernel),
                 ('merged_weekend', weekend_kernel, affected_weekend_kernel),
+                (
+                    'merged_weekend_spread',
+                    weekend_spread_kernel,
+                    affected_weekend_spread_kernel,
+                ),
                 (
                     'merged_same_shift',
                     same_shift_kernel['replacement_by_assignment'],
@@ -5167,6 +5279,25 @@ class Command(BaseCommand):
                         }
                         structural_reconstruction_attempt['accepted'] = True
             if transition_validation is None and best_vectorized_candidate is not None:
+                spread_checkpoint = bool(
+                    abs(float(best_vectorized_candidate[
+                        'predicted_official_delta'
+                    ])) <= 0.0001
+                    and abs(float(best_vectorized_candidate.get(
+                        'predicted_spread_priority_delta', 0.0,
+                    ))) > 0.0001
+                )
+                if spread_checkpoint and current_scoring is None:
+                    current_scoring = _score_schedule(
+                        instances,
+                        physicians,
+                        state,
+                        targets,
+                        contracts,
+                        requests_by_physician_date,
+                        eligible_facilities_by_physician,
+                        minimum_rest_by_physician,
+                    )
                 transition_exact = evaluate_plateau_pairwise_swap(
                     instances=instances,
                     physicians=physicians,
@@ -5188,11 +5319,12 @@ class Command(BaseCommand):
                     right_instance_id=best_vectorized_candidate['right_instance_id'],
                     right_physician_id=best_vectorized_candidate['right_physician_id'],
                     allow_proportional_tiebreak=True,
+                    allow_spread_tiebreak=weekend_spread_priority_scoring,
                     current_scoring=current_scoring,
-                    legality_only=not score_checkpoint,
+                    legality_only=not (score_checkpoint or spread_checkpoint),
                 )
                 authoritative_legal = bool(transition_exact.get('legal'))
-                if score_checkpoint:
+                if score_checkpoint or spread_checkpoint:
                     authoritative_improving = bool(
                         transition_exact.get('improving')
                     )
@@ -5200,6 +5332,11 @@ class Command(BaseCommand):
                         float(transition_exact['score_delta'])
                         if transition_exact.get('score_delta') is not None
                         else None
+                    )
+                    authoritative_spread_priority_delta = (
+                        float(transition_exact['spread_priority_delta'])
+                        if transition_exact.get('spread_priority_delta')
+                        is not None else None
                     )
                     authoritative_proportionality_delta = (
                         float(transition_exact['proportionality_delta'])
@@ -5211,6 +5348,11 @@ class Command(BaseCommand):
                     predicted_official_delta = float(
                         best_vectorized_candidate['predicted_official_delta']
                     )
+                    predicted_spread_priority_delta = float(
+                        best_vectorized_candidate[
+                            'predicted_spread_priority_delta'
+                        ]
+                    )
                     predicted_proportionality_delta = float(
                         best_vectorized_candidate[
                             'predicted_proportionality_delta'
@@ -5220,10 +5362,20 @@ class Command(BaseCommand):
                         predicted_official_delta < 0
                         or (
                             abs(predicted_official_delta) <= 0.0001
-                            and predicted_proportionality_delta < 0
+                            and (
+                                predicted_spread_priority_delta < 0
+                                or (
+                                    abs(predicted_spread_priority_delta)
+                                    <= 0.0001
+                                    and predicted_proportionality_delta < 0
+                                )
+                            )
                         )
                     )
                     authoritative_official_delta = predicted_official_delta
+                    authoritative_spread_priority_delta = (
+                        predicted_spread_priority_delta
+                    )
                     authoritative_proportionality_delta = (
                         predicted_proportionality_delta
                     )
@@ -5233,6 +5385,9 @@ class Command(BaseCommand):
                     'authoritative_legal': authoritative_legal,
                     'authoritative_improving': authoritative_improving,
                     'authoritative_official_delta': authoritative_official_delta,
+                    'authoritative_spread_priority_delta': (
+                        authoritative_spread_priority_delta
+                    ),
                     'authoritative_proportionality_delta': (
                         authoritative_proportionality_delta
                     ),
@@ -5252,7 +5407,10 @@ class Command(BaseCommand):
                         + 0.0001
                     )
                 )
-            elif reassignment_shortlist:
+                if spread_checkpoint and not authoritative_improving:
+                    transition_validation = None
+                    best_selection = None
+            if transition_validation is None and reassignment_shortlist:
                 best_reassignment = None
                 for candidate in reassignment_shortlist:
                     exact = evaluate_plateau_reassignment(
@@ -5274,12 +5432,23 @@ class Command(BaseCommand):
                         old_physician_id=candidate['old_physician_id'],
                         new_physician_id=candidate['new_physician_id'],
                         allow_proportional_tiebreak=True,
+                        allow_spread_tiebreak=(
+                            weekend_spread_priority_scoring
+                        ),
                         current_scoring=current_scoring,
                     )
                     if not exact.get('legal') or not exact.get('improving'):
                         continue
                     ranking = (
                         float(exact['score_delta']),
+                        *(
+                            (
+                                float(
+                                    exact.get('spread_priority_delta') or 0.0
+                                ),
+                            )
+                            if weekend_spread_priority_scoring else ()
+                        ),
                         float(exact.get('proportionality_delta') or 0.0),
                     )
                     if (
@@ -5295,6 +5464,9 @@ class Command(BaseCommand):
                         'predicted_official_delta': float(
                             exact['score_delta']
                         ),
+                        'predicted_spread_priority_delta': float(
+                            exact.get('spread_priority_delta') or 0.0
+                        ),
                         'predicted_proportionality_delta': float(
                             exact.get('proportionality_delta') or 0.0
                         ),
@@ -5302,6 +5474,9 @@ class Command(BaseCommand):
                         'authoritative_improving': True,
                         'authoritative_official_delta': float(
                             exact['score_delta']
+                        ),
+                        'authoritative_spread_priority_delta': float(
+                            exact.get('spread_priority_delta') or 0.0
                         ),
                         'authoritative_proportionality_delta': float(
                             exact.get('proportionality_delta') or 0.0
@@ -5627,6 +5802,7 @@ class Command(BaseCommand):
                     right_instance_id=sample['right_instance_id'],
                     right_physician_id=sample['right_physician_id'],
                     allow_proportional_tiebreak=True,
+                    allow_spread_tiebreak=weekend_spread_priority_scoring,
                     current_scoring=current_scoring,
                 )
                 if not exact.get('legal'):
@@ -6004,6 +6180,9 @@ class Command(BaseCommand):
             ),
             'balanced_weekend_exchange_scoring': (
                 balanced_weekend_exchange_scoring
+            ),
+            'weekend_spread_priority_scoring': (
+                weekend_spread_priority_scoring
             ),
             'applied_in_memory_swaps': applied_in_memory_swaps,
             'run_number': run.run_number,
