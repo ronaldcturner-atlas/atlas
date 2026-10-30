@@ -1,4 +1,4 @@
-from datetime import date, time
+from datetime import date, time, timedelta
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
@@ -84,14 +84,14 @@ class DomainAccessBoundaryTests(TestCase):
             start_date=date(2027, 1, 1),
             end_date=date(2027, 1, 31),
             request_open_datetime=now,
-            request_close_datetime=now,
+            request_close_datetime=now + timedelta(days=1),
         )
         self.block_b = ScheduleBlock.objects.create(
             domain=self.domain_b,
             start_date=date(2027, 2, 1),
             end_date=date(2027, 2, 28),
             request_open_datetime=now,
-            request_close_datetime=now,
+            request_close_datetime=now + timedelta(days=1),
         )
         self.version_b = ScheduleVersion.objects.create(
             schedule_block=self.block_b,

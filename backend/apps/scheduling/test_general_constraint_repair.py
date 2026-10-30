@@ -18,6 +18,7 @@ class GeneralConstraintRepairTests(SimpleTestCase):
         improvements = []
         with patch.object(optimizer, '_score_schedule', side_effect=self.scoring), \
              patch.object(optimizer, '_request_repair_candidates', return_value=[(1, 1)]), \
+             patch.object(optimizer, '_weekend_repair_candidates', return_value=[]), \
              patch.object(optimizer, '_same_shift_break_candidates', return_value=[]), \
              patch.object(optimizer, '_consecutive_day_break_candidates', return_value=[]), \
              patch.object(optimizer, '_can_assign_in_state', return_value=True):
@@ -40,6 +41,7 @@ class GeneralConstraintRepairTests(SimpleTestCase):
             with self.subTest(manual=bool(manual_pairs)), \
                  patch.object(optimizer, '_score_schedule', side_effect=worse), \
                  patch.object(optimizer, '_request_repair_candidates', return_value=[(1, 1)]), \
+                 patch.object(optimizer, '_weekend_repair_candidates', return_value=[]), \
                  patch.object(optimizer, '_same_shift_break_candidates', return_value=[(1, 1)]), \
                  patch.object(optimizer, '_consecutive_day_break_candidates', return_value=[(1, 1)]), \
                  patch.object(optimizer, '_can_assign_in_state', return_value=True):
@@ -57,6 +59,7 @@ class GeneralConstraintRepairTests(SimpleTestCase):
         physicians = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
         with patch.object(optimizer, '_score_schedule', side_effect=self.scoring), \
              patch.object(optimizer, '_request_repair_candidates', return_value=[(1, 1)]), \
+             patch.object(optimizer, '_weekend_repair_candidates', return_value=[]), \
              patch.object(optimizer, '_same_shift_break_candidates', return_value=[]), \
              patch.object(optimizer, '_consecutive_day_break_candidates', return_value=[]), \
              patch.object(optimizer, '_can_assign_in_state', return_value=True):
