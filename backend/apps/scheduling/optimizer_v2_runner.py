@@ -41,6 +41,7 @@ from .optimizer_revisions import (
     STABLE_V2_REVISION,
     V2_RUN_KIND,
     V2_RUN_KINDS,
+    ZERO_SCORE_STOP_V2_REVISIONS,
     code_release_identifier,
     configured_scoring_revision,
     configuration_digest,
@@ -752,7 +753,6 @@ def optimize_schedule_version_v2(
         != ScheduleShiftAssignment.AssignmentSource.MANUAL
         for assignment in source_assignments
     )
-
     output = io.StringIO()
     diagnostic_state = {
         'run_id': optimizer_run.id,
@@ -772,12 +772,21 @@ def optimize_schedule_version_v2(
         0.0,
     )
     user_stopped = bool(stop_requested is not None and stop_requested())
-    if initial_score == 0 and not has_movable_assignment:
+    zero_score_stop_enabled = (
+        optimizer_run.optimizer_revision in ZERO_SCORE_STOP_V2_REVISIONS
+    )
+    if initial_score == 0 and (
+        zero_score_stop_enabled or not has_movable_assignment
+    ):
         search_result = {
             'stage': 'V2_CONTINUOUS_IMPROVEMENT_CHAIN',
             'swaps': [],
             'wall_seconds': 0.0,
-            'stopped_reason': 'complete_fixed_schedule',
+            'stopped_reason': (
+                'score_zero'
+                if zero_score_stop_enabled
+                else 'complete_fixed_schedule'
+            ),
             'total_evaluations': 0,
             'accepted_transitions': 0,
             'improving_transitions': 0,

@@ -5982,6 +5982,72 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         )
         self.assertEqual(v2_run.lineage_search_exhaustion_count, 0)
 
+    def test_atlas_v2_completes_zero_score_movable_schedule_without_search(self):
+        from apps.scheduling.optimizer_revisions import (
+            ZERO_SCORE_STOP_V2_REVISION,
+        )
+        from apps.scheduling.optimizer_v2_runner import (
+            optimize_schedule_version_v2_test,
+        )
+
+        version = self._create_build_version()
+        instance = self._create_shift_instance(
+            version, self.day_template, self.block.start_date,
+        )
+        physician = self._create_assignment_physician(
+            'v2.movable.complete@example.com', 'V2 Movable Complete',
+            facilities=[self.facility],
+        )
+        v2_run = OptimizerRun.objects.create(
+            schedule_version=version,
+            run_number=1,
+            created_by=self.scheduler_user,
+            status=OptimizerRun.Status.RUNNING,
+            start_mode=OptimizerRun.StartMode.FRESH_FILL,
+            run_kind='OPTIMIZER_V2_TEST',
+            optimizer_revision=ZERO_SCORE_STOP_V2_REVISION,
+            max_runtime_seconds=60,
+            seed=9185,
+        )
+
+        def bootstrap(_version, **kwargs):
+            ScheduleShiftAssignment.objects.create(
+                shift_instance=instance,
+                physician=physician,
+                created_by=self.scheduler_user,
+                assignment_source=(
+                    ScheduleShiftAssignment.AssignmentSource.OPTIMIZER
+                ),
+                optimizer_run=kwargs['optimizer_run'],
+                is_locked=False,
+            )
+            return {
+                'unfilled_shift_count': 0,
+                'final_overlap_violations': 0,
+                'final_score': 0,
+            }
+
+        with patch(
+            'apps.scheduling.initial_schedule.construct_complete_fresh_fill_schedule',
+            side_effect=bootstrap,
+        ), patch(
+            'apps.scheduling.optimizer_v2_runner.call_command',
+        ) as search:
+            summary = optimize_schedule_version_v2_test(
+                version,
+                optimizer_run=v2_run,
+                source_run=None,
+                created_by=self.scheduler_user,
+            )
+
+        search.assert_not_called()
+        v2_run.refresh_from_db()
+        self.assertEqual(v2_run.status, OptimizerRun.Status.COMPLETED)
+        self.assertEqual(v2_run.final_score, 0)
+        self.assertEqual(summary['stopped_reason'], 'score_zero')
+        self.assertEqual(summary['iterations_run'], 0)
+        self.assertEqual(summary['unfilled_shift_count'], 0)
+
     @override_settings(ATLAS_V2_ENABLED=False)
     def test_background_atlas_v2_test_is_gated_until_workers_restart(self):
         version = self._create_build_version()

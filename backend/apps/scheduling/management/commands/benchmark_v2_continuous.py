@@ -12,6 +12,7 @@ from apps.scheduling.optimizer import (
 from apps.scheduling.optimizer_telemetry import ProductionOptimizerTelemetry
 from apps.scheduling.optimizer_revisions import (
     STABLE_V2_REVISION,
+    ZERO_SCORE_STOP_V2_REVISIONS,
     require_supported_v2_revision,
 )
 
@@ -731,6 +732,30 @@ class Command(BaseCommand):
                 'transition': transition,
                 'rejected_transition': rejected_transition,
             })
+            if (
+                checkpoint_score
+                and optimizer_revision in ZERO_SCORE_STOP_V2_REVISIONS
+                and authoritative_current <= 0.0001
+            ):
+                # The authoritative score is non-negative, so zero is a
+                # proven global floor. Preserve this exact verified state and
+                # do not spend the remaining runtime diversifying away from a
+                # schedule that cannot be improved.
+                current_score = 0.0
+                best_score = 0.0
+                best_proportionality_offset = current_proportionality_offset
+                best_swaps = list(current_swaps)
+                stopped_reason = 'score_zero'
+                update_diagnostic_state(
+                    phase='score_floor_reached',
+                    runtime_seconds=float(runtime_clock() - started),
+                    stopped_reason=stopped_reason,
+                    current_predicted_score=current_score,
+                    best_predicted_score=best_score,
+                    current_operation_chain=current_swaps,
+                    best_operation_chain=best_swaps,
+                )
+                break
             if transition is None:
                 if selection_mode == 'diversify' and diversification_applied:
                     diversification_remaining = 0

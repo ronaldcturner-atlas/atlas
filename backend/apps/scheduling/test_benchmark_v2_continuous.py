@@ -382,6 +382,63 @@ class V2ContinuousCommandTests(SimpleTestCase):
 
         self.assertEqual(progress, [125.0, 115.0])
 
+    def test_authoritative_zero_stops_before_further_diversification(self):
+        from apps.scheduling.optimizer_revisions import (
+            ZERO_SCORE_STOP_V2_REVISION,
+        )
+
+        zero_transition = self._transition(0)
+        zero_transition.update({
+            'authoritative_official_delta': -100.0,
+            'predicted_official_delta': -100.0,
+            'predicted_component_deltas': {'request_score': -100.0},
+        })
+        results = [
+            self._kernel_result(
+                'initial', zero_transition, current_score=100.0,
+            ),
+            self._kernel_result(
+                'zero', self._transition(1), current_score=0.0,
+            ),
+        ]
+        progress = []
+
+        def fake_kernel(_name, **kwargs):
+            kwargs['stdout'].write(json.dumps(results.pop(0)))
+
+        command = Command()
+        command.stdout = io.StringIO()
+        with patch(
+            'apps.scheduling.management.commands.'
+            'benchmark_v2_continuous.call_command',
+            side_effect=fake_kernel,
+        ):
+            command.handle(
+                run_number=95, run_id=None, target_evaluations=100,
+                max_transitions=10, max_runtime_seconds=None,
+                minimum_rate=0, stress_contract_count=0,
+                validate_sample=0, checkpoint_interval=1,
+                initial_swap=[], as_json=True, stop_requested=None,
+                progress_callback=lambda score: progress.append(float(score)),
+                starting_score=100, distribution_focus=False,
+                soft_restart_moves=3, deep_restart_moves=8,
+                soft_restart_maximum_penalty=5000,
+                deep_restart_maximum_penalty=10000,
+                optimizer_revision=ZERO_SCORE_STOP_V2_REVISION,
+            )
+
+        result = json.loads(command.stdout.getvalue())
+        self.assertEqual(result['stopped_reason'], 'score_zero')
+        self.assertEqual(result['predicted_final_score'], 0.0)
+        self.assertEqual(result['accepted_transitions'], 1)
+        self.assertEqual(result['swaps'], ['1:10:2:20'])
+        self.assertEqual(len(result['neighborhoods']), 2)
+        self.assertEqual(
+            result['best_authoritative_checkpoint']['score'], 0.0,
+        )
+        self.assertEqual(progress, [100.0, 0.0])
+        self.assertEqual(results, [])
+
     def test_continuous_search_rejects_checkpoint_score_divergence(self):
         results = [
             self._kernel_result('a', self._transition(0)),
