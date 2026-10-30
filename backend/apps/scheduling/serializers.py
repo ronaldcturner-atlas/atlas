@@ -1003,6 +1003,14 @@ class ContractSerializer(serializers.ModelSerializer):
             for group in shift_settings.get('rules') or []:
                 if not isinstance(group, dict):
                     continue
+                self._normalize_whole_number_fields(
+                    group,
+                    (
+                        'max_same_shifts_in_row',
+                        'max_same_shifts_in_row_penalty_weight',
+                    ),
+                    'shift_settings',
+                )
                 for row in group.get('period_rules') or []:
                     if isinstance(row, dict):
                         self._normalize_whole_number_fields(

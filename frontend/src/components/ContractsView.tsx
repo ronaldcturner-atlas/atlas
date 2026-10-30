@@ -72,13 +72,14 @@ type ContractRecord = {
   setup_required?: boolean
 }
 
-type PeriodType = 'WEEK' | 'MONTH' | 'SCHEDULE_BLOCK'
+type PeriodType = 'WEEK' | 'MONTH' | 'SCHEDULE_BLOCK' | 'IN_A_ROW'
 type RuleUnits = 'HOURS' | 'SHIFTS'
 
 const workloadPeriodLabels: Record<PeriodType, string> = {
   WEEK: 'Week',
   MONTH: 'Month',
   SCHEDULE_BLOCK: 'Schedule Block',
+  IN_A_ROW: 'In a row',
 }
 
 function workloadRuleSummary(rule: MinMaxRule) {
@@ -499,15 +500,34 @@ function normalizeContractToForm(contract: ContractRecord): ContractFormState {
         ? shiftSettings.rules
         : fallback.shift_settings.rules)
         .filter((rule) => !('shared_rule_id' in (rule as unknown as Record<string, unknown>)))
-        .map((rule) => ({
-        ...makeShiftRule(),
-        ...rule,
-        id: makeId('shift-group'),
-        period_rules: (Array.isArray(rule.period_rules)
-          ? rule.period_rules
-          : [makeMinMaxRule('WEEK')])
-          .map((periodRule) => normalizeMinMaxRule(periodRule as Partial<MinMaxRule> & Record<string, unknown>)),
-      })),
+        .map((rule) => {
+          const ruleRecord = rule as unknown as Record<string, unknown>
+          const periodRules = (Array.isArray(rule.period_rules)
+            ? rule.period_rules
+            : [makeMinMaxRule('WEEK')])
+            .map((periodRule) => normalizeMinMaxRule(periodRule as Partial<MinMaxRule> & Record<string, unknown>))
+          const inRowMaximum = ruleRecord.max_same_shifts_in_row
+          const inRowPenalty = ruleRecord.max_same_shifts_in_row_penalty_weight
+          if (
+            !periodRules.some((periodRule) => periodRule.period_type === 'IN_A_ROW')
+            && (inRowMaximum !== undefined || inRowPenalty !== undefined)
+            && (String(inRowMaximum ?? '') !== '' || String(inRowPenalty ?? '') !== '')
+          ) {
+            periodRules.push({
+              ...makeMinMaxRule('IN_A_ROW'),
+              units: 'SHIFTS',
+              max_value: String(inRowMaximum ?? ''),
+              max_penalty_weight: String(inRowPenalty ?? ''),
+              spread_violations: Boolean(ruleRecord.spread_violations),
+            })
+          }
+          return {
+            ...makeShiftRule(),
+            ...rule,
+            id: makeId('shift-group'),
+            period_rules: periodRules,
+          }
+        }),
     },
     shared_rules: Array.isArray(contract.shared_rules)
       ? contract.shared_rules.map((rule) => ({ ...rule }))
@@ -555,11 +575,19 @@ function sanitizeFormPayload(formState: ContractFormState) {
       period_rules: formState.workload_settings.period_rules.map(({ id, ...rule }) => rule),
     },
     shift_settings: {
-      rules: formState.shift_settings.rules.map((rule) => ({
-        label: rule.label,
-        shift_template_ids: rule.shift_template_ids,
-        period_rules: rule.period_rules.map(({ id, ...periodRule }) => periodRule),
-      })),
+      rules: formState.shift_settings.rules.map((rule) => {
+        const inRowRule = rule.period_rules.find((periodRule) => periodRule.period_type === 'IN_A_ROW')
+        return {
+          label: rule.label,
+          shift_template_ids: rule.shift_template_ids,
+          period_rules: rule.period_rules
+            .filter((periodRule) => periodRule.period_type !== 'IN_A_ROW')
+            .map(({ id, ...periodRule }) => periodRule),
+          max_same_shifts_in_row: inRowRule?.max_value || '',
+          max_same_shifts_in_row_penalty_weight: inRowRule?.max_penalty_weight || '',
+          spread_violations: inRowRule?.spread_violations || false,
+        }
+      }),
     },
     shared_rule_settings: formState.shared_rules.map((rule) => ({
       shared_rule_id: rule.id,
@@ -1554,26 +1582,50 @@ export default function ContractsView() {
                       </div>
 
                       <div className="contract-rule-grid">
-                        {shiftRule.period_rules.map((rule, periodIndex) => (
-                          <div key={rule.id} className="contract-rule-row">
+                        {shiftRule.period_rules.map((rule, periodIndex) => {
+                          const inARow = rule.period_type === 'IN_A_ROW'
+                          const anotherInARowRuleExists = shiftRule.period_rules.some(
+                            (candidate, candidateIndex) => candidateIndex !== periodIndex && candidate.period_type === 'IN_A_ROW',
+                          )
+                          const updateRule = (changes: Partial<MinMaxRule>) => setFormState((current) => ({
+                            ...current,
+                            shift_settings: {
+                              ...current.shift_settings,
+                              rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex
+                                ? {
+                                  ...item,
+                                  period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex
+                                    ? { ...periodRule, ...changes }
+                                    : periodRule),
+                                }
+                                : item),
+                            },
+                          }))
+                          return <div key={rule.id} className="contract-rule-row">
                             <div className="contract-value-penalty-columns">
                               <div className="contract-minmax-stack">
-                                <label className="facility-field"><span>Minimum</span><input type="number" value={rule.min_value} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, min_value: event.target.value } : periodRule) } : item) } }))} /></label>
-                                <label className="facility-field"><span>Maximum</span><input type="number" value={rule.max_value} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, max_value: event.target.value } : periodRule) } : item) } }))} /></label>
+                                <label className="facility-field"><span>Minimum</span><input type="number" value={rule.min_value} disabled={inARow} placeholder={inARow ? 'Not used' : undefined} onChange={(event) => updateRule({ min_value: event.target.value })} /></label>
+                                <label className="facility-field"><span>Maximum</span><input type="number" min={inARow ? 1 : 0} value={rule.max_value} onChange={(event) => updateRule({ max_value: event.target.value })} /></label>
                               </div>
                               <div className="contract-minmax-stack">
-                                <label className="facility-field"><span>Minimum penalty</span><input type="number" value={rule.min_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, min_penalty_weight: event.target.value } : periodRule) } : item) } }))} /></label>
-                                <label className="facility-field"><span>Maximum penalty</span><input type="number" value={rule.max_penalty_weight} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, max_penalty_weight: event.target.value } : periodRule) } : item) } }))} /></label>
+                                <label className="facility-field"><span>Minimum penalty</span><input type="number" value={rule.min_penalty_weight} disabled={inARow} placeholder={inARow ? 'Not used' : undefined} onChange={(event) => updateRule({ min_penalty_weight: event.target.value })} /></label>
+                                <label className="facility-field"><span>Maximum penalty</span><input type="number" min="0" value={rule.max_penalty_weight} onChange={(event) => updateRule({ max_penalty_weight: event.target.value })} /></label>
                               </div>
                             </div>
                             <div className="contract-rule-controls-grid">
-                              <label className="facility-field"><span>Period</span><select value={rule.period_type} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, period_type: event.target.value as PeriodType } : periodRule) } : item) } }))}><option value="WEEK">Week</option><option value="MONTH">Month</option><option value="SCHEDULE_BLOCK">Schedule Block</option></select></label>
-                              <label className="facility-field"><span>Units</span><select value={rule.units} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, units: event.target.value as RuleUnits } : periodRule) } : item) } }))}><option value="HOURS">Hours</option><option value="SHIFTS">Shifts</option></select></label>
-                              <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={rule.spread_violations} onChange={(event) => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.map((periodRule, targetPeriodIndex) => targetPeriodIndex === periodIndex ? { ...periodRule, spread_violations: event.target.checked } : periodRule) } : item) } }))} /></label>
+                              <label className="facility-field"><span>Period</span><select value={rule.period_type} onChange={(event) => {
+                                const periodType = event.target.value as PeriodType
+                                updateRule(periodType === 'IN_A_ROW'
+                                  ? { period_type: periodType, units: 'SHIFTS', min_value: '', min_penalty_weight: '' }
+                                  : { period_type: periodType })
+                              }}><option value="WEEK">Week</option><option value="MONTH">Month</option><option value="SCHEDULE_BLOCK">Schedule Block</option><option value="IN_A_ROW" disabled={anotherInARowRuleExists}>In a row</option></select></label>
+                              <label className="facility-field"><span>Units</span><select value={rule.units} disabled={inARow} onChange={(event) => updateRule({ units: event.target.value as RuleUnits })}><option value="HOURS">Hours</option><option value="SHIFTS">Shifts</option></select></label>
+                              <label className="inline-checkbox-field"><span>Spread violations</span><input type="checkbox" checked={rule.spread_violations} onChange={(event) => updateRule({ spread_violations: event.target.checked })} /></label>
                             </div>
+                            {inARow && <div className="contract-rule-help">Counts adjacent calendar dates assigned from the selected shifts. Select one shift when the limit should apply to that exact shift.</div>}
                             <button type="button" className="contract-remove-button" onClick={() => setFormState((current) => ({ ...current, shift_settings: { ...current.shift_settings, rules: current.shift_settings.rules.map((item, itemIndex) => itemIndex === shiftIndex ? { ...item, period_rules: item.period_rules.filter((_, targetPeriodIndex) => targetPeriodIndex !== periodIndex) } : item) } }))}>Remove</button>
                           </div>
-                        ))}
+                        })}
                       </div>
 
                       <button

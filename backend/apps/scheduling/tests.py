@@ -11973,6 +11973,30 @@ class ContractApiTests(TestCase):
             payload['workload_settings'],
         )
 
+    def test_create_contract_persists_shift_group_in_a_row_rule(self):
+        payload = self._build_payload()
+        payload['shift_settings'] = {
+            'rules': [{
+                'label': 'Day shift streak',
+                'shift_template_ids': [101],
+                'period_rules': [],
+                'max_same_shifts_in_row': '4.0',
+                'max_same_shifts_in_row_penalty_weight': '1000.0',
+                'spread_violations': True,
+            }],
+        }
+
+        response = self.client.post('/api/contracts/', data=payload, format='json')
+
+        self.assertEqual(response.status_code, 201)
+        stored = response.json()['shift_settings']['rules'][0]
+        self.assertEqual(stored['max_same_shifts_in_row'], '4')
+        self.assertEqual(
+            stored['max_same_shifts_in_row_penalty_weight'], '1000',
+        )
+        self.assertTrue(stored['spread_violations'])
+        self.assertEqual(stored['period_rules'], [])
+
     def test_facility_period_rule_scores_each_users_assignments(self):
         response = self.client.post(
             '/api/contracts/', data=self._build_payload(), format='json',
