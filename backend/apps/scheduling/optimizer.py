@@ -2969,6 +2969,7 @@ def _attach_published_boundary_context(version, instances, contracts):
     previous_day = version.schedule_block.start_date - timedelta(days=1)
     previous_block = (
         ScheduleBlock.objects.filter(
+            domain=version.domain,
             published_at__isnull=False,
             end_date=previous_day,
         )
@@ -3067,6 +3068,24 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
     )
     boundary_context = _published_boundary_context(instances)
     current_instance_ids = {instance.id for instance in instances}
+    schedule_block = (
+        getattr(instances[0], 'schedule_block', None)
+        if instances else None
+    )
+    block_start = (
+        schedule_block.start_date
+        if schedule_block is not None
+        else min((instance.date for instance in instances), default=None)
+    )
+    prior_date_range = (
+        getattr(instances[0], '_published_boundary_date_range', None)
+        if instances else None
+    )
+    unknown_sunday_start_boundary = bool(
+        block_start is not None
+        and block_start.weekday() == 6
+        and prior_date_range is None
+    )
     if default_target is None:
         default_target = Decimal(sum(map(len, assigned.values()))) / len(physicians) if physicians else Decimal('0')
     score, violations = Decimal('0'), []
@@ -3156,6 +3175,21 @@ def _weekend_volume_report(instances, physicians, state, contracts, default_targ
                 actual = len(block)
                 if side == 'min':
                     deviation = max(limit - actual, 0)
+                    # A Sunday-starting block sees only the final day of the
+                    # preceding Friday-through-Sunday weekend. When there is
+                    # no adjacent published schedule in this same domain, the
+                    # earlier days are unknowable. Do not invent a short
+                    # weekend-shift streak at that first-ever boundary.
+                    if (
+                        deviation
+                        and unknown_sunday_start_boundary
+                        and any(
+                            instance.id in current_instance_ids
+                            and instance.date == block_start
+                            for instance in block
+                        )
+                    ):
+                        deviation = 0
                 else:
                     prior_count = sum(
                         instance.id not in current_instance_ids

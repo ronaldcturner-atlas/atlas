@@ -290,6 +290,10 @@ class PenaltyScopeTests(SimpleTestCase):
     def test_weekend_shift_streak_without_prior_assignment_is_penalized(self):
         current = self.make_instances([date(2026, 11, 1)])[0]
         current._published_weekend_context = {}
+        current._published_boundary_date_range = (
+            date(2026, 10, 1),
+            date(2026, 10, 31),
+        )
         physician = SimpleNamespace(id=1)
         contract = SimpleNamespace(
             id=11,

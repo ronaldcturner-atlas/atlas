@@ -7704,6 +7704,7 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         contract.save(update_fields=['weekend_settings', 'updated_at'])
 
         previous_block = ScheduleBlock.objects.create(
+            domain=self.domain,
             start_date=date(2026, 9, 1),
             end_date=date(2026, 10, 31),
             request_open_datetime=timezone.make_aware(datetime(2026, 7, 1, 12, 0)),
@@ -7765,6 +7766,124 @@ class ScheduleBuildWorkspaceApiTests(TestCase):
         self.assertEqual(
             [instance.id for instance in context[physician.id]],
             [prior_instance.id],
+        )
+        self.assertEqual(report, {'score': 0, 'violations': []})
+
+    def test_weekend_scoring_ignores_unknown_first_sunday_boundary(self):
+        weekend_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(19, 0),
+            active_days_of_week=['Saturday', 'Sunday'],
+            weekend_days=['Saturday', 'Sunday'],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        physician = self._create_assignment_physician(
+            'first.sunday.boundary@example.com',
+            'First Sunday Boundary',
+            facilities=[self.facility],
+        )
+        contract = Contract.objects.get(user_assignments__physician=physician)
+        contract.weekend_settings = {
+            'min_consecutive_weekend_shifts': 2,
+            'min_consecutive_weekend_shifts_penalty_weight': 10000,
+        }
+        contract.save(update_fields=['weekend_settings', 'updated_at'])
+
+        current_version = self._create_build_version(
+            date(2026, 11, 1), date(2026, 11, 30),
+        )
+        current_instance = self._create_shift_instance(
+            current_version, weekend_template, date(2026, 11, 1),
+        )
+        contracts = {physician.id: contract}
+
+        context = _attach_published_weekend_context(
+            current_version,
+            [current_instance],
+            contracts,
+        )
+        report = _weekend_volume_report(
+            [current_instance],
+            [physician],
+            {current_instance.id: [physician.id]},
+            contracts,
+            details=True,
+        )
+
+        self.assertEqual(context, {})
+        self.assertEqual(report, {'score': 0, 'violations': []})
+
+    def test_weekend_boundary_context_is_isolated_by_domain(self):
+        other_region = Region.objects.create(
+            organization=self.domain.region.organization,
+            name='Other Region',
+        )
+        other_domain = Domain.objects.create(
+            region=other_region,
+            name='Physician',
+            active=True,
+        )
+        ScheduleBlock.objects.create(
+            domain=other_domain,
+            start_date=date(2026, 10, 1),
+            end_date=date(2026, 10, 31),
+            request_open_datetime=timezone.make_aware(
+                datetime(2026, 8, 1, 12, 0)
+            ),
+            request_close_datetime=timezone.make_aware(
+                datetime(2026, 8, 15, 12, 0)
+            ),
+            build_status=ScheduleBlock.BuildStatus.ARCHIVE,
+            published_at=timezone.now(),
+        )
+        weekend_template = ShiftTemplate.objects.create(
+            facility=self.facility,
+            start_time=time(7, 0),
+            end_time=time(19, 0),
+            active_days_of_week=['Sunday'],
+            weekend_days=['Sunday'],
+            night_shift=False,
+            default_staffing_count=1,
+            active=True,
+        )
+        physician = self._create_assignment_physician(
+            'domain.boundary@example.com',
+            'Domain Boundary',
+            facilities=[self.facility],
+        )
+        contract = Contract.objects.get(user_assignments__physician=physician)
+        contract.weekend_settings = {
+            'min_consecutive_weekend_shifts': 2,
+            'min_consecutive_weekend_shifts_penalty_weight': 10000,
+        }
+        contract.save(update_fields=['weekend_settings', 'updated_at'])
+        current_version = self._create_build_version(
+            date(2026, 11, 1), date(2026, 11, 30),
+        )
+        current_instance = self._create_shift_instance(
+            current_version, weekend_template, date(2026, 11, 1),
+        )
+        contracts = {physician.id: contract}
+
+        context = _attach_published_weekend_context(
+            current_version,
+            [current_instance],
+            contracts,
+        )
+        report = _weekend_volume_report(
+            [current_instance],
+            [physician],
+            {current_instance.id: [physician.id]},
+            contracts,
+            details=True,
+        )
+
+        self.assertEqual(context, {})
+        self.assertIsNone(
+            getattr(current_instance, '_published_boundary_date_range')
         )
         self.assertEqual(report, {'score': 0, 'violations': []})
 
