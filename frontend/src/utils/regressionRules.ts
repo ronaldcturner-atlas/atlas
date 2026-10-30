@@ -41,6 +41,15 @@ export function optimizerRecalculateTarget<T>(
   return startMode === 'PREVIOUS_OPTIMIZER_RUN' ? startingRun : viewedRun
 }
 
+export function shouldTickOptimizerClock(
+  runningRuns: Array<{ started_at?: string | null }>,
+) {
+  // A newly queued run may not have started_at yet. Polling fills that value
+  // without changing the run id, so the clock must already be ticking rather
+  // than waiting for a dependency change that will never occur.
+  return runningRuns.length > 0
+}
+
 export function assignablePhysicians<T extends { can_assign: boolean; already_assigned: boolean }>(
   physicians: T[],
 ) {

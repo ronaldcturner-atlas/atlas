@@ -5,6 +5,7 @@ import {
   assignablePhysicians,
   optimizerRecalculateTarget,
   optimizerStartOptions,
+  shouldTickOptimizerClock,
   type OptimizerStartSelection,
 } from '../utils/regressionRules'
 
@@ -1168,7 +1169,8 @@ export default function ScheduleBuildWorkspace({ blockId, onBack }: Props) {
   }, [context?.selected_version?.id, runningOptimizerRunIds])
 
   useEffect(() => {
-    if (!runningOptimizerRuns.some((run) => run.started_at)) return
+    if (!shouldTickOptimizerClock(runningOptimizerRuns)) return
+    setOptimizerClockMs(Date.now())
     const timer = window.setInterval(() => setOptimizerClockMs(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [runningOptimizerRunIds])

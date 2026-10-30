@@ -8,6 +8,7 @@ import {
   optimizerStartOptions,
   penaltyContributingRows,
   pendingTradeHighlights,
+  shouldTickOptimizerClock,
   shiftHasStarted,
   tradeRequestAttention,
 } from '../src/utils/regressionRules'
@@ -58,6 +59,16 @@ describe('optimizer schedule source selection', () => {
     expect(optimizerRecalculateTarget(
       'FRESH_FILL', startingRun, viewedRun,
     )).toBe(viewedRun)
+  })
+})
+
+describe('optimizer elapsed-time clock', () => {
+  it('starts ticking while a queued run is waiting for its started timestamp', () => {
+    expect(shouldTickOptimizerClock([{ started_at: null }])).toBe(true)
+  })
+
+  it('stops when there are no running runs', () => {
+    expect(shouldTickOptimizerClock([])).toBe(false)
   })
 })
 
